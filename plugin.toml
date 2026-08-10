@@ -1,0 +1,87 @@
+[plugin]
+id = "neko_anyadance_body"
+name = "N.E.K.O AnyaDance Body"
+description = "让 N.E.K.O 通过 AnyaDance 与 VRChat OSC 控制虚拟身体姿态、Avatar 参数和握持输入"
+short_description = "控制 AnyaDance 姿态与 VRChat OSC 动作"
+keywords = ["anyadance", "steamvr", "vrchat", "osc", "body", "pose", "gesture", "姿态", "举手", "握持"]
+version = "0.13.9"
+type = "plugin"
+entry = "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
+
+[plugin.author]
+name = "N.E.K.O Community"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "debug"
+title = "AnyaDance 身体调试台"
+entry = "ui/panel.tsx"
+context = "debug_dashboard"
+permissions = ["state:read", "action:call"]
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[anyadance]
+host = "127.0.0.1"
+port = 39570
+rate_hz = 60
+
+[body_profile]
+height_m = 1.50
+shoulder_width_m = 0.36
+shoulder_drop_m = 0.18
+arm_length_m = 0.58
+
+[motion]
+default_duration_ms = 600
+max_queue_size = 8
+
+[behavior]
+default_crossfade_ms = 400
+protect_full_body_motion = true
+prefer_vmd_expressions = true
+transition_history_size = 16
+
+[vmc_idle]
+enabled = true
+listen_host = "127.0.0.1"
+listen_port = 39539
+allowed_sender = "127.0.0.1"
+stale_after_ms = 500
+manage_host_output = true
+host_api_url = "http://127.0.0.1:48911"
+host_api_timeout_seconds = 3.0
+host_output_host = "127.0.0.1"
+host_send_rate_hz = 60
+
+[vrchat_osc]
+enabled = true
+send_host = "127.0.0.1"
+send_port = 9000
+listen_host = "127.0.0.1"
+listen_port = 9001
+allowed_sender = "127.0.0.1"
+input_pulse_ms = 100
+parameter_cache_size = 256
+awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding"]
+
+[clips]
+directory = "motions"
+max_file_bytes = 67108864
+max_frames = 18000
+max_duration_seconds = 300
+
+[safety]
+max_position_abs_m = 3.0
+max_y_m = 2.0
+max_linear_speed_mps = 2.0
+max_angular_speed_dps = 360.0
+max_action_duration_ms = 5000

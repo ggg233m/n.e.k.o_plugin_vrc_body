@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.neko-plugin
+store.db
+tmp/
