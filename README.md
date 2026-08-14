@@ -1,4 +1,9 @@
-# N.E.K.O AnyaDance Body
+## 此项目正在开发中功能尚未完善 ##
+
+
+
+
+# N.E.K.O VRC Body
 
 这是一个独立的 N.E.K.O 插件：待机时把宿主公开的 VMC 骨骼流转换为 AnyaDance 六点姿态，显式动作时由 LLM 通过受控语义工具接管，并通过 VRChat OSC 控制 Avatar 参数和交互输入。
 
