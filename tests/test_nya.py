@@ -140,6 +140,15 @@ class NyaClipTests(unittest.TestCase):
         clip = parse_nya(json.dumps(source), name="clamped", config=self.config)
         self.assertEqual(clip.frames[1].frame.devices["right_controller"].position[1], 2.0)
 
+    def test_relaxed_safety_bounds_keep_the_original_height(self) -> None:
+        relaxed = PluginConfig.from_mapping({
+            "safety": {"max_position_abs_m": 30.0, "max_y_m": 25.0}
+        })
+        source = json.loads((FIXTURES / "sample_clip.nya").read_text(encoding="utf-8"))
+        source["frames"][1]["devices"]["right_controller"]["p"][1] = 2.019
+        clip = parse_nya(json.dumps(source), name="relaxed", config=relaxed)
+        self.assertEqual(clip.frames[1].frame.devices["right_controller"].position[1], 2.019)
+
     def test_default_file_limit_accepts_large_pretty_printed_dances(self) -> None:
         self.assertEqual(self.config.clip_max_file_bytes, 64 * 1024 * 1024)
 

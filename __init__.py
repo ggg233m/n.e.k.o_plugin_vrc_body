@@ -15,6 +15,7 @@ from plugin.sdk.plugin import NekoPluginBase, Ok, lifecycle, llm_tool, neko_plug
 
 from .behavior import EXPRESSION_INTENTS, resolve_expression
 from .config import PluginConfig
+from .driver_log import DriverLogListener
 from .host_vmc import HostVmcController
 from .instructions import BODY_AI_INSTRUCTIONS
 from .motion import GESTURE_NAMES
@@ -112,6 +113,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._scheduler: BodyScheduler | None = None
         self._clip_library: ClipLibrary | None = None
         self._osc: VrchatOscBridge | None = None
+        self._driver_log: DriverLogListener | None = None
         self._vmc_idle: VmcIdleRelay | None = None
         self._host_vmc: HostVmcController | None = None
         self._vmc_calibration_stop = threading.Event()
@@ -205,6 +207,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             await asyncio.to_thread(self._osc.stop)
         self._osc = VrchatOscBridge(self._body_config.vrchat_osc, logger=self.logger)
         self._osc.start()
+        if self._driver_log:
+            await asyncio.to_thread(self._driver_log.stop)
+        self._driver_log = DriverLogListener(self._body_config.driver_log, logger=self.logger)
+        self._driver_log.start()
         self._inject_ai_instructions()
         self.logger.info(
             "AnyaDance body scheduler ready (output disabled, target=%s:%s, rate=%s Hz)",
@@ -227,11 +233,21 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 vmc_status["listen_address"],
                 vmc_status["receiver_listening"],
             )
+        if self._body_config.driver_log.enabled:
+            driver_log_status = self._driver_log.snapshot()
+            self.logger.info(
+                "AnyaDance driver log listener ready (group=%s, receiver_listening=%s)",
+                driver_log_status["listen_address"],
+                driver_log_status["receiver_listening"],
+            )
         return Ok({"status": "ready", "output_enabled": False})
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_: Any):
         self._stop_vmc_calibration()
+        if self._driver_log:
+            await asyncio.to_thread(self._driver_log.stop)
+            self._driver_log = None
         if self._osc:
             await asyncio.to_thread(self._osc.stop)
             self._osc = None
@@ -335,6 +351,75 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         if self._osc:
             self._osc.cancel_scheduled_inputs(release=True)
 
+    def _driver_log_snapshot(self) -> dict[str, Any]:
+        if not self._driver_log:
+            return {
+                "enabled": False,
+                "connection": "unknown",
+                "receiver_listening": False,
+                "last_error": "driver log listener is not initialized",
+            }
+        return self._driver_log.snapshot()
+
+    @staticmethod
+    def _apply_driver_log_to_udp(snapshot: dict[str, Any], driver_log: Mapping[str, Any]) -> None:
+        """Replace the unverifiable UDP fields with driver-reported facts.
+
+        The pose protocol has no response, so both fields stay at their
+        unverifiable defaults whenever the telemetry group is off or silent --
+        an older driver simply never reports and nothing here changes.
+        """
+        udp = snapshot.get("udp")
+        if not isinstance(udp, dict) or not driver_log.get("enabled"):
+            return
+        connection = driver_log.get("connection")
+        if connection not in {"detected", "stale"}:
+            return
+        udp["connected"] = connection
+
+        senders = [str(item) for item in driver_log.get("senders") or []]
+        local_port = udp.get("local_port")
+        if local_port is None:
+            snapshot["concurrent_sender_detection"] = "detected_unattributed"
+            return
+        others = [item for item in senders if not item.endswith(f":{local_port}")]
+        udp["other_senders"] = others
+        snapshot["concurrent_sender_detection"] = "concurrent" if others else "exclusive"
+
+    @staticmethod
+    def _driver_delivery_awareness(
+        snapshot: Mapping[str, Any], driver_log: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Tell the model whether the driver actually received the commands."""
+        connection = str(driver_log.get("connection", "unknown"))
+        concurrent = str(snapshot.get("concurrent_sender_detection", "unsupported"))
+        accepted = int(driver_log.get("accepted_commands", 0) or 0)
+        rejected = int(driver_log.get("rejected_commands", 0) or 0)
+        y_clamped = int(driver_log.get("y_clamped_commands", 0) or 0)
+        if not driver_log.get("enabled"):
+            summary = "驱动遥测已禁用；只能确认本地发送成功，无法确认 AnyaDance 驱动收到。"
+        elif connection == "detected":
+            summary = f"AnyaDance 驱动已确认收到命令（接受 {accepted} 条，拒绝 {rejected} 条）。"
+            if y_clamped:
+                summary += f"其中 {y_clamped} 条被驱动钳制了 Y 高度。"
+            if concurrent == "concurrent":
+                summary += "检测到其他程序也在向驱动发送姿态，可能造成抖动。"
+        elif connection == "stale":
+            summary = "驱动曾确认收到命令，但最近一段时间没有新的上报。"
+        elif connection == "listening":
+            summary = "已加入驱动遥测组但尚未收到上报；驱动可能未运行或未启用该通道。"
+        else:
+            summary = "驱动遥测不可用；只能确认本地发送成功。"
+        return {
+            "enabled": bool(driver_log.get("enabled")),
+            "connection": connection,
+            "accepted_commands": accepted,
+            "rejected_commands": rejected,
+            "y_clamped_commands": y_clamped,
+            "concurrent_sender_detection": concurrent,
+            "summary": summary,
+        }
+
     def _ui_event(self, command: str, arguments: Mapping[str, Any], payload: Any) -> None:
         value = getattr(payload, "value", payload)
         result = value if isinstance(value, Mapping) else {}
@@ -358,8 +443,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
 
     @ui.context(id="debug_dashboard", title="AnyaDance 身体调试台")
     async def debug_dashboard_context(self):
+        driver_log = self._driver_log_snapshot()
         if self._scheduler:
             body = self._scheduler.snapshot()
+            self._apply_driver_log_to_udp(body, driver_log)
             awareness = dict(body.get("awareness") or {})
         else:
             body = {
@@ -398,6 +485,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "body": body,
             "awareness": awareness,
             "vrchat_osc": osc,
+            "driver_log": driver_log,
             "host_vmc": self._host_vmc.snapshot() if self._host_vmc else {
                 "managed": False,
                 "active": False,
@@ -411,6 +499,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "vmc_idle_listen_address": f"{self._body_config.vmc_idle.listen_host}:{self._body_config.vmc_idle.listen_port}",
                 "osc_send_target": f"{self._body_config.vrchat_osc.send_host}:{self._body_config.vrchat_osc.send_port}",
                 "osc_listen_address": f"{self._body_config.vrchat_osc.listen_host}:{self._body_config.vrchat_osc.listen_port}",
+                "driver_log_address": f"{self._body_config.driver_log.multicast_group}:{self._body_config.driver_log.listen_port}",
             },
             "ui_events": events,
         }
@@ -927,6 +1016,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "reason": "scheduler is not initialized",
                 "idle_relay": self._vmc_idle.snapshot() if self._vmc_idle else {"enabled": False},
                 "vrchat_osc": self._osc.snapshot() if self._osc else {"enabled": False},
+                "driver_log": self._driver_log_snapshot(),
             })
         snapshot = self._scheduler.snapshot()
         snapshot["vrchat_osc"] = self._osc.snapshot() if self._osc else {
@@ -934,6 +1024,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "connection": "unknown",
             "last_error": "OSC bridge is not initialized",
         }
+        driver_log = self._driver_log_snapshot()
+        snapshot["driver_log"] = driver_log
+        self._apply_driver_log_to_udp(snapshot, driver_log)
         return Ok(snapshot)
 
     @llm_tool(**BODY_AWARENESS)
@@ -952,12 +1045,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "vrchat_osc": self._osc.awareness() if self._osc else {"enabled": False},
             })
         snapshot = self._scheduler.snapshot()
+        driver_log = self._driver_log_snapshot()
+        self._apply_driver_log_to_udp(snapshot, driver_log)
         return Ok({
             "state": snapshot["state"],
             "output_enabled": snapshot["output_enabled"],
             "safety_state": snapshot["safety_state"],
             "queue_length": snapshot["queue_length"],
             **snapshot["awareness"],
+            "driver_delivery": self._driver_delivery_awareness(snapshot, driver_log),
             "vrchat_osc": self._osc.awareness() if self._osc else {
                 "enabled": False,
                 "connection": "unknown",

@@ -39,6 +39,8 @@ from .expression_motion import (
 class DatagramTransport(Protocol):
     def send(self, payload: bytes, address: tuple[str, int]) -> None: ...
     def close(self) -> None: ...
+    @property
+    def local_port(self) -> int | None: ...
 
 
 class IdleFrameSource(Protocol):
@@ -53,6 +55,14 @@ class UdpTransport:
 
     def send(self, payload: bytes, address: tuple[str, int]) -> None:
         self._socket.sendto(payload, address)
+
+    @property
+    def local_port(self) -> int | None:
+        """Source port the kernel bound on first send, for sender attribution."""
+        try:
+            return int(self._socket.getsockname()[1]) or None
+        except OSError:
+            return None
 
     def close(self) -> None:
         self._socket.close()
@@ -189,6 +199,7 @@ class BodyScheduler:
             "udp": {
                 "target": f"{self.config.host}:{self.config.port}",
                 "connected": "unknown",
+                "local_port": None,
                 "last_send_at_monotonic": None,
                 "sent_packets": 0,
                 "send_failures": 0,
@@ -1320,6 +1331,8 @@ class BodyScheduler:
             actual_hz = 1.0 / mean_interval if mean_interval > 0 else 0.0
         behavior = self._behavior.snapshot(runtime_state=self._state, now=now)
         idle_relay = self._idle_relay_snapshot()
+        transport = self._transport
+        local_port = transport.local_port if transport is not None else None
         snapshot = {
             "state": self._state,
             "safety_state": self._safety_state,
@@ -1327,6 +1340,7 @@ class BodyScheduler:
             "udp": {
                 "target": f"{self.config.host}:{self.config.port}",
                 "connected": "unknown",
+                "local_port": local_port,
                 "last_send_at_monotonic": self._last_send_at,
                 "sent_packets": self._sent_packets,
                 "send_failures": self._send_failures,

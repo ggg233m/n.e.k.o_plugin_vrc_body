@@ -73,12 +73,26 @@ input_pulse_ms = 100
 parameter_cache_size = 256
 awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding"]
 
+# 订阅 AnyaDance 驱动的遥测多播，用于确认驱动是否真的收到了命令。
+# 需要驱动支持该通道（steamvr.vrsettings 的 driver_anyadance.command_log_enabled）；
+# 旧版驱动下监听器会正常启动但收不到数据，相关字段回落为 unknown/unsupported。
+[driver_log]
+enabled = true
+multicast_group = "239.255.39.71"
+listen_port = 39571
+interface_host = "127.0.0.1"
+stale_after_ms = 3000
+history_size = 64
+
 [clips]
 directory = "motions"
 max_file_bytes = 67108864
 max_frames = 18000
 max_duration_seconds = 300
 
+# 比 AnyaDance 驱动更严格的安全子集。驱动本身允许 ±30 m 位置、25 m 高度。
+# 可放宽到 max_position_abs_m = 30.0、max_y_m = 25.0，但必须满足
+# max_y_m <= max_position_abs_m，否则位置校验会拒绝被 Y 钳制后的帧。
 [safety]
 max_position_abs_m = 3.0
 max_y_m = 2.0

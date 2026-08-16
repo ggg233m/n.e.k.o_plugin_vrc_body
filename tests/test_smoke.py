@@ -100,6 +100,20 @@ class PluginSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stale_after_ms"):
             PluginConfig.from_mapping({"vmc_idle": {"stale_after_ms": 20}})
 
+    def test_safety_config_is_bounded(self) -> None:
+        config = PluginConfig.from_mapping({
+            "safety": {"max_position_abs_m": 30.0, "max_y_m": 25.0}
+        })
+        self.assertEqual(config.safety.max_position_abs_m, 30.0)
+        self.assertEqual(config.safety.max_y_m, 25.0)
+
+        with self.assertRaisesRegex(ValueError, "max_y_m"):
+            PluginConfig.from_mapping({"safety": {"max_y_m": 25.1}})
+        # A Y ceiling above the all-axis position bound would make the .nya
+        # loader clamp to a value the frame validator then rejects.
+        with self.assertRaisesRegex(ValueError, "max_position_abs_m"):
+            PluginConfig.from_mapping({"safety": {"max_y_m": 10.0}})
+
 
 if __name__ == "__main__":
     unittest.main()

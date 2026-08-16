@@ -50,6 +50,7 @@ type DebugState = {
   body?: Record<string, any>
   awareness?: Record<string, any>
   vrchat_osc?: Record<string, any>
+  driver_log?: Record<string, any>
   host_vmc?: Record<string, any>
   clips?: {
     clips?: ClipSummary[]
@@ -138,6 +139,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const body = state.body || {}
   const awareness = state.awareness || {}
   const osc = state.vrchat_osc || {}
+  const driverLog = state.driver_log || {}
   const idleRelay = body.idle_relay || awareness.idle_relay || {}
   const hostVmc = state.host_vmc || {}
   const metrics = body.metrics || {}
@@ -287,6 +289,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         <StatCard label="状态" value={body.state || "shutdown"} />
         <StatCard label="实际发送频率" value={`${fixed(metrics.actual_hz)} Hz`} />
         <StatCard label="AnyaDance 数据包" value={udp.sent_packets || 0} />
+        <StatCard label="驱动已接受" value={driverLog.accepted_commands ?? "—"} />
         <StatCard label="OSC 收/发" value={`${osc.received_packets || 0} / ${osc.sent_packets || 0}`} />
       </Grid>
 
@@ -318,6 +321,9 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
           <KeyValue
             items={[
               { key: "udp", label: "AnyaDance UDP", value: udp.target || state.config?.anyadance_target || "—" },
+              { key: "driverLog", label: "驱动遥测", value: driverLog.enabled === false ? "已禁用" : `${driverLog.connection || "unknown"} @ ${driverLog.listen_address || state.config?.driver_log_address || "—"}` },
+              { key: "driverAck", label: "驱动确认", value: udp.connected === "detected" ? `已确认（接受 ${driverLog.accepted_commands || 0} / 拒绝 ${driverLog.rejected_commands || 0}）` : (udp.connected === "stale" ? "曾确认，已过期" : "无法确认") },
+              { key: "concurrentSender", label: "并发发送者", value: body.concurrent_sender_detection === "concurrent" ? `存在其他发送者：${(udp.other_senders || []).join("、") || "未知"}` : (body.concurrent_sender_detection || "unsupported") },
               { key: "oscSend", label: "OSC 发送", value: osc.send_target || state.config?.osc_send_target || "—" },
               { key: "oscListen", label: "OSC 监听", value: osc.listen_address || state.config?.osc_listen_address || "—" },
               { key: "oscListening", label: "9001 监听", value: osc.receiver_listening ? "正常" : "未监听" },

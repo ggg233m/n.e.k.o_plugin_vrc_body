@@ -88,8 +88,8 @@ class VmcIdleRelayTests(unittest.TestCase):
         })
         expected_positions = {
             "hmd": (0.0, 1.50, 0.0),
-            "left_controller": (-0.62, 1.33, -0.10),
-            "right_controller": (0.62, 1.33, -0.10),
+            "left_controller": (-0.68, 1.33, -0.10),
+            "right_controller": (0.68, 1.33, -0.10),
             "hip": (0.0, 1.07, -0.05),
             "left_foot": (-0.09, 0.26, 0.10),
             "right_foot": (0.09, 0.26, 0.10),
@@ -305,7 +305,7 @@ class VmcIdleRelayTests(unittest.TestCase):
         accepted = relay.latest_frame()
         self.assertIsNotNone(accepted)
         assert accepted is not None
-        self.assertEqual(accepted.devices["left_controller"].position, (-0.62, 1.33, -0.10))
+        self.assertEqual(accepted.devices["left_controller"].position, (-0.68, 1.33, -0.10))
         self.assertFalse(relay.snapshot()["calibration"]["waiting_for_t_pose_frame"])
 
 

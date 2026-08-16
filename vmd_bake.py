@@ -277,6 +277,7 @@ def retarget_solved_document(
     hip_height_offset_m: float = 0.0,
     head_mount_up_m: float = 0.10,
     floor_offset_m: float = 0.0,
+    max_device_y_m: float = 2.0,
     loop: bool = True,
 ) -> dict[str, Any]:
     """Convert an AnyaDance solved-motion document into a version-1 .nya document."""
@@ -295,6 +296,9 @@ def retarget_solved_document(
     hip_height_offset_m = _number(hip_height_offset_m, "hip_height_offset_m")
     head_mount_up_m = _number(head_mount_up_m, "head_mount_up_m")
     floor_offset_m = _number(floor_offset_m, "floor_offset_m")
+    max_device_y_m = _number(max_device_y_m, "max_device_y_m")
+    if not 0.5 <= max_device_y_m <= 25.0:
+        raise ValueError("max_device_y_m must be between 0.5 and 25.0")
     if not 0.5 <= target_height_m <= 2.0:
         raise ValueError("target_height_m must be between 0.5 and 2.0")
     if not 0.5 <= hand_reach_scale <= 2.0:
@@ -394,7 +398,7 @@ def retarget_solved_document(
             if name in {"hmd", "hip", "left_controller", "right_controller"}:
                 scaled = scaled[0], scaled[1] + upper_body_lift, scaled[2]
             lift = head_mount_up_m if name == "hmd" else 0.0
-            return scaled[0], min(2.0, scaled[1] + lift + floor_offset_m), scaled[2]
+            return scaled[0], min(max_device_y_m, scaled[1] + lift + floor_offset_m), scaled[2]
 
         def device_rotation(name: str) -> Quat:
             if name.endswith("_controller"):
@@ -436,6 +440,7 @@ def retarget_solved_document(
             "hip_height_offset_m": hip_height_offset_m,
             "head_mount_up_m": head_mount_up_m,
             "floor_offset_m": floor_offset_m,
+            "max_device_y_m": max_device_y_m,
         },
         "frames": output_frames,
     }
@@ -451,6 +456,7 @@ def convert_solved_file(
     body_width_scale: float = 1.0,
     leg_length_scale: float = 1.0,
     hip_height_offset_m: float = 0.0,
+    max_device_y_m: float = 2.0,
 ) -> dict[str, Any]:
     document = json.loads(solved_path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping):
@@ -463,6 +469,7 @@ def convert_solved_file(
         body_width_scale=body_width_scale,
         leg_length_scale=leg_length_scale,
         hip_height_offset_m=hip_height_offset_m,
+        max_device_y_m=max_device_y_m,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -486,6 +493,7 @@ def bake_vmd_file(
     body_width_scale: float = 1.0,
     leg_length_scale: float = 1.0,
     hip_height_offset_m: float = 0.0,
+    max_device_y_m: float = 2.0,
 ) -> dict[str, Any]:
     for label, path in (
         ("Blender", blender_path),
@@ -527,6 +535,7 @@ def bake_vmd_file(
             body_width_scale=body_width_scale,
             leg_length_scale=leg_length_scale,
             hip_height_offset_m=hip_height_offset_m,
+            max_device_y_m=max_device_y_m,
         )
 
 
@@ -546,6 +555,7 @@ def _main() -> int:
     parser.add_argument("--body-width-scale", type=float, default=1.0)
     parser.add_argument("--leg-length-scale", type=float, default=1.0)
     parser.add_argument("--hip-height-offset", type=float, default=0.0)
+    parser.add_argument("--max-device-y", type=float, default=2.0)
     parser.add_argument("--no-loop", action="store_true")
     args = parser.parse_args()
     if args.solved is not None:
@@ -558,6 +568,7 @@ def _main() -> int:
             body_width_scale=args.body_width_scale,
             leg_length_scale=args.leg_length_scale,
             hip_height_offset_m=args.hip_height_offset,
+            max_device_y_m=args.max_device_y,
         )
     else:
         missing = [name for name in ("model", "blender", "export_script") if getattr(args, name) is None]
@@ -577,6 +588,7 @@ def _main() -> int:
             body_width_scale=args.body_width_scale,
             leg_length_scale=args.leg_length_scale,
             hip_height_offset_m=args.hip_height_offset,
+            max_device_y_m=args.max_device_y,
         )
     frames = result["frames"]
     duration = frames[-1]["t"] if frames else 0.0

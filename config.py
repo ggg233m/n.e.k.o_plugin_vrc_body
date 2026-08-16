@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import math
 from typing import Any, Mapping
 
@@ -117,6 +118,16 @@ class VrchatOscConfig:
 
 
 @dataclass(frozen=True)
+class DriverLogConfig:
+    enabled: bool = True
+    multicast_group: str = "239.255.39.71"
+    listen_port: int = 39571
+    interface_host: str = "127.0.0.1"
+    stale_after_ms: int = 3000
+    history_size: int = 64
+
+
+@dataclass(frozen=True)
 class PluginConfig:
     host: str = "127.0.0.1"
     port: int = 39570
@@ -130,6 +141,7 @@ class PluginConfig:
     behavior: BehaviorConfig = BehaviorConfig()
     vmc_idle: VmcIdleConfig = VmcIdleConfig()
     vrchat_osc: VrchatOscConfig = VrchatOscConfig()
+    driver_log: DriverLogConfig = DriverLogConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
 
@@ -143,6 +155,7 @@ class PluginConfig:
         behavior = _section(root, "behavior")
         vmc_idle = _section(root, "vmc_idle")
         vrchat_osc = _section(root, "vrchat_osc")
+        driver_log = _section(root, "driver_log")
         safety = _section(root, "safety")
 
         host = str(anyadance.get("host", "127.0.0.1")).strip()
@@ -156,12 +169,18 @@ class PluginConfig:
             arm_length_m=_finite_float(profile.get("arm_length_m"), 0.58, minimum=0.25, maximum=1.0, name="body_profile.arm_length_m"),
         )
         safety_config = SafetyConfig(
-            max_position_abs_m=_finite_float(safety.get("max_position_abs_m"), 3.0, minimum=0.5, maximum=10.0, name="safety.max_position_abs_m"),
-            max_y_m=_finite_float(safety.get("max_y_m"), 2.0, minimum=1.0, maximum=2.0, name="safety.max_y_m"),
+            max_position_abs_m=_finite_float(safety.get("max_position_abs_m"), 3.0, minimum=0.5, maximum=30.0, name="safety.max_position_abs_m"),
+            max_y_m=_finite_float(safety.get("max_y_m"), 2.0, minimum=1.0, maximum=25.0, name="safety.max_y_m"),
             max_linear_speed_mps=_finite_float(safety.get("max_linear_speed_mps"), 2.0, minimum=0.1, maximum=10.0, name="safety.max_linear_speed_mps"),
             max_angular_speed_dps=_finite_float(safety.get("max_angular_speed_dps"), 360.0, minimum=30.0, maximum=1440.0, name="safety.max_angular_speed_dps"),
             max_action_duration_ms=_bounded_int(safety.get("max_action_duration_ms"), 5000, minimum=100, maximum=30000, name="safety.max_action_duration_ms"),
         )
+        if safety_config.max_y_m > safety_config.max_position_abs_m:
+            # The position bound is checked on every axis, so a Y ceiling above
+            # it would reject the very frames the .nya loader clamps to it.
+            raise ValueError(
+                "safety.max_y_m must not exceed safety.max_position_abs_m"
+            )
         clip_directory = str(clips.get("directory", "motions")).strip()
         if not clip_directory or any(char in clip_directory for char in ("/", "\\", ":")) or clip_directory in {".", ".."}:
             raise ValueError("clips.directory must be a single relative directory name")
@@ -192,6 +211,25 @@ class PluginConfig:
             input_pulse_ms=_bounded_int(vrchat_osc.get("input_pulse_ms"), 100, minimum=20, maximum=1000, name="vrchat_osc.input_pulse_ms"),
             parameter_cache_size=_bounded_int(vrchat_osc.get("parameter_cache_size"), 256, minimum=16, maximum=2048, name="vrchat_osc.parameter_cache_size"),
             awareness_parameters=tuple(awareness_parameters),
+        )
+
+        multicast_group = str(driver_log.get("multicast_group", "239.255.39.71")).strip()
+        try:
+            parsed_group = ipaddress.ip_address(multicast_group)
+        except ValueError as exc:
+            raise ValueError("driver_log.multicast_group must be an IPv4 address") from exc
+        if parsed_group.version != 4 or not parsed_group.is_multicast:
+            raise ValueError("driver_log.multicast_group must be an IPv4 multicast address")
+        interface_host = str(driver_log.get("interface_host", "127.0.0.1")).strip()
+        if not interface_host or "\x00" in interface_host:
+            raise ValueError("driver_log.interface_host must not be empty")
+        driver_log_config = DriverLogConfig(
+            enabled=_boolean(driver_log.get("enabled"), True, name="driver_log.enabled"),
+            multicast_group=multicast_group,
+            listen_port=_bounded_int(driver_log.get("listen_port"), 39571, minimum=1, maximum=65535, name="driver_log.listen_port"),
+            interface_host=interface_host,
+            stale_after_ms=_bounded_int(driver_log.get("stale_after_ms"), 3000, minimum=100, maximum=60000, name="driver_log.stale_after_ms"),
+            history_size=_bounded_int(driver_log.get("history_size"), 64, minimum=8, maximum=512, name="driver_log.history_size"),
         )
         behavior_config = BehaviorConfig(
             default_crossfade_ms=_bounded_int(
@@ -285,6 +323,7 @@ class PluginConfig:
             behavior=behavior_config,
             vmc_idle=vmc_idle_config,
             vrchat_osc=osc_config,
+            driver_log=driver_log_config,
             profile=body_profile,
             safety=safety_config,
         )

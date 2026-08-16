@@ -69,8 +69,8 @@ def neutral_frame() -> FrameState:
     return FrameState(
         devices={
             "hmd": DeviceState((0.0, 1.50, 0.0), IDENTITY_QUAT),
-            "left_controller": DeviceState((-0.62, 1.33, -0.10), LEFT_CANONICAL_QUAT),
-            "right_controller": DeviceState((0.62, 1.33, -0.10), RIGHT_CANONICAL_QUAT),
+            "left_controller": DeviceState((-0.68, 1.33, -0.10), LEFT_CANONICAL_QUAT),
+            "right_controller": DeviceState((0.68, 1.33, -0.10), RIGHT_CANONICAL_QUAT),
             "hip": DeviceState((0.0, 1.07, -0.05), IDENTITY_QUAT),
             "left_foot": DeviceState((-0.09, 0.26, 0.10), IDENTITY_QUAT),
             "right_foot": DeviceState((0.09, 0.26, 0.10), IDENTITY_QUAT),

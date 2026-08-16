@@ -29,6 +29,10 @@ class FakeTransport:
     def close(self) -> None:
         self.closed = True
 
+    @property
+    def local_port(self) -> int | None:
+        return None
+
     def count(self) -> int:
         with self.lock:
             return len(self.packets)
@@ -388,7 +392,7 @@ class SchedulerTests(unittest.TestCase):
         wait_until(lambda: self.scheduler.snapshot()["state"] == "idle")
         payload = self.transport.latest_payload()
         right_hand = payload["devices"]["right_controller"]["pose"]["position"]
-        self.assertAlmostEqual(right_hand[0], 0.62, places=4)
+        self.assertAlmostEqual(right_hand[0], 0.68, places=4)
         self.assertAlmostEqual(right_hand[1], 1.33, places=4)
 
     def test_stop_releases_inputs_and_reset_recovers(self) -> None:

@@ -52,6 +52,7 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("ui.action", action_source)
         self.assertIn("plugin_entry", action_source)
         self.assertIn(".catalog()", context_source)
+        self.assertIn("driver_log", context_source)
         self.assertNotIn(".list()", context_source)
         self.assertIn("asyncio.to_thread", list_source)
         self.assertIn("asyncio.to_thread", play_source)

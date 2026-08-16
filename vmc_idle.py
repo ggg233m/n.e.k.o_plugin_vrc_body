@@ -76,8 +76,8 @@ _CANONICAL_HEIGHT_M = 1.50
 # 1.50 m; calibration maps the current VRM's joint anchors onto them.
 _CANONICAL_DEVICE_POSITIONS: dict[str, Vec3] = {
     "hmd": (0.0, 1.50, 0.0),
-    "left_controller": (-0.62, 1.33, -0.10),
-    "right_controller": (0.62, 1.33, -0.10),
+    "left_controller": (-0.68, 1.33, -0.10),
+    "right_controller": (0.68, 1.33, -0.10),
     "hip": (0.0, 1.07, -0.05),
     "left_foot": (-0.09, 0.26, 0.10),
     "right_foot": (0.09, 0.26, 0.10),
