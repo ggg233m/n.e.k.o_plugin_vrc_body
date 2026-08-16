@@ -72,7 +72,12 @@ def parse_driver_log_event(payload: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(root, dict):
         return None
-    if root.get("version") != DRIVER_LOG_PROTOCOL_VERSION:
+    version = root.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != DRIVER_LOG_PROTOCOL_VERSION
+    ):
         return None
 
     sequence = root.get("sequence")
@@ -154,7 +159,7 @@ class DriverLogListener:
         self._last_command: dict[str, Any] | None = None
         self._last_haptic: dict[str, Any] | None = None
         self._last_command_at: float | None = None
-        self._senders: OrderedDict[str, int] = OrderedDict()
+        self._senders: OrderedDict[str, float] = OrderedDict()
         self._last_error: str | None = None
 
     @property
@@ -296,7 +301,8 @@ class DriverLogListener:
             if command["y_clamped"]:
                 self._y_clamped_commands += 1
             origin = f"{source['host']}:{source['port']}"
-            self._senders[origin] = self._senders.get(origin, 0) + 1
+            self._senders[origin] = now
+            self._senders.move_to_end(origin)
             while len(self._senders) > _MAX_TRACKED_SENDERS:
                 self._senders.popitem(last=False)
             self._last_command = {
@@ -326,8 +332,8 @@ class DriverLogListener:
         else:
             self._unknown_events += 1
 
-    def snapshot(self) -> dict[str, Any]:
-        now = self._clock()
+    def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+        now = self._clock() if now is None else now
         with self._lock:
             age_ms = (
                 max(0.0, (now - self._last_command_at) * 1000.0)
@@ -345,6 +351,11 @@ class DriverLogListener:
                 connection = "listening"
             else:
                 connection = "unknown"
+            stale_threshold_s = self.config.stale_after_ms / 1000.0
+            active_senders = [
+                origin for origin, last_seen in self._senders.items()
+                if now - last_seen <= stale_threshold_s
+            ]
             return {
                 "enabled": self.config.enabled,
                 "listen_address": f"{self.config.multicast_group}:{self.config.listen_port}",
@@ -364,7 +375,7 @@ class DriverLogListener:
                 "y_clamped_commands": self._y_clamped_commands,
                 "last_command": dict(self._last_command) if self._last_command else None,
                 "last_haptic": dict(self._last_haptic) if self._last_haptic else None,
-                "senders": list(self._senders),
+                "senders": active_senders,
                 "last_error": self._last_error,
             }
 

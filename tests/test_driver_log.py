@@ -90,6 +90,8 @@ class DriverLogParseTests(unittest.TestCase):
         self.assertIsNone(parse_driver_log_event(datagram(COMMAND_EVENT, sequence=-1)))
         self.assertIsNone(parse_driver_log_event(datagram(COMMAND_EVENT, event="")))
         self.assertIsNone(parse_driver_log_event(b'{"version":1,"event":"x","sequence":NaN}'))
+        self.assertIsNone(parse_driver_log_event(datagram(COMMAND_EVENT, version=True)))
+        self.assertIsNone(parse_driver_log_event(datagram(COMMAND_EVENT, version=1.0)))
 
     def test_oversized_payload_is_truncated(self) -> None:
         event = parse_driver_log_event(
@@ -190,6 +192,33 @@ class DriverLogListenerTests(unittest.TestCase):
         self.assertEqual(
             listener.snapshot()["senders"], ["127.0.0.1:54321", "127.0.0.1:9999"]
         )
+
+    def test_recent_sender_is_retained_when_sender_history_is_bounded(self) -> None:
+        listener = self.listener()
+        listener.ingest_packet(datagram(COMMAND_EVENT, sequence=1), now=100.0)
+        for sequence, port in enumerate(range(55000, 55015), start=2):
+            listener.ingest_packet(
+                datagram(
+                    COMMAND_EVENT,
+                    sequence=sequence,
+                    source={"host": "127.0.0.1", "port": port},
+                ),
+                now=100.0,
+            )
+        # Refresh the original source so it is more recent than the 15th
+        # source, then add one more source to force bounded-history eviction.
+        listener.ingest_packet(datagram(COMMAND_EVENT, sequence=17), now=100.0)
+        listener.ingest_packet(
+            datagram(
+                COMMAND_EVENT,
+                sequence=18,
+                source={"host": "127.0.0.1", "port": 55015},
+            ),
+            now=100.0,
+        )
+        senders = listener.snapshot()["senders"]
+        self.assertIn("127.0.0.1:54321", senders)
+        self.assertNotIn("127.0.0.1:55000", senders)
 
     def test_connection_goes_stale_after_the_configured_window(self) -> None:
         current = [100.0]

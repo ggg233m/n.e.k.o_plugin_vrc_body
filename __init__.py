@@ -378,11 +378,21 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         udp["connected"] = connection
 
         senders = [str(item) for item in driver_log.get("senders") or []]
+
+        if connection == "stale":
+            return
+
         local_port = udp.get("local_port")
         if local_port is None:
             snapshot["concurrent_sender_detection"] = "detected_unattributed"
             return
-        others = [item for item in senders if not item.endswith(f":{local_port}")]
+
+        # The telemetry source is the sender's address, while udp["target"]
+        # is the destination address and is stored as a "host:port" string.
+        # UDP source ports are unique on this host, so exclude our own sender
+        # by port rather than conflating the destination host with the source.
+        local_port_text = str(local_port)
+        others = [item for item in senders if not item.endswith(f":{local_port_text}")]
         udp["other_senders"] = others
         snapshot["concurrent_sender_detection"] = "concurrent" if others else "exclusive"
 

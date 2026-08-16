@@ -253,7 +253,7 @@ BODY_RESET = {
 
 BODY_STATUS = {
     "name": "body_status",
-    "description": "读取 AnyaDance 发送状态、当前动作、手臂和手部状态、安全锁定、队列及调度指标。UDP 无法确认接收端连接。",
+    "description": "读取 AnyaDance 发送状态、当前动作、手臂和手部状态、安全锁定、队列及调度指标。UDP 本身没有响应；启用并收到驱动遥测时，driver_log 可确认 AnyaDance 是否实际处理了命令。",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 

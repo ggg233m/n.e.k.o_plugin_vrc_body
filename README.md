@@ -31,8 +31,8 @@
 
 1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
 2. `body_stop` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作；调用 `body_reset` 才能恢复。
-3. UDP 协议没有响应或发送者身份。`body_status` 只能报告本地发送成功，不能确认 AnyaDance 驱动已连接。
-4. 插件不会阻止 AnyaDance UI 或其他程序同时向 39570 发送。多发送者数据报会按到达顺序覆盖，可能造成抖动；`concurrent_sender_detection` 固定为 `unsupported`。
+3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_awareness.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
+4. 插件不会阻止 AnyaDance UI 或其他程序同时向 39570 发送。多发送者数据报会按到达顺序覆盖，可能造成抖动；启用且收到驱动遥测时，`concurrent_sender_detection` 会报告其他活跃来源，否则为 `unsupported` 或 `detected_unattributed`。
 5. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
 6. OSC 同样使用 UDP。`delivery_confirmed=false` 只表示本机完成发送；只有收到 9001 回传时 `connection` 才显示 `detected`，没有回传时为 `unknown`，不能据此断言 VRChat 离线。
 7. 默认只有一个程序能独占监听 `127.0.0.1:9001`。若已有 OSC 路由器占用该端口，应修改 `listen_port`，并让路由器或 VRChat 向新端口转发。
