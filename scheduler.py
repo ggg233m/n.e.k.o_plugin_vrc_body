@@ -561,8 +561,11 @@ class BodyScheduler:
             if kind in {"play_clip", "semantic_clip"}:
                 self._start_clip(command, now)
                 return
-            raise ValueError(f"unknown scheduler command: {kind}")
-        except CommandRejected as exc:
+            raise CommandRejected(f"unknown scheduler command: {kind}")
+        except (CommandRejected, ValueError) as exc:
+            # Target-frame construction and safety validation happen before any
+            # scheduler state is mutated, so an unusable command is rejected on
+            # its own instead of latching the whole body output into a fault.
             self._behavior.reject(
                 action_id=command.action_id,
                 kind=command.kind,
@@ -1283,7 +1286,7 @@ class BodyScheduler:
             status["frame_error"] = self._idle_relay_error
         return status
 
-    def _build_awareness(self, now: float) -> Dict[str, Any]:
+    def _build_awareness(self, now: float, behavior: Dict[str, Any], idle_relay: Dict[str, Any]) -> Dict[str, Any]:
         pose = self._semantic_pose()
         motion = self._motion_awareness(now)
         return {
@@ -1302,8 +1305,8 @@ class BodyScheduler:
             ],
             "previous_action": copy.deepcopy(self._previous_action),
             "transition": copy.deepcopy(self._transition),
-            "behavior": self._behavior.snapshot(runtime_state=self._state, now=now),
-            "idle_relay": self._idle_relay_snapshot(),
+            "behavior": behavior,
+            "idle_relay": idle_relay,
             "pose": pose,
             "summary": self._awareness_summary(motion, pose),
             "updated_at_monotonic": now,
@@ -1315,6 +1318,8 @@ class BodyScheduler:
         if self._send_intervals:
             mean_interval = sum(self._send_intervals) / len(self._send_intervals)
             actual_hz = 1.0 / mean_interval if mean_interval > 0 else 0.0
+        behavior = self._behavior.snapshot(runtime_state=self._state, now=now)
+        idle_relay = self._idle_relay_snapshot()
         snapshot = {
             "state": self._state,
             "safety_state": self._safety_state,
@@ -1327,7 +1332,7 @@ class BodyScheduler:
                 "send_failures": self._send_failures,
             },
             "current_action": copy.deepcopy(self._current_action),
-            "awareness": self._build_awareness(now),
+            "awareness": self._build_awareness(now, behavior, idle_relay),
             "queue_length": self._commands.qsize() + (1 if self._urgent_stop is not None else 0),
             "arms": copy.deepcopy(self._arm_state),
             "hands": copy.deepcopy(self._hand_state),
@@ -1347,8 +1352,8 @@ class BodyScheduler:
                 ],
                 "last": copy.deepcopy(self._last_expression),
             },
-            "idle_relay": self._idle_relay_snapshot(),
-            "behavior": self._behavior.snapshot(runtime_state=self._state, now=now),
+            "idle_relay": idle_relay,
+            "behavior": behavior,
             "metrics": {
                 "actual_hz": round(actual_hz, 2),
                 "skipped_frames": self._skipped_frames,

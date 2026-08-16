@@ -14,12 +14,14 @@ def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 def _finite_float(value: Any, default: float, *, minimum: float, maximum: float, name: str) -> float:
     if value is None:
-        return default
+        # Some bounds are derived from other config sections, so the built-in
+        # default can fall outside the effective range.
+        return min(maximum, max(minimum, default))
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
@@ -28,7 +30,7 @@ def _finite_float(value: Any, default: float, *, minimum: float, maximum: float,
 
 def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int, name: str) -> int:
     if value is None:
-        return default
+        return min(maximum, max(minimum, default))
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
     try:

@@ -374,7 +374,6 @@ class ClipLibrary:
             for name in removed:
                 self._summaries.pop(name, None)
                 self._loaded.pop(name, None)
-                self._load_locks.pop(name, None)
             self._catalog_calls += 1
             self._last_catalog_ms = (time.perf_counter() - started) * 1000.0
         return {

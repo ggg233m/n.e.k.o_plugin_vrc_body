@@ -57,7 +57,7 @@ def _number(name: str, value: Any, *, minimum: float, maximum: float) -> float:
         raise ValueError(f"{name} must be a finite number")
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
@@ -69,7 +69,7 @@ def _integer(name: str, value: Any, *, minimum: int, maximum: int) -> int:
         raise ValueError(f"{name} must be an integer")
     try:
         numeric = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
     if not math.isfinite(numeric) or not numeric.is_integer():
         raise ValueError(f"{name} must be an integer")
@@ -145,10 +145,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._vmc_calibration_stop = stop_event
 
         def calibrate() -> None:
-            host_vmc.calibrate_rest_pose(
+            calibrated = host_vmc.calibrate_rest_pose(
                 lambda: relay.reset_calibration(reason="host_t_pose"),
+                timeout_seconds=120.0,
                 stop_event=stop_event,
             )
+            if not calibrated and not stop_event.is_set():
+                # Never leave the relay held forever: fall back to calibrating
+                # against the next complete frame instead of the host T pose.
+                relay.reset_calibration(reason="t_pose_unavailable")
 
         self._vmc_calibration_thread = threading.Thread(
             target=calibrate,
