@@ -169,28 +169,21 @@ body_disable()
 
 ## 预制动作
 
-旧版三个由手工坐标拼出的演示片段已经移除；它们没有经过真实骨架 FK/IK 解算，会导致手腕、脚和身体重心不自然。当前 13 个动作均由真实 VMD 经 Blender + MMD Tools + AnyaDance 重定向管线烘焙：
+仓库不再分发预制 `.nya` 动作和 `motions/catalog.json`。这些文件可能包含第三方 VMD/PMX 素材的派生数据，是否可以再分发取决于各自授权；因此安装包默认只包含动作加载器，首次安装后动作目录可能为空。
 
-- `vmd_greeting`：致意问候，7.47 秒。
-- `vmd_v_sign`：V 手势，11.97 秒。
-- `vmd_showcase`：全身展示，11.97 秒。
-- `vmd_idle_03`：自然待机，13.97 秒。
-- `vmd_idle_01/02/04/05`：另外四种自然待机。
-- `vmd_model_pose`：连续模特姿势。
-- `vmd_stretch`：全身屈伸和舒展。
-- `vmd_shooting_pose`：具有明确指向感的动态姿态。
-- `vmd_silly_walk`：夸张活泼的行走式动作。
-- `vmd_turn`：旋转展示动作。
+如果你拥有已授权的 AnyaDance `.nya` 文件，把它们放入插件配置目录下的 `motions/` 目录即可。`catalog.json` 是可选的：存在时，`body_express` 会按意图、侧别和强度选择目录中的真实动作；不存在或没有匹配项时，会回退到程序化表达动作。
+
+动作目录的文件名就是调用时使用的逻辑名称（不含 `.nya` 扩展名），支持中文名称，但不接受绝对路径、子目录或 Windows 非法文件名字符。
 
 调用示例：
 
 ```text
 body_list_clips()
-body_play_clip(clip_name="vmd_greeting", speed=1.0, loop_count=1, restore_after=true)
-body_play_clip(clip_name="vmd_idle_03", speed=1.0, loop_count=1, restore_after=false)
+body_play_clip(clip_name="my_greeting", speed=1.0, loop_count=1, restore_after=true)
+body_play_clip(clip_name="my_idle", speed=1.0, loop_count=1, restore_after=false)
 ```
 
-可以把 AnyaDance 保存的 `.nya` 文件放入插件的 `motions/` 目录。调用时只传不含扩展名的逻辑名称，支持中文名称，但不接受绝对路径、子目录或 Windows 非法文件名字符。播放默认把片段第一帧 HMD 的 X/Z 对齐到当前姿态；`body_stop` 和 `body_cancel` 可随时中断。
+播放默认把片段第一帧 HMD 的 X/Z 对齐到当前姿态；`body_stop` 和 `body_cancel` 可随时中断。
 
 `vmd_bake.py` 提供离线烘焙命令。它让 Blender/MMD Tools 完成真实骨架的 FK、IK 和约束求值，再复用 AnyaDance 的六设备重定向算法生成 `.nya`，不会在插件实时调度线程中运行：
 

@@ -32,9 +32,12 @@ def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int, name: 
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
     try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{name} must be an integer")
+    parsed = int(numeric)
     if not minimum <= parsed <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return parsed

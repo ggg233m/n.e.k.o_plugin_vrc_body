@@ -70,6 +70,13 @@ class MotionCatalog:
         return result
 
     @classmethod
+    def _integer(cls, value: Any, label: str, low: int, high: int) -> int:
+        result = cls._number(value, label, low, high)
+        if not result.is_integer():
+            raise ValueError(f"{label} must be an integer")
+        return int(result)
+
+    @classmethod
     def _parse_entry(cls, value: Any, index: int) -> MotionMetadata:
         if not isinstance(value, dict):
             raise ValueError(f"motions[{index}] must be an object")
@@ -83,8 +90,8 @@ class MotionCatalog:
         side = cls._text(value.get("side", "both"), f"{prefix}.side", maximum=16)
         if side not in {"left", "right", "both", "neutral"}:
             raise ValueError(f"{prefix}.side is unsupported")
-        transition_ms = int(cls._number(value.get("transition_ms", 400), f"{prefix}.transition_ms", 0, 5000))
-        loop_count = int(cls._number(value.get("loop_count", 1), f"{prefix}.loop_count", 1, 10))
+        transition_ms = cls._integer(value.get("transition_ms", 400), f"{prefix}.transition_ms", 0, 5000)
+        loop_count = cls._integer(value.get("loop_count", 1), f"{prefix}.loop_count", 1, 10)
         restore_after = value.get("restore_after", True)
         if not isinstance(restore_after, bool):
             raise ValueError(f"{prefix}.restore_after must be a boolean")

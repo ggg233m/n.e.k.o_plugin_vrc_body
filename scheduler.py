@@ -83,6 +83,10 @@ class ActiveMotion:
     normalized_params: Dict[str, Any]
 
 
+class CommandRejected(ValueError):
+    """A normalized command cannot be run without faulting the scheduler."""
+
+
 @dataclass
 class SequenceSegment:
     offset_s: float
@@ -122,6 +126,7 @@ class BodyScheduler:
         logger: Any = None,
         transport: Optional[DatagramTransport] = None,
         idle_frame_source: Optional[IdleFrameSource] = None,
+        motion_started_callback: Callable[[BodyCommand, float], None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -130,6 +135,7 @@ class BodyScheduler:
         self._transport = transport
         self._owns_transport = transport is None
         self._idle_frame_source = idle_frame_source
+        self._motion_started_callback = motion_started_callback
         self._clock = clock
         self._sleep = sleeper
         self._commands: queue.PriorityQueue[PrioritizedCommand] = queue.PriorityQueue(config.max_queue_size)
@@ -556,6 +562,13 @@ class BodyScheduler:
                 self._start_clip(command, now)
                 return
             raise ValueError(f"unknown scheduler command: {kind}")
+        except CommandRejected as exc:
+            self._behavior.reject(
+                action_id=command.action_id,
+                kind=command.kind,
+                now=now,
+                reason=str(exc),
+            )
         finally:
             self._commands.task_done()
 
@@ -721,6 +734,13 @@ class BodyScheduler:
             policy_kind=command.kind,
             policy_params=command.params,
         )
+        callback = self._motion_started_callback
+        if callback is not None:
+            try:
+                callback(command, duration)
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning("motion-start callback failed: %s", exc)
 
     def _start_gesture(self, command: BodyCommand, now: float) -> None:
         start = self._frame.clone()
@@ -800,6 +820,8 @@ class BodyScheduler:
                 current = target.clone()
 
         total_duration = max(offset, 1.0 / self.config.rate_hz)
+        if total_duration > 30.0:
+            raise CommandRejected("expanded sequence duration must not exceed 30000 ms")
 
         def sample(progress: float) -> FrameState:
             elapsed = min(total_duration, max(0.0, progress) * total_duration)

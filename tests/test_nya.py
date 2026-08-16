@@ -22,16 +22,11 @@ class NyaClipTests(unittest.TestCase):
         self.config = PluginConfig()
         self.library = ClipLibrary(ROOT / "motions", self.config)
 
-    def test_builtin_catalog_contains_real_vmd_presets(self) -> None:
-        catalog = self.library.list()
+    def test_empty_external_motion_directory_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = ClipLibrary(Path(directory), self.config).list()
+        self.assertEqual(catalog["clips"], [])
         self.assertEqual(catalog["invalid_clips"], [])
-        names = {clip["name"] for clip in catalog["clips"]}
-        self.assertEqual(names, {
-            "vmd_greeting", "vmd_v_sign", "vmd_showcase", "vmd_model_pose",
-            "vmd_stretch", "vmd_shooting_pose", "vmd_silly_walk", "vmd_turn",
-            "vmd_idle_01", "vmd_idle_02", "vmd_idle_03", "vmd_idle_04", "vmd_idle_05",
-        })
-        self.assertTrue(all(clip["frame_count"] > 400 for clip in catalog["clips"]))
         self.assertEqual(catalog["motion_catalog"]["errors"], [])
         self.assertEqual(catalog["motion_catalog"]["missing_clips"], [])
 

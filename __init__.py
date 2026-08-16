@@ -20,7 +20,7 @@ from .instructions import BODY_AI_INSTRUCTIONS
 from .motion import GESTURE_NAMES
 from .nya import ClipLibrary
 from .osc import VrchatOscBridge, normalize_parameter_value, validate_parameter_name
-from .scheduler import BodyScheduler
+from .scheduler import BodyCommand, BodyScheduler
 from .vmc_idle import VmcIdleRelay
 from .tool_defs import (
     BODY_ARM_POSE,
@@ -193,6 +193,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._body_config,
             logger=self.logger,
             idle_frame_source=self._vmc_idle,
+            motion_started_callback=self._on_motion_started,
         )
         self._scheduler.start()
         if self._osc:
@@ -262,6 +263,31 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "safety_state": "fault",
             }
         return self._scheduler.submit(kind, params)
+
+    def _on_motion_started(self, command: BodyCommand, duration_s: float) -> None:
+        """Schedule reach-and-grab input from the scheduler's safe duration."""
+        if command.kind != "reach_and_grab" or self._osc is None:
+            return
+        action_id = command.action_id
+        side = str(command.params["side"])
+
+        def action_is_current() -> bool:
+            if not self._scheduler:
+                return False
+            snapshot = self._scheduler.snapshot()
+            current = snapshot.get("current_action") or {}
+            return (
+                snapshot.get("output_enabled") is True
+                and current.get("id") == action_id
+                and current.get("name") == "reach_and_grab"
+            )
+
+        self._osc.schedule_input_pulse(
+            "grab",
+            side,
+            delay_s=max(0.0, duration_s * 0.85),
+            guard=action_is_current,
+        )
 
     def _invalid(self, reason: str) -> dict[str, Any]:
         state = self._scheduler.snapshot() if self._scheduler else {"state": "shutdown", "safety_state": "fault"}
@@ -567,27 +593,12 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         result = self._submit("reach_and_grab", params)
         result["grip_engaged"] = bool(result["accepted"])
         result["object_held"] = "unknown"
-        result["vrchat_osc_grab_scheduled"] = False
-        if result["accepted"] and self._osc:
-            action_id = str(result.get("action_id", ""))
-
-            def action_is_current() -> bool:
-                if not self._scheduler:
-                    return False
-                snapshot = self._scheduler.snapshot()
-                current = snapshot.get("current_action") or {}
-                return (
-                    snapshot.get("output_enabled") is True
-                    and current.get("id") == action_id
-                    and current.get("name") == "reach_and_grab"
-                )
-
-            result["vrchat_osc_grab_scheduled"] = self._osc.schedule_input_pulse(
-                "grab",
-                params["side"],
-                delay_s=(params["duration_ms"] / 1000.0) * 0.85,
-                guard=action_is_current,
-            )
+        result["vrchat_osc_grab_scheduled"] = bool(
+            result["accepted"]
+            and self._osc
+            and self._osc.config.enabled
+            and self._osc.thread_alive
+        )
         return Ok(result)
 
     @llm_tool(**BODY_GESTURE)

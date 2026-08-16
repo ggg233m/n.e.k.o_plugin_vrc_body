@@ -206,6 +206,7 @@ class _ScheduledInput:
     side: str = field(compare=False)
     pressed: bool = field(compare=False)
     guard: Callable[[], bool] | None = field(compare=False, default=None)
+    pulse_id: int | None = field(compare=False, default=None)
 
 
 class VrchatOscBridge:
@@ -231,6 +232,8 @@ class VrchatOscBridge:
         self._receive_socket: socket.socket | None = None
         self._scheduled: list[_ScheduledInput] = []
         self._schedule_sequence = itertools.count()
+        self._pulse_sequence = itertools.count()
+        self._started_pulses: set[int] = set()
         self._parameters: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
@@ -368,8 +371,15 @@ class VrchatOscBridge:
         if not self.config.enabled or self._send_socket is None:
             return False
         duration_ms = self.config.input_pulse_ms if hold_ms is None else hold_ms
-        self._schedule_input(action, side, True, max(0.0, delay_s), guard=guard)
-        self._schedule_input(action, side, False, max(0.0, delay_s) + duration_ms / 1000.0)
+        pulse_id = next(self._pulse_sequence)
+        self._schedule_input(action, side, True, max(0.0, delay_s), guard=guard, pulse_id=pulse_id)
+        self._schedule_input(
+            action,
+            side,
+            False,
+            max(0.0, delay_s) + duration_ms / 1000.0,
+            pulse_id=pulse_id,
+        )
         return True
 
     def _schedule_input(
@@ -380,6 +390,7 @@ class VrchatOscBridge:
         delay_s: float,
         *,
         guard: Callable[[], bool] | None = None,
+        pulse_id: int | None = None,
     ) -> None:
         normalized_action = str(action).strip().lower()
         normalized_side = str(side).strip().lower()
@@ -392,6 +403,7 @@ class VrchatOscBridge:
             normalized_side,
             bool(pressed),
             guard,
+            pulse_id,
         )
         with self._lock:
             heapq.heappush(self._scheduled, event)
@@ -400,6 +412,7 @@ class VrchatOscBridge:
     def cancel_scheduled_inputs(self, *, release: bool) -> None:
         with self._lock:
             self._scheduled.clear()
+            self._started_pulses.clear()
             held = tuple(self._held_inputs)
         if release:
             # Release known pressed inputs, then send all supported releases so
@@ -423,7 +436,18 @@ class VrchatOscBridge:
                 except Exception as exc:
                     self._record_error(f"scheduled input guard failed: {exc}")
                     continue
-            self.send_input(event.action, event.side, event.pressed)
+            if event.pulse_id is not None and not event.pressed:
+                with self._lock:
+                    if event.pulse_id not in self._started_pulses:
+                        continue
+            sent, _ = self.send_input(event.action, event.side, event.pressed)
+            if event.pulse_id is not None:
+                with self._lock:
+                    if event.pressed:
+                        if sent:
+                            self._started_pulses.add(event.pulse_id)
+                    else:
+                        self._started_pulses.discard(event.pulse_id)
 
     @staticmethod
     def _safe_value(value: Any) -> Any:

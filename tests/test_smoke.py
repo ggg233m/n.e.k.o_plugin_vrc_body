@@ -64,6 +64,10 @@ class PluginSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transition_history_size"):
             PluginConfig.from_mapping({"behavior": {"transition_history_size": 2}})
 
+    def test_integer_config_values_are_not_silently_truncated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "anyadance.port"):
+            PluginConfig.from_mapping({"anyadance": {"port": 39570.5}})
+
     def test_vrchat_osc_config_is_bounded(self) -> None:
         config = PluginConfig.from_mapping({
             "vrchat_osc": {

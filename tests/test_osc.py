@@ -68,6 +68,26 @@ class OscProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_parameter_value("1")
 
+    def test_guarded_pulse_does_not_emit_release_if_press_is_skipped(self) -> None:
+        now = [0.0]
+        sent: list[tuple[str, str, bool]] = []
+        bridge = VrchatOscBridge(
+            VrchatOscConfig(input_pulse_ms=20),
+            clock=lambda: now[0],
+        )
+        bridge._send_socket = object()  # type: ignore[assignment]
+        bridge.send_input = lambda action, side, pressed: (  # type: ignore[method-assign]
+            sent.append((action, side, pressed)) or (True, None)
+        )
+        self.assertTrue(bridge.schedule_input_pulse(
+            "grab", "right", delay_s=1.0, guard=lambda: False,
+        ))
+        now[0] = 1.1
+        bridge._run_due_inputs()
+        now[0] = 1.2
+        bridge._run_due_inputs()
+        self.assertEqual(sent, [])
+
 
 class OscBridgeIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:

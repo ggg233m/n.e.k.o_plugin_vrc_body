@@ -188,6 +188,46 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(final["grip_click"])
         self.assertEqual(final["grip_value"], 1.0)
 
+    def test_reach_start_callback_receives_safe_duration(self) -> None:
+        self.scheduler.shutdown()
+        started: list[float] = []
+        self.transport = FakeTransport()
+        self.scheduler = BodyScheduler(
+            PluginConfig(),
+            transport=self.transport,
+            motion_started_callback=lambda _command, duration: started.append(duration),
+        )
+        self.scheduler.start()
+        self.enable()
+        result = self.scheduler.submit("reach_and_grab", {
+            "side": "right", "height": "chest", "direction": "forward", "distance_m": 0.70,
+            "duration_ms": 100,
+        })
+        self.assertTrue(result["accepted"])
+        wait_until(lambda: bool(started))
+        self.assertGreater(started[0], 0.1)
+
+    def test_expanded_sequence_limit_does_not_fault_scheduler(self) -> None:
+        self.enable()
+        def step(x: float) -> dict:
+            return {
+                "type": "move_hand", "side": "right", "relative_to": "hmd",
+                "x_m": x, "y_m": -1.0, "z_m": -1.0, "palm": "neutral",
+                "wrist_pitch_deg": 0.0, "wrist_yaw_deg": 0.0, "wrist_roll_deg": 0.0,
+                "duration_ms": 100,
+            }
+        result = self.scheduler.submit("sequence", {
+            "steps": [step(-1.0 if index % 2 == 0 else 1.0) for index in range(16)],
+            "loop_count": 4,
+        })
+        self.assertTrue(result["accepted"])
+        wait_until(lambda: (
+            self.scheduler.snapshot()["behavior"]["last_decision"] or {}
+        ).get("accepted") is False)
+        snapshot = self.scheduler.snapshot()
+        self.assertEqual(snapshot["safety_state"], "normal")
+        self.assertIn("expanded sequence duration", snapshot["behavior"]["last_decision"]["reason"])
+
     def test_semantic_expression_uses_overlay_layer_and_returns_to_idle(self) -> None:
         self.enable()
         result = self.scheduler.submit("express", {

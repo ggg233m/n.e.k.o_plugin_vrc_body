@@ -49,6 +49,16 @@ class MotionCatalogTests(unittest.TestCase):
             self.assertTrue(summary["errors"])
             self.assertEqual(summary["missing_clips"], ["missing"])
 
+    def test_rejects_fractional_integer_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "catalog.json").write_text(json.dumps({
+                "version": 1,
+                "motions": [{"name": "fractional", "intents": ["idle"], "transition_ms": 400.5}],
+            }), encoding="utf-8")
+            summary = MotionCatalog(root).summary()
+            self.assertIn("must be an integer", summary["errors"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
