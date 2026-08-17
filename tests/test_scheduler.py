@@ -352,6 +352,22 @@ class SchedulerTests(unittest.TestCase):
         wait_until(lambda: self.scheduler.snapshot()["state"] == "holding")
         self.assertIsNone(self.scheduler.snapshot()["current_action"])
 
+    def test_sequence_gesture_applies_minimum_safe_duration(self) -> None:
+        self.enable()
+        sequence = self.scheduler.submit("sequence", {
+            "steps": [{
+                "type": "gesture", "name": "wave", "side": "right",
+                "intensity": 1.0, "duration_ms": 100,
+            }],
+            "loop_count": 1,
+        })
+        self.assertTrue(sequence["accepted"])
+        wait_until(lambda: (
+            self.scheduler.snapshot()["current_action"] or {}
+        ).get("params", {}).get("applied_duration_ms", 0) > 100)
+        params = self.scheduler.snapshot()["current_action"]["params"]
+        self.assertGreater(params["applied_duration_ms"], 100)
+
     def test_preset_clip_plays_to_last_frame_and_holds(self) -> None:
         self.enable()
         root = Path(__file__).resolve().parents[1]

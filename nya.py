@@ -371,6 +371,8 @@ class ClipLibrary:
 
         with self._cache_lock:
             removed = set(self._summaries) - present
+            # 注意：这里不能移除 _load_locks。加载锁必须在进程生命周期内持续存在，
+            # 才能避免同一动作被并发 load() 时获取不同的锁对象，破坏互斥保证。
             for name in removed:
                 self._summaries.pop(name, None)
                 self._loaded.pop(name, None)

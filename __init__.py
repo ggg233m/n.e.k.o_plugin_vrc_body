@@ -375,22 +375,36 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         connection = driver_log.get("connection")
         if connection not in {"detected", "stale"}:
             return
-        udp["connected"] = connection
-
         senders = [str(item) for item in driver_log.get("senders") or []]
+        local_port = udp.get("local_port")
+
+        def is_local_sender(origin: Any) -> bool:
+            return (
+                local_port is not None
+                and isinstance(origin, str)
+                and origin.endswith(f":{local_port}")
+            )
+
+        # 过期状态没有活动发送端：driver_log 会在超过过期窗口后主动清理发送端。
+        # 因此还要检查最后一条命令的来源，才能把过期状态归属到本地发送端。
+        last_command = driver_log.get("last_command")
+        last_source = last_command.get("source") if isinstance(last_command, Mapping) else None
+        owns_recent_report = any(is_local_sender(sender) for sender in senders)
+
+        # 只有确认至少一个发送端来自本插件的 UDP 源端口时，才能认定驱动连接状态。
+        # 否则遥测可能属于其他进程，连接状态应继续保持未知。
+        if owns_recent_report or (connection == "stale" and is_local_sender(last_source)):
+            udp["connected"] = connection
 
         if connection == "stale":
             return
-
-        local_port = udp.get("local_port")
         if local_port is None:
             snapshot["concurrent_sender_detection"] = "detected_unattributed"
             return
 
-        # The telemetry source is the sender's address, while udp["target"]
-        # is the destination address and is stored as a "host:port" string.
-        # UDP source ports are unique on this host, so exclude our own sender
-        # by port rather than conflating the destination host with the source.
+        # 遥测来源是发送端地址，而 udp["target"] 是以“主机:端口”保存的目标地址。
+        # 本机 UDP 源端口通常唯一，因此按端口排除本插件发送端，避免把目标地址
+        # 与来源地址混为一谈。
         local_port_text = str(local_port)
         others = [item for item in senders if not item.endswith(f":{local_port_text}")]
         udp["other_senders"] = others

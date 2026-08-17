@@ -487,6 +487,9 @@ class BodyScheduler:
                     not target_id or self._current_action.get("id") == target_id
                 ):
                     self._clear_current_action(now, "cancelled")
+                # 表达层动作位于独立的低优先级通道，不会记录在 _active 或
+                # _current_action 中，因此 body_cancel 仍需淡出匹配的表达层动作。
+                self._cancel_expression_overlays(now, action_id=target_id)
                 return
             if kind in {"express", "semantic_clip"} and self.config.behavior.protect_full_body_motion:
                 live_snapshot = {
@@ -506,7 +509,6 @@ class BodyScheduler:
             if kind == "express":
                 self._start_expression_overlay(command, now)
                 return
-            self._cancel_expression_overlays(now)
             if kind == "arm_pose":
                 target = arm_pose_target(
                     self._frame,
@@ -514,6 +516,7 @@ class BodyScheduler:
                     **{key: value for key, value in command.params.items() if key != "duration_ms"},
                 )
                 validate_frame(target, self.config.safety)
+                self._cancel_expression_overlays(now)
                 self._start_target_motion(command, now, target, completion="holding")
                 for side in self._selected_sides(command.params["side"]):
                     self._arm_state[side] = {
@@ -530,6 +533,7 @@ class BodyScheduler:
                     **{key: value for key, value in command.params.items() if key != "duration_ms"},
                 )
                 validate_frame(target, self.config.safety)
+                self._cancel_expression_overlays(now)
                 self._start_target_motion(command, now, target, completion="holding")
                 for side in self._selected_sides(command.params["side"]):
                     self._hand_state[side] = command.params["pose"]
@@ -541,6 +545,7 @@ class BodyScheduler:
                     **{key: value for key, value in command.params.items() if key != "duration_ms"},
                 )
                 validate_frame(target, self.config.safety)
+                self._cancel_expression_overlays(now)
                 self._start_target_motion(command, now, target, completion="holding")
                 side = command.params["side"]
                 self._arm_state[side] = {
@@ -573,10 +578,11 @@ class BodyScheduler:
                 self._start_clip(command, now)
                 return
             raise CommandRejected(f"unknown scheduler command: {kind}")
-        except (CommandRejected, ValueError) as exc:
-            # Target-frame construction and safety validation happen before any
-            # scheduler state is mutated, so an unusable command is rejected on
-            # its own instead of latching the whole body output into a fault.
+        except ValueError as exc:  # CommandRejected 是 ValueError 的子类
+            # 目标帧构建和安全校验在调度器状态变更前完成，因此无效命令只会被拒绝，
+            # 不会把整个身体输出错误地锁进故障状态。
+            if self.logger:
+                self.logger.warning("body command rejected (%s): %s", command.kind, exc)
             self._behavior.reject(
                 action_id=command.action_id,
                 kind=command.kind,
@@ -646,9 +652,9 @@ class BodyScheduler:
             )
         self._expression_overlays.clear()
 
-    def _cancel_expression_overlays(self, now: float) -> None:
+    def _cancel_expression_overlays(self, now: float, *, action_id: str | None = None) -> None:
         for overlay in self._expression_overlays:
-            if overlay.cancelled_at is None:
+            if (not action_id or overlay.action_id == action_id) and overlay.cancelled_at is None:
                 overlay.cancelled_at = now
 
     def _sample_expression_motion(self, now: float) -> None:
@@ -722,6 +728,7 @@ class BodyScheduler:
         })
         target_grip = apply_hand_pose(target_open, side=command.params["side"], pose="grip", strength=1.0)
         validate_frame(target_grip, self.config.safety)
+        self._cancel_expression_overlays(now)
         requested = command.params["duration_ms"] / 1000.0
         duration = max(requested, self._minimum_safe_duration(start, target_open))
 
@@ -759,6 +766,16 @@ class BodyScheduler:
     def _start_gesture(self, command: BodyCommand, now: float) -> None:
         start = self._frame.clone()
         duration = GESTURE_DURATIONS[command.params["name"]]
+        # 手势预设与显式命令共用手臂/手部求解器，极端体型可能在轨迹中途越界。
+        # 先预检关键轨迹点，让明显越界的坏手势提前拒绝；运行时校验负责兜底。
+        minimum_duration = self._validate_gesture_trajectory(
+            start,
+            name=command.params["name"],
+            side=command.params["side"],
+            intensity=command.params["intensity"],
+        )
+        duration = max(duration, minimum_duration)
+        self._cancel_expression_overlays(now)
         self._active = ActiveMotion(
             action_id=command.action_id,
             name=command.kind,
@@ -781,11 +798,52 @@ class BodyScheduler:
             policy_params=command.params,
         )
 
+    def _validate_gesture_trajectory(
+        self,
+        start: FrameState,
+        *,
+        name: str,
+        side: str,
+        intensity: float,
+    ) -> float:
+        """预检手势轨迹并返回满足速度限制所需的最小时长。"""
+        # 五个关键进度点可以覆盖手势的主要分段，同时避免在实时线程中
+        # 为一个序列重复计算数百个完整 FrameState；未采到的点由运行时校验兜底。
+        progress_points = (0.0, 0.25, 0.5, 0.75, 1.0)
+        minimum_duration = 1.0 / self.config.rate_hz
+        previous: FrameState | None = None
+        previous_progress = 0.0
+        for progress in progress_points:
+            current = gesture_frame(
+                start,
+                name=name,
+                side=side,
+                intensity=intensity,
+                progress=progress,
+                profile=self.config.profile,
+            )
+            validate_frame(current, self.config.safety)
+            if previous is not None:
+                progress_delta = max(progress - previous_progress, 1e-6)
+                linear = max(
+                    _distance(previous.devices[device].position, current.devices[device].position)
+                    for device in previous.devices
+                ) / (progress_delta * self.config.safety.max_linear_speed_mps)
+                angular = max(
+                    _quat_angle_deg(previous.devices[device].rotation, current.devices[device].rotation)
+                    for device in previous.devices
+                ) / (progress_delta * self.config.safety.max_angular_speed_dps)
+                minimum_duration = max(minimum_duration, linear, angular)
+            previous = current
+            previous_progress = progress
+        return minimum_duration
+
     def _start_sequence(self, command: BodyCommand, now: float) -> None:
         segments: list[SequenceSegment] = []
         current = self._frame.clone()
         offset = 0.0
         steps = command.params["steps"]
+        gesture_cache: dict[tuple[str, str, float], tuple[FrameState, float]] = {}
         for _ in range(command.params["loop_count"]):
             for step in steps:
                 kind = step["type"]
@@ -797,7 +855,19 @@ class BodyScheduler:
                     sampler = lambda progress, base=start: base.clone()
                 elif kind == "gesture":
                     target = start.clone()
-                    duration = requested
+                    gesture_key = (step["name"], step["side"], step["intensity"])
+                    cached = gesture_cache.get(gesture_key)
+                    if cached is not None and cached[0] == start:
+                        minimum_duration = cached[1]
+                    else:
+                        minimum_duration = self._validate_gesture_trajectory(
+                            start,
+                            name=step["name"],
+                            side=step["side"],
+                            intensity=step["intensity"],
+                        )
+                        gesture_cache[gesture_key] = (start.clone(), minimum_duration)
+                    duration = max(requested, minimum_duration)
                     sampler = lambda progress, base=start, spec=step: gesture_frame(
                         base,
                         name=spec["name"],
@@ -836,6 +906,9 @@ class BodyScheduler:
         total_duration = max(offset, 1.0 / self.config.rate_hz)
         if total_duration > 30.0:
             raise CommandRejected("expanded sequence duration must not exceed 30000 ms")
+
+        # 所有步骤已经展开并完成校验，此时再取消表达层动作，不会因命令拒绝而遗留半状态。
+        self._cancel_expression_overlays(now)
 
         def sample(progress: float) -> FrameState:
             elapsed = min(total_duration, max(0.0, progress) * total_duration)
@@ -882,6 +955,7 @@ class BodyScheduler:
         last = sample_clip(clip, clip.duration_s, base=base, offset_x=offset_x, offset_z=offset_z)
         validate_frame(first, self.config.safety)
         validate_frame(last, self.config.safety)
+        self._cancel_expression_overlays(now)
 
         requested_transition = command.params["transition_ms"] / 1000.0
         transition_in = max(requested_transition, self._minimum_safe_duration(base, first))
@@ -949,8 +1023,26 @@ class BodyScheduler:
         if motion is None:
             return
         progress = min(1.0, max(0.0, (now - motion.started_at) / max(motion.duration_s, 1e-6)))
-        self._frame = motion.sampler(progress)
-        validate_frame(self._frame, self.config.safety)
+        sampled = motion.sampler(progress)
+        try:
+            validate_frame(sampled, self.config.safety)
+        except ValueError as exc:
+            # 轨迹预检采用有限采样点，运行时仍必须把未采到的越界帧当作普通拒绝，
+            # 不能让一个坏动作把整个实时调度器锁死。保留上一帧合法姿态并结束动作。
+            self._output_frame = self._frame.clone()
+            self._active = None
+            self._state = "holding"
+            self._clear_current_action(now, "rejected")
+            self._behavior.reject(
+                action_id=motion.action_id,
+                kind=motion.name,
+                now=now,
+                reason=str(exc),
+            )
+            if self.logger:
+                self.logger.warning("body motion rejected during sampling (%s): %s", motion.name, exc)
+            return
+        self._frame = sampled
         if self._current_action is not None:
             self._current_action["progress"] = round(progress, 4)
             self._current_action["params"] = motion.normalized_params
