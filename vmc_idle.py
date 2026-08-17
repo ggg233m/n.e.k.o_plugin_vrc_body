@@ -33,11 +33,13 @@ class Transform:
 _ROOT = Transform((0.0, 0.0, 0.0), IDENTITY_QUAT)
 _REQUIRED_BONES = frozenset({
     "Hips",
+    "Spine", "Chest", "UpperChest", "Neck",
     "Head",
+    "LeftShoulder", "RightShoulder",
     "LeftUpperArm", "LeftLowerArm", "LeftHand",
     "RightUpperArm", "RightLowerArm", "RightHand",
-    "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
-    "RightUpperLeg", "RightLowerLeg", "RightFoot",
+    "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "LeftToes",
+    "RightUpperLeg", "RightLowerLeg", "RightFoot", "RightToes",
 })
 _PARENT_CANDIDATES: dict[str, tuple[str, ...]] = {
     "Spine": ("Hips",),
@@ -389,12 +391,20 @@ class VmcIdleRelay:
                 return None
             visiting.add(name)
             parent = self._root
-            for candidate in _PARENT_CANDIDATES.get(name, ()):
-                if candidate in self._pending_bones:
-                    resolved_parent = resolve(candidate)
-                    if resolved_parent is not None:
-                        parent = resolved_parent
-                    break
+            candidates = _PARENT_CANDIDATES.get(name, ())
+            if candidates:
+                parent_name = next(
+                    (candidate for candidate in candidates if candidate in self._pending_bones),
+                    None,
+                )
+                if parent_name is None:
+                    visiting.discard(name)
+                    return None
+                resolved_parent = resolve(parent_name)
+                if resolved_parent is None:
+                    visiting.discard(name)
+                    return None
+                parent = resolved_parent
             visiting.discard(name)
             result[name] = _compose(parent, local)
             return result[name]

@@ -103,6 +103,9 @@ _DEBUG_COMMAND_NAMES = (
     "body_vrchat_input",
 )
 
+_VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
+_VMC_CALIBRATION_RETRY_SECONDS = 5.0
+
 
 @neko_plugin
 class NekoAnyadanceBodyPlugin(NekoPluginBase):
@@ -141,21 +144,37 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
     def _start_vmc_calibration(self) -> None:
         host_vmc = self._host_vmc
         relay = self._vmc_idle
-        if host_vmc is None or relay is None or not host_vmc.snapshot()["active"]:
+        if host_vmc is None or relay is None:
+            return
+        if not self._body_config.vmc_idle.enabled or not self._body_config.vmc_idle.manage_host_output:
+            return
+        if self._vmc_calibration_thread and self._vmc_calibration_thread.is_alive():
             return
         stop_event = threading.Event()
         self._vmc_calibration_stop = stop_event
 
         def calibrate() -> None:
-            calibrated = host_vmc.calibrate_rest_pose(
-                lambda: relay.reset_calibration(reason="host_t_pose"),
-                timeout_seconds=120.0,
-                stop_event=stop_event,
-            )
-            if not calibrated and not stop_event.is_set():
-                # Never leave the relay held forever: fall back to calibrating
-                # against the next complete frame instead of the host T pose.
+            while not stop_event.is_set():
+                if not host_vmc.snapshot()["active"]:
+                    # 宿主可能比插件晚启动；失败时短暂等待后重试，而不是让校准锁永久保持。
+                    if not host_vmc.start():
+                        stop_event.wait(_VMC_CALIBRATION_RETRY_SECONDS)
+                        continue
+                    if stop_event.is_set():
+                        return
+
+                # 只有真正开始一次校准时才暂停普通帧；校准失败会在下方明确解锁。
+                relay.hold_calibration(reason="waiting_for_host_t_pose")
+                calibrated = host_vmc.calibrate_rest_pose(
+                    lambda: relay.reset_calibration(reason="host_t_pose"),
+                    timeout_seconds=_VMC_CALIBRATION_TIMEOUT_SECONDS,
+                    stop_event=stop_event,
+                )
+                if calibrated or stop_event.is_set():
+                    return
+
                 relay.reset_calibration(reason="t_pose_unavailable")
+                stop_event.wait(_VMC_CALIBRATION_RETRY_SECONDS)
 
         self._vmc_calibration_thread = threading.Thread(
             target=calibrate,
@@ -184,11 +203,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._body_config.profile,
             logger=self.logger,
         )
-        if (
-            self._body_config.vmc_idle.enabled
-            and self._body_config.vmc_idle.manage_host_output
-        ):
-            self._vmc_idle.hold_calibration(reason="waiting_for_host_t_pose")
         self._vmc_idle.start()
         self._host_vmc = HostVmcController(
             self._body_config.vmc_idle,

@@ -169,7 +169,7 @@ class MotionCatalog:
                 if intent in entry.intents and (self.directory / f"{entry.name}.nya").is_file()
             ]
         if side != "auto":
-            exact = [entry for entry in candidates if entry.side in {side, "neutral"}]
+            exact = [entry for entry in candidates if entry.side in {side, "both", "neutral"}]
             if exact:
                 candidates = exact
             else:

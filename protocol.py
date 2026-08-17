@@ -13,7 +13,7 @@ MAX_PACKET_BYTES = 8192
 
 
 def validate_frame(frame: FrameState, safety: SafetyConfig) -> None:
-    if tuple(frame.devices.keys()) != DEVICE_IDS and set(frame.devices) != set(DEVICE_IDS):
+    if tuple(frame.devices.keys()) != DEVICE_IDS or set(frame.devices) != set(DEVICE_IDS):
         raise ValueError("frame must contain exactly the six AnyaDance devices")
     if set(frame.controllers) != set(CONTROLLER_IDS):
         raise ValueError("frame must contain both controller input states")
@@ -98,4 +98,3 @@ def encode_frame(frame: FrameState, safety: SafetyConfig) -> bytes:
     if len(encoded) >= MAX_PACKET_BYTES:
         raise ValueError(f"serialized UDP packet is {len(encoded)} bytes; limit is < {MAX_PACKET_BYTES}")
     return encoded
-

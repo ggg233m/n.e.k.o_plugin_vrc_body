@@ -100,19 +100,20 @@ class HostVmcController:
         on_t_pose_started: Callable[[], None],
         *,
         duration_sec: float = 2.0,
-        timeout_seconds: float | None = None,
+        timeout_seconds: float | None = 8.0,
         poll_interval_seconds: float = 0.1,
         stop_event: threading.Event | None = None,
     ) -> bool:
         """Request the documented host T-pose and reset the relay once it starts."""
         if not self.config.enabled or not self.config.manage_host_output:
             return False
+        if timeout_seconds is None:
+            timeout_seconds = 8.0
         if (
             not math.isfinite(duration_sec)
             or not 0.1 <= duration_sec <= 10.0
             or (
-                timeout_seconds is not None
-                and (not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0)
+                not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0
             )
             or not math.isfinite(poll_interval_seconds)
             or poll_interval_seconds < 0.0
@@ -137,12 +138,8 @@ class HostVmcController:
             # poll plus WebSocket reconnect/backoff before it can publish the
             # requested rest pose.  This wait runs on a daemon worker and does
             # not block plugin startup.
-            deadline = (
-                time.monotonic() + timeout_seconds
-                if timeout_seconds is not None
-                else None
-            )
-            while deadline is None or time.monotonic() < deadline:
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     with self._lock:
                         self._calibration_state = "cancelled"

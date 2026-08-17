@@ -7,7 +7,7 @@ import unittest
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.config import SafetyConfig
 from neko_anyadance_body.model import CONTROLLER_IDS, DEVICE_IDS, neutral_frame
-from neko_anyadance_body.protocol import MAX_PACKET_BYTES, encode_frame
+from neko_anyadance_body.protocol import MAX_PACKET_BYTES, encode_frame, validate_frame
 
 
 class ProtocolTests(unittest.TestCase):
@@ -35,6 +35,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NaN or Infinity"):
             encode_frame(frame, self.safety)
 
+    def test_device_order_is_rejected(self) -> None:
+        frame = neutral_frame()
+        frame.devices = dict(reversed(tuple(frame.devices.items())))
+        with self.assertRaisesRegex(ValueError, "exactly the six"):
+            validate_frame(frame, self.safety)
+
     def test_oversized_position_and_bad_quaternion_are_rejected(self) -> None:
         frame = neutral_frame()
         frame.devices["left_foot"].position = (-3.1, 0.26, 0.1)
@@ -53,4 +59,3 @@ class ProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

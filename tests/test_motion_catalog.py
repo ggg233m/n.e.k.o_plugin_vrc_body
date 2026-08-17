@@ -14,7 +14,11 @@ class MotionCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entries = []
-            for name, side, intensity in (("calm", "neutral", 0.2), ("active", "right", 0.8)):
+            for name, side, intensity in (
+                ("calm", "neutral", 0.2),
+                ("active", "right", 0.8),
+                ("mirrored", "both", 0.6),
+            ):
                 (root / f"{name}.nya").write_text("{}", encoding="utf-8")
                 entries.append({
                     "name": name, "label": name, "description": name,
@@ -27,6 +31,7 @@ class MotionCatalogTests(unittest.TestCase):
             catalog = MotionCatalog(root)
             self.assertEqual(catalog.select("idle", intensity=0.1)["name"], "calm")
             self.assertEqual(catalog.select("idle", side="right", intensity=0.9)["name"], "active")
+            self.assertEqual(catalog.select("idle", side="left", intensity=0.6)["name"], "mirrored")
             self.assertIsNone(catalog.select("missing"))
 
     def test_reports_invalid_metadata_and_missing_clip(self) -> None:

@@ -267,10 +267,13 @@ class BodyScheduler:
             return copy.deepcopy(self._snapshot)
 
     def submit(self, kind: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        params = dict(params or {})
         action_id = str(uuid.uuid4())
         current = self.snapshot()
         state = current["state"]
+        try:
+            params = dict(params or {})
+        except (TypeError, ValueError) as exc:
+            return self._rejection(action_id, state, f"invalid command parameters: {exc}")
         if not self.thread_alive:
             return self._rejection(action_id, state, "scheduler is not running")
         if kind in self.NORMAL_COMMANDS and state in {"disabled", "stopped_latched", "fault_latched", "shutdown"}:
@@ -278,6 +281,12 @@ class BodyScheduler:
         if kind == "reset" and state == "disabled":
             return self._rejection(action_id, state, "body output is disabled; call body_enable first")
         if kind == "enable" and state != "disabled":
+            if state in {"stopped_latched", "fault_latched"}:
+                return self._rejection(
+                    action_id,
+                    state,
+                    f"body output is {state}; call body_reset before enabling it again",
+                )
             return self._rejection(action_id, state, "body output is already enabled")
         if kind == "disable" and state == "disabled":
             return self._rejection(action_id, state, "body output is already disabled")
@@ -578,9 +587,10 @@ class BodyScheduler:
                 self._start_clip(command, now)
                 return
             raise CommandRejected(f"unknown scheduler command: {kind}")
-        except ValueError as exc:  # CommandRejected 是 ValueError 的子类
-            # 目标帧构建和安全校验在调度器状态变更前完成，因此无效命令只会被拒绝，
-            # 不会把整个身体输出错误地锁进故障状态。
+        except Exception as exc:
+            # 目标帧构建和安全校验属于单条命令；任何参数或执行异常都只拒绝当前命令，
+            # 不把整个身体输出错误地锁进故障状态。传输和调度线程级异常仍由 _run 统一兜底。
+            self._last_error = f"command {command.kind} rejected: {type(exc).__name__}: {exc}"
             if self.logger:
                 self.logger.warning("body command rejected (%s): %s", command.kind, exc)
             self._behavior.reject(

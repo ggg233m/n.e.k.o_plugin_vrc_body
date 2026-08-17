@@ -101,6 +101,22 @@ class HostVmcControllerTests(unittest.TestCase):
         t_pose_call = next(call for call in requester.calls if call[1] == "/api/vmc/t_pose")
         self.assertEqual(t_pose_call[2], {"duration_sec": 2.0})
 
+    def test_rest_calibration_times_out_when_host_never_leaves_request_state(self) -> None:
+        requester = FakeRequester({
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 39539,
+            "send_rate_hz": 60,
+        })
+        controller = HostVmcController(VmcIdleConfig(), requester=requester)
+        self.assertTrue(controller.start())
+        self.assertFalse(controller.calibrate_rest_pose(
+            lambda: self.fail("T-pose callback must not run after timeout"),
+            timeout_seconds=0.001,
+            poll_interval_seconds=0.0,
+        ))
+        self.assertEqual(controller.snapshot()["calibration"]["state"], "timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,11 +30,14 @@ def _complete_frame_messages():
         _bone("Hips", 0.0, 1.0),
         _bone("Spine", 0.0, 0.2),
         _bone("Chest", 0.0, 0.2),
+        _bone("UpperChest", 0.0, 0.0),
         _bone("Neck", 0.0, 0.2),
         _bone("Head", 0.0, 0.2),
+        _bone("LeftShoulder", 0.0, 0.0),
         _bone("LeftUpperArm", -0.2, 0.15),
         _bone("LeftLowerArm", -0.3, 0.0),
         _bone("LeftHand", -0.25, 0.0),
+        _bone("RightShoulder", 0.0, 0.0),
         _bone("RightUpperArm", 0.2, 0.15),
         _bone("RightLowerArm", 0.3, 0.0),
         _bone("RightHand", 0.25, 0.0),
@@ -140,6 +143,20 @@ class VmcIdleRelayTests(unittest.TestCase):
         self.assertNotEqual(frame.devices["left_controller"].rotation, LEFT_CANONICAL_QUAT)
         for actual, expected in zip(frame.devices["right_controller"].rotation, RIGHT_CANONICAL_QUAT):
             self.assertAlmostEqual(actual, expected, places=12)
+
+    def test_missing_intermediate_bone_rejects_frame(self) -> None:
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile(), clock=lambda: 10.0)
+        incomplete = [
+            message
+            for message in _complete_frame_messages()
+            if not (
+                message[0] == "/VMC/Ext/Bone/Pos"
+                and message[1][0] == "Neck"
+            )
+        ]
+        relay.ingest_messages(incomplete, now=10.0)
+        self.assertIsNone(relay.latest_frame())
+        self.assertEqual(relay.snapshot()["incomplete_frames"], 1)
 
     def test_tracker_mount_offset_rotates_with_driving_bone(self) -> None:
         current = [10.0]

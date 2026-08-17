@@ -130,6 +130,23 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(stopped["accepted"])
         wait_until(lambda: self.scheduler.snapshot()["state"] == "stopped_latched")
         self.assertEqual(self.scheduler.snapshot()["queue_length"], 0)
+        enable_again = self.scheduler.submit("enable")
+        self.assertFalse(enable_again["accepted"])
+        self.assertIn("body_reset", enable_again["reason"])
+
+    def test_malformed_direct_command_does_not_latch_scheduler_fault(self) -> None:
+        self.enable()
+        result = self.scheduler.submit("arm_pose", {"side": "right"})
+        self.assertTrue(result["accepted"])
+        wait_until(
+            lambda: (
+                self.scheduler.snapshot()["behavior"]["last_decision"] is not None
+                and self.scheduler.snapshot()["behavior"]["last_decision"].get("id") == result["action_id"]
+            )
+        )
+        snapshot = self.scheduler.snapshot()
+        self.assertNotEqual(snapshot["state"], "fault_latched")
+        self.assertIn("rejected", snapshot["last_error"])
 
     def test_arm_pose_holds_and_status_reports_angle(self) -> None:
         self.enable()
