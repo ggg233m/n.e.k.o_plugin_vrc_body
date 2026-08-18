@@ -41,6 +41,7 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(tool_defs.BODY_AWARENESS["name"], "body_awareness")
         self.assertEqual(tool_defs.BODY_AVATAR_PARAMETER["name"], "body_avatar_parameter")
         self.assertEqual(tool_defs.BODY_VRCHAT_INPUT["name"], "body_vrchat_input")
+        self.assertEqual(tool_defs.WORLD_OBSERVE["name"], "world_observe")
         self.assertEqual(tool_defs.BODY_EXPRESS["name"], "body_express")
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
         self.assertIn("body_awareness", BODY_AI_INSTRUCTIONS)

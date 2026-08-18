@@ -3,3 +3,6 @@ name = "neko_anyadance_body"
 version = "0.13.9"
 requires-python = ">=3.11"
 dependencies = []
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"

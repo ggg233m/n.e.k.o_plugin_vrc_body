@@ -1,4 +1,4 @@
-"""N.E.K.O plugin entry point for safe AnyaDance body control."""
+"""N.E.K.O 插件入口：提供安全的 AnyaDance 身体控制。"""
 
 from __future__ import annotations
 
@@ -13,16 +13,12 @@ import uuid
 
 from plugin.sdk.plugin import NekoPluginBase, Ok, lifecycle, llm_tool, neko_plugin, plugin_entry, ui
 
-from .behavior import EXPRESSION_INTENTS, resolve_expression
+from .backend.client import BackendClient, BackendUnavailable
+from .behavior import EXPRESSION_INTENTS
 from .config import PluginConfig
-from .driver_log import DriverLogListener
-from .host_vmc import HostVmcController
 from .instructions import BODY_AI_INSTRUCTIONS
 from .motion import GESTURE_NAMES
-from .nya import ClipLibrary
-from .osc import VrchatOscBridge, normalize_parameter_value, validate_parameter_name
-from .scheduler import BodyCommand, BodyScheduler
-from .vmc_idle import VmcIdleRelay
+from .osc import normalize_parameter_value, validate_parameter_name
 from .tool_defs import (
     BODY_ARM_POSE,
     BODY_AVATAR_PARAMETER,
@@ -42,6 +38,7 @@ from .tool_defs import (
     BODY_STATUS,
     BODY_STOP,
     BODY_VRCHAT_INPUT,
+    WORLD_OBSERVE,
 )
 
 
@@ -103,128 +100,67 @@ _DEBUG_COMMAND_NAMES = (
     "body_vrchat_input",
 )
 
-_VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
-_VMC_CALIBRATION_RETRY_SECONDS = 5.0
-
-
 @neko_plugin
 class NekoAnyadanceBodyPlugin(NekoPluginBase):
     def __init__(self, ctx: Any):
         super().__init__(ctx)
         self.logger = ctx.logger
         self._body_config = PluginConfig()
-        self._scheduler: BodyScheduler | None = None
-        self._clip_library: ClipLibrary | None = None
-        self._osc: VrchatOscBridge | None = None
-        self._driver_log: DriverLogListener | None = None
-        self._vmc_idle: VmcIdleRelay | None = None
-        self._host_vmc: HostVmcController | None = None
-        self._vmc_calibration_stop = threading.Event()
-        self._vmc_calibration_thread: threading.Thread | None = None
-        self._expression_side_count = 0
-        self._motion_intent_counts: dict[str, int] = {}
+        self._raw_config: Mapping[str, Any] = {}
+        self._backend_client: BackendClient | None = None
+        self._scheduler: Any | None = None
+        self._osc: Any | None = None
+        self._driver_log: Any | None = None
+        self._vmc_idle: Any | None = None
+        self._host_vmc: Any | None = None
+        # 视觉状态独立于 60 Hz 身体调度器；后端可以发布观测而不改变 VMC 待机路径。
+        self._vision: Any | None = None
         self._ui_event_lock = threading.Lock()
         self._ui_events: deque[dict[str, Any]] = deque(maxlen=40)
 
     async def _load_config(self) -> PluginConfig:
+        self._raw_config = {}
         try:
             raw = await self.config.dump()
-            return PluginConfig.from_mapping(raw)
+            parsed = PluginConfig.from_mapping(raw)
+            # 只有配置完整校验通过后，才把原始映射交给后端进程。
+            self._raw_config = dict(raw) if isinstance(raw, Mapping) else {}
+            return parsed
         except Exception as exc:
             self.logger.warning("Invalid AnyaDance body config; using safe defaults: %s", exc)
             return PluginConfig()
 
-    def _stop_vmc_calibration(self) -> None:
-        self._vmc_calibration_stop.set()
-        thread = self._vmc_calibration_thread
-        if thread and thread.is_alive():
-            thread.join(timeout=min(4.0, self._body_config.vmc_idle.host_api_timeout_seconds + 0.5))
-        self._vmc_calibration_thread = None
-
-    def _start_vmc_calibration(self) -> None:
-        host_vmc = self._host_vmc
-        relay = self._vmc_idle
-        if host_vmc is None or relay is None:
-            return
-        if not self._body_config.vmc_idle.enabled or not self._body_config.vmc_idle.manage_host_output:
-            return
-        if self._vmc_calibration_thread and self._vmc_calibration_thread.is_alive():
-            return
-        stop_event = threading.Event()
-        self._vmc_calibration_stop = stop_event
-
-        def calibrate() -> None:
-            while not stop_event.is_set():
-                if not host_vmc.snapshot()["active"]:
-                    # 宿主可能比插件晚启动；失败时短暂等待后重试，而不是让校准锁永久保持。
-                    if not host_vmc.start():
-                        stop_event.wait(_VMC_CALIBRATION_RETRY_SECONDS)
-                        continue
-                    if stop_event.is_set():
-                        return
-
-                # 只有真正开始一次校准时才暂停普通帧；校准失败会在下方明确解锁。
-                relay.hold_calibration(reason="waiting_for_host_t_pose")
-                calibrated = host_vmc.calibrate_rest_pose(
-                    lambda: relay.reset_calibration(reason="host_t_pose"),
-                    timeout_seconds=_VMC_CALIBRATION_TIMEOUT_SECONDS,
-                    stop_event=stop_event,
-                )
-                if calibrated or stop_event.is_set():
-                    return
-
-                relay.reset_calibration(reason="t_pose_unavailable")
-                stop_event.wait(_VMC_CALIBRATION_RETRY_SECONDS)
-
-        self._vmc_calibration_thread = threading.Thread(
-            target=calibrate,
-            name="neko-vmc-rest-calibration",
-            daemon=True,
-        )
-        self._vmc_calibration_thread.start()
-
     @lifecycle(id="startup")
     async def on_startup(self, **_: Any):
         self._body_config = await self._load_config()
-        self._clip_library = ClipLibrary(
-            self.config_dir / self._body_config.clip_directory,
-            self._body_config,
+        # 重载插件会启动新的感知周期，同时重新建立后端运行时。
+        if self._backend_client:
+            await asyncio.to_thread(self._backend_client.stop)
+        self._backend_client = BackendClient(
+            self._raw_config,
+            self.config_dir,
+            logger=self.logger,
         )
-        if self._scheduler:
-            await asyncio.to_thread(self._scheduler.shutdown)
-        self._stop_vmc_calibration()
-        if self._host_vmc:
-            await asyncio.to_thread(self._host_vmc.stop)
+        try:
+            await asyncio.to_thread(self._backend_client.start)
+        except BackendUnavailable as exc:
+            self.logger.error("独立 AnyaDance 后端不可用：%s", exc)
+            self._backend_client = None
+        if self._backend_client:
+            # 这些是远程兼容代理，真实对象位于后端进程而不是插件进程。
+            self._scheduler = self._backend_client.scheduler
+            self._osc = self._backend_client.osc
+            self._driver_log = self._backend_client.driver_log
+            self._vmc_idle = self._backend_client.vmc_idle
+            self._host_vmc = self._backend_client.host_vmc
+            self._vision = self._backend_client.vision
+        else:
+            self._scheduler = None
+            self._osc = None
+            self._driver_log = None
+            self._vmc_idle = None
             self._host_vmc = None
-        if self._vmc_idle:
-            await asyncio.to_thread(self._vmc_idle.stop)
-        self._vmc_idle = VmcIdleRelay(
-            self._body_config.vmc_idle,
-            self._body_config.profile,
-            logger=self.logger,
-        )
-        self._vmc_idle.start()
-        self._host_vmc = HostVmcController(
-            self._body_config.vmc_idle,
-            logger=self.logger,
-        )
-        await asyncio.to_thread(self._host_vmc.start)
-        self._start_vmc_calibration()
-        self._scheduler = BodyScheduler(
-            self._body_config,
-            logger=self.logger,
-            idle_frame_source=self._vmc_idle,
-            motion_started_callback=self._on_motion_started,
-        )
-        self._scheduler.start()
-        if self._osc:
-            await asyncio.to_thread(self._osc.stop)
-        self._osc = VrchatOscBridge(self._body_config.vrchat_osc, logger=self.logger)
-        self._osc.start()
-        if self._driver_log:
-            await asyncio.to_thread(self._driver_log.stop)
-        self._driver_log = DriverLogListener(self._body_config.driver_log, logger=self.logger)
-        self._driver_log.start()
+            self._vision = None
         self._inject_ai_instructions()
         self.logger.info(
             "AnyaDance body scheduler ready (output disabled, target=%s:%s, rate=%s Hz)",
@@ -233,46 +169,53 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._body_config.rate_hz,
         )
         if self._body_config.vrchat_osc.enabled:
-            osc_status = self._osc.snapshot(include_parameters=False)
+            osc_status = await asyncio.to_thread(self._osc.snapshot, include_parameters=False) if self._osc else {
+                "send_target": f"{self._body_config.vrchat_osc.send_host}:{self._body_config.vrchat_osc.send_port}",
+                "listen_address": f"{self._body_config.vrchat_osc.listen_host}:{self._body_config.vrchat_osc.listen_port}",
+                "receiver_listening": False,
+                "last_error": "backend unavailable",
+            }
             self.logger.info(
                 "VRChat OSC bridge ready (send=%s, listen=%s, receiver_listening=%s)",
-                osc_status["send_target"],
-                osc_status["listen_address"],
-                osc_status["receiver_listening"],
+                osc_status.get("send_target", f"{self._body_config.vrchat_osc.send_host}:{self._body_config.vrchat_osc.send_port}"),
+                osc_status.get("listen_address", f"{self._body_config.vrchat_osc.listen_host}:{self._body_config.vrchat_osc.listen_port}"),
+                osc_status.get("receiver_listening", False),
             )
         if self._body_config.vmc_idle.enabled:
-            vmc_status = self._vmc_idle.snapshot()
+            vmc_status = await asyncio.to_thread(self._vmc_idle.snapshot) if self._vmc_idle else {
+                "listen_address": f"{self._body_config.vmc_idle.listen_host}:{self._body_config.vmc_idle.listen_port}",
+                "receiver_listening": False,
+                "last_error": "backend unavailable",
+            }
             self.logger.info(
                 "N.E.K.O VMC idle relay ready (listen=%s, receiver_listening=%s)",
-                vmc_status["listen_address"],
-                vmc_status["receiver_listening"],
+                vmc_status.get("listen_address", f"{self._body_config.vmc_idle.listen_host}:{self._body_config.vmc_idle.listen_port}"),
+                vmc_status.get("receiver_listening", False),
             )
         if self._body_config.driver_log.enabled:
-            driver_log_status = self._driver_log.snapshot()
+            driver_log_status = await asyncio.to_thread(self._driver_log.snapshot) if self._driver_log else {
+                "listen_address": f"{self._body_config.driver_log.multicast_group}:{self._body_config.driver_log.listen_port}",
+                "receiver_listening": False,
+                "last_error": "backend unavailable",
+            }
             self.logger.info(
                 "AnyaDance driver log listener ready (group=%s, receiver_listening=%s)",
-                driver_log_status["listen_address"],
-                driver_log_status["receiver_listening"],
+                driver_log_status.get("listen_address", f"{self._body_config.driver_log.multicast_group}:{self._body_config.driver_log.listen_port}"),
+                driver_log_status.get("receiver_listening", False),
             )
         return Ok({"status": "ready", "output_enabled": False})
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_: Any):
-        self._stop_vmc_calibration()
-        if self._driver_log:
-            await asyncio.to_thread(self._driver_log.stop)
-            self._driver_log = None
-        if self._osc:
-            await asyncio.to_thread(self._osc.stop)
-            self._osc = None
-        if self._scheduler:
-            await asyncio.to_thread(self._scheduler.shutdown)
-        if self._host_vmc:
-            await asyncio.to_thread(self._host_vmc.stop)
-            self._host_vmc = None
-        if self._vmc_idle:
-            await asyncio.to_thread(self._vmc_idle.stop)
-            self._vmc_idle = None
+        if self._backend_client:
+            await asyncio.to_thread(self._backend_client.stop)
+        self._backend_client = None
+        self._scheduler = None
+        self._osc = None
+        self._driver_log = None
+        self._host_vmc = None
+        self._vmc_idle = None
+        self._vision = None
         return Ok({"status": "stopped"})
 
     def _inject_ai_instructions(self) -> None:
@@ -299,33 +242,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             }
         return self._scheduler.submit(kind, params)
 
-    def _on_motion_started(self, command: BodyCommand, duration_s: float) -> None:
-        """Schedule reach-and-grab input from the scheduler's safe duration."""
-        if command.kind != "reach_and_grab" or self._osc is None:
-            return
-        action_id = command.action_id
-        side = str(command.params["side"])
+    async def _submit_async(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """在线程池中执行一次后端动作提交，避免阻塞插件事件循环。"""
+        return await asyncio.to_thread(self._submit, kind, params)
 
-        def action_is_current() -> bool:
-            if not self._scheduler:
-                return False
-            snapshot = self._scheduler.snapshot()
-            current = snapshot.get("current_action") or {}
-            return (
-                snapshot.get("output_enabled") is True
-                and current.get("id") == action_id
-                and current.get("name") == "reach_and_grab"
-            )
-
-        self._osc.schedule_input_pulse(
-            "grab",
-            side,
-            delay_s=max(0.0, duration_s * 0.85),
-            guard=action_is_current,
-        )
-
-    def _invalid(self, reason: str) -> dict[str, Any]:
-        state = self._scheduler.snapshot() if self._scheduler else {"state": "shutdown", "safety_state": "fault"}
+    async def _invalid(self, reason: str) -> dict[str, Any]:
+        if self._scheduler:
+            state = await asyncio.to_thread(self._scheduler.snapshot)
+        else:
+            state = {"state": "shutdown", "safety_state": "fault"}
         return {
             "accepted": False,
             "action_id": None,
@@ -339,14 +264,14 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         maximum = self._body_config.safety.max_action_duration_ms
         return _integer("duration_ms", default if value is None else value, minimum=100, maximum=maximum)
 
-    def _osc_result(
+    async def _osc_result(
         self,
         *,
         accepted: bool,
         normalized_params: dict[str, Any],
         reason: str | None,
     ) -> dict[str, Any]:
-        snapshot = self._scheduler.snapshot() if self._scheduler else {
+        snapshot = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
             "state": "shutdown",
             "safety_state": "fault",
         }
@@ -361,9 +286,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "delivery_confirmed": False,
         }
 
-    def _release_osc_inputs(self) -> None:
+    async def _release_osc_inputs(self) -> None:
         if self._osc:
-            self._osc.cancel_scheduled_inputs(release=True)
+            await asyncio.to_thread(self._osc.cancel_scheduled_inputs, release=True)
 
     def _driver_log_snapshot(self) -> dict[str, Any]:
         if not self._driver_log:
@@ -377,11 +302,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
 
     @staticmethod
     def _apply_driver_log_to_udp(snapshot: dict[str, Any], driver_log: Mapping[str, Any]) -> None:
-        """Replace the unverifiable UDP fields with driver-reported facts.
+        """用驱动上报事实替换无法由 UDP 验证的字段。
 
-        The pose protocol has no response, so both fields stay at their
-        unverifiable defaults whenever the telemetry group is off or silent --
-        an older driver simply never reports and nothing here changes.
+        姿态协议没有响应，因此遥测组关闭或没有上报时，两个字段保持不可验证
+        的默认值；旧版驱动不发送上报时，这里也不会擅自改变状态。
         """
         udp = snapshot.get("udp")
         if not isinstance(udp, dict) or not driver_log.get("enabled"):
@@ -428,7 +352,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
     def _driver_delivery_awareness(
         snapshot: Mapping[str, Any], driver_log: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Tell the model whether the driver actually received the commands."""
+        """向模型说明驱动是否实际收到命令。"""
         connection = str(driver_log.get("connection", "unknown"))
         concurrent = str(snapshot.get("concurrent_sender_detection", "unsupported"))
         accepted = int(driver_log.get("accepted_commands", 0) or 0)
@@ -481,9 +405,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
 
     @ui.context(id="debug_dashboard", title="AnyaDance 身体调试台")
     async def debug_dashboard_context(self):
-        driver_log = self._driver_log_snapshot()
+        driver_log = await asyncio.to_thread(self._driver_log_snapshot)
         if self._scheduler:
-            body = self._scheduler.snapshot()
+            body = await asyncio.to_thread(self._scheduler.snapshot)
             self._apply_driver_log_to_udp(body, driver_log)
             awareness = dict(body.get("awareness") or {})
         else:
@@ -501,20 +425,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "motion": None,
                 "pose": {},
             }
-        osc = self._osc.snapshot() if self._osc else {
+        osc = await asyncio.to_thread(self._osc.snapshot) if self._osc else {
             "enabled": False,
             "connection": "unknown",
             "receiver_listening": False,
             "last_error": "OSC bridge is not initialized",
         }
-        # Hosted UI refreshes this context every second.  A catalog scan only
-        # stats files and reuses cached metadata; it must never parse a large
-        # .nya payload on the plugin event loop.
-        clip_library = self._clip_library.catalog() if self._clip_library else {
-            "clips": [],
-            "invalid_clips": [],
-            "directory": None,
-        }
+        # Hosted UI 每秒刷新一次上下文。目录扫描只统计文件并复用缓存元数据，
+        # 不能在插件事件循环中解析大型 .nya 内容。
+        backend_client = self._backend_client
+        clip_library = (
+            await asyncio.to_thread(lambda: backend_client.catalog())
+            if backend_client
+            else {
+                "clips": [],
+                "invalid_clips": [],
+                "directory": None,
+            }
+        )
         with self._ui_event_lock:
             events = list(self._ui_events)
         return {
@@ -524,10 +452,14 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "awareness": awareness,
             "vrchat_osc": osc,
             "driver_log": driver_log,
-            "host_vmc": self._host_vmc.snapshot() if self._host_vmc else {
+            "host_vmc": await asyncio.to_thread(self._host_vmc.snapshot) if self._host_vmc else {
                 "managed": False,
                 "active": False,
                 "last_error": "host VMC controller is not initialized",
+            },
+            "world": await asyncio.to_thread(self._vision.snapshot) if self._vision else {
+                "available": False,
+                "uncertainties": ["backend_unavailable"],
             },
             "clips": clip_library,
             "config": {
@@ -567,13 +499,17 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         normalized = str(command or "").strip()
         params = dict(arguments) if isinstance(arguments, Mapping) else {}
         if normalized not in _DEBUG_COMMAND_NAMES:
+            state = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
+                "state": "shutdown",
+                "safety_state": "fault",
+            }
             result = Ok({
                 "accepted": False,
                 "action_id": None,
-                "state": self._scheduler.snapshot()["state"] if self._scheduler else "shutdown",
+                "state": state["state"],
                 "normalized_params": {},
                 "reason": "unsupported debug command",
-                "safety_state": self._scheduler.snapshot()["safety_state"] if self._scheduler else "fault",
+                "safety_state": state["safety_state"],
             })
             self._ui_event(normalized or "unknown", params, result)
             return result
@@ -586,26 +522,30 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             result = await handler(**params)
         except Exception as exc:
             self.logger.warning("Body debug UI command failed (%s): %s", normalized, exc)
+            state = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
+                "state": "shutdown",
+                "safety_state": "fault",
+            }
             result = Ok({
                 "accepted": False,
                 "action_id": None,
-                "state": self._scheduler.snapshot()["state"] if self._scheduler else "shutdown",
+                "state": state["state"],
                 "normalized_params": {},
                 "reason": str(exc)[:500],
-                "safety_state": self._scheduler.snapshot()["safety_state"] if self._scheduler else "fault",
+                "safety_state": state["safety_state"],
             })
         self._ui_event(normalized, params, result)
         return result
 
     @llm_tool(**BODY_ENABLE)
     async def body_enable(self, **_: Any):
-        return Ok(self._submit("enable"))
+        return Ok(await self._submit_async("enable"))
 
     @llm_tool(**BODY_DISABLE)
     async def body_disable(self, **_: Any):
-        result = self._submit("disable", {"duration_ms": self._body_config.default_duration_ms})
+        result = await self._submit_async("disable", {"duration_ms": self._body_config.default_duration_ms})
         if result.get("accepted"):
-            self._release_osc_inputs()
+            await self._release_osc_inputs()
         return Ok(result)
 
     @llm_tool(**BODY_ARM_POSE)
@@ -644,8 +584,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "duration_ms": self._duration(duration_ms, self._body_config.default_duration_ms),
             }
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("arm_pose", params))
+            return Ok(await self._invalid(str(exc)))
+        return Ok(await self._submit_async("arm_pose", params))
 
     @llm_tool(**BODY_MOVE_HAND)
     async def body_move_hand(
@@ -677,8 +617,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "duration_ms": self._duration(duration_ms, self._body_config.default_duration_ms),
             }
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("move_hand", params))
+            return Ok(await self._invalid(str(exc)))
+        return Ok(await self._submit_async("move_hand", params))
 
     @llm_tool(**BODY_HAND)
     async def body_hand(
@@ -698,8 +638,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "duration_ms": self._duration(duration_ms, 300),
             }
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("hand", params))
+            return Ok(await self._invalid(str(exc)))
+        return Ok(await self._submit_async("hand", params))
 
     @llm_tool(**BODY_REACH_AND_GRAB)
     async def body_reach_and_grab(
@@ -721,8 +661,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "duration_ms": self._duration(duration_ms, 700),
             }
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        result = self._submit("reach_and_grab", params)
+            return Ok(await self._invalid(str(exc)))
+        result = await self._submit_async("reach_and_grab", params)
         result["grip_engaged"] = bool(result["accepted"])
         result["object_held"] = "unknown"
         result["vrchat_osc_grab_scheduled"] = bool(
@@ -749,8 +689,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "intensity": _number("intensity", intensity, minimum=0.0, maximum=1.0),
             }
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("gesture", params))
+            return Ok(await self._invalid(str(exc)))
+        return Ok(await self._submit_async("gesture", params))
 
     @llm_tool(**BODY_EXPRESS)
     async def body_express(
@@ -771,64 +711,21 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             normalized_duration = None if duration_ms is None else _integer(
                 "duration_ms", duration_ms, minimum=500, maximum=5000
             )
-            alternate_side = "left" if self._expression_side_count % 2 else "right"
-            params = resolve_expression(
-                normalized_intent,
-                side=normalized_side,
-                intensity=normalized_intensity,
-                duration_ms=normalized_duration,
-                alternate_side=alternate_side,
-            )
         except (KeyError, ValueError) as exc:
-            return Ok(self._invalid(str(exc)))
-
-        if self._body_config.behavior.prefer_vmd_expressions and self._clip_library is not None:
-            selection_index = self._motion_intent_counts.get(normalized_intent, 0)
-            metadata = self._clip_library.select_for_intent(
-                normalized_intent,
-                side=normalized_side,
-                intensity=normalized_intensity,
-                sequence_index=selection_index,
-            )
-            if metadata is not None:
-                try:
-                    clip = await asyncio.to_thread(self._clip_library.load, metadata["name"])
-                    speed = float(metadata["recommended_speed"])
-                    if normalized_duration is not None and not clip.is_pose:
-                        requested_seconds = normalized_duration / 1000.0
-                        speed = min(3.0, max(0.25, clip.duration_s / requested_seconds))
-                    result = self._submit("semantic_clip", {
-                        "clip_name": clip.name,
-                        "speed": speed,
-                        "loop_count": int(metadata["loop_count"]),
-                        "transition_ms": int(metadata["transition_ms"]),
-                        "anchor": True,
-                        "restore_after": bool(metadata["restore_after"]),
-                        "semantic_intent": normalized_intent,
-                        "intent_label": params["intent_label"],
-                        "motion_source": str(metadata["source_kind"]),
-                        "motion_label": str(metadata["label"]),
-                        "source_name": str(metadata["source_name"]),
-                        "requested_intensity": normalized_intensity,
-                        "requested_duration_ms": normalized_duration,
-                        "_clip": clip,
-                    })
-                except (KeyError, OSError, ValueError) as exc:
-                    self.logger.warning(
-                        "Semantic VMD clip %s could not be loaded; using procedural fallback: %s",
-                        metadata.get("name"),
-                        exc,
-                    )
-                else:
-                    if result.get("accepted"):
-                        self._motion_intent_counts[normalized_intent] = selection_index + 1
-                        if normalized_side == "auto":
-                            self._expression_side_count += 1
-                    return Ok(result)
-
-        result = self._submit("express", params)
-        if result.get("accepted") and normalized_side == "auto":
-            self._expression_side_count += 1
+            return Ok(await self._invalid(str(exc)))
+        if not self._backend_client:
+            return Ok(await self._invalid("backend is not initialized"))
+        # VMD 选择、片段加载和程序化回退都由后端负责；插件只校验面向 LLM 的输入，
+        # 然后通过本机回环 IPC 发送一个粗粒度语义命令。
+        result = await asyncio.to_thread(
+            self._backend_client.semantic_express,
+            {
+                "intent": normalized_intent,
+                "side": normalized_side,
+                "intensity": normalized_intensity,
+                "duration_ms": normalized_duration,
+            },
+        )
         return Ok(result)
 
     def _normalize_sequence_step(self, raw: Any, index: int) -> dict[str, Any]:
@@ -893,26 +790,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             if requested_total > 30000:
                 raise ValueError("sequence requested duration must not exceed 30000 ms")
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("sequence", {"steps": normalized_steps, "loop_count": loops}))
+            return Ok(await self._invalid(str(exc)))
+        return Ok(await self._submit_async("sequence", {"steps": normalized_steps, "loop_count": loops}))
 
     @llm_tool(**BODY_CANCEL)
     async def body_cancel(self, *, action_id: Any = "", **_: Any):
         normalized = str(action_id or "").strip()
         if len(normalized) > 128:
-            return Ok(self._invalid("action_id must be at most 128 characters"))
-        result = self._submit("cancel", {"action_id": normalized or None})
+            return Ok(await self._invalid("action_id must be at most 128 characters"))
+        result = await self._submit_async("cancel", {"action_id": normalized or None})
         if result.get("accepted"):
-            self._release_osc_inputs()
+            await self._release_osc_inputs()
         return Ok(result)
 
     @llm_tool(**BODY_LIST_CLIPS)
     async def body_list_clips(self, **_: Any):
-        if not self._clip_library:
-            return Ok({"clips": [], "invalid_clips": [], "reason": "clip library is not initialized"})
-        # Explicit listing indexes every clip.  JSON decoding a large dance is
-        # CPU-heavy, so keep it off the SDK/event-loop thread.
-        return Ok(await asyncio.to_thread(self._clip_library.list))
+        if not self._backend_client:
+            return Ok({"clips": [], "invalid_clips": [], "reason": "backend is not initialized"})
+        return Ok(await asyncio.to_thread(self._backend_client.list_clips))
 
     @llm_tool(**BODY_PLAY_CLIP)
     async def body_play_clip(
@@ -926,14 +821,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         restore_after: Any = False,
         **_: Any,
     ):
-        if not self._clip_library:
-            return Ok(self._invalid("clip library is not initialized"))
         try:
             name = str(clip_name or "").strip()
-            # First use parses and validates the clip; subsequent calls use the
-            # signature-aware resident cache.  Parsing happens in a worker so
-            # the debug panel and other plugin entries remain responsive.
-            clip = await asyncio.to_thread(self._clip_library.load, name)
+            if not name or len(name) > 256:
+                raise ValueError("clip_name must not be empty and must be at most 256 characters")
             normalized_speed = _number("speed", speed, minimum=0.25, maximum=3.0)
             loops = _integer("loop_count", loop_count, minimum=1, maximum=10)
             transition = self._body_config.behavior.default_crossfade_ms if transition_ms is None else _integer(
@@ -941,22 +832,21 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             )
             anchored = _boolean("anchor", anchor)
             restore = _boolean("restore_after", restore_after)
-            playback_seconds = 0.0 if clip.is_pose else (clip.duration_s / normalized_speed) * loops
-            if playback_seconds > self._body_config.clip_max_duration_seconds:
-                raise ValueError(
-                    f"expanded clip playback must not exceed {self._body_config.clip_max_duration_seconds:g} seconds"
-                )
-        except (ValueError, OSError) as exc:
-            return Ok(self._invalid(str(exc)))
-        return Ok(self._submit("play_clip", {
-            "clip_name": clip.name,
-            "speed": normalized_speed,
-            "loop_count": loops,
-            "transition_ms": transition,
-            "anchor": anchored,
-            "restore_after": restore,
-            "_clip": clip,
-        }))
+        except ValueError as exc:
+            return Ok(await self._invalid(str(exc)))
+        result = await asyncio.to_thread(
+            self._submit,
+            "play_clip",
+            {
+                "clip_name": name,
+                "speed": normalized_speed,
+                "loop_count": loops,
+                "transition_ms": transition,
+                "anchor": anchored,
+                "restore_after": restore,
+            },
+        )
+        return Ok(result)
 
     @llm_tool(**BODY_AVATAR_PARAMETER)
     async def body_avatar_parameter(self, *, name: Any = "", value: Any = None, **_: Any):
@@ -964,20 +854,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             parameter = validate_parameter_name(name)
             normalized_value = normalize_parameter_value(value)
         except ValueError as exc:
-            return Ok(self._osc_result(
+            return Ok(await self._osc_result(
                 accepted=False,
                 normalized_params={},
                 reason=str(exc),
             ))
         normalized = {"name": parameter, "value": normalized_value}
         if not self._osc:
-            return Ok(self._osc_result(
+            return Ok(await self._osc_result(
                 accepted=False,
                 normalized_params=normalized,
                 reason="VRChat OSC bridge is not initialized",
             ))
-        accepted, reason = self._osc.send_parameter(parameter, normalized_value)
-        return Ok(self._osc_result(
+        accepted, reason = await asyncio.to_thread(
+            self._osc.send_parameter,
+            parameter,
+            normalized_value,
+        )
+        return Ok(await self._osc_result(
             accepted=accepted,
             normalized_params=normalized,
             reason=reason,
@@ -1004,23 +898,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 ),
             }
         except ValueError as exc:
-            return Ok(self._osc_result(
+            return Ok(await self._osc_result(
                 accepted=False,
                 normalized_params={},
                 reason=str(exc),
             ))
         if not self._osc:
-            return Ok(self._osc_result(
+            return Ok(await self._osc_result(
                 accepted=False,
                 normalized_params=normalized,
                 reason="VRChat OSC bridge is not initialized",
             ))
-        accepted, reason = self._osc.pulse_input(
+        accepted, reason = await asyncio.to_thread(
+            self._osc.pulse_input,
             normalized["action"],
             normalized["side"],
             normalized["hold_ms"],
         )
-        result = self._osc_result(
+        result = await self._osc_result(
             accepted=accepted,
             normalized_params=normalized,
             reason=reason,
@@ -1030,8 +925,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
 
     @llm_tool(**BODY_STOP)
     async def body_stop(self, **_: Any):
-        result = self._submit("stop")
-        self._release_osc_inputs()
+        result = await self._submit_async("stop")
+        await self._release_osc_inputs()
         return Ok(result)
 
     @llm_tool(**BODY_RESET)
@@ -1039,10 +934,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         try:
             duration = self._duration(duration_ms, self._body_config.default_duration_ms)
         except ValueError as exc:
-            return Ok(self._invalid(str(exc)))
-        result = self._submit("reset", {"duration_ms": duration})
+            return Ok(await self._invalid(str(exc)))
+        result = await self._submit_async("reset", {"duration_ms": duration})
         if result.get("accepted"):
-            self._release_osc_inputs()
+            await self._release_osc_inputs()
         return Ok(result)
 
     @llm_tool(**BODY_STATUS)
@@ -1052,17 +947,17 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "state": "shutdown",
                 "output_enabled": False,
                 "reason": "scheduler is not initialized",
-                "idle_relay": self._vmc_idle.snapshot() if self._vmc_idle else {"enabled": False},
-                "vrchat_osc": self._osc.snapshot() if self._osc else {"enabled": False},
-                "driver_log": self._driver_log_snapshot(),
+                "idle_relay": await asyncio.to_thread(self._vmc_idle.snapshot) if self._vmc_idle else {"enabled": False},
+                "vrchat_osc": await asyncio.to_thread(self._osc.snapshot) if self._osc else {"enabled": False},
+                "driver_log": await asyncio.to_thread(self._driver_log_snapshot),
             })
-        snapshot = self._scheduler.snapshot()
-        snapshot["vrchat_osc"] = self._osc.snapshot() if self._osc else {
+        snapshot = await asyncio.to_thread(self._scheduler.snapshot)
+        snapshot["vrchat_osc"] = await asyncio.to_thread(self._osc.snapshot) if self._osc else {
             "enabled": False,
             "connection": "unknown",
             "last_error": "OSC bridge is not initialized",
         }
-        driver_log = self._driver_log_snapshot()
+        driver_log = await asyncio.to_thread(self._driver_log_snapshot)
         snapshot["driver_log"] = driver_log
         self._apply_driver_log_to_udp(snapshot, driver_log)
         return Ok(snapshot)
@@ -1079,11 +974,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "previous_action": None,
                 "transition": None,
                 "pose": {},
-                "idle_relay": self._vmc_idle.snapshot() if self._vmc_idle else {"enabled": False},
-                "vrchat_osc": self._osc.awareness() if self._osc else {"enabled": False},
+                "idle_relay": await asyncio.to_thread(self._vmc_idle.snapshot) if self._vmc_idle else {"enabled": False},
+                "vrchat_osc": await asyncio.to_thread(self._osc.awareness) if self._osc else {"enabled": False},
             })
-        snapshot = self._scheduler.snapshot()
-        driver_log = self._driver_log_snapshot()
+        snapshot = await asyncio.to_thread(self._scheduler.snapshot)
+        driver_log = await asyncio.to_thread(self._driver_log_snapshot)
         self._apply_driver_log_to_udp(snapshot, driver_log)
         return Ok({
             "state": snapshot["state"],
@@ -1092,7 +987,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "queue_length": snapshot["queue_length"],
             **snapshot["awareness"],
             "driver_delivery": self._driver_delivery_awareness(snapshot, driver_log),
-            "vrchat_osc": self._osc.awareness() if self._osc else {
+            "vrchat_osc": await asyncio.to_thread(self._osc.awareness) if self._osc else {
                 "enabled": False,
                 "connection": "unknown",
                 "summary": "VRChat OSC 桥接器尚未初始化。",
@@ -1101,6 +996,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "pickup_confirmation_available": False,
             },
         })
+
+    @llm_tool(**WORLD_OBSERVE)
+    async def world_observe(self, **_: Any):
+        """返回最新的视觉世界快照，不阻塞插件事件循环。"""
+        if self._vision is None:
+            return Ok({
+                "available": False,
+                "uncertainties": ["backend_unavailable"],
+            })
+        return Ok(await asyncio.to_thread(self._vision.snapshot))
 
 
 __all__ = ["NekoAnyadanceBodyPlugin"]

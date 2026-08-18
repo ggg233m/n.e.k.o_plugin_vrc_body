@@ -1,4 +1,4 @@
-"""Central LLM tool metadata."""
+"""LLM 工具的集中元数据定义。"""
 
 BODY_ENABLE = {
     "name": "body_enable",
@@ -260,5 +260,11 @@ BODY_STATUS = {
 BODY_AWARENESS = {
     "name": "body_awareness",
     "description": "读取 LLM 可理解的实时身体自知：当前/上一动作、切换关系、进度与剩余时间，以及双臂、双手和头部的语义姿态。连续动作、切换动作或回答当前在做什么之前应先调用。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+WORLD_OBSERVE = {
+    "name": "world_observe",
+    "description": "读取最近的视觉世界状态。结果来自可选的 VRChat 画面检测器/VLM，包含目标、事件、置信度和不确定性；没有新观测时必须按 unknown 处理，不能把空结果当成世界为空。",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }

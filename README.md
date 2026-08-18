@@ -72,6 +72,16 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 `body_awareness.vrchat_osc` 只报告 VRChat 实际发回的 Avatar ID 和配置参数，不提供实时骨骼角度，也不能确认 Pickup 是否附着。默认关注 `NEKO_Action`、`NEKO_ActionActive`、`NEKO_ActionPhase` 和 `NEKO_Holding`；这些参数需要先在 Avatar 的 Expression Parameters/Animator 中创建并驱动。
 
+## 独立后端进程
+
+身体运行时采用一个粗粒度的本机后端进程，而不是把每个动作拆成独立服务。Hosted 插件只保留 LLM 工具参数校验、UI 和 IPC 适配；后端进程统一持有 `BodyScheduler`、AnyaDance UDP 输出、VMC idle 中转、VRChat OSC、驱动遥测、动作加载和世界状态。两者通过带随机令牌的 loopback HTTP 通信，后端不可用时插件进入安全的 `backend_unavailable` 状态。
+
+## 视觉世界状态（第一阶段）
+
+插件新增 `world_observe` 工具；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层。它们不进入 AnyaDance 的 60 Hz 调度线程，也不替代宿主 VMC 待机中转。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
+
+当前版本只提供无第三方依赖的后端协议和安全状态缓存。YOLO、VRChat 画面采集及 VLM 适配器将在后续按运行环境启用；未配置后端时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
+
 ## N.E.K.O VMC 待机中转
 
 插件启动后会通过 N.E.K.O 公开的 VMC REST 控制面自动启用输出，并将目标设为 `127.0.0.1:39539`；随后请求一次短暂 T Pose，以 VRM 原始静止姿势校准手腕朝向与手指弯曲零点。插件关闭时恢复宿主原来的启用状态、目标和频率。插件接收 `/VMC/Ext/Root/Pos` 与 `/VMC/Ext/Bone/Pos`，把局部 Humanoid 骨骼变换经过 FK、坐标系还原和身高标定后转换为 AnyaDance 六设备帧：

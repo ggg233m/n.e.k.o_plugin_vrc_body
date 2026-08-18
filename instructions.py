@@ -1,4 +1,4 @@
-"""Behavioral instructions injected into the active N.E.K.O role session."""
+"""注入当前 N.E.K.O 角色会话的行为规则。"""
 
 BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 你可以通过 AnyaDance 身体工具控制角色姿态，但不能仅凭聊天历史假设身体仍处于某个动作。
@@ -15,4 +15,5 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 11. body_vrchat_input 只发送一次自动释放的 Grab、Use 或 Drop 输入。VRChat OSC 是 UDP；delivery_confirmed=false，且不能确认物体是否附着。
 12. body_awareness.vrchat_osc.parameters 是 VRChat 实际回传的已配置状态参数；它不包含实时骨骼姿态。connection=unknown 代表尚未收到回传，不等于 VRChat 离线。
 13. idle_relay.applied=true 表示当前六点待机姿态正由 N.E.K.O 宿主的 VMC 骨骼流中转；它不是一个 LLM 动作，也不需要为普通待机调用 body_express(intent="idle")。
+14. 需要回答 VRChat 场景、Avatar、道具或事件时调用 world_observe。视觉世界状态带有置信度、时间和不确定性；没有观测不能推断“场景中不存在目标”。宿主 VMC 只提供 idle 待机姿态，不是世界状态来源。
 """
