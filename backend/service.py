@@ -19,6 +19,7 @@ from .adapters import (
     VrchatOscBridge,
     resolve_expression,
 )
+from .cognition import CognitionRuntime
 from .vision import VisionRuntime
 from .world_state import WorldStateStore
 
@@ -28,7 +29,7 @@ _VMC_CALIBRATION_RETRY_SECONDS = 5.0
 
 
 class _DryRunDatagramTransport:
-    """Scheduler transport that records frames without touching the network."""
+    """只记录帧数、不触碰网络的调度器传输层。"""
 
     local_port = None
 
@@ -72,6 +73,55 @@ class BackendService:
         self._last_error: str | None = None
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
+        self.cognition = CognitionRuntime(self._cognition_sources)
+
+    def _cognition_sources(self) -> dict[str, dict[str, Any]]:
+        """暴露各数据源健康状况，且不会递归调用 ``snapshot``。"""
+        body = self.scheduler.snapshot() if self.scheduler else {"state": "shutdown"}
+        osc = self.osc.snapshot() if self.osc else {"enabled": False}
+        driver = self.driver_log.snapshot() if self.driver_log else {"enabled": False}
+        vmc = self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False}
+        world = self.vision.snapshot()
+        return {
+            "body": {
+                "state": body.get("state"),
+                "safety_state": body.get("safety_state"),
+                "output_enabled": body.get("output_enabled"),
+                "current_action": body.get("current_action"),
+                "sent_packets": (body.get("udp") or {}).get("sent_packets", 0),
+                "send_failures": (body.get("udp") or {}).get("send_failures", 0),
+                "actual_hz": (body.get("metrics") or {}).get("actual_hz", 0.0),
+            },
+            "vrchat_osc": {
+                "enabled": osc.get("enabled"),
+                "connection": osc.get("connection"),
+                "received_packets": osc.get("received_packets", 0),
+                "parameter_count": osc.get("parameter_count", 0),
+                "send_failures": osc.get("send_failures", 0),
+            },
+            "driver_log": {
+                "enabled": driver.get("enabled"),
+                "connection": driver.get("connection"),
+                "received_packets": driver.get("received_packets", 0),
+                "accepted_commands": driver.get("accepted_commands", 0),
+                "rejected_commands": driver.get("rejected_commands", 0),
+                "last_command_age_ms": driver.get("last_command_age_ms"),
+            },
+            "vmc_idle": {
+                "enabled": vmc.get("enabled"),
+                "connection": vmc.get("connection"),
+                "source_available": vmc.get("source_available"),
+                "received_packets": vmc.get("received_packets", 0),
+                "last_frame_age_ms": vmc.get("last_frame_age_ms"),
+            },
+            "world": {
+                "available": world.get("available"),
+                "entity_count": (world.get("status") or {}).get("entity_count", 0),
+                "event_count": (world.get("status") or {}).get("event_count", 0),
+                "last_observation_age_ms": (world.get("status") or {}).get("last_observation_age_ms"),
+                "vision_enabled": (world.get("vision") or {}).get("enabled", False),
+            },
+        }
 
     def start(self) -> None:
         with self._lock:
@@ -190,33 +240,37 @@ class BackendService:
             self._started = False
 
     def submit(self, kind: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            self.cognition.record_action(kind, result)
+            return result
+
         scheduler = self.scheduler
         if scheduler is None:
-            return {
+            return finish({
                 "accepted": False,
                 "action_id": None,
                 "state": "shutdown",
                 "normalized_params": {},
                 "reason": "backend scheduler is not initialized",
                 "safety_state": "fault",
-            }
+            })
         normalized = dict(params or {})
         if kind in {"play_clip", "semantic_clip"} and "_clip" not in normalized:
             clip_name = str(normalized.get("clip_name") or "").strip()
             if not clip_name:
-                return {
+                return finish({
                     "accepted": False,
                     "action_id": None,
                     "state": scheduler.snapshot()["state"],
                     "normalized_params": normalized,
                     "reason": "clip_name is required",
                     "safety_state": scheduler.snapshot()["safety_state"],
-                }
+                })
             try:
                 normalized["_clip"] = self.clip_library.load(clip_name)
             except (KeyError, OSError, ValueError) as exc:
                 state = scheduler.snapshot()
-                return {
+                return finish({
                     "accepted": False,
                     "action_id": None,
                     "state": state["state"],
@@ -225,7 +279,7 @@ class BackendService:
                     },
                     "reason": str(exc),
                     "safety_state": state["safety_state"],
-                }
+                })
         if kind in {"play_clip", "semantic_clip"}:
             clip = normalized.get("_clip")
             try:
@@ -236,7 +290,7 @@ class BackendService:
                 playback_seconds = 0.0 if clip.is_pose else (clip.duration_s / speed) * loops
             except (AttributeError, TypeError, ValueError, ZeroDivisionError, OverflowError):
                 state = scheduler.snapshot()
-                return {
+                return finish({
                     "accepted": False,
                     "action_id": None,
                     "state": state["state"],
@@ -245,10 +299,10 @@ class BackendService:
                     },
                     "reason": "invalid clip playback parameters",
                     "safety_state": state["safety_state"],
-                }
+                })
             if not math.isfinite(playback_seconds) or playback_seconds > self.config.clip_max_duration_seconds:
                 state = scheduler.snapshot()
-                return {
+                return finish({
                     "accepted": False,
                     "action_id": None,
                     "state": state["state"],
@@ -260,8 +314,8 @@ class BackendService:
                         f"{self.config.clip_max_duration_seconds:g} seconds"
                     ),
                     "safety_state": state["safety_state"],
-                }
-        return scheduler.submit(kind, normalized)
+                })
+        return finish(scheduler.submit(kind, normalized))
 
     def snapshot(self) -> dict[str, Any]:
         scheduler = self.scheduler
@@ -279,6 +333,7 @@ class BackendService:
             "idle_relay": self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False},
             "host_vmc": self.host_vmc.snapshot() if self.host_vmc else {"managed": False, "active": False},
             "world": self.vision.snapshot(),
+            "cognition": self.cognition.snapshot(),
             "backend": {
                 "started": self._started,
                 "dry_run": self.dry_run,
@@ -372,7 +427,47 @@ class BackendService:
         return result
 
     def ingest_world(self, observation: Mapping[str, Any]) -> dict[str, Any]:
-        return self.vision.ingest(observation)
+        result = self.vision.ingest(observation)
+        confidence = observation.get("confidence")
+        if confidence is None:
+            def normalize_confidence(value: Any) -> float:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return 0.0
+                if not math.isfinite(numeric):
+                    return 0.0
+                return min(1.0, max(0.0, numeric))
+
+            candidates = [
+                normalize_confidence(item.get("confidence"))
+                for item in (observation.get("entities") or ())
+                if isinstance(item, Mapping)
+            ] + [
+                normalize_confidence(item.get("confidence"))
+                for item in (observation.get("events") or ())
+                if isinstance(item, Mapping)
+            ]
+            confidence = max(candidates, default=0.0)
+        self.cognition.observe(
+            str(observation.get("source") or "world"),
+            "world_observation",
+            {
+                "entity_count": len(result.get("entities") or []),
+                "event_count": len(result.get("events") or []),
+                "available": bool(result.get("available")),
+            },
+            confidence=confidence,
+            observed_at=observation.get("observed_at"),
+            frame_id=str(observation.get("frame_id")) if observation.get("frame_id") is not None else None,
+        )
+        return result
+
+    def plan(self, goal: Mapping[str, Any] | None) -> dict[str, Any]:
+        return self.cognition.plan(goal)
+
+    def cognition_feedback(self, feedback: Mapping[str, Any] | None) -> dict[str, Any]:
+        return self.cognition.feedback(feedback)
 
 
 __all__ = ["BackendService"]

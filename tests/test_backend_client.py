@@ -72,11 +72,34 @@ class BackendClientTests(unittest.TestCase):
                 "/world/ingest",
                 {
                     "source": "test_detector",
-                    "entities": [{"id": "button", "label": "button", "confidence": 0.9}],
+                    "entities": [
+                        {"id": "button", "label": "button", "confidence": 0.9},
+                        {"id": "avatar", "label": "avatar"},
+                    ],
                 },
             )
             self.assertTrue(world["available"])
             self.assertEqual(world["entities"][0]["id"], "button")
+            plan = client.request(
+                "POST",
+                "/cognition/plan",
+                {"goal": "raise hand", "action": "arm_pose", "params": {"side": "right"}},
+            )
+            self.assertEqual(plan["status"], "planned")
+            cognition = client.request("GET", "/cognition")
+            self.assertEqual(cognition["plan"]["id"], plan["id"])
+            self.assertEqual(cognition["state"]["mode"], "nominal")
+            self.assertGreaterEqual(
+                cognition["state"]["sources"]["world"]["runtime"]["entity_count"],
+                1,
+            )
+            feedback = client.request(
+                "POST",
+                "/cognition/feedback",
+                {"type": "world_changed", "data": {"entity": "button"}},
+            )
+            self.assertTrue(feedback["replan_required"])
+            self.assertEqual(feedback["replan_reason"], "world_changed")
             rejected = client.scheduler.submit("play_clip", {"clip_name": "does-not-exist"})
             self.assertFalse(rejected["accepted"])
             self.assertIn("unknown preset clip", rejected["reason"])

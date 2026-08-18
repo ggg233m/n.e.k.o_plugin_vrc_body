@@ -77,6 +77,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/awareness":
             self._json(200, self.server.service.awareness())
             return
+        if self.path == "/cognition":
+            self._json(200, self.server.service.cognition.snapshot())
+            return
         self._json(404, {"error": "unknown endpoint"})
 
     def do_POST(self) -> None:
@@ -106,6 +109,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.semantic_express(value)
             elif self.path == "/world/ingest":
                 result = self.server.service.ingest_world(value)
+            elif self.path == "/cognition/plan":
+                result = self.server.service.plan(value)
+            elif self.path == "/cognition/feedback":
+                result = self.server.service.cognition_feedback(value)
             elif self.path == "/shutdown":
                 result = {"accepted": True}
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -168,9 +175,8 @@ def main() -> int:
         service = BackendService(config_data, args.config_dir, dry_run=offline)
         server: BackendHttpServer | None = None
         try:
-            # Bind before starting VMC/OSC resources, and keep both resources
-            # under one finally block so a bind/start failure always restores
-            # any partially initialized host state.
+            # 先完成端口绑定再启动 VMC/OSC 资源，并把两者放在同一个 finally 块中；
+            # 这样绑定或启动失败时，总能恢复已部分初始化的宿主状态。
             server = BackendHttpServer((args.host, args.port), token, service)
             service.start()
             print(

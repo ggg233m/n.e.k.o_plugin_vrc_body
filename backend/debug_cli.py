@@ -1,4 +1,4 @@
-"""Small SDK-free command line client for live backend debugging."""
+"""用于实时调试后端的小型命令行客户端，不依赖插件 SDK。"""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=48912)
     parser.add_argument("--token", required=True)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("health", "snapshot", "awareness", "shutdown"):
+    for name in ("health", "snapshot", "awareness", "cognition", "shutdown"):
         sub.add_parser(name)
     action = sub.add_parser("action")
     action.add_argument("--kind", required=True)
@@ -68,6 +68,12 @@ def main() -> int:
     ingest = sub.add_parser("ingest")
     ingest.add_argument("--json", default=None)
     ingest.add_argument("--file", type=Path, default=None)
+    plan = sub.add_parser("plan")
+    plan.add_argument("--json", default=None)
+    plan.add_argument("--file", type=Path, default=None)
+    feedback = sub.add_parser("feedback")
+    feedback.add_argument("--json", default=None)
+    feedback.add_argument("--file", type=Path, default=None)
     args = parser.parse_args()
     try:
         if args.command == "health":
@@ -76,8 +82,28 @@ def main() -> int:
             result = request(args.host, args.port, args.token, "GET", "/snapshot")
         elif args.command == "awareness":
             result = request(args.host, args.port, args.token, "GET", "/awareness")
+        elif args.command == "cognition":
+            result = request(args.host, args.port, args.token, "GET", "/cognition")
         elif args.command == "shutdown":
             result = request(args.host, args.port, args.token, "POST", "/shutdown", {})
+        elif args.command == "plan":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/cognition/plan",
+                _json_arg(args.json, args.file),
+            )
+        elif args.command == "feedback":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/cognition/feedback",
+                _json_arg(args.json, args.file),
+            )
         elif args.command == "action":
             result = request(
                 args.host,

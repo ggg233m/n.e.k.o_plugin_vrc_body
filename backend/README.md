@@ -12,7 +12,9 @@
   直接启动开发后端；完全省略配置时也默认使用该安全模式。
 - `client.py` 是插件侧的轻量 IPC 客户端和兼容代理层。
 - `debug_cli.py` 是不依赖 SDK 的实时调试命令行，可以读取状态、注入世界观测、
-  提交动作和停止后端。
+  提交动作、创建高层计划、注入反馈和停止后端。
+- `cognition.py` 保存有界的观测、状态新鲜度/置信度、严格计划 JSON 和执行反馈；
+  它不进入 AnyaDance 的 60 Hz 控制线程，未来的 LLM 只需要生成同一计划格式。
 - `adapters.py` 是唯一的宿主项目集成接缝，负责把后端映射到当前项目的调度器、
   VMC、OSC、遥测、配置和动作片段库。
 - `vision.py` 与 `world_state.py` 是无第三方依赖的感知状态基础模块；可以挂接
@@ -36,6 +38,13 @@ python backend/process.py --config-file plugin.toml --offline --port 48912 --tok
 ```powershell
 python backend/debug_cli.py --port 48912 --token dev snapshot
 python backend/debug_cli.py --port 48912 --token dev ingest --json '{"source":"yolo","entities":[{"id":"button","label":"button","confidence":0.92}]}'
+python backend/debug_cli.py --port 48912 --token dev plan --json '{"goal":"举右手","action":"arm_pose","params":{"side":"right","elevation_deg":110}}'
+python backend/debug_cli.py --port 48912 --token dev cognition
+python backend/debug_cli.py --port 48912 --token dev feedback --json '{"type":"world_changed","data":{"reason":"new_avatar"}}'
 python backend/debug_cli.py --port 48912 --token dev action --kind enable --json '{}'
 python backend/debug_cli.py --port 48912 --token dev shutdown
 ```
+
+HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
+`POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
+执行仍必须经过 `/action` 或插件工具。
