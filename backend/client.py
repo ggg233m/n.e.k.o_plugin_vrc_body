@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import base64
 import json
@@ -13,7 +14,7 @@ import sys
 import threading
 import time
 from typing import Any, Mapping
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -43,6 +44,8 @@ class BackendClient:
         self.port = 0
         self.token = ""
         self.process: subprocess.Popen[Any] | None = None
+        self._stderr_lines: deque[str] = deque(maxlen=64)
+        self._stderr_thread: threading.Thread | None = None
         osc = self.config_data.get("vrchat_osc")
         osc_mapping = osc if isinstance(osc, Mapping) else {}
         raw_enabled = osc_mapping.get("enabled", True)
@@ -96,6 +99,16 @@ class BackendClient:
             stderr=subprocess.PIPE,
             creationflags=creationflags,
         )
+        stderr = self.process.stderr
+        if stderr is not None:
+            self._stderr_lines.clear()
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(stderr,),
+                name="neko-backend-stderr",
+                daemon=True,
+            )
+            self._stderr_thread.start()
         deadline = time.monotonic() + max(1.0, timeout_s)
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -122,12 +135,11 @@ class BackendClient:
                     process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     pass
-        child_error = ""
-        if process is not None and process.stderr is not None:
-            try:
-                child_error = process.stderr.read(4096).decode("utf-8", errors="replace").strip()
-            except OSError:
-                child_error = ""
+        stderr_thread = self._stderr_thread
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1.0)
+        self._stderr_thread = None
+        child_error = "".join(self._stderr_lines).strip()
         detail = child_error or str(last_error or "process exited")
         # Windows 可能在探测和子进程绑定之间暂时占用临时端口；使用新端口重试，
         # 避免瞬时竞争导致插件启动失败。
@@ -136,6 +148,13 @@ class BackendClient:
             self.token = ""
             return self.start(timeout_s=timeout_s, _retry=_retry + 1)
         raise BackendUnavailable(f"backend did not become ready: {detail[:500]}")
+
+    def _drain_stderr(self, stream: Any) -> None:
+        try:
+            for raw_line in iter(stream.readline, b""):
+                self._stderr_lines.append(raw_line.decode("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return
 
     def stop(self) -> None:
         process = self.process
@@ -156,6 +175,10 @@ class BackendClient:
                         process.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:
                         pass
+            stderr_thread = self._stderr_thread
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
+            self._stderr_thread = None
         finally:
             self.port = 0
             self.token = ""
@@ -208,6 +231,13 @@ class BackendClient:
             try:
                 with urlopen(request, timeout=timeout_s) as response:
                     value = json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                try:
+                    detail = json.loads(exc.read().decode("utf-8"))
+                    message = detail.get("error") if isinstance(detail, dict) else None
+                except (OSError, ValueError, UnicodeError):
+                    message = None
+                raise BackendUnavailable(message or str(exc)) from exc
             except (OSError, URLError, TimeoutError) as exc:
                 raise BackendUnavailable(str(exc)) from exc
         if not isinstance(value, dict):

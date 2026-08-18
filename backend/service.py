@@ -27,13 +27,36 @@ _VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
 
 
+class _DryRunDatagramTransport:
+    """Scheduler transport that records frames without touching the network."""
+
+    local_port = None
+
+    def __init__(self) -> None:
+        self.sent_packets = 0
+
+    def send(self, _payload: bytes, _target: tuple[str, int]) -> None:
+        self.sent_packets += 1
+
+    def close(self) -> None:
+        return
+
+
 class BackendService:
     """在插件进程之外持有所有长期运行的身体与视觉资源。"""
 
-    def __init__(self, config_data: Mapping[str, Any], config_dir: str | Path, *, logger: Any = None) -> None:
+    def __init__(
+        self,
+        config_data: Mapping[str, Any],
+        config_dir: str | Path,
+        *,
+        logger: Any = None,
+        dry_run: bool = False,
+    ) -> None:
         self.config = PluginConfig.from_mapping(config_data)
         self.config_dir = Path(config_dir)
         self.logger = logger
+        self.dry_run = bool(dry_run)
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
         self.world_state = WorldStateStore()
         self.vision = VisionRuntime(self.world_state)
@@ -63,6 +86,7 @@ class BackendService:
                 self.scheduler = BodyScheduler(
                     self.config,
                     logger=self.logger,
+                    transport=_DryRunDatagramTransport() if self.dry_run else None,
                     idle_frame_source=self.vmc_idle,
                     motion_started_callback=self._on_motion_started,
                 )
@@ -257,6 +281,7 @@ class BackendService:
             "world": self.vision.snapshot(),
             "backend": {
                 "started": self._started,
+                "dry_run": self.dry_run,
                 "last_error": self._last_error,
                 "pid": __import__("os").getpid(),
             },

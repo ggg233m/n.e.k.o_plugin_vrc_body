@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
 import os
 from pathlib import Path
+import secrets
 import signal
 import sys
 import threading
+import tomllib
 from typing import Any
 import types
 
@@ -129,29 +132,74 @@ class BackendHttpServer(ThreadingHTTPServer):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--token", required=True)
-    parser.add_argument("--config-dir", required=True)
-    parser.add_argument("--config-json", required=True)
+    parser.add_argument("--port", type=int, default=48912)
+    parser.add_argument("--token", default=None)
+    parser.add_argument("--config-dir", default=str(PROJECT_DIR))
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--config-json", default=None)
+    source.add_argument("--config-file", type=Path, default=None, help="JSON or TOML config file")
+    parser.add_argument(
+        "--offline",
+        "--dry-run",
+        action="store_true",
+        help="disable VMC, VRChat OSC, and driver telemetry for local development",
+    )
     args = parser.parse_args()
     try:
-        config_data = json.loads(base64.urlsafe_b64decode(args.config_json.encode("ascii")).decode("utf-8"))
+        if args.config_json:
+            config_data = json.loads(base64.urlsafe_b64decode(args.config_json.encode("ascii")).decode("utf-8"))
+        elif args.config_file:
+            raw = args.config_file.read_bytes()
+            if args.config_file.suffix.lower() == ".toml":
+                config_data = tomllib.loads(raw.decode("utf-8"))
+            else:
+                config_data = json.loads(raw.decode("utf-8"))
+        else:
+            config_data = {}
         if not isinstance(config_data, dict):
             raise ValueError("config must be a JSON object")
-        service = BackendService(config_data, args.config_dir)
-        service.start()
-        server = BackendHttpServer((args.host, args.port), args.token, service)
-
-        def stop(*_: Any) -> None:
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-        signal.signal(signal.SIGTERM, stop)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, stop)
+        offline = bool(args.offline or (args.config_json is None and args.config_file is None))
+        if offline:
+            config_data = copy.deepcopy(config_data)
+            for section in ("vmc_idle", "vrchat_osc", "driver_log"):
+                config_data.setdefault(section, {})["enabled"] = False
+            config_data.setdefault("vmc_idle", {})["manage_host_output"] = False
+        token = str(args.token or secrets.token_urlsafe(24))
+        service = BackendService(config_data, args.config_dir, dry_run=offline)
+        server: BackendHttpServer | None = None
         try:
+            # Bind before starting VMC/OSC resources, and keep both resources
+            # under one finally block so a bind/start failure always restores
+            # any partially initialized host state.
+            server = BackendHttpServer((args.host, args.port), token, service)
+            service.start()
+            print(
+                json.dumps(
+                    {
+                        "ready": True,
+                        "host": args.host,
+                        "port": args.port,
+                        "token": token,
+                        "pid": os.getpid(),
+                        "offline": offline,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+            def stop(*_: Any) -> None:
+                if server is not None:
+                    threading.Thread(target=server.shutdown, daemon=True).start()
+
+            signal.signal(signal.SIGTERM, stop)
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, stop)
             server.serve_forever(poll_interval=0.1)
         finally:
-            server.server_close()
+            if server is not None:
+                server.server_close()
             service.stop()
         return 0
     except Exception as exc:

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import replace
+import json
+from pathlib import Path
+import socket
 from types import SimpleNamespace
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 
 from tests import _bootstrap  # noqa: F401
@@ -77,6 +83,108 @@ class BackendClientTests(unittest.TestCase):
         finally:
             client.stop()
         self.assertIsNone(client.process)
+
+    def test_process_and_debug_cli_run_without_plugin_sdk(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "backend.toml"
+            config_file.write_text(
+                "[vmc_idle]\nenabled=false\nmanage_host_output=false\n"
+                "[vrchat_osc]\nenabled=false\n[driver_log]\nenabled=false\n",
+                encoding="utf-8",
+            )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = int(probe.getsockname()[1])
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(root / "backend" / "process.py"),
+                    "--config-file", str(config_file),
+                    "--config-dir", temp_dir,
+                    "--offline",
+                    "--port", str(port),
+                    "--token", "dev",
+                ],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=creationflags,
+            )
+            try:
+                health = None
+                for _ in range(60):
+                    if process.poll() is not None:
+                        break
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(root / "backend" / "debug_cli.py"),
+                            "--port", str(port),
+                            "--token", "dev",
+                            "health",
+                        ],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        creationflags=creationflags,
+                    )
+                    if result.returncode == 0:
+                        health = json.loads(result.stdout)
+                        break
+                    time.sleep(0.1)
+                self.assertIsNotNone(health)
+                self.assertTrue(health["ok"])
+                action = subprocess.run(
+                    [
+                        sys.executable,
+                        str(root / "backend" / "debug_cli.py"),
+                        "--port", str(port),
+                        "--token", "dev",
+                        "action", "--kind", "enable", "--json", "{}",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    creationflags=creationflags,
+                )
+                self.assertEqual(action.returncode, 0, action.stderr)
+                snapshot = subprocess.run(
+                    [
+                        sys.executable,
+                        str(root / "backend" / "debug_cli.py"),
+                        "--port", str(port),
+                        "--token", "dev",
+                        "snapshot",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    creationflags=creationflags,
+                )
+                self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+                snapshot_data = json.loads(snapshot.stdout)
+                self.assertTrue(snapshot_data["backend"]["dry_run"])
+                self.assertIsNone(snapshot_data["body"]["udp"]["local_port"])
+            finally:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(root / "backend" / "debug_cli.py"),
+                        "--port", str(port),
+                        "--token", "dev",
+                        "shutdown",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    creationflags=creationflags,
+                )
+                try:
+                    process.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
 
 
 if __name__ == "__main__":
