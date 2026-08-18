@@ -51,6 +51,92 @@ class BackendClientTests(unittest.TestCase):
         self.assertFalse(result["accepted"])
         self.assertIn("must not exceed", result["reason"])
 
+    def test_backend_submit_gates_declared_world_preconditions(self) -> None:
+        service = BackendService({}, Path.cwd())
+
+        class FakeScheduler:
+            def __init__(self):
+                self.submissions = []
+
+            def snapshot(self):
+                return {"state": "idle", "safety_state": "normal"}
+
+            def submit(self, kind, params):
+                self.submissions.append((kind, params))
+                return {
+                    "accepted": True,
+                    "action_id": "a-1",
+                    "state": "active",
+                    "normalized_params": params,
+                    "reason": None,
+                    "safety_state": "normal",
+                }
+
+        scheduler = FakeScheduler()
+        service.scheduler = scheduler
+        condition = [{
+            "kind": "entity_visible",
+            "entity_id": "yolo:cup:7",
+            "source": "yolo",
+            "min_confidence": 0.8,
+            "max_age_ms": 500,
+        }]
+        rejected = service.submit(
+            "reach_and_grab",
+            {"side": "right"},
+            preconditions=condition,
+        )
+        self.assertFalse(rejected["accepted"])
+        self.assertEqual(rejected["reason_code"], "world_precondition_failed")
+        self.assertTrue(rejected["replan_required"])
+        self.assertEqual(
+            rejected["precondition_check"]["failures"][0]["code"],
+            "entity_not_visible",
+        )
+        self.assertEqual(scheduler.submissions, [])
+        feedback = service.cognition.snapshot()["feedback"][-1]
+        self.assertEqual(feedback["reason_code"], "world_precondition_failed")
+        self.assertEqual(
+            feedback["precondition_check"]["failures"][0]["code"],
+            "entity_not_visible",
+        )
+
+        conflicting_alias = service.submit(
+            "reach_and_grab",
+            {"side": "right", "_world_preconditions": []},
+            preconditions=condition,
+        )
+        self.assertFalse(conflicting_alias["accepted"])
+        self.assertEqual(
+            conflicting_alias["precondition_check"]["failures"][0]["code"],
+            "invalid_world_precondition",
+        )
+        self.assertEqual(scheduler.submissions, [])
+
+        stopped = service.submit("stop", {}, preconditions=condition)
+        self.assertTrue(stopped["accepted"])
+        self.assertTrue(stopped["precondition_check"]["bypassed"])
+        self.assertEqual(len(scheduler.submissions), 1)
+
+        service.ingest_world({
+            "source": "yolo",
+            "entities": [{
+                "id": "yolo:cup:7",
+                "label": "cup",
+                "confidence": 0.95,
+                "source": ["yolo"],
+                "ttl_s": 2.0,
+            }],
+        })
+        accepted = service.submit(
+            "reach_and_grab",
+            {"side": "right"},
+            preconditions=condition,
+        )
+        self.assertTrue(accepted["accepted"])
+        self.assertTrue(accepted["precondition_check"]["passed"])
+        self.assertEqual(len(scheduler.submissions), 2)
+
     def test_standalone_backend_process_health_and_shutdown(self) -> None:
         root = Path(__file__).resolve().parents[1]
         client = BackendClient(
@@ -80,12 +166,43 @@ class BackendClientTests(unittest.TestCase):
             )
             self.assertTrue(world["available"])
             self.assertEqual(world["entities"][0]["id"], "button")
+            gated = client.scheduler.submit(
+                "arm_pose",
+                {"side": "right", "elevation_deg": 90},
+                preconditions=[{
+                    "kind": "entity_visible",
+                    "entity_id": "missing-target",
+                    "min_confidence": 0.8,
+                }],
+            )
+            self.assertFalse(gated["accepted"])
+            self.assertEqual(gated["reason_code"], "world_precondition_failed")
+            malformed_gate = client.scheduler.submit(
+                "arm_pose",
+                {"side": "right", "elevation_deg": 90},
+                preconditions=42,
+            )
+            self.assertFalse(malformed_gate["accepted"])
+            self.assertEqual(
+                malformed_gate["precondition_check"]["failures"][0]["code"],
+                "invalid_world_precondition",
+            )
             plan = client.request(
                 "POST",
                 "/cognition/plan",
-                {"goal": "raise hand", "action": "arm_pose", "params": {"side": "right"}},
+                {
+                    "goal": "raise hand",
+                    "action": "arm_pose",
+                    "params": {"side": "right"},
+                    "preconditions": [{
+                        "kind": "entity_visible",
+                        "entity_id": "button",
+                        "min_confidence": 0.8,
+                    }],
+                },
             )
             self.assertEqual(plan["status"], "planned")
+            self.assertTrue(plan["precondition_check"]["passed"])
             cognition = client.request("GET", "/cognition")
             self.assertEqual(cognition["plan"]["id"], plan["id"])
             self.assertEqual(cognition["state"]["mode"], "nominal")

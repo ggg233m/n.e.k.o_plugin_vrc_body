@@ -1,5 +1,31 @@
 """LLM 工具的集中元数据定义。"""
 
+WORLD_PRECONDITIONS = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 16,
+    "description": "执行前必须由最新世界状态满足的条件；字段或阈值非法时动作会被拒绝。",
+    "items": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["world_available", "entity_visible", "event_recent"],
+            },
+            "entity_id": {"type": "string", "minLength": 1, "maxLength": 96},
+            "event_type": {"type": "string", "minLength": 1, "maxLength": 64},
+            "target_id": {"type": "string", "minLength": 1, "maxLength": 96},
+            "source": {"type": "string", "minLength": 1, "maxLength": 48},
+            "label": {"type": "string", "minLength": 1, "maxLength": 64},
+            "state": {"type": "string", "minLength": 1, "maxLength": 64},
+            "min_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "max_age_ms": {"type": "number", "minimum": 0, "maximum": 60000},
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
+    },
+}
+
 BODY_ENABLE = {
     "name": "body_enable",
     "description": "显式启用 AnyaDance 身体姿态输出。启用后从标准 T Pose 开始以 60 Hz 输出。",
@@ -71,7 +97,7 @@ BODY_HAND = {
 
 BODY_REACH_AND_GRAB = {
     "name": "body_reach_and_grab",
-    "description": "向局部语义目标伸手并在最后阶段握持。只能确认 grip 已触发，不能确认实际拿到 VRChat 物体。",
+    "description": "向局部语义目标伸手并在最后阶段握持。视觉目标动作应携带 world_observe 返回实体的 preconditions；只能确认 grip 已触发，不能确认实际拿到 VRChat 物体。",
     "parameters": {
         "type": "object",
         "properties": {
@@ -80,6 +106,7 @@ BODY_REACH_AND_GRAB = {
             "direction": {"type": "string", "enum": ["forward", "inward", "outward"], "default": "forward"},
             "distance_m": {"type": "number", "minimum": 0.15, "maximum": 0.70, "default": 0.35},
             "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 700},
+            "preconditions": WORLD_PRECONDITIONS,
         },
         "required": ["side", "height"],
     },

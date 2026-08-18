@@ -230,7 +230,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self.logger.warning("Could not inject AnyaDance body awareness instructions: %s", exc)
 
 
-    def _submit(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _submit(
+        self,
+        kind: str,
+        params: dict[str, Any] | None = None,
+        *,
+        preconditions: Any = None,
+    ) -> dict[str, Any]:
         if not self._scheduler:
             return {
                 "accepted": False,
@@ -240,11 +246,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "reason": "plugin scheduler is not initialized",
                 "safety_state": "fault",
             }
-        return self._scheduler.submit(kind, params)
+        if preconditions is None:
+            return self._scheduler.submit(kind, params)
+        return self._scheduler.submit(kind, params, preconditions=preconditions)
 
-    async def _submit_async(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _submit_async(
+        self,
+        kind: str,
+        params: dict[str, Any] | None = None,
+        *,
+        preconditions: Any = None,
+    ) -> dict[str, Any]:
         """在线程池中执行一次后端动作提交，避免阻塞插件事件循环。"""
-        return await asyncio.to_thread(self._submit, kind, params)
+        return await asyncio.to_thread(
+            self._submit,
+            kind,
+            params,
+            preconditions=preconditions,
+        )
 
     async def _invalid(self, reason: str) -> dict[str, Any]:
         if self._scheduler:
@@ -650,6 +669,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         direction: Any = "forward",
         distance_m: Any = 0.35,
         duration_ms: Any = None,
+        preconditions: Any = None,
         **_: Any,
     ):
         try:
@@ -662,7 +682,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             }
         except ValueError as exc:
             return Ok(await self._invalid(str(exc)))
-        result = await self._submit_async("reach_and_grab", params)
+        result = await self._submit_async(
+            "reach_and_grab",
+            params,
+            preconditions=preconditions,
+        )
         result["grip_engaged"] = bool(result["accepted"])
         result["object_held"] = "unknown"
         result["vrchat_osc_grab_scheduled"] = bool(

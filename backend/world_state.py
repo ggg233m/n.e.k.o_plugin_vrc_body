@@ -234,12 +234,33 @@ class WorldStateStore:
         source: str = "vision",
         observed_at: float | None = None,
     ) -> dict[str, Any]:
-        now = self._clock() if observed_at is None else _finite(observed_at, self._clock())
+        received_at = self._clock()
+        now = (
+            received_at
+            if observed_at is None
+            else min(received_at, _finite(observed_at, received_at))
+        )
         normalized_entities: list[WorldEntity] = []
         for item in entities:
             try:
-                entity = item if isinstance(item, WorldEntity) else WorldEntity.from_mapping(
-                    item,
+                raw_entity: Mapping[str, Any] = (
+                    {
+                        "id": item.id,
+                        "label": item.label,
+                        "confidence": item.confidence,
+                        "bbox": item.bbox,
+                        "state": item.state,
+                        "attributes": item.attributes,
+                        "relations": item.relations,
+                        "source": item.source,
+                        "observed_at": item.observed_at,
+                        "ttl_s": item.ttl_s,
+                    }
+                    if isinstance(item, WorldEntity)
+                    else item
+                )
+                entity = WorldEntity.from_mapping(
+                    raw_entity,
                     now=now,
                     default_source=source,
                     default_ttl_s=self.default_ttl_s,
@@ -250,8 +271,20 @@ class WorldStateStore:
         normalized_events: list[WorldEvent] = []
         for item in events:
             try:
-                event = item if isinstance(item, WorldEvent) else WorldEvent.from_mapping(
-                    item,
+                raw_event: Mapping[str, Any] = (
+                    {
+                        "type": item.kind,
+                        "target_id": item.target_id,
+                        "confidence": item.confidence,
+                        "data": item.data,
+                        "source": item.source,
+                        "observed_at": item.observed_at,
+                    }
+                    if isinstance(item, WorldEvent)
+                    else item
+                )
+                event = WorldEvent.from_mapping(
+                    raw_event,
                     now=now,
                     default_source=source,
                 )
@@ -260,7 +293,9 @@ class WorldStateStore:
             normalized_events.append(event)
         with self._lock:
             for entity in normalized_entities:
-                self._entities[entity.id] = entity
+                previous = self._entities.get(entity.id)
+                if previous is None or entity.observed_at >= previous.observed_at:
+                    self._entities[entity.id] = entity
             if len(self._entities) > self.max_entities:
                 ranked = sorted(
                     self._entities.values(),
@@ -269,9 +304,9 @@ class WorldStateStore:
                 )[: self.max_entities]
                 self._entities = {item.id: item for item in ranked}
             self._events.extend(normalized_events)
-            self._last_observation_at = now
+            self._last_observation_at = max(self._last_observation_at or now, now)
             self._observation_count += 1
-        return self.snapshot(now=now)
+        return self.snapshot(now=received_at)
 
     def clear(self) -> None:
         with self._lock:

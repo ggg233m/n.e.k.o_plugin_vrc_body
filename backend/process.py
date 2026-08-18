@@ -89,7 +89,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         try:
             value = self._read_json()
             if self.path == "/action":
-                result = self.server.service.submit(str(value.get("kind") or ""), value.get("params") or {})
+                result = self.server.service.submit(
+                    str(value.get("kind") or ""),
+                    value.get("params") or {},
+                    preconditions=value.get("preconditions"),
+                )
             elif self.path == "/osc/parameter":
                 result = self.server.service.send_avatar_parameter(str(value.get("name") or ""), value.get("value"))
                 result = {"accepted": result[0], "reason": result[1]}

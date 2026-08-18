@@ -4,7 +4,7 @@ import unittest
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.vision import VisionObservation, VisionRuntime
-from neko_anyadance_body.backend.world_state import WorldStateStore
+from neko_anyadance_body.backend.world_state import WorldEntity, WorldEvent, WorldStateStore
 
 
 class WorldStateStoreTests(unittest.TestCase):
@@ -52,6 +52,68 @@ class WorldStateStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(snapshot["entities"]), 2)
         self.assertEqual({item["id"] for item in snapshot["entities"]}, {"b", "c"})
+
+    def test_future_timestamps_are_clamped_and_older_tracks_do_not_replace_newer(self) -> None:
+        now = [10.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=1.0)
+        first = store.ingest(
+            entities=[{
+                "id": "yolo:cup:7",
+                "label": "cup",
+                "confidence": 0.9,
+                "state": "new",
+            }],
+            source="yolo",
+            observed_at=999.0,
+        )
+        self.assertEqual(first["entities"][0]["age_ms"], 0.0)
+
+        now[0] = 10.5
+        reordered = store.ingest(
+            entities=[{
+                "id": "yolo:cup:7",
+                "label": "cup",
+                "confidence": 0.95,
+                "state": "old",
+            }],
+            source="yolo",
+            observed_at=9.5,
+        )
+        self.assertEqual(reordered["entities"][0]["state"], "new")
+        self.assertEqual(reordered["status"]["last_observation_age_ms"], 500.0)
+
+        now[0] = 11.1
+        self.assertFalse(store.snapshot()["available"])
+
+    def test_dataclass_observations_cannot_bypass_normalization(self) -> None:
+        now = [20.0]
+        store = WorldStateStore(clock=lambda: now[0])
+        snapshot = store.ingest(
+            entities=[WorldEntity(
+                id="yolo:cup:8",
+                label="cup",
+                confidence=4.0,
+                source=("yolo",),
+                observed_at=999_999.0,
+                ttl_s=0.1,
+            )],
+            events=[WorldEvent(
+                kind="cup_seen",
+                target_id="yolo:cup:8",
+                confidence=3.0,
+                source=("yolo",),
+                observed_at=999_999.0,
+            )],
+        )
+        self.assertEqual(snapshot["entities"][0]["confidence"], 1.0)
+        self.assertEqual(snapshot["entities"][0]["age_ms"], 0.0)
+        self.assertEqual(snapshot["events"][0]["confidence"], 1.0)
+        self.assertEqual(snapshot["events"][0]["age_ms"], 0.0)
+
+        now[0] = 20.2
+        expired = store.snapshot()
+        self.assertEqual(expired["entities"], [])
+        self.assertEqual(expired["events"][0]["age_ms"], 200.0)
 
 
 class _Detector:

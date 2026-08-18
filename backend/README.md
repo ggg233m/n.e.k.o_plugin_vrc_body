@@ -48,3 +48,44 @@ python backend/debug_cli.py --port 48912 --token dev shutdown
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
 执行仍必须经过 `/action` 或插件工具。
+
+## 世界状态动作门禁
+
+计划步骤与 `POST /action` 都可以显式声明 `preconditions`。未声明时保持原有动作
+行为；声明后，认知层会在规划第一步和实际提交前分别检查一次。支持的条件为：
+
+- `world_available`：存在未过期的世界观测，可用 `max_age_ms` 进一步限制新鲜度；
+- `entity_visible`：按稳定 `entity_id` 检查可见性，并可约束 `source`、`label`、
+  `state`、`min_confidence` 和 `max_age_ms`；
+- `event_recent`：按 `event_type` 检查近期事件，并可约束 `target_id`、`source`、
+  `min_confidence` 和 `max_age_ms`。
+
+`entity_visible` 和 `event_recent` 未显式填写 `min_confidence` 时默认使用 `0.5`；
+`event_recent` 未填写 `max_age_ms` 时默认使用 `2000` 毫秒。实体过期仍以各实体自己的
+`ttl_s` 为准。紧急/安全控制动作 `stop`、`disable`、`reset`、`cancel` 永远不会被
+视觉门禁阻止；若错误地携带了前置条件，响应会标记
+`precondition_check.bypassed: true`。
+
+检测器发布的实体 ID 应采用 `{source}:{track_id}` 或
+`{source}:{class}:{track_id}`，并在连续帧之间保持稳定。一个带视觉门禁的动作请求示例：
+
+```json
+{
+  "kind": "reach_and_grab",
+  "params": {"side": "right"},
+  "preconditions": [
+    {
+      "kind": "entity_visible",
+      "entity_id": "yolo:cup:7",
+      "source": "yolo",
+      "min_confidence": 0.8,
+      "max_age_ms": 500
+    }
+  ]
+}
+```
+
+失败响应包含 `reason_code: "world_precondition_failed"`、`replan_required: true`
+及逐项 `precondition_check.failures`。门禁只读取世界状态快照，不进入或阻塞 60 Hz
+身体调度线程。多步计划在创建时只预检当前第一步；后续每一步仍须在提交执行时携带
+自身的 `preconditions`，以免把前一步尚未产生的世界变化误判为失败。

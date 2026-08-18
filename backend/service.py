@@ -26,6 +26,7 @@ from .world_state import WorldStateStore
 
 _VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
+_WORLD_GATE_BYPASS_ACTIONS = frozenset({"stop", "disable", "reset", "cancel"})
 
 
 class _DryRunDatagramTransport:
@@ -73,7 +74,10 @@ class BackendService:
         self._last_error: str | None = None
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
-        self.cognition = CognitionRuntime(self._cognition_sources)
+        self.cognition = CognitionRuntime(
+            self._cognition_sources,
+            world_provider=lambda: self.world_state.snapshot(),
+        )
 
     def _cognition_sources(self) -> dict[str, dict[str, Any]]:
         """暴露各数据源健康状况，且不会递归调用 ``snapshot``。"""
@@ -239,7 +243,13 @@ class BackendService:
             self.vmc_idle = None
             self._started = False
 
-    def submit(self, kind: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        kind: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        preconditions: Any = None,
+    ) -> dict[str, Any]:
         def finish(result: dict[str, Any]) -> dict[str, Any]:
             self.cognition.record_action(kind, result)
             return result
@@ -255,6 +265,55 @@ class BackendService:
                 "safety_state": "fault",
             })
         normalized = dict(params or {})
+        embedded_preconditions = normalized.pop("_world_preconditions", None)
+        precondition_alias_conflict = (
+            preconditions is not None and embedded_preconditions is not None
+        )
+        if preconditions is None:
+            preconditions = embedded_preconditions
+        preconditions_declared = preconditions is not None
+        if kind in _WORLD_GATE_BYPASS_ACTIONS:
+            precondition_check = {
+                "passed": True,
+                "checked": 0,
+                "preconditions": [],
+                "failures": [],
+                "bypassed": preconditions_declared,
+                "bypass_reason": "safety_control_action" if preconditions_declared else None,
+            }
+        elif precondition_alias_conflict:
+            precondition_check = {
+                "passed": False,
+                "checked": 0,
+                "preconditions": [],
+                "failures": [{
+                    "index": None,
+                    "code": "invalid_world_precondition",
+                    "message": (
+                        "preconditions must not be combined with "
+                        "params._world_preconditions"
+                    ),
+                }],
+            }
+        else:
+            precondition_check = self.cognition.check_preconditions(preconditions)
+        if not precondition_check["passed"]:
+            state = scheduler.snapshot()
+            failures = precondition_check.get("failures") or []
+            first = failures[0] if failures else {}
+            detail = str(first.get("message") or "world preconditions are not satisfied")
+            return finish({
+                "accepted": False,
+                "action_id": None,
+                "state": state["state"],
+                "normalized_params": normalized,
+                "reason": f"world precondition failed: {detail}"[:500],
+                "reason_code": "world_precondition_failed",
+                "replan_required": True,
+                "replan_reason": "world_precondition_failed",
+                "precondition_check": precondition_check,
+                "safety_state": state["safety_state"],
+            })
         if kind in {"play_clip", "semantic_clip"} and "_clip" not in normalized:
             clip_name = str(normalized.get("clip_name") or "").strip()
             if not clip_name:
@@ -315,7 +374,10 @@ class BackendService:
                     ),
                     "safety_state": state["safety_state"],
                 })
-        return finish(scheduler.submit(kind, normalized))
+        result = scheduler.submit(kind, normalized)
+        if preconditions_declared:
+            result["precondition_check"] = precondition_check
+        return finish(result)
 
     def snapshot(self) -> dict[str, Any]:
         scheduler = self.scheduler

@@ -43,6 +43,16 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(tool_defs.BODY_VRCHAT_INPUT["name"], "body_vrchat_input")
         self.assertEqual(tool_defs.WORLD_OBSERVE["name"], "world_observe")
         self.assertEqual(tool_defs.BODY_EXPRESS["name"], "body_express")
+        reach_preconditions = tool_defs.BODY_REACH_AND_GRAB["parameters"]["properties"]["preconditions"]
+        self.assertEqual(reach_preconditions["maxItems"], 16)
+        condition_kinds = set(
+            reach_preconditions["items"]["properties"]["kind"]["enum"]
+        )
+        self.assertEqual(
+            condition_kinds,
+            {"world_available", "entity_visible", "event_recent"},
+        )
+        self.assertIn("preconditions", BODY_AI_INSTRUCTIONS)
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
         self.assertIn("body_awareness", BODY_AI_INSTRUCTIONS)
         self.assertIn("accepted=true", BODY_AI_INSTRUCTIONS)

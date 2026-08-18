@@ -251,14 +251,25 @@ class RemoteScheduler:
     def __init__(self, client: BackendClient) -> None:
         self.client = client
 
-    def submit(self, kind: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        kind: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        preconditions: Any = None,
+    ) -> dict[str, Any]:
         normalized = {
             str(key): value
             for key, value in dict(params or {}).items()
             if key != "_clip"
         }
         try:
-            return self.client.request("POST", "/action", {"kind": kind, "params": normalized})
+            payload: dict[str, Any] = {"kind": kind, "params": normalized}
+            if preconditions is not None:
+                # 保留原 JSON 类型，让后端严格 schema 统一生成结构化拒绝；
+                # 在客户端 list(...) 会让标量异常逃出动作结果协议。
+                payload["preconditions"] = preconditions
+            return self.client.request("POST", "/action", payload)
         except BackendUnavailable as exc:
             return {
                 "accepted": False,
