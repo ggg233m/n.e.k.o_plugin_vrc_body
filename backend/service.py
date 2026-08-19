@@ -121,7 +121,9 @@ class BackendService:
         self.dry_run = bool(dry_run)
         self._vision_source = vision_source
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
-        self.world_state = WorldStateStore()
+        self.world_state = WorldStateStore(
+            lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
+        )
         self.vision = VisionRuntime(
             self.world_state,
             detector=vision_detector,
@@ -712,6 +714,7 @@ class BackendService:
         result = self.vision.ingest(observation)
         if not ack_only:
             return result
+        changes = result.get("changes") if isinstance(result.get("changes"), Mapping) else {}
         return {
             "accepted": True,
             "source": str(observation.get("source") or "vision"),
@@ -720,6 +723,12 @@ class BackendService:
             "entity_count": len(result.get("entities") or ()),
             "event_count": len(result.get("events") or ()),
             "observation_count": (result.get("status") or {}).get("observation_count", 0),
+            "revision": (result.get("status") or {}).get("revision", 0),
+            # WorldStateStore bounds this list with max_removals; do not apply a
+            # smaller transport-side slice that makes an otherwise atomic ack
+            # impossible to reconcile.
+            "removed_entity_ids": list(changes.get("removed_entity_ids") or ()),
+            "removed_entity_count": int(changes.get("removed_entity_count", 0) or 0),
         }
 
     def plan(self, goal: Mapping[str, Any] | None) -> dict[str, Any]:

@@ -57,11 +57,51 @@ HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 
 `POST /world/ingest` 仍支持完整状态回包；高频外部发布者可设置
 `"ack_only": true`，只得到 source/frame_id、实体/事件计数和 observation_count，
-避免重复传输完整世界快照。后端内置 worker 直接写入 `WorldStateStore`，不经过 HTTP。
+以及 revision、完整的本批次删除 ID 和删除计数，避免重复传输完整世界快照。
+`revision` 与这批变更对应，便于调用方确认删除确认和快照属于同一提交。后端内置
+worker 直接写入 `WorldStateStore`，不经过 HTTP。
 
-外部 detector 应为每个持续跟踪目标使用稳定 ID，推荐调用
-`stable_entity_id(source, label, track_id)` 生成
-`{source}:{label}:{track_id}`；不要在未启用 tracking 时按帧生成随机 UUID。
+生命周期来源可以在同一批次提交明确的实体删除：
+
+```json
+{
+  "source": "vrchat_log",
+  "events": [{
+    "type": "player_left",
+    "target_id": "vrchat:player:usr_123",
+    "confidence": 1.0
+  }],
+  "remove_entity_ids": ["vrchat:player:usr_123"],
+  "remove_source": "vrchat_log",
+  "ack_only": true
+}
+```
+
+删除只接受发布者明确给出的 ID；普通检测漏帧不会自动删除实体。带
+`remove_entity_ids` 时必须同时提供非空 `remove_source`，它是删除命令的来源所有者
+校验，不是可省略的提示字段；`remove_source` 不能单独触发整来源清理。实体
+`source` 数组的第一项是 canonical owner，后续项只能表示辅助证据。删除和离开
+事件在同一锁区间提交，响应中的 `removed_entity_ids` 和 `revision` 可用于确认
+没有幽灵玩家。若世界日志
+适配器运行在后端进程内，换世界时可调用
+`WorldStateStore.remove_entities_by_source("vrchat_log", prefix="vrchat:player:")`；
+若它是独立进程，则应维护自己的玩家 ID 集合并逐个提交删除，不能通过 HTTP 请求
+一个无范围的“清空来源”操作。
+水位表有界保留（默认至少覆盖一个完整删除批次）；若适配器存在很长的离线队列，
+应提高 `WorldStateStore(lifecycle_watermark_limit=...)`，不要依赖过期的旧帧恢复实体。
+来源/换世界清理还会移除该来源对应范围内的旧事件，避免上一世界的
+`player_joined`/Contact 类事件继续满足 `event_recent` 门禁。
+
+外部 detector 应为每个持续跟踪目标使用稳定 ID。新 detector 应显式调用
+`stable_track_entity_id(source, track_id)` 生成不受类别抖动影响的
+`{source}:track:{track_id}`；状态层对缺少 `id` 的旧调用仍兼容使用
+`stable_entity_id(source, label, track_id)`，但它只适合类别不可变的来源。不要在
+未启用 tracking 时按帧生成随机 UUID。
+
+直接接入外部世界日志前必须做字段翻译：日志适配器要把事件映射为 `type`、稳定的
+`target_id`、canonical `source`，并在 `player_left` 同批提供 `remove_entity_ids`；
+旧版 `{event, detail, at_unix}` 结构不能直接提交，否则会被当作 `unknown` 事件，
+也不会触发玩家删除。
 
 配置段默认关闭：
 
@@ -71,10 +111,15 @@ enabled = false
 source = "none" # none / mss / external
 interval_ms = 100
 queue_size = 1
+lifecycle_watermark_limit = 4096
 ```
 
 配置只描述 worker，不下载或加载模型。YOLO 后端交付后再把它作为外部
 `FrameDetector` 接入；当前仓库不会安装 Ultralytics、Torch 或模型权重。
+
+当前核心不内置 Contact 事件总线、Autonomy 反射规划、浏览器视觉桥或动作生成
+模型，也不会为这些未启用功能在插件里维护隐式状态。将来接入时应各自实现独立
+适配器/sidecar，并通过配置显式启用；不能改变身体调度器和世界状态协议的默认行为。
 
 ## 世界状态动作门禁
 
@@ -103,7 +148,7 @@ queue_size = 1
   "preconditions": [
     {
       "kind": "entity_visible",
-      "entity_id": "yolo:cup:7",
+      "entity_id": "yolo:track:7",
       "source": "yolo",
       "min_confidence": 0.8,
       "max_age_ms": 500

@@ -17,6 +17,8 @@ from neko_anyadance_body.backend.world_state import (
     WorldEvent,
     WorldStateStore,
     stable_entity_id,
+    stable_track_entity_id,
+    vrchat_player_entity_id,
 )
 
 
@@ -24,6 +26,8 @@ class WorldStateStoreTests(unittest.TestCase):
     def test_stable_entity_id_and_track_id_fallback(self) -> None:
         self.assertEqual(stable_entity_id("yolo", "cup", 7), "yolo:cup:7")
         self.assertEqual(stable_entity_id("yolo", "cup:large", 7), "yolo:cup_large:7")
+        self.assertEqual(stable_track_entity_id("yolo", 7), "yolo:track:7")
+        self.assertEqual(vrchat_player_entity_id("usr:123"), "vrchat:player:usr_123")
         with self.assertRaises(ValueError):
             stable_entity_id("yolo", "cup", "")
 
@@ -145,6 +149,296 @@ class WorldStateStoreTests(unittest.TestCase):
         self.assertEqual(expired["entities"], [])
         self.assertEqual(expired["events"][0]["age_ms"], 200.0)
 
+    def test_remove_entities_is_atomic_source_filtered_and_keeps_events(self) -> None:
+        now = [10.0]
+        store = WorldStateStore(clock=lambda: now[0])
+        store.ingest(
+            entities=[
+                {
+                    "id": "vrchat:player:alice",
+                    "label": "player",
+                    "source": "vrchat_log",
+                    "confidence": 0.9,
+                },
+                {
+                    "id": "vision:player:alice",
+                    "label": "player",
+                    "source": "vision",
+                    "confidence": 0.8,
+                },
+                {
+                    "id": "vrchat:player:bob",
+                    "label": "player",
+                    "source": "vrchat_log",
+                    "confidence": 0.7,
+                },
+            ],
+            source="test",
+        )
+
+        result = store.remove_entities(
+            ["vrchat:player:alice", "vrchat:player:alice", "missing"],
+            source="vrchat_log",
+            events=[{
+                "type": "player_left",
+                "target_id": "vrchat:player:alice",
+                "source": "vrchat_log",
+                "confidence": 1.0,
+            }],
+        )
+
+        self.assertEqual(
+            {item["id"] for item in result["entities"]},
+            {"vision:player:alice", "vrchat:player:bob"},
+        )
+        self.assertEqual(result["events"][0]["type"], "player_left")
+        self.assertEqual(result["events"][0]["target_id"], "vrchat:player:alice")
+        # 返回值包含本次变更；其核心世界快照应与后续读取一致。
+        current = store.snapshot()
+        self.assertEqual(current["entities"], result["entities"])
+        self.assertEqual(current["events"], result["events"])
+        self.assertEqual(current["status"], result["status"])
+
+    def test_remove_entity_and_source_prefix_helpers(self) -> None:
+        store = WorldStateStore(clock=lambda: 20.0)
+        store.ingest(
+            entities=[
+                {"id": "vrchat:player:alice", "label": "player", "source": "vrchat_log"},
+                {"id": "vrchat:player:bob", "label": "player", "source": "vrchat_log"},
+                {"id": "vrchat:world:portal", "label": "portal", "source": "vrchat_log"},
+                {"id": "vision:player:alice", "label": "player", "source": "vision"},
+            ]
+        )
+
+        self.assertFalse(store.remove_entity("missing"))
+        self.assertFalse(store.remove_entity("vision:player:alice", source="vrchat_log"))
+        self.assertTrue(store.remove_entity("vrchat:player:alice", source="vrchat_log"))
+        self.assertFalse(store.remove_entity("vrchat:player:alice", source="vrchat_log"))
+        self.assertEqual(store.remove_entities_by_source("vrchat_log", prefix="vrchat:player:"), 1)
+        self.assertEqual(store.remove_entities_by_source("vrchat_log", prefix="vrchat:player:"), 0)
+        snapshot = store.snapshot()
+        self.assertEqual(
+            {item["id"] for item in snapshot["entities"]},
+            {"vrchat:world:portal", "vision:player:alice"},
+        )
+
+    def test_remove_missing_entity_with_owner_fences_late_first_frame(self) -> None:
+        now = [10.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=10.0)
+        self.assertFalse(store.remove_entity("vrchat:player:early", source="vrchat_log"))
+        now[0] = 11.0
+        stale = store.ingest(entities=[{
+            "id": "vrchat:player:early",
+            "label": "late",
+            "source": "vrchat_log",
+            "observed_at": 10.0,
+        }], source="vrchat_log")
+        self.assertEqual(stale["entities"], [])
+
+    def test_ingest_lifecycle_removal_is_atomic_and_source_scoped(self) -> None:
+        now = [30.0]
+        store = WorldStateStore(clock=lambda: now[0])
+        store.ingest(
+            entities=[{
+                "id": "vrchat:player:usr_1",
+                "label": "player",
+                "source": "vrchat_log",
+            }]
+        )
+        result = store.ingest(
+            entities=[{
+                "id": "vrchat:player:usr_1",
+                "label": "stale-reappearance",
+                "source": "vrchat_log",
+            }],
+            events=[{
+                "type": "player_left",
+                "target_id": "vrchat:player:usr_1",
+                "source": "vrchat_log",
+                "confidence": 1.0,
+            }],
+            source="vrchat_log",
+            remove_entity_ids="vrchat:player:usr_1",
+            remove_source="vrchat_log",
+        )
+        self.assertEqual(result["changes"]["removed_entity_ids"], ["vrchat:player:usr_1"])
+        self.assertEqual(result["changes"]["removed_entity_count"], 1)
+        self.assertEqual(result["entities"], [])
+        self.assertEqual(result["events"][0]["type"], "player_left")
+
+        # 来源过滤不能删掉同 ID 的其他来源实体。
+        store.ingest(entities=[{
+            "id": "shared-id",
+            "label": "vision-object",
+            "source": "vision",
+        }])
+        scoped = store.ingest(
+            source="vrchat_log",
+            remove_entity_ids=["shared-id"],
+            remove_source="vrchat_log",
+        )
+        self.assertEqual(scoped["changes"]["removed_entity_ids"], [])
+        self.assertEqual(scoped["entities"][0]["id"], "shared-id")
+        with self.assertRaises(ValueError):
+            store.ingest(remove_source="vrchat_log")
+
+    def test_delayed_player_left_does_not_delete_newer_entity(self) -> None:
+        now = [100.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=10.0)
+        store.ingest(
+            entities=[{
+                "id": "vrchat:player:u1",
+                "label": "player",
+                "source": "vrchat_log",
+                "observed_at": 100.0,
+            }],
+            source="vrchat_log",
+        )
+
+        # The log event was observed at 90 but arrived after a newer detector
+        # frame. It must not erase the newer state.
+        now[0] = 101.0
+        result = store.ingest(
+            events=[{
+                "type": "player_left",
+                "target_id": "vrchat:player:u1",
+                "source": "vrchat_log",
+                "observed_at": 90.0,
+            }],
+            source="vrchat_log",
+            observed_at=90.0,
+            remove_entity_ids=["vrchat:player:u1"],
+            remove_source="vrchat_log",
+        )
+        self.assertEqual(result["changes"]["removed_entity_ids"], [])
+        self.assertEqual(result["entities"][0]["id"], "vrchat:player:u1")
+
+    def test_delete_watermark_blocks_late_frame_but_allows_newer_reentry(self) -> None:
+        now = [100.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=10.0)
+        store.ingest(entities=[{
+            "id": "vrchat:player:u2",
+            "label": "player",
+            "source": "vrchat_log",
+            "observed_at": 100.0,
+        }], source="vrchat_log")
+
+        now[0] = 101.0
+        removed = store.ingest(
+            source="vrchat_log",
+            remove_entity_ids=["vrchat:player:u2"],
+            remove_source="vrchat_log",
+            observed_at=101.0,
+        )
+        self.assertEqual(removed["changes"]["removed_entity_ids"], ["vrchat:player:u2"])
+
+        now[0] = 102.0
+        stale = store.ingest(entities=[{
+            "id": "vrchat:player:u2",
+            "label": "stale",
+            "source": "vrchat_log",
+            "observed_at": 100.0,
+        }], source="vrchat_log")
+        self.assertEqual(stale["entities"], [])
+
+        now[0] = 103.0
+        fresh = store.ingest(entities=[{
+            "id": "vrchat:player:u2",
+            "label": "rejoined",
+            "source": "vrchat_log",
+            "observed_at": 102.0,
+        }], source="vrchat_log")
+        self.assertEqual(fresh["entities"][0]["label"], "rejoined")
+
+    def test_lifecycle_schema_requires_source_and_full_removal_batch(self) -> None:
+        store = WorldStateStore(max_removals=1, clock=lambda: 10.0)
+        store.ingest(entities=[{
+            "id": "target",
+            "label": "object",
+            "source": "vision",
+        }])
+        with self.assertRaisesRegex(ValueError, "remove_source is required"):
+            store.ingest(remove_entity_ids=["target"])
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            store.ingest(remove_entity_ids=["target"], remove_source=" ")
+        with self.assertRaisesRegex(ValueError, "at most 1"):
+            store.ingest(
+                remove_entity_ids=["missing", "target"],
+                remove_source="vision",
+            )
+        self.assertEqual(store.snapshot()["entities"][0]["id"], "target")
+
+    def test_player_left_must_match_removed_target_and_bulk_reset_rejects_it(self) -> None:
+        store = WorldStateStore(clock=lambda: 10.0)
+        with self.assertRaisesRegex(ValueError, "target_id"):
+            store.ingest(
+                events=[{
+                    "type": "player_left",
+                    "target_id": "a",
+                    "source": "vrchat_log",
+                }],
+                source="vrchat_log",
+                remove_entity_ids=["b"],
+                remove_source="vrchat_log",
+            )
+        with self.assertRaisesRegex(ValueError, "cannot publish player_left"):
+            store.remove_entities_by_source(
+                "vrchat_log",
+                events=[{
+                    "type": "player_left",
+                    "target_id": "vrchat:player:a",
+                    "source": "vrchat_log",
+                }],
+            )
+
+    def test_bulk_source_reset_fences_late_frames(self) -> None:
+        now = [10.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=10.0)
+        store.ingest(entities=[{
+            "id": "vrchat:player:u3",
+            "label": "player",
+            "source": "vrchat_log",
+            "observed_at": 10.0,
+        }], events=[{
+            "type": "player_joined",
+            "target_id": "vrchat:player:u3",
+            "source": "vrchat_log",
+        }], source="vrchat_log")
+        now[0] = 11.0
+        self.assertEqual(
+            store.remove_entities_by_source(
+                "vrchat_log",
+                prefix="vrchat:player:",
+                observed_at=10.0,
+            ),
+            1,
+        )
+        self.assertEqual(store.snapshot()["events"], [])
+        now[0] = 12.0
+        stale = store.ingest(entities=[{
+            "id": "vrchat:player:u3",
+            "label": "stale",
+            "source": "vrchat_log",
+            "observed_at": 10.0,
+        }], source="vrchat_log")
+        self.assertEqual(stale["entities"], [])
+
+    def test_lifecycle_source_uses_canonical_owner_for_multi_source_entity(self) -> None:
+        now = [10.0]
+        store = WorldStateStore(clock=lambda: now[0], default_ttl_s=10.0)
+        store.ingest(entities=[{
+            "id": "shared",
+            "label": "object",
+            "source": ["vision", "vrchat_log"],
+        }])
+        result = store.ingest(
+            source="vrchat_log",
+            remove_entity_ids=["shared"],
+            remove_source="vrchat_log",
+        )
+        self.assertEqual(result["changes"]["removed_entity_ids"], [])
+        self.assertEqual(result["entities"][0]["id"], "shared")
+
 
 class _Detector:
     name = "fake_yolo"
@@ -229,6 +523,32 @@ class _WorkerDetector:
 
 
 class VisionRuntimeTests(unittest.TestCase):
+    def test_lifecycle_mapping_rejects_scalar_and_blank_source(self) -> None:
+        runtime = VisionRuntime(WorldStateStore())
+        with self.assertRaisesRegex(ValueError, "must be an array"):
+            runtime.ingest({"remove_entity_ids": "entity"})
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            runtime.ingest({"remove_entity_ids": ["entity"], "remove_source": " "})
+        with self.assertRaisesRegex(ValueError, "observation must be an object"):
+            runtime.ingest(42)  # type: ignore[arg-type]
+
+    def test_normal_observation_keeps_legacy_store_signature_compatible(self) -> None:
+        class LegacyStore:
+            def __init__(self):
+                self.calls = []
+
+            def ingest(self, entities, events, *, source, observed_at):
+                self.calls.append((entities, events, source, observed_at))
+                return {"entities": [], "events": [], "status": {}}
+
+            def set_backend_status(self, *_args):
+                return None
+
+        store = LegacyStore()
+        runtime = VisionRuntime(store)  # type: ignore[arg-type]
+        runtime.ingest(VisionObservation(source="legacy"))
+        self.assertEqual(store.calls[0][2], "legacy")
+
     def test_optional_mss_source_degrades_without_model_dependencies(self) -> None:
         source = MssFrameSource()
         status = source.status()

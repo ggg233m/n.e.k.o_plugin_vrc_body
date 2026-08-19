@@ -135,6 +135,7 @@ class VisionConfig:
     source: str = "none"
     interval_ms: int = 100
     queue_size: int = 1
+    lifecycle_watermark_limit: int = 4096
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,13 @@ class PluginConfig:
                 minimum=1,
                 maximum=4,
                 name="vision.queue_size",
+            ),
+            lifecycle_watermark_limit=_bounded_int(
+                vision.get("lifecycle_watermark_limit"),
+                4096,
+                minimum=256,
+                maximum=65536,
+                name="vision.lifecycle_watermark_limit",
             ),
         )
         behavior_config = BehaviorConfig(

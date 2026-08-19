@@ -84,6 +84,16 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 当前版本只提供无第三方依赖的后端协议和安全状态缓存。YOLO、VRChat 画面采集及 VLM 适配器将在后续按运行环境启用；未配置后端时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
+世界日志若以后启用，只能作为低置信度辅助来源。玩家实体应使用
+`vrchat:player:<user_id>` 这样的稳定 ID；收到 `player_left` 时，适配器必须在同一
+批次提交 `remove_entity_ids` 和离开事件，并用 `remove_source` 限制删除范围。这样
+玩家退出后不会残留幽灵实体，也不会误删视觉检测器发布的同名对象；后端还会用接收
+水位拒绝保留窗口内迟到的旧帧，避免删除后幽灵复活。换世界时只清理日志来源的玩家实体；
+若适配器会积压超长离线队列，应提高视觉水位上限。
+当前仓库不接入世界日志解析器、Contact/Autonomy、浏览器视觉桥，也不安装动作生成
+模型；未来模型通过独立 detector 或 sidecar 接口接入，并由配置显式启用，不把未启用
+功能的状态塞进插件主流程。
+
 ## N.E.K.O VMC 待机中转
 
 插件启动后会通过 N.E.K.O 公开的 VMC REST 控制面自动启用输出，并将目标设为 `127.0.0.1:39539`；随后请求一次短暂 T Pose，以 VRM 原始静止姿势校准手腕朝向与手指弯曲零点。插件关闭时恢复宿主原来的启用状态、目标和频率。插件接收 `/VMC/Ext/Root/Pos` 与 `/VMC/Ext/Bone/Pos`，把局部 Humanoid 骨骼变换经过 FK、坐标系还原和身高标定后转换为 AnyaDance 六设备帧：

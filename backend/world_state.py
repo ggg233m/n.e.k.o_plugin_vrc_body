@@ -14,6 +14,10 @@ import time
 from typing import Any, Iterable, Mapping
 
 
+VRCHAT_LOG_SOURCE = "vrchat_log"
+VRCHAT_PLAYER_ID_PREFIX = "vrchat:player:"
+
+
 def _text(value: Any, *, default: str = "", limit: int = 128) -> str:
     result = str(value if value is not None else default).strip()
     return result[:limit]
@@ -80,7 +84,11 @@ def _sources(value: Any, default: str) -> tuple[str, ...]:
 
 
 def stable_entity_id(source: Any, label: Any, track_id: Any) -> str:
-    """生成跨帧稳定的实体 ID，供外部 detector 统一采用。"""
+    """生成带类别的兼容实体 ID。
+
+    这个旧接口保留给明确需要类别分段的调用方；如果类别可能抖动，
+    请使用 :func:`stable_track_entity_id`，否则同一 track 会被拆成多个实体。
+    """
     parts: list[str] = []
     for name, value, limit in (
         ("source", source, 48),
@@ -93,6 +101,25 @@ def stable_entity_id(source: Any, label: Any, track_id: Any) -> str:
         # 冒号是协议分隔符；替换掉输入中的冒号，避免产生歧义 ID。
         parts.append(text.replace(":", "_"))
     return ":".join(parts)
+
+
+def stable_track_entity_id(source: Any, track_id: Any) -> str:
+    """生成不受检测类别抖动影响的跨帧实体 ID。"""
+    source_text = _text(source, limit=48)
+    track_text = _text(track_id, limit=96)
+    if not source_text:
+        raise ValueError("stable track entity id requires source")
+    if not track_text:
+        raise ValueError("stable track entity id requires track_id")
+    return f"{source_text.replace(':', '_')}:track:{track_text.replace(':', '_')}"
+
+
+def vrchat_player_entity_id(user_id: Any) -> str:
+    """生成世界日志与视觉适配器共用的 VRChat 玩家实体 ID。"""
+    normalized = _text(user_id, limit=96)
+    if not normalized:
+        raise ValueError("VRChat player user_id must not be empty")
+    return f"{VRCHAT_PLAYER_ID_PREFIX}{normalized.replace(':', '_')}"
 
 
 @dataclass(frozen=True)
@@ -123,6 +150,9 @@ class WorldEntity:
         label = _text(value.get("label"), default="unknown", limit=64) or "unknown"
         entity_id = _text(value.get("id"), limit=96)
         if not entity_id and value.get("track_id") is not None:
+            # Preserve the original implicit ID format for existing callers and
+            # precondition references. New detectors should provide an explicit
+            # ID from stable_track_entity_id() to avoid label churn.
             entity_id = stable_entity_id(source[0], label, value.get("track_id"))
         if not entity_id:
             raise ValueError("world entity id or track_id must not be empty")
@@ -222,13 +252,26 @@ class WorldStateStore:
         self,
         *,
         max_entities: int = 128,
+        max_removals: int = 256,
+        lifecycle_watermark_limit: int = 4096,
         event_history_size: int = 64,
         default_ttl_s: float = 2.0,
         clock: Any = time.monotonic,
     ) -> None:
-        if max_entities < 1 or event_history_size < 1:
+        if (
+            max_entities < 1
+            or max_removals < 1
+            or lifecycle_watermark_limit < 1
+            or event_history_size < 1
+        ):
             raise ValueError("world state bounds must be positive")
         self.max_entities = max_entities
+        self.max_removals = min(4096, int(max_removals))
+        # 至少保留一个完整的删除批次作为围栏；当调用方的世界适配器玩家进出窗口较长时，可选择更大的上限。
+        self.lifecycle_watermark_limit = min(
+            65536,
+            max(self.max_removals, int(lifecycle_watermark_limit)),
+        )
         self.event_history_size = event_history_size
         self.default_ttl_s = min(60.0, max(0.1, float(default_ttl_s)))
         self._clock = clock
@@ -238,6 +281,16 @@ class WorldStateStore:
         self._backend: dict[str, dict[str, Any]] = {}
         self._last_observation_at: float | None = None
         self._observation_count = 0
+        self._revision = 0
+        # 精确的生命周期删除和来源/世界重置都会留下水印；
+        # 否则延迟的检测器帧可能会复活已离场的实体。
+        self._delete_watermarks: dict[tuple[str, str], float] = {}
+        self._delete_event_times: dict[tuple[str, str], float] = {}
+        self._source_reset_watermarks: dict[tuple[str, str | None], float] = {}
+        self._source_reset_event_times: dict[tuple[str, str | None], float] = {}
+        # 按所有者索引的视图使高频实体检查无需扫描
+        # 无关来源的重置围栏
+        self._source_reset_index: dict[str, dict[str | None, float]] = {}
 
     def set_backend_status(self, name: str, status: Mapping[str, Any]) -> None:
         backend_name = _text(name, default="unknown", limit=48) or "unknown"
@@ -246,6 +299,109 @@ class WorldStateStore:
                 str(key)[:64]: _safe_value(item) for key, item in list(status.items())[:24]
             }
 
+    def _normalize_remove_ids(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            # 保持旧版进程内便捷 API 的兼容性；HTTP 和 VisionRuntime 适配器
+            # 在到达此兼容路径之前会拒绝标量 JSON 值。
+            value = (value,)
+        elif isinstance(value, bytes):
+            raise ValueError("remove_entity_ids must be an array")
+        try:
+            iterator = iter(value)
+        except TypeError as exc:
+            raise ValueError("remove_entity_ids must be an array") from exc
+        result: list[str] = []
+        for item in iterator:
+            if not isinstance(item, str):
+                raise ValueError("remove_entity_ids must contain strings")
+            entity_id = _text(item, limit=96)
+            if not entity_id:
+                raise ValueError("remove_entity_ids must not contain empty IDs")
+            if entity_id not in result:
+                if len(result) >= self.max_removals:
+                    raise ValueError(
+                        f"remove_entity_ids must contain at most {self.max_removals} items"
+                    )
+                result.append(entity_id)
+        return result
+
+    @staticmethod
+    def _normalize_remove_source(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("remove_source must be a non-empty string")
+        source = value.strip()
+        if not source or len(source) > 48:
+            raise ValueError("remove_source must be a non-empty string")
+        return source
+
+    def _watermark_blocks(self, entity: WorldEntity) -> bool:
+        owner = entity.source[0] if entity.source else ""
+        if not owner:
+            return False
+        exact = self._delete_watermarks.get((owner, entity.id), -math.inf)
+        for prefix, watermark in self._source_reset_index.get(owner, {}).items():
+            if prefix is None or entity.id.startswith(prefix):
+                exact = max(exact, watermark)
+        return entity.observed_at <= exact
+
+    def _clear_superseded_watermarks(self, entity: WorldEntity) -> None:
+        owner = entity.source[0] if entity.source else ""
+        if not owner:
+            return
+        key = (owner, entity.id)
+        watermark = self._delete_watermarks.get(key)
+        if watermark is not None and entity.observed_at > watermark:
+            self._delete_watermarks.pop(key, None)
+            self._delete_event_times.pop(key, None)
+
+    def _prune_lifecycle_watermarks(self) -> None:
+        """Bound tombstone memory while retaining the newest receive fences."""
+        limit = self.lifecycle_watermark_limit
+        if len(self._delete_watermarks) > limit:
+            newest = sorted(
+                self._delete_watermarks.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:limit]
+            self._delete_watermarks = dict(newest)
+            self._delete_event_times = {
+                key: self._delete_event_times[key]
+                for key, _ in newest
+                if key in self._delete_event_times
+            }
+        if len(self._source_reset_watermarks) > limit:
+            newest_resets = sorted(
+                self._source_reset_watermarks.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:limit]
+            self._source_reset_watermarks = dict(newest_resets)
+            self._source_reset_event_times = {
+                key: self._source_reset_event_times[key]
+                for key, _ in newest_resets
+                if key in self._source_reset_event_times
+            }
+        self._source_reset_index = {}
+        for (source, prefix), watermark in self._source_reset_watermarks.items():
+            source_index = self._source_reset_index.setdefault(source, {})
+            source_index[prefix] = max(source_index.get(prefix, -math.inf), watermark)
+
+    def _drop_events_for_source_reset(self, source: str, prefix: str | None) -> None:
+        """Remove stale source events when a world/source reset is committed."""
+        retained: list[WorldEvent] = []
+        for event in self._events:
+            owner = event.source[0] if event.source else ""
+            if owner != source:
+                retained.append(event)
+                continue
+            if prefix is not None and (
+                not event.target_id or not event.target_id.startswith(prefix)
+            ):
+                retained.append(event)
+        self._events = deque(retained, maxlen=self.event_history_size)
+
     def ingest(
         self,
         entities: Iterable[WorldEntity | Mapping[str, Any]] = (),
@@ -253,7 +409,15 @@ class WorldStateStore:
         *,
         source: str = "vision",
         observed_at: float | None = None,
+        remove_entity_ids: Iterable[Any] = (),
+        remove_source: str | None = None,
     ) -> dict[str, Any]:
+        """写入观测，并可在同一批次撤销明确声明的实体生命周期。
+
+        ``remove_entity_ids``/``remove_source`` 只用于发布者明确知道实体已
+        离场的情况（例如玩家退出）；``remove_source`` 仅过滤这些明确 ID，
+        不会在未提供 ID 时清空整个来源。普通检测漏帧不应使用它们。
+        """
         received_at = self._clock()
         now = (
             received_at
@@ -311,11 +475,63 @@ class WorldStateStore:
             except (TypeError, ValueError):
                 continue
             normalized_events.append(event)
+        normalized_remove_ids = self._normalize_remove_ids(remove_entity_ids)
+        remove_source_name: str | None = None
+        if remove_source is not None:
+            remove_source_name = self._normalize_remove_source(remove_source)
+        if remove_source_name is not None and not normalized_remove_ids:
+            raise ValueError(
+                "remove_source requires remove_entity_ids; "
+                "use remove_entities_by_source for bulk cleanup"
+            )
+        if normalized_remove_ids and remove_source_name is None:
+            raise ValueError("remove_source is required when removing entity IDs")
+        for event in normalized_events:
+            if event.kind != "player_left":
+                continue
+            if not event.target_id or event.target_id not in normalized_remove_ids:
+                raise ValueError(
+                    "player_left target_id must be included in remove_entity_ids"
+                )
+            if remove_source_name is None or not event.source or event.source[0] != remove_source_name:
+                raise ValueError("player_left source must match remove_source")
+            if remove_source_name == VRCHAT_LOG_SOURCE and not event.target_id.startswith(
+                VRCHAT_PLAYER_ID_PREFIX
+            ):
+                raise ValueError("VRChat player_left target_id has an invalid namespace")
+        removed_entity_ids: list[str] = []
         with self._lock:
+            # 先建立删除水位，再处理 upsert；同一时间戳的离场优先，
+            # 迟到的旧检测帧不会把玩家复活。
+            for entity_id in normalized_remove_ids:
+                if remove_source_name is None:
+                    continue
+                entity = self._entities.get(entity_id)
+                # A source-scoped lifecycle command must not create a tombstone
+                # for an entity owned by another source. Otherwise a shared ID
+                # could be blocked by an unrelated publisher.
+                if entity is not None and (
+                    not entity.source or entity.source[0] != remove_source_name
+                ):
+                    continue
+                delete_key = (remove_source_name, entity_id)
+                previous_watermark = self._delete_watermarks.get(delete_key, -math.inf)
+                self._delete_watermarks[delete_key] = max(previous_watermark, received_at)
+                previous_event_time = self._delete_event_times.get(delete_key, -math.inf)
+                self._delete_event_times[delete_key] = max(previous_event_time, now)
+                if entity is None:
+                    continue
+                if entity.observed_at > self._delete_event_times[delete_key]:
+                    continue
+                del self._entities[entity_id]
+                removed_entity_ids.append(entity_id)
             for entity in normalized_entities:
+                if self._watermark_blocks(entity):
+                    continue
                 previous = self._entities.get(entity.id)
                 if previous is None or entity.observed_at >= previous.observed_at:
                     self._entities[entity.id] = entity
+                    self._clear_superseded_watermarks(entity)
             if len(self._entities) > self.max_entities:
                 ranked = sorted(
                     self._entities.values(),
@@ -324,16 +540,178 @@ class WorldStateStore:
                 )[: self.max_entities]
                 self._entities = {item.id: item for item in ranked}
             self._events.extend(normalized_events)
+            self._prune_lifecycle_watermarks()
             self._last_observation_at = max(self._last_observation_at or now, now)
             self._observation_count += 1
-        return self.snapshot(now=received_at)
+            self._revision += 1
+            snapshot = self.snapshot(now=received_at)
+        if normalized_remove_ids:
+            snapshot["changes"] = {
+                "removed_entity_ids": removed_entity_ids,
+                "removed_entity_count": len(removed_entity_ids),
+            }
+        return snapshot
+
+    def remove_entities(
+        self,
+        entity_ids: Iterable[Any] = (),
+        *,
+        source: str | None = None,
+        events: Iterable[WorldEvent | Mapping[str, Any]] = (),
+        observed_at: float | None = None,
+        event_source: str | None = None,
+    ) -> dict[str, Any]:
+        """原子删除实体并（可选）追加事件，返回删除后的快照。
+
+        ``source`` 是保护性过滤器；事件和删除会走与普通 ingest 相同的
+        规范化及时间戳钳制路径，避免维护两套生命周期逻辑。
+        """
+        event_source_name = event_source or source or "world_state"
+        return self.ingest(
+            events=events,
+            source=event_source_name,
+            observed_at=observed_at,
+            remove_entity_ids=entity_ids,
+            remove_source=source,
+        )
+
+    def remove_entity(
+        self,
+        entity_id: Any,
+        *,
+        source: str | None = None,
+    ) -> bool:
+        """删除一个实体，返回是否实际删除。"""
+        normalized_id = _text(entity_id, limit=96)
+        if not normalized_id:
+            return False
+        # 先在同一把 RLock 下确认目标存在；RLock 允许随后复用统一的
+        # ingest 事务，并在调用者明确给出 owner 时为“先离场、后首帧”的
+        # 情况留下 tombstone。
+        with self._lock:
+            entity = self._entities.get(normalized_id)
+            if entity is None:
+                # 知晓所属来源的调用方可能会在首个检测帧到达之前就发布真正的离场事件。
+                # 此时应保留一个墓碑（tombstone），防止迟到的旧帧复活已离场的实体 ID。
+                # 若没有所属来源，则无法确定安全的作用域。
+                if source is not None:
+                    source_name = self._normalize_remove_source(source)
+                    self.remove_entities([normalized_id], source=source_name)
+                return False
+            if source is not None:
+                source_name = self._normalize_remove_source(source)
+                if not entity.source or entity.source[0] != source_name:
+                    return False
+            elif len(entity.source) == 1:
+                source_name = entity.source[0]
+            else:
+                raise ValueError("source is required for a multi-source entity")
+            result = self.remove_entities([normalized_id], source=source_name)
+            return bool((result.get("changes") or {}).get("removed_entity_count"))
+
+    def remove_entities_by_source(
+        self,
+        source: str,
+        *,
+        prefix: str | None = None,
+        observed_at: float | None = None,
+        events: Iterable[WorldEvent | Mapping[str, Any]] = (),
+        event_source: str | None = None,
+    ) -> int:
+        """按来源清理实体并可在同一事务追加事件，返回实际删除数量。
+
+        ``prefix`` 可用于只清理来源下的一类实体，例如
+        ``vrchat:player:``。清理会记录 source reset watermark，阻止队列中的
+        旧帧重新插入已清理实体。
+        """
+        source_name = self._normalize_remove_source(source)
+        prefix_value = None if prefix is None else _text(prefix, limit=96)
+        if prefix is not None and not prefix_value:
+            raise ValueError("prefix must not be empty")
+        received_at = self._clock()
+        reset_at = (
+            received_at
+            if observed_at is None
+            else min(received_at, _finite(observed_at, received_at))
+        )
+        normalized_events: list[WorldEvent] = []
+        default_event_source = (
+            self._normalize_remove_source(event_source)
+            if event_source is not None
+            else source_name
+        )
+        for item in events:
+            if isinstance(item, WorldEvent):
+                raw_event: Mapping[str, Any] = {
+                    "type": item.kind,
+                    "target_id": item.target_id,
+                    "confidence": item.confidence,
+                    "data": item.data,
+                    "source": item.source,
+                    "observed_at": item.observed_at,
+                }
+            elif isinstance(item, Mapping):
+                raw_event = item
+            else:
+                raise ValueError("events must contain objects")
+            normalized_events.append(
+                WorldEvent.from_mapping(raw_event, now=reset_at, default_source=default_event_source)
+            )
+        if any(event.kind == "player_left" for event in normalized_events):
+            raise ValueError(
+                "remove_entities_by_source cannot publish player_left; "
+                "use remove_entities with explicit remove_entity_ids"
+            )
+        with self._lock:
+            reset_key = (source_name, prefix_value)
+            self._source_reset_watermarks[reset_key] = max(
+                self._source_reset_watermarks.get(reset_key, -math.inf), received_at
+            )
+            self._source_reset_index.setdefault(source_name, {})[prefix_value] = max(
+                self._source_reset_index.get(source_name, {}).get(prefix_value, -math.inf),
+                received_at,
+            )
+            self._source_reset_event_times[reset_key] = max(
+                self._source_reset_event_times.get(reset_key, -math.inf), reset_at
+            )
+            removed = [
+                entity_id
+                for entity_id, entity in self._entities.items()
+                if entity.source
+                and entity.source[0] == source_name
+                and (prefix_value is None or entity_id.startswith(prefix_value))
+                and entity.observed_at <= reset_at
+            ]
+            for entity_id in removed:
+                self._entities.pop(entity_id, None)
+                self._delete_watermarks[(source_name, entity_id)] = max(
+                    self._delete_watermarks.get((source_name, entity_id), -math.inf),
+                    received_at,
+                )
+                self._delete_event_times[(source_name, entity_id)] = max(
+                    self._delete_event_times.get((source_name, entity_id), -math.inf),
+                    reset_at,
+                )
+            self._drop_events_for_source_reset(source_name, prefix_value)
+            self._events.extend(normalized_events)
+            self._prune_lifecycle_watermarks()
+            self._last_observation_at = max(self._last_observation_at or reset_at, reset_at)
+            self._observation_count += 1
+            self._revision += 1
+            return len(removed)
 
     def clear(self) -> None:
         with self._lock:
             self._entities.clear()
             self._events.clear()
+            self._delete_watermarks.clear()
+            self._delete_event_times.clear()
+            self._source_reset_watermarks.clear()
+            self._source_reset_event_times.clear()
+            self._source_reset_index.clear()
             self._last_observation_at = None
             self._observation_count = 0
+            self._revision += 1
 
     def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
         timestamp = self._clock() if now is None else now
@@ -360,9 +738,22 @@ class WorldStateStore:
                     "event_count": len(recent_events),
                     "last_observation_age_ms": age_ms,
                     "observation_count": self._observation_count,
+                    "revision": self._revision,
+                    "lifecycle_watermark_count": (
+                        len(self._delete_watermarks) + len(self._source_reset_watermarks)
+                    ),
                 },
                 "backends": {key: dict(value) for key, value in self._backend.items()},
             }
 
 
-__all__ = ["WorldEntity", "WorldEvent", "WorldStateStore", "stable_entity_id"]
+__all__ = [
+    "VRCHAT_LOG_SOURCE",
+    "VRCHAT_PLAYER_ID_PREFIX",
+    "WorldEntity",
+    "WorldEvent",
+    "WorldStateStore",
+    "stable_entity_id",
+    "stable_track_entity_id",
+    "vrchat_player_entity_id",
+]

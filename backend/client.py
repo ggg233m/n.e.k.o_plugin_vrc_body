@@ -21,6 +21,16 @@ from urllib.request import Request, urlopen
 class BackendUnavailable(RuntimeError):
     """独立后端当前不可访问。"""
 
+    status_code: int | None = None
+
+
+class BackendRejected(BackendUnavailable):
+    """后端已响应，但拒绝了请求（通常是 4xx schema/lifecycle 错误）。"""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+
 
 def _free_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -237,6 +247,19 @@ class BackendClient:
                     message = detail.get("error") if isinstance(detail, dict) else None
                 except (OSError, ValueError, UnicodeError):
                     message = None
+                status_code: int | None
+                try:
+                    status_code = int(exc.code)
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    status_code = None
+                # 400/422 are the backend's structured schema/lifecycle errors.
+                # Keep auth, routing, and rate-limit failures on the unavailable
+                # path so callers do not mislabel them as bad observations.
+                if status_code in {400, 422}:
+                    raise BackendRejected(
+                        message or str(exc),
+                        status_code=status_code,
+                    ) from exc
                 raise BackendUnavailable(message or str(exc)) from exc
             except (OSError, URLError, TimeoutError) as exc:
                 raise BackendUnavailable(str(exc)) from exc
@@ -430,5 +453,54 @@ class RemoteVision:
         except BackendUnavailable as exc:
             return {"available": False, "uncertainties": ["backend_unavailable"], "error": str(exc)}
 
+    def ingest(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        ack_only: bool = False,
+    ) -> dict[str, Any]:
+        """向后端发布一批观测；生命周期删除与事件可在同一批次提交。
 
-__all__ = ["BackendClient", "BackendUnavailable"]
+        这是传输接缝，不在插件侧运行 detector，也不对观测做宽松重写；
+        后端会统一执行实体 ID、来源和时间戳校验。
+        """
+        if not isinstance(observation, Mapping):
+            return {
+                "accepted": False,
+                "reason_code": "invalid_world_observation",
+                "reason": "observation must be an object",
+            }
+        payload = dict(observation)
+        if ack_only:
+            payload["ack_only"] = True
+        try:
+            return self.client.request("POST", "/world/ingest", payload)
+        except BackendRejected as exc:
+            if exc.status_code not in {400, 422}:
+                return {
+                    "accepted": False,
+                    "reason_code": "backend_unavailable",
+                    "reason": str(exc),
+                    "status_code": exc.status_code,
+                }
+            return {
+                "accepted": False,
+                "reason_code": "invalid_world_observation",
+                "reason": str(exc),
+                "status_code": exc.status_code,
+            }
+        except BackendUnavailable as exc:
+            return {
+                "accepted": False,
+                "reason_code": "backend_unavailable",
+                "reason": str(exc),
+            }
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "accepted": False,
+                "reason_code": "invalid_world_observation",
+                "reason": f"invalid observation: {exc}"[:500],
+            }
+
+
+__all__ = ["BackendClient", "BackendRejected", "BackendUnavailable"]

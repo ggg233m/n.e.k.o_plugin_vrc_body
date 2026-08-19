@@ -91,6 +91,7 @@ enabled = false
 source = "none"
 interval_ms = 100
 queue_size = 1
+lifecycle_watermark_limit = 4096
 
 [clips]
 directory = "motions"

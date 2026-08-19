@@ -90,10 +90,13 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertTrue(configured.vision.enabled)
         self.assertEqual(configured.vision.interval_ms, 50)
         self.assertEqual(configured.vision.queue_size, 2)
+        self.assertEqual(configured.vision.lifecycle_watermark_limit, 4096)
         with self.assertRaisesRegex(ValueError, "vision.source"):
             PluginConfig.from_mapping({"vision": {"source": "unknown"}})
         with self.assertRaisesRegex(ValueError, "vision.interval_ms"):
             PluginConfig.from_mapping({"vision": {"interval_ms": 5}})
+        with self.assertRaisesRegex(ValueError, "vision.lifecycle_watermark_limit"):
+            PluginConfig.from_mapping({"vision": {"lifecycle_watermark_limit": 128}})
 
     def test_integer_config_values_are_not_silently_truncated(self) -> None:
         with self.assertRaisesRegex(ValueError, "anyadance.port"):

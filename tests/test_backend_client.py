@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from io import BytesIO
 import json
 from pathlib import Path
 import socket
@@ -10,14 +11,70 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 from tests import _bootstrap  # noqa: F401
-from neko_anyadance_body.backend.client import BackendClient, BackendUnavailable, RemoteScheduler
+from neko_anyadance_body.backend.client import (
+    BackendClient,
+    BackendRejected,
+    BackendUnavailable,
+    RemoteScheduler,
+    RemoteVision,
+)
 from neko_anyadance_body.backend.service import BackendService
 from neko_anyadance_body.backend.vision import VisionObservation
 
 
 class BackendClientTests(unittest.TestCase):
+    def test_remote_vision_keeps_lifecycle_publish_as_a_structured_transport_call(self) -> None:
+        client = BackendClient({}, Path.cwd())
+        invalid = client.vision.ingest(42)  # type: ignore[arg-type]
+        self.assertFalse(invalid["accepted"])
+        self.assertEqual(invalid["reason_code"], "invalid_world_observation")
+        unavailable = client.vision.ingest({"remove_entity_ids": ["x"]})
+        self.assertFalse(unavailable["accepted"])
+        self.assertEqual(unavailable["reason_code"], "backend_unavailable")
+        class SerializationFailure:
+            def request(self, *_args, **_kwargs):
+                raise TypeError("not JSON serializable")
+
+        malformed = RemoteVision(SerializationFailure()).ingest({"attributes": object()})
+        self.assertFalse(malformed["accepted"])
+        self.assertEqual(malformed["reason_code"], "invalid_world_observation")
+
+    def test_http_schema_errors_are_rejected_not_reported_as_offline(self) -> None:
+        client = BackendClient({}, Path.cwd())
+        client.port = 12345
+        client.token = "test"
+        error = HTTPError(
+            "http://127.0.0.1:12345/world/ingest",
+            400,
+            "bad observation",
+            {},
+            BytesIO(b'{"error":"ValueError: remove_source is required"}'),
+        )
+        with patch("neko_anyadance_body.backend.client.urlopen", side_effect=error):
+            with self.assertRaises(BackendRejected) as raised:
+                client.request("POST", "/world/ingest", {})
+        self.assertEqual(raised.exception.status_code, 400)
+
+        class RejectingClient:
+            def request(self, *_args, **_kwargs):
+                raise BackendRejected("unauthorized", status_code=401)
+
+        unauthorized = RemoteVision(RejectingClient()).ingest({})
+        self.assertFalse(unauthorized["accepted"])
+        self.assertEqual(unauthorized["reason_code"], "backend_unavailable")
+
+        class SchemaRejectingClient:
+            def request(self, *_args, **_kwargs):
+                raise BackendRejected("bad schema", status_code=422)
+
+        schema = RemoteVision(SchemaRejectingClient()).ingest({})
+        self.assertFalse(schema["accepted"])
+        self.assertEqual(schema["reason_code"], "invalid_world_observation")
+
     def test_remote_osc_config_invalid_values_fall_back_safely(self) -> None:
         client = BackendClient({"vrchat_osc": {"enabled": "no", "input_pulse_ms": "bad"}}, Path.cwd())
         self.assertTrue(client.osc_config.enabled)
@@ -266,6 +323,10 @@ class BackendClientTests(unittest.TestCase):
             self.assertTrue(client.request("GET", "/health")["ok"])
             self.assertEqual(client.scheduler.snapshot()["state"], "disabled")
             self.assertFalse(client.vision.snapshot()["available"])
+            invalid_lifecycle = client.vision.ingest({"remove_entity_ids": ["button"]})
+            self.assertFalse(invalid_lifecycle["accepted"])
+            self.assertEqual(invalid_lifecycle["reason_code"], "invalid_world_observation")
+            self.assertEqual(invalid_lifecycle["status_code"], 400)
             world = client.request(
                 "POST",
                 "/world/ingest",
@@ -274,11 +335,36 @@ class BackendClientTests(unittest.TestCase):
                     "entities": [
                         {"id": "button", "label": "button", "confidence": 0.9},
                         {"id": "avatar", "label": "avatar"},
+                        {
+                            "id": "vrchat:player:usr_1",
+                            "label": "player",
+                            "source": "vrchat_log",
+                            "confidence": 0.95,
+                        },
                     ],
                 },
             )
             self.assertTrue(world["available"])
-            self.assertEqual(world["entities"][0]["id"], "button")
+            self.assertIn("button", {item["id"] for item in world["entities"]})
+            left = client.vision.ingest(
+                {
+                    "source": "vrchat_log",
+                    "events": [{
+                        "type": "player_left",
+                        "target_id": "vrchat:player:usr_1",
+                        "confidence": 1.0,
+                    }],
+                    "remove_entity_ids": ["vrchat:player:usr_1"],
+                    "remove_source": "vrchat_log",
+                },
+                ack_only=True,
+            )
+            self.assertTrue(left["accepted"])
+            self.assertEqual(left["removed_entity_ids"], ["vrchat:player:usr_1"])
+            self.assertNotIn(
+                "vrchat:player:usr_1",
+                {item["id"] for item in client.vision.snapshot()["entities"]},
+            )
             ack = client.request(
                 "POST",
                 "/world/ingest",

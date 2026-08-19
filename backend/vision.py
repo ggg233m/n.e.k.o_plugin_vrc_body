@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib.util
 from queue import Empty, Full, Queue
 import threading
@@ -18,11 +18,22 @@ from .world_state import WorldEntity, WorldEvent, WorldStateStore
 
 @dataclass(frozen=True)
 class VisionObservation:
+    """一批世界观测。
+
+    ``remove_entity_ids`` 用于生命周期事件（例如玩家离开）在同一批次中
+    撤销旧实体。它不是模型检测结果的隐式清理机制；只有发布者明确提供
+    ID 时才会删除实体，避免把短暂漏检误当成离场。
+    """
+
     entities: tuple[WorldEntity | Mapping[str, Any], ...] = ()
     events: tuple[WorldEvent | Mapping[str, Any], ...] = ()
     source: str = "vision"
     observed_at: float | None = None
     frame_id: str | None = None
+    # Keep lifecycle fields at the end so existing positional constructors remain
+    # compatible with the original observation protocol.
+    remove_entity_ids: tuple[str, ...] = ()
+    remove_source: str | None = None
 
 
 class FrameDetector(Protocol):
@@ -402,22 +413,62 @@ class VisionRuntime:
         self.store.set_backend_status("vision_runtime", self.status())
 
     def ingest(self, observation: VisionObservation | Mapping[str, Any]) -> dict[str, Any]:
+        def array_field(mapping: Mapping[str, Any], name: str) -> tuple[Any, ...]:
+            raw = mapping.get(name)
+            if raw is None:
+                return ()
+            if not isinstance(raw, (list, tuple, set, frozenset)):
+                raise ValueError(f"{name} must be an array")
+            return tuple(raw)
+
         if isinstance(observation, VisionObservation):
-            value = observation
-        else:
-            value = VisionObservation(
-                entities=tuple(observation.get("entities") or ()) if isinstance(observation, Mapping) else (),
-                events=tuple(observation.get("events") or ()) if isinstance(observation, Mapping) else (),
-                source=str(observation.get("source") or "vision") if isinstance(observation, Mapping) else "vision",
-                observed_at=observation.get("observed_at") if isinstance(observation, Mapping) else None,
-                frame_id=str(observation.get("frame_id")) if isinstance(observation, Mapping) and observation.get("frame_id") is not None else None,
+            raw_remove_ids = observation.remove_entity_ids
+            if raw_remove_ids is None:
+                normalized_remove_ids: tuple[Any, ...] = ()
+            elif isinstance(raw_remove_ids, (tuple, list, set, frozenset)):
+                normalized_remove_ids = tuple(raw_remove_ids)
+            else:
+                raise ValueError("remove_entity_ids must be an array")
+            raw_remove_source = observation.remove_source
+            if raw_remove_source is not None:
+                if not isinstance(raw_remove_source, str) or not raw_remove_source.strip():
+                    raise ValueError("remove_source must be a non-empty string")
+                normalized_remove_source: str | None = raw_remove_source.strip()
+            else:
+                normalized_remove_source = None
+            value = replace(
+                observation,
+                remove_entity_ids=normalized_remove_ids,
+                remove_source=normalized_remove_source,
             )
-        result = self.store.ingest(
-            value.entities,
-            value.events,
-            source=value.source,
-            observed_at=value.observed_at,
-        )
+        else:
+            if not isinstance(observation, Mapping):
+                raise ValueError("observation must be an object")
+            normalized_remove_ids = array_field(observation, "remove_entity_ids")
+            raw_remove_source = observation.get("remove_source")
+            if raw_remove_source is not None:
+                if not isinstance(raw_remove_source, str) or not raw_remove_source.strip():
+                    raise ValueError("remove_source must be a non-empty string")
+                normalized_remove_source: str | None = raw_remove_source.strip()
+            else:
+                normalized_remove_source = None
+            value = VisionObservation(
+                entities=array_field(observation, "entities"),
+                events=array_field(observation, "events"),
+                remove_entity_ids=normalized_remove_ids,
+                remove_source=normalized_remove_source,
+                source=str(observation.get("source") or "vision"),
+                observed_at=observation.get("observed_at"),
+                frame_id=str(observation.get("frame_id")) if observation.get("frame_id") is not None else None,
+            )
+        ingest_kwargs: dict[str, Any] = {
+            "source": value.source,
+            "observed_at": value.observed_at,
+        }
+        if value.remove_entity_ids or value.remove_source is not None:
+            ingest_kwargs["remove_entity_ids"] = value.remove_entity_ids
+            ingest_kwargs["remove_source"] = value.remove_source
+        result = self.store.ingest(value.entities, value.events, **ingest_kwargs)
         callback = self._observation_callback
         if callback is not None:
             try:
