@@ -21,7 +21,9 @@
   VMC、OSC、遥测、配置和动作片段库。
 - `vision.py` 与 `world_state.py` 是无模型依赖的感知状态基础模块；其中
   `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。`DesktopMirrorFrameSource`
-  会优先尝试 DXcam、再回退 MSS；`OpenVinoLocalDetector` 和
+  会自动探测 DXGI 适配器/输出，失败后按物理显示器回退 MSS；DXcam 还会在可用时尝试
+  WinRT 后端。每个候选输出的错误会出现在 `/perception` 的 `source.backends` 和
+  `candidate_errors` 中，不再把所有失败压缩成一个 BitBlt 错误。`OpenVinoLocalDetector` 和
   `OpenAICompatibleSemanticBackend` 是可插拔的 YOLOX/depth/OCR/VLM 接缝，不会在缺少
   依赖时伪造检测。外部 detector 只需实现 `status()` 与
   `observe(frame, now=...)`，再通过 `BackendService.attach_vision()` 注入。
@@ -177,11 +179,17 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 ```toml
 [vision]
 enabled = false
-source = "none" # none / mss / external
+source = "none" # none / mss / dxcam / desktop_mirror / external
 capture = "desktop_mirror"
 local_backend = "openvino"
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
+# -1 自动探测；MSS 的 0 是虚拟桌面，物理显示器从 1 开始。
+monitor_index = -1
+# -1 自动探测 DXGI 设备/输出；也可以填固定索引排查多 GPU 环境。
+dxcam_device_idx = -1
+dxcam_output_idx = -1
+dxcam_backend = "auto" # auto / dxgi / winrt
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096
@@ -190,6 +198,15 @@ lifecycle_watermark_limit = 4096
 配置只描述 worker，不下载或加载模型。OpenVINO 模型包、VLM endpoint 和 API key
 由部署环境提供（VLM endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），
 没有依赖时状态会明确标记为 unavailable。
+
+Windows 上若 DXGI 返回 `0x80070005`，可安装 `dxcam[winrt]` 启用合成器捕获回退：
+
+```powershell
+python -m pip install --user "dxcam[winrt]"
+```
+
+这条路径与 OBS 的 Windows Graphics Capture 更接近，不需要把后端提升为管理员；
+如果目标窗口属于受保护内容，仍可能不可捕获，状态会保留在 `source.backends`。
 
 当前核心不内置 Contact 事件总线、Autonomy 反射规划、浏览器视觉桥或动作生成
 模型，也不会为这些未启用功能在插件里维护隐式状态。将来接入时应各自实现独立

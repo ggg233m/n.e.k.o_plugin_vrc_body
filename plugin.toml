@@ -108,6 +108,13 @@ capture = "desktop_mirror"
 local_backend = "openvino"
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
+# -1 自动探测；物理显示器优先，0 表示 MSS 虚拟桌面。
+monitor_index = -1
+# DXcam 的设备/输出索引；-1 自动探测全部可见适配器与输出。
+dxcam_device_idx = -1
+dxcam_output_idx = -1
+# auto 先尝试 DXGI，再尝试 Windows Graphics Capture (WinRT)。
+dxcam_backend = "auto"
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096

@@ -91,8 +91,28 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(configured.vision.interval_ms, 50)
         self.assertEqual(configured.vision.queue_size, 2)
         self.assertEqual(configured.vision.lifecycle_watermark_limit, 4096)
+        self.assertEqual(configured.vision.monitor_index, -1)
+        self.assertEqual(configured.vision.dxcam_device_idx, -1)
+        self.assertEqual(configured.vision.dxcam_output_idx, -1)
+        self.assertEqual(configured.vision.dxcam_backend, "auto")
+        selected = PluginConfig.from_mapping({
+            "vision": {
+                "monitor_index": 2,
+                "dxcam_device_idx": 1,
+                "dxcam_output_idx": 0,
+                "dxcam_backend": "winrt",
+            }
+        })
+        self.assertEqual(selected.vision.monitor_index, 2)
+        self.assertEqual(selected.vision.dxcam_device_idx, 1)
+        self.assertEqual(selected.vision.dxcam_output_idx, 0)
+        self.assertEqual(selected.vision.dxcam_backend, "winrt")
         with self.assertRaisesRegex(ValueError, "vision.source"):
             PluginConfig.from_mapping({"vision": {"source": "unknown"}})
+        with self.assertRaisesRegex(ValueError, "vision.dxcam_backend"):
+            PluginConfig.from_mapping({"vision": {"dxcam_backend": "unknown"}})
+        with self.assertRaisesRegex(ValueError, "vision.monitor_index"):
+            PluginConfig.from_mapping({"vision": {"monitor_index": -2}})
         with self.assertRaisesRegex(ValueError, "vision.interval_ms"):
             PluginConfig.from_mapping({"vision": {"interval_ms": 5}})
         with self.assertRaisesRegex(ValueError, "vision.lifecycle_watermark_limit"):

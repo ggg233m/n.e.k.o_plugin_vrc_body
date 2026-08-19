@@ -12,6 +12,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -72,10 +73,21 @@ class SemanticBackend(Protocol):
 
 def optional_dependency_status() -> dict[str, bool]:
     """不导入重量级模型包，只报告可选能力是否存在。"""
+    # ``find_spec`` raises ``ModuleNotFoundError`` for a nested module when its
+    # parent package is absent (for example on non-Windows hosts).  Keep this
+    # probe best-effort so a missing WinRT wheel never prevents the backend
+    # from starting.  The granular keys are useful to explain why DXcam's
+    # WinRT candidate was or was not added to the capture probe list.
+    dxcam_available = _module_available("dxcam")
+    winrt_available = _module_available("winrt")
+    winrt_capture_available = _module_available("winrt.windows.graphics.capture")
     return {
         "opencv": importlib.util.find_spec("cv2") is not None,
         "mss": importlib.util.find_spec("mss") is not None,
-        "dxcam": importlib.util.find_spec("dxcam") is not None,
+        "dxcam": dxcam_available,
+        "winrt": winrt_available,
+        "winrt_graphics_capture": winrt_capture_available,
+        "dxcam_winrt": dxcam_available and winrt_capture_available,
         "PIL": importlib.util.find_spec("PIL") is not None,
         "numpy": importlib.util.find_spec("numpy") is not None,
         "ultralytics": importlib.util.find_spec("ultralytics") is not None,
@@ -85,20 +97,40 @@ def optional_dependency_status() -> dict[str, bool]:
     }
 
 
+def _module_available(module_name: str) -> bool:
+    """Return whether an optional module can be resolved without importing it."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
 class MssFrameSource:
-    """可选的纯 mss 桌面采集器，不依赖插件 SDK 或模型包。"""
+    """可选的纯 mss 桌面采集器，不依赖插件 SDK 或模型包。
+
+    ``mss`` exposes monitor ``0`` as the virtual desktop and monitors
+    ``1..N`` as physical outputs.  A BitBlt failure can be output-specific,
+    so the source probes physical outputs and rotates to the next one after a
+    failed grab instead of getting stuck on the first monitor forever.
+    """
 
     name = "mss"
 
     def __init__(
         self,
         *,
-        monitor_index: int = 1,
+        monitor_index: int = -1,
         region: Mapping[str, Any] | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._capture: Any = None
         self._monitor: Mapping[str, int] | None = None
+        self._monitors: list[Mapping[str, int]] = []
+        self._candidate_indices: list[int] = []
+        self._candidate_pos = 0
+        self._requested_monitor_index = int(monitor_index)
+        self._active_monitor_index: int | None = None
+        self._candidate_errors: dict[str, str] = {}
         self._np: Any = None
         self._image: Any = None
         self._closed = False
@@ -107,21 +139,40 @@ class MssFrameSource:
         try:
             import mss  # type: ignore[import-not-found]
 
-            self._capture = mss.mss()
+            factory = getattr(mss, "MSS", getattr(mss, "mss", None))
+            if factory is None:
+                raise RuntimeError("mss does not expose a capture factory")
+            self._capture = factory()
             monitors = list(getattr(self._capture, "monitors", ()))
             if not monitors:
                 raise RuntimeError("mss reported no monitors")
-            index = min(max(int(monitor_index), 0), len(monitors) - 1)
-            base = dict(monitors[index])
-            if region is not None:
-                for key in ("left", "top", "width", "height"):
-                    if key in region:
-                        base[key] = int(region[key])
-            if base.get("width", 0) <= 0 or base.get("height", 0) <= 0:
-                raise ValueError("capture region must have positive width and height")
-            self._monitor = {
-                key: int(base[key]) for key in ("left", "top", "width", "height")
-            }
+            normalized: list[Mapping[str, int]] = []
+            for item in monitors:
+                base = dict(item)
+                if region is not None:
+                    for key in ("left", "top", "width", "height"):
+                        if key in region:
+                            base[key] = int(region[key])
+                if base.get("width", 0) <= 0 or base.get("height", 0) <= 0:
+                    raise ValueError("capture region must have positive width and height")
+                normalized.append({
+                    key: int(base[key]) for key in ("left", "top", "width", "height")
+                })
+            self._monitors = normalized
+            physical = list(range(1, len(normalized)))
+            if monitor_index >= 0:
+                preferred = [int(monitor_index)] if int(monitor_index) < len(normalized) else []
+                self._candidate_indices = preferred + [
+                    index for index in physical + [0] if index not in preferred
+                ]
+                if not preferred:
+                    self._last_error = f"requested monitor index {int(monitor_index)} is unavailable; probing all outputs"
+            else:
+                # Prefer an actual output over MSS's virtual-desktop entry.
+                self._candidate_indices = physical + ([0] if normalized else [])
+            if not self._candidate_indices:
+                raise RuntimeError("mss reported no usable monitor regions")
+            self._select_candidate_locked(0)
             try:
                 import numpy as np  # type: ignore[import-not-found]
 
@@ -139,12 +190,31 @@ class MssFrameSource:
     def status(self) -> Mapping[str, Any]:
         with self._lock:
             return {
-                "available": self._capture is not None and self._monitor is not None and not self._closed,
+                "available": (
+                    self._capture is not None
+                    and self._monitor is not None
+                    and not self._closed
+                    and self._last_error is None
+                ),
                 "name": self.name,
                 "monitor": dict(self._monitor or {}),
+                "monitor_index": self._active_monitor_index,
+                "requested_monitor_index": self._requested_monitor_index,
+                "candidate_indices": list(self._candidate_indices),
+                "candidate_errors": dict(self._candidate_errors),
                 "frames": self._frames,
                 "last_error": self._last_error,
             }
+
+    def _select_candidate_locked(self, position: int) -> None:
+        if not self._candidate_indices or not self._monitors:
+            self._monitor = None
+            self._active_monitor_index = None
+            return
+        self._candidate_pos = int(position) % len(self._candidate_indices)
+        index = self._candidate_indices[self._candidate_pos]
+        self._monitor = self._monitors[index]
+        self._active_monitor_index = index
 
     def read(self) -> Any:
         with self._lock:
@@ -167,7 +237,17 @@ class MssFrameSource:
             return shot.rgb
         except Exception as exc:
             with self._lock:
-                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+                message = f"{type(exc).__name__}: {exc}"[:256]
+                if self._active_monitor_index is not None:
+                    self._candidate_errors[str(self._active_monitor_index)] = message
+                if len(self._candidate_indices) > 1:
+                    self._select_candidate_locked(self._candidate_pos + 1)
+                    next_index = self._active_monitor_index
+                    self._last_error = (
+                        f"monitor capture failed ({message}); trying monitor {next_index}"
+                    )[:256]
+                else:
+                    self._last_error = message
             return None
 
     def close(self) -> None:
@@ -175,6 +255,7 @@ class MssFrameSource:
             self._closed = True
             capture = self._capture
             self._capture = None
+            self._monitor = None
         if capture is not None:
             try:
                 capture.close()
@@ -192,30 +273,186 @@ class DxcamFrameSource:
 
     name = "dxcam"
 
-    def __init__(self, *, region: Mapping[str, Any] | None = None, output_idx: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        region: Mapping[str, Any] | None = None,
+        output_idx: int = -1,
+        device_idx: int = -1,
+        backend: str = "auto",
+    ) -> None:
         self._lock = threading.Lock()
         self._camera: Any = None
         self._region = None
         self._closed = False
         self._frames = 0
         self._last_error: str | None = None
+        self._requested_output_idx = int(output_idx)
+        self._requested_device_idx = int(device_idx)
+        self._requested_backend = str(backend).strip().lower() or "auto"
+        if self._requested_backend not in {"auto", "dxgi", "winrt"}:
+            self._requested_backend = "auto"
+        self._selected_device_idx: int | None = None
+        self._selected_output_idx: int | None = None
+        self._selected_backend: str | None = None
+        self._candidate_specs: list[tuple[int, int | None, str]] = []
+        self._candidate_pos = 0
+        self._candidate_errors: dict[str, str] = {}
+        self._dxcam: Any = None
+        # Keep this separate from the selected backend: ``auto`` may begin on
+        # DXGI and only switch to WinRT after a failed grab.  Exposing the
+        # capability in status makes that fallback diagnosable before the
+        # first frame arrives.
+        self._winrt_available = _module_available("winrt.windows.graphics.capture")
         try:
             import dxcam  # type: ignore[import-not-found]
 
-            self._camera = dxcam.create(output_idx=int(output_idx), output_color="RGB")
+            self._dxcam = dxcam
             if region is not None:
                 self._region = tuple(int(region.get(key, 0)) for key in ("left", "top", "right", "bottom"))
                 if self._region[2] <= self._region[0] or self._region[3] <= self._region[1]:
                     raise ValueError("DXcam region must have positive width and height")
+            self._candidate_specs = self._build_candidates(dxcam)
+            self._activate_candidate_locked(0)
+            if self._camera is None and self._last_error is None:
+                self._last_error = "DXcam could not initialize any adapter/output/backend"
         except Exception as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+
+    def _build_candidates(self, dxcam: Any) -> list[tuple[int, int | None, str]]:
+        if self._requested_device_idx >= 0:
+            devices = [self._requested_device_idx]
+        else:
+            try:
+                devices = list(range(max(1, len(dxcam.enum_dxgi_adapters()))))
+            except Exception:
+                devices = [0]
+        output_map: dict[int, list[int]] = {}
+        if self._requested_output_idx < 0:
+            try:
+                info = str(dxcam.output_info())
+                for device_text, output_text in re.findall(r"Device\[(\d+)\]\s+Output\[(\d+)\]", info):
+                    device = int(device_text)
+                    output_map.setdefault(device, []).append(int(output_text))
+            except Exception:
+                output_map = {}
+            if output_map:
+                devices = [device for device in devices if device in output_map] or [min(output_map)]
+        if self._requested_output_idx >= 0:
+            outputs_by_device = {
+                device: [self._requested_output_idx] for device in devices
+            }
+        else:
+            outputs_by_device = {
+                # ``None`` and output 0 both normally mean the primary
+                # display; avoid probing the same output twice.
+                device: [None, *[
+                    index for index in sorted(set(output_map.get(device, [0])))
+                    if index != 0
+                ]]
+                for device in devices
+            }
+            # When output_info is unavailable, retain a small bounded probe
+            # instead of silently trusting only the primary output.
+            if not output_map:
+                outputs_by_device = {device: [None, 0, 1, 2, 3] for device in devices}
+        if self._requested_backend != "auto":
+            backends = [self._requested_backend]
+        else:
+            backends = ["dxgi"]
+            if self._winrt_available:
+                backends.append("winrt")
+        return [
+            (int(device), output, backend_name)
+            for device in devices
+            for output in outputs_by_device.get(device, [None])
+            for backend_name in backends
+        ]
+
+    @staticmethod
+    def _release_camera(camera: Any) -> None:
+        if camera is None:
+            return
+        for method_name in ("stop", "release"):
+            try:
+                method = getattr(camera, method_name, None)
+                if method is not None:
+                    method()
+            except Exception:
+                pass
+
+    def _create_camera(self, spec: tuple[int, int | None, str]) -> Any:
+        if self._dxcam is None:
+            return None
+        device, output, backend = spec
+        try:
+            return self._dxcam.create(
+                device_idx=device,
+                output_idx=output,
+                output_color="RGB",
+                backend=backend,
+            )
+        except TypeError:
+            # Older DXcam releases do not expose the backend selector.  It is
+            # safe to retry only for the historical/default DXGI path.  An
+            # explicit WinRT request must not silently produce a DXGI camera
+            # while reporting ``backend=winrt`` in status.
+            if backend != "dxgi":
+                raise
+            return self._dxcam.create(
+                device_idx=device,
+                output_idx=output,
+                output_color="RGB",
+            )
+
+    def _activate_candidate_locked(self, position: int) -> bool:
+        old_camera = self._camera
+        self._camera = None
+        self._release_camera(old_camera)
+        if not self._candidate_specs or self._closed:
+            return False
+        for offset in range(len(self._candidate_specs)):
+            candidate_pos = (int(position) + offset) % len(self._candidate_specs)
+            spec = self._candidate_specs[candidate_pos]
+            try:
+                camera = self._create_camera(spec)
+                if camera is None:
+                    raise RuntimeError("DXcam returned no camera")
+                self._candidate_pos = candidate_pos
+                self._camera = camera
+                self._selected_device_idx, self._selected_output_idx, self._selected_backend = spec
+                self._last_error = None
+                return True
+            except Exception as exc:
+                self._candidate_errors[self._format_spec(spec)] = f"{type(exc).__name__}: {exc}"[:256]
+        self._selected_device_idx = None
+        self._selected_output_idx = None
+        self._selected_backend = None
+        errors = list(self._candidate_errors.values())
+        self._last_error = "; ".join(errors[-3:])[:500] or "DXcam could not initialize any candidate"
+        return False
+
+    @staticmethod
+    def _format_spec(spec: tuple[int, int | None, str]) -> str:
+        device, output, backend = spec
+        output_label = "primary" if output is None else str(output)
+        return f"device={device},output={output_label},backend={backend}"
 
     def status(self) -> Mapping[str, Any]:
         with self._lock:
             return {
-                "available": self._camera is not None and not self._closed,
+                "available": self._camera is not None and not self._closed and self._last_error is None,
                 "name": self.name,
                 "region": self._region,
+                "device_idx": self._selected_device_idx,
+                "output_idx": self._selected_output_idx,
+                "backend": self._selected_backend,
+                "requested_device_idx": self._requested_device_idx,
+                "requested_output_idx": self._requested_output_idx,
+                "requested_backend": self._requested_backend,
+                "winrt_available": self._winrt_available,
+                "candidate_count": len(self._candidate_specs),
+                "candidate_errors": dict(self._candidate_errors),
                 "frames": self._frames,
                 "last_error": self._last_error,
             }
@@ -233,7 +470,15 @@ class DxcamFrameSource:
             return frame
         except Exception as exc:
             with self._lock:
-                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+                message = f"{type(exc).__name__}: {exc}"[:256]
+                if self._candidate_specs:
+                    spec = self._candidate_specs[self._candidate_pos]
+                    self._candidate_errors[self._format_spec(spec)] = message
+                    self._activate_candidate_locked(self._candidate_pos + 1)
+                    if self._camera is None:
+                        self._last_error = message
+                else:
+                    self._last_error = message
             return None
 
     def close(self) -> None:
@@ -241,41 +486,77 @@ class DxcamFrameSource:
             self._closed = True
             camera = self._camera
             self._camera = None
-        if camera is not None:
-            try:
-                camera.stop()
-            except Exception:
-                pass
-            try:
-                camera.release()
-            except Exception:
-                pass
+        self._release_camera(camera)
 
 
 class DesktopMirrorFrameSource:
-    """Select DXcam first and fall back to MSS without changing the worker API."""
+    """Select DXcam first and fall back to MSS without changing the worker API.
+
+    Both backends stay alive during probing.  This matters on systems where
+    DXGI is denied for one GPU while GDI/MSS can still capture another output.
+    """
 
     name = "desktop_mirror"
 
-    def __init__(self, *, region: Mapping[str, Any] | None = None) -> None:
-        dx = DxcamFrameSource(region=region)
-        if bool(dx.status().get("available")):
-            self._source: FrameSource = dx
-        else:
-            dx.close()
-            self._source = MssFrameSource(region=region)
+    def __init__(
+        self,
+        *,
+        region: Mapping[str, Any] | None = None,
+        monitor_index: int = -1,
+        dxcam_device_idx: int = -1,
+        dxcam_output_idx: int = -1,
+        dxcam_backend: str = "auto",
+    ) -> None:
+        self._lock = threading.Lock()
+        self._sources: list[FrameSource] = [
+            DxcamFrameSource(
+                region=region,
+                device_idx=dxcam_device_idx,
+                output_idx=dxcam_output_idx,
+                backend=dxcam_backend,
+            ),
+            MssFrameSource(monitor_index=monitor_index, region=region),
+        ]
+        self._active_index = 0
 
     def status(self) -> Mapping[str, Any]:
-        result = dict(self._source.status())
+        with self._lock:
+            active_index = self._active_index
+            sources = list(self._sources)
+        statuses = [dict(source.status()) for source in sources]
+        active = statuses[active_index] if statuses else {"available": False}
+        result = dict(active)
         result["name"] = self.name
-        result["backend"] = getattr(self._source, "name", "unknown")
+        result["backend"] = getattr(sources[active_index], "name", "unknown") if sources else "unknown"
+        result["active_backend_index"] = active_index
+        result["backends"] = statuses
+        result["available"] = any(bool(item.get("available")) for item in statuses)
+        if not result.get("available"):
+            errors = [str(item.get("last_error")) for item in statuses if item.get("last_error")]
+            if errors:
+                result["last_error"] = " | ".join(errors)[:500]
         return result
 
     def read(self) -> Any:
-        return self._source.read()
+        with self._lock:
+            sources = list(self._sources)
+            active_index = self._active_index
+        if not sources:
+            return None
+        for offset in range(len(sources)):
+            index = (active_index + offset) % len(sources)
+            frame = sources[index].read()
+            if frame is not None:
+                with self._lock:
+                    self._active_index = index
+                return frame
+        return None
 
     def close(self) -> None:
-        self._source.close()
+        with self._lock:
+            sources = list(self._sources)
+        for source in sources:
+            source.close()
 
 
 class OpenVinoLocalDetector:
@@ -493,12 +774,14 @@ class VisionWorker:
         *,
         interval_s: float = 0.1,
         queue_size: int = 1,
+        capture_only: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.runtime = runtime
         self.source = source
         self.interval_s = min(2.0, max(0.01, float(interval_s)))
         self.queue: Queue[CapturedFrame] = Queue(maxsize=max(1, min(4, int(queue_size))))
+        self.capture_only = bool(capture_only)
         self._clock = clock
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -518,7 +801,7 @@ class VisionWorker:
             if self._running:
                 return True
             candidates = [item for item in (self.runtime.detector, self.runtime.semantic) if item is not None]
-            if not candidates:
+            if not candidates and not self.capture_only:
                 self._last_error = "no detector or semantic backend is configured"
                 return False
             available = False
@@ -533,7 +816,7 @@ class VisionWorker:
                 except Exception:
                     available = True
                     break
-            if not available:
+            if candidates and not available:
                 self._last_error = "; ".join(errors)[:256] or "configured vision backends are unavailable"
                 return False
             self._stop.clear()
@@ -638,6 +921,7 @@ class VisionWorker:
             return {
                 "enabled": True,
                 "running": self._running,
+                "capture_only": self.capture_only,
                 "source": source_status,
                 "queue_size": self.queue.maxsize,
                 "queue_depth": self.queue.qsize(),

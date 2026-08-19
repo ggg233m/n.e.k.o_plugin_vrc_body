@@ -86,6 +86,21 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 当前版本默认不加载第三方模型，但已经提供 DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 的可选适配器；未配置依赖时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
+桌面镜像采集会自动探测 DXGI 的 GPU/显示输出，并在失败时逐个尝试 MSS 物理显示器；
+`/perception` 会保留每个候选输出的错误，便于区分权限、显卡和 BitBlt 问题。可在
+`[vision]` 中设置 `monitor_index`、`dxcam_device_idx`、`dxcam_output_idx`，或把
+`dxcam_backend` 固定为 `dxgi`/`winrt` 进行排查。
+
+要启用接近 OBS 窗口捕获的 Windows Graphics Capture 路径，可在后端使用的 Python
+环境中安装可选组件：
+
+```powershell
+python -m pip install --user "dxcam[winrt]"
+```
+
+安装后保持 `dxcam_backend = "auto"`；DXGI 被拒绝时会自动切换到 WinRT。该依赖仍是
+可选的，未安装时插件会继续使用 DXGI/MSS，并在 `/perception` 报告缺失原因。
+
 自主目标不会直接把主 LLM 接入身体控制线程。后端的 `LocalNavigator` 会在会话手动
 授权后，以约 10 Hz 根据新鲜视觉实体生成受限的短摇杆脉冲；目标不可见、方位或距离
 未知、观测过期或世界带不确定性时立即释放输入。主 LLM 只负责目标和行为选择，

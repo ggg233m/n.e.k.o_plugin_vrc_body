@@ -164,6 +164,12 @@ class VisionConfig:
     local_backend: str = "openvino"
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
+    # -1 means automatic probing.  Physical monitors are preferred over the
+    # MSS virtual desktop, and DXcam probes all visible adapters/outputs.
+    monitor_index: int = -1
+    dxcam_device_idx: int = -1
+    dxcam_output_idx: int = -1
+    dxcam_backend: str = "auto"
     interval_ms: int = 100
     queue_size: int = 1
     lifecycle_watermark_limit: int = 4096
@@ -335,6 +341,9 @@ class PluginConfig:
         semantic_backend = str(vision.get("semantic_backend", "openai_compatible")).strip().lower() or "openai_compatible"
         if semantic_backend not in {"openai_compatible", "none", "external"}:
             raise ValueError("vision.semantic_backend must be openai_compatible, none, or external")
+        dxcam_backend = str(vision.get("dxcam_backend", "auto")).strip().lower() or "auto"
+        if dxcam_backend not in {"auto", "dxgi", "winrt"}:
+            raise ValueError("vision.dxcam_backend must be auto, dxgi, or winrt")
         vision_config = VisionConfig(
             enabled=_boolean(vision.get("enabled"), False, name="vision.enabled"),
             source=vision_source,
@@ -348,6 +357,28 @@ class PluginConfig:
                 maximum=30,
                 name="vision.semantic_max_per_minute",
             ),
+            monitor_index=_bounded_int(
+                vision.get("monitor_index"),
+                -1,
+                minimum=-1,
+                maximum=32,
+                name="vision.monitor_index",
+            ),
+            dxcam_device_idx=_bounded_int(
+                vision.get("dxcam_device_idx"),
+                -1,
+                minimum=-1,
+                maximum=32,
+                name="vision.dxcam_device_idx",
+            ),
+            dxcam_output_idx=_bounded_int(
+                vision.get("dxcam_output_idx"),
+                -1,
+                minimum=-1,
+                maximum=32,
+                name="vision.dxcam_output_idx",
+            ),
+            dxcam_backend=dxcam_backend,
             interval_ms=_bounded_int(
                 vision.get("interval_ms"),
                 100,

@@ -167,11 +167,22 @@ class BackendService:
             # Capture/model dependencies remain optional and are instantiated
             # only when vision is explicitly enabled.
             if self.config.vision.capture == "mss" or self.config.vision.source == "mss":
-                vision_source = MssFrameSource()
+                vision_source = MssFrameSource(
+                    monitor_index=self.config.vision.monitor_index,
+                )
             elif self.config.vision.capture == "dxcam":
-                vision_source = DxcamFrameSource()
+                vision_source = DxcamFrameSource(
+                    device_idx=self.config.vision.dxcam_device_idx,
+                    output_idx=self.config.vision.dxcam_output_idx,
+                    backend=self.config.vision.dxcam_backend,
+                )
             else:
-                vision_source = DesktopMirrorFrameSource()
+                vision_source = DesktopMirrorFrameSource(
+                    monitor_index=self.config.vision.monitor_index,
+                    dxcam_device_idx=self.config.vision.dxcam_device_idx,
+                    dxcam_output_idx=self.config.vision.dxcam_output_idx,
+                    dxcam_backend=self.config.vision.dxcam_backend,
+                )
         self._vision_source = vision_source
         if vision_detector is None and self.config.vision.enabled and self.config.vision.local_backend == "openvino":
             vision_detector = OpenVinoLocalDetector(model_path=os.getenv("VRC_OPENVINO_MODEL"))
@@ -201,7 +212,7 @@ class BackendService:
             observation_callback=self._on_vision_observation,
         )
         self.vision_worker: VisionWorker | None = None
-        if self.config.vision.enabled and vision_source is not None and vision_detector is not None:
+        if self.config.vision.enabled and vision_source is not None:
             self.vision_worker = self._new_vision_worker(vision_source)
         self.scheduler: BodyScheduler | None = None
         self.osc: VrchatOscBridge | None = None
@@ -248,6 +259,7 @@ class BackendService:
             source,
             interval_s=self.config.vision.interval_ms / 1000.0,
             queue_size=self.config.vision.queue_size,
+            capture_only=self.vision.detector is None and self.vision.semantic is None,
         )
 
     def _cognition_sources(self) -> dict[str, dict[str, Any]]:

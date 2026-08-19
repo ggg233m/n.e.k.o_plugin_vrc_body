@@ -590,6 +590,21 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertIn("no detector", worker.status()["last_error"])
         worker.stop()
 
+    def test_capture_only_worker_reports_frames_without_fabricating_world_entities(self) -> None:
+        source = _FrameSource()
+        store = WorldStateStore()
+        runtime = VisionRuntime(store)
+        worker = VisionWorker(runtime, source, interval_s=0.01, capture_only=True)
+        self.assertTrue(worker.start())
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and worker.status()["frames_captured"] < 1:
+            time.sleep(0.005)
+        worker.stop()
+        status = worker.status()
+        self.assertTrue(status["capture_only"])
+        self.assertGreaterEqual(status["frames_captured"], 1)
+        self.assertEqual(store.snapshot()["entities"], [])
+
     def test_detector_runs_every_frame_and_semantic_backend_is_rate_limited(self) -> None:
         now = [0.0]
         detector = _Detector()
