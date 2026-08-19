@@ -51,6 +51,25 @@ python backend/debug_cli.py --port 48912 --token dev action --kind enable --json
 python backend/debug_cli.py --port 48912 --token dev shutdown
 ```
 
+在没有 N.E.K.O 宿主时，后端也可以直接作为临时宿主使用。`debug_cli.py` 提供
+VRChat OSC 的轻量控制入口；它不会自动启用身体输出，第一次使用仍需显式发送
+`action --kind enable`：
+
+```powershell
+python backend/debug_cli.py --port 48912 --token dev action --kind enable --json '{}'
+python backend/debug_cli.py --port 48912 --token dev locomotion --vertical 0.35 --duration-ms 600
+python backend/debug_cli.py --port 48912 --token dev turn --horizontal -0.5 --duration-ms 500
+python backend/debug_cli.py --port 48912 --token dev input --action grab --side right --hold-ms 100
+python backend/debug_cli.py --port 48912 --token dev parameter --name NEKO_Action --value 1
+python backend/debug_cli.py --port 48912 --token dev chatbox --text '你好'
+python backend/debug_cli.py --port 48912 --token dev stop-movement
+```
+
+`parameter --value` 使用 JSON 标量解析，因此 `true`、`1` 和 `0.5` 会分别作为
+Bool、Int 和 Float 发送；`chatbox` 默认立即显示，使用 `--deferred` 可改为仅在
+输入时显示。所有移动轴都有时限，结束时会自动归零；`stop-movement` 和
+`cancel-inputs` 可用于手动释放状态。
+
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
 执行仍必须经过 `/action` 或插件工具。

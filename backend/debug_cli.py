@@ -24,6 +24,17 @@ def _json_arg(value: str | None, file_path: Path | None) -> dict:
     return payload
 
 
+def _scalar_arg(value: str) -> object:
+    """Parse a JSON scalar used by an OSC parameter command."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = value
+    if isinstance(parsed, (dict, list)):
+        raise ValueError("value must be a scalar")
+    return parsed
+
+
 def request(host: str, port: int, token: str, method: str, path: str, payload: dict | None = None) -> dict:
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(
@@ -74,6 +85,31 @@ def main() -> int:
     feedback = sub.add_parser("feedback")
     feedback.add_argument("--json", default=None)
     feedback.add_argument("--file", type=Path, default=None)
+    parameter = sub.add_parser("parameter", help="send one VRChat Avatar parameter")
+    parameter.add_argument("--name", required=True)
+    parameter.add_argument("--value", required=True, help="JSON scalar such as true, 1, or 0.5")
+    osc_input = sub.add_parser("input", help="pulse a VRChat Grab, Use, or Drop input")
+    osc_input.add_argument("--action", choices=("grab", "use", "drop"), required=True)
+    osc_input.add_argument("--side", choices=("left", "right"), required=True)
+    osc_input.add_argument("--hold-ms", type=int, default=100)
+    locomotion = sub.add_parser("locomotion", help="send a timed VRChat movement axis")
+    locomotion.add_argument("--vertical", type=float, default=0.0)
+    locomotion.add_argument("--horizontal", type=float, default=0.0)
+    locomotion.add_argument("--duration-ms", type=int, default=1000)
+    turn = sub.add_parser("turn", help="send a timed VRChat turn axis")
+    turn.add_argument("--horizontal", type=float, required=True)
+    turn.add_argument("--duration-ms", type=int, default=500)
+    sub.add_parser("stop-movement", help="zero VRChat movement and turn axes")
+    chatbox = sub.add_parser("chatbox", help="send text to the VRChat chatbox")
+    chatbox.add_argument("--text", required=True)
+    chatbox.add_argument(
+        "--deferred",
+        action="store_false",
+        dest="immediate",
+        help="show the message only while typing",
+    )
+    chatbox.set_defaults(immediate=True)
+    sub.add_parser("cancel-inputs", help="cancel pending inputs and release buttons")
     args = parser.parse_args()
     try:
         if args.command == "health":
@@ -113,6 +149,59 @@ def main() -> int:
                 "/action",
                 {"kind": args.kind, "params": _json_arg(args.json, args.file)},
             )
+        elif args.command == "parameter":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/parameter",
+                {"name": args.name, "value": _scalar_arg(args.value)},
+            )
+        elif args.command == "input":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/input",
+                {"action": args.action, "side": args.side, "hold_ms": args.hold_ms},
+            )
+        elif args.command == "locomotion":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/locomotion",
+                {
+                    "vertical": args.vertical,
+                    "horizontal": args.horizontal,
+                    "duration_ms": args.duration_ms,
+                },
+            )
+        elif args.command == "turn":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/turn",
+                {"horizontal": args.horizontal, "duration_ms": args.duration_ms},
+            )
+        elif args.command == "stop-movement":
+            result = request(args.host, args.port, args.token, "POST", "/osc/stop_movement", {})
+        elif args.command == "chatbox":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/chatbox",
+                {"text": args.text, "immediate": args.immediate},
+            )
+        elif args.command == "cancel-inputs":
+            result = request(args.host, args.port, args.token, "POST", "/osc/cancel", {})
         else:
             result = request(
                 args.host,
