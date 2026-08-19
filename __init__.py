@@ -102,6 +102,10 @@ _DEBUG_COMMAND_NAMES = (
     "body_play_clip",
     "body_avatar_parameter",
     "body_vrchat_input",
+    "body_locomotion",
+    "body_turn",
+    "body_stop_movement",
+    "body_chatbox",
 )
 
 @neko_plugin
@@ -1136,7 +1140,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         **_: Any,
     ):
         try:
-            message = str(text or "").strip()
+            if not isinstance(text, str):
+                raise ValueError("text must be a string")
+            message = text.replace("\x00", "").strip()
             if not message or len(message) > 144:
                 raise ValueError("text must be between 1 and 144 characters")
             normalized = {

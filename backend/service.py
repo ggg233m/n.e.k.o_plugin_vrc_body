@@ -27,6 +27,64 @@ from .world_state import WorldStateStore
 _VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
 _WORLD_GATE_BYPASS_ACTIONS = frozenset({"stop", "disable", "reset", "cancel"})
+_OSC_AXIS_MIN = -1.0
+_OSC_AXIS_MAX = 1.0
+_OSC_DURATION_MIN_MS = 100
+_OSC_DURATION_MAX_MS = 10000
+_OSC_HOLD_MIN_MS = 20
+_OSC_HOLD_MAX_MS = 1000
+
+
+def _osc_axis_value(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(numeric) or not _OSC_AXIS_MIN <= numeric <= _OSC_AXIS_MAX:
+        raise ValueError(f"{name} must be between {_OSC_AXIS_MIN:g} and {_OSC_AXIS_MAX:g}")
+    return numeric
+
+
+def _osc_duration_ms(value: Any, default: int, name: str = "duration_ms") -> int:
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if (
+        not math.isfinite(numeric)
+        or not numeric.is_integer()
+        or not _OSC_DURATION_MIN_MS <= numeric <= _OSC_DURATION_MAX_MS
+    ):
+        raise ValueError(
+            f"{name} must be an integer between {_OSC_DURATION_MIN_MS} and {_OSC_DURATION_MAX_MS}"
+        )
+    return int(numeric)
+
+
+def _osc_hold_ms(value: Any, default: int) -> int:
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError("hold_ms must be an integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("hold_ms must be an integer") from exc
+    if (
+        not math.isfinite(numeric)
+        or not numeric.is_integer()
+        or not _OSC_HOLD_MIN_MS <= numeric <= _OSC_HOLD_MAX_MS
+    ):
+        raise ValueError(
+            f"hold_ms must be an integer between {_OSC_HOLD_MIN_MS} and {_OSC_HOLD_MAX_MS}"
+        )
+    return int(numeric)
 
 
 class _DryRunDatagramTransport:
@@ -464,35 +522,84 @@ class BackendService:
             return False, "VRChat OSC bridge is not initialized"
         return self.osc.send_parameter(name, value)
 
-    def pulse_input(self, action: str, side: str, hold_ms: int) -> tuple[bool, str | None]:
+    def pulse_input(self, action: str, side: str, hold_ms: Any) -> tuple[bool, str | None]:
+        try:
+            normalized_hold = _osc_hold_ms(hold_ms, self.config.vrchat_osc.input_pulse_ms)
+        except ValueError as exc:
+            return False, str(exc)
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
-        return self.osc.pulse_input(action, side, hold_ms)
+        return self.osc.pulse_input(action, side, normalized_hold)
 
-    def set_locomotion(self, vertical: float, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+    def set_locomotion(self, vertical: Any, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
+        try:
+            normalized_vertical = _osc_axis_value(vertical, "vertical")
+            normalized_horizontal = _osc_axis_value(horizontal, "horizontal")
+            normalized_duration = _osc_duration_ms(duration_ms, 1000)
+        except ValueError as exc:
+            return False, str(exc)
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
-        duration_s = duration_ms / 1000.0
-        self.osc.set_axis("move_vertical", vertical, duration_s)
-        self.osc.set_axis("move_horizontal", horizontal, duration_s)
-        return True, None
+        duration_s = normalized_duration / 1000.0
+        set_axes = getattr(self.osc, "set_axes", None)
+        if callable(set_axes):
+            return set_axes(
+                {
+                    "move_vertical": normalized_vertical,
+                    "move_horizontal": normalized_horizontal,
+                },
+                duration_s,
+            )
+        vertical_result = self.osc.set_axis("move_vertical", normalized_vertical, duration_s)
+        if not vertical_result[0]:
+            rollback = getattr(self.osc, "stop_axes", None)
+            if callable(rollback):
+                rollback(("move_vertical", "move_horizontal"))
+            else:
+                self.osc.stop_all_axes()
+            return False, vertical_result[1] or "VRChat OSC locomotion send failed"
+        horizontal_result = self.osc.set_axis("move_horizontal", normalized_horizontal, duration_s)
+        if horizontal_result[0]:
+            return True, None
+        # A partial locomotion command is unsafe: release both movement axes
+        # so a caller never gets an apparently successful half-command.
+        rollback = getattr(self.osc, "stop_axes", None)
+        if callable(rollback):
+            rollback(("move_vertical", "move_horizontal"))
+        else:
+            self.osc.stop_all_axes()
+        return False, horizontal_result[1] or "VRChat OSC locomotion send failed"
 
-    def set_turn(self, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+    def set_turn(self, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
+        try:
+            normalized_horizontal = _osc_axis_value(horizontal, "horizontal")
+            normalized_duration = _osc_duration_ms(duration_ms, 500)
+        except ValueError as exc:
+            return False, str(exc)
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
-        self.osc.set_axis("look_horizontal", horizontal, duration_ms / 1000.0)
-        return True, None
+        return self.osc.set_axis(
+            "look_horizontal",
+            normalized_horizontal,
+            normalized_duration / 1000.0,
+        )
 
     def stop_movement(self) -> tuple[bool, str | None]:
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
-        self.osc.stop_all_axes()
-        return True, None
+        return self.osc.stop_all_axes()
 
-    def send_chatbox(self, text: str, immediate: bool) -> tuple[bool, str | None]:
+    def send_chatbox(self, text: Any, immediate: Any) -> tuple[bool, str | None]:
+        if not isinstance(text, str):
+            return False, "text must be a string"
+        if not isinstance(immediate, bool):
+            return False, "immediate must be a boolean"
+        message = text.replace("\x00", "").strip()
+        if not message or len(message) > 144:
+            return False, "text must be between 1 and 144 characters"
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
-        return self.osc.send_chatbox(text, immediate=immediate)
+        return self.osc.send_chatbox(message, immediate=immediate)
 
     def cancel_inputs(self) -> None:
         if self.osc:

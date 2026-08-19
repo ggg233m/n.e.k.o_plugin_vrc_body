@@ -88,6 +88,109 @@ class OscProtocolTests(unittest.TestCase):
         bridge._run_due_inputs()
         self.assertEqual(sent, [])
 
+    def test_axis_rejects_nonfinite_and_unbounded_commands(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+        bridge._send = lambda address, arguments: (  # type: ignore[method-assign]
+            sent.append((address, tuple(arguments))) or (True, None)
+        )
+
+        for value, duration in (
+            (float("nan"), 1.0),
+            (float("inf"), 1.0),
+            (1.0, float("nan")),
+            (1.0, -1.0),
+            (1.0, 0.0),
+        ):
+            accepted, reason = bridge.set_axis("move_vertical", value, duration)
+            self.assertFalse(accepted, (value, duration, reason))
+        self.assertEqual(sent, [])
+
+    def test_set_axes_rolls_back_partial_locomotion(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+
+        def send(address: str, arguments: tuple[object, ...]):
+            sent.append((address, tuple(arguments)))
+            if address == "/input/Horizontal" and arguments != (0.0,):
+                return False, "horizontal failed"
+            return True, None
+
+        bridge._send = send  # type: ignore[method-assign]
+        accepted, reason = bridge.set_axes(
+            {"move_vertical": 1.0, "move_horizontal": 1.0},
+            1.0,
+        )
+        self.assertFalse(accepted)
+        self.assertIn("horizontal failed", reason or "")
+        self.assertEqual(
+            sent,
+            [
+                ("/input/Vertical", (1.0,)),
+                ("/input/Horizontal", (1.0,)),
+                ("/input/Vertical", (0.0,)),
+                ("/input/Horizontal", (0.0,)),
+            ],
+        )
+        self.assertEqual(bridge.snapshot()["active_axes"], {})
+
+    def test_stop_all_axes_resets_known_axes_without_active_state(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+        bridge._send = lambda address, arguments: (  # type: ignore[method-assign]
+            sent.append((address, tuple(arguments))) or (True, None)
+        )
+
+        accepted, reason = bridge.stop_all_axes()
+        self.assertTrue(accepted, reason)
+        self.assertEqual(
+            sent,
+            [
+                ("/input/Vertical", (0.0,)),
+                ("/input/Horizontal", (0.0,)),
+                ("/input/LookHorizontal", (0.0,)),
+            ],
+        )
+
+    def test_button_path_uses_integer_payload(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+        bridge._send = lambda address, arguments: (  # type: ignore[method-assign]
+            sent.append((address, tuple(arguments))) or (True, None)
+        )
+
+        accepted, reason = bridge.send_button("jump", True)
+        self.assertTrue(accepted, reason)
+        self.assertEqual(sent, [("/input/Jump", (1,))])
+        accepted, reason = bridge.send_button("jump", False)
+        self.assertTrue(accepted, reason)
+        self.assertEqual(sent[-1], ("/input/Jump", (0,)))
+
+    def test_pulse_rejects_invalid_hold_without_pressing(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+        bridge._send = lambda address, arguments: (  # type: ignore[method-assign]
+            sent.append((address, tuple(arguments))) or (True, None)
+        )
+
+        for hold_ms in (float("nan"), float("inf"), -1, 1001, True):
+            accepted, reason = bridge.pulse_input("grab", "right", hold_ms)
+            self.assertFalse(accepted, (hold_ms, reason))
+        self.assertEqual(sent, [])
+
+    def test_chatbox_rejects_invalid_types_and_length(self) -> None:
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig())
+        bridge._send = lambda address, arguments: (  # type: ignore[method-assign]
+            sent.append((address, tuple(arguments))) or (True, None)
+        )
+
+        self.assertFalse(bridge.send_chatbox("x" * 145)[0])
+        self.assertFalse(bridge.send_chatbox("hello", immediate="false")[0])  # type: ignore[arg-type]
+        accepted, reason = bridge.send_chatbox("hello", immediate=False)
+        self.assertTrue(accepted, reason)
+        self.assertEqual(sent, [("/chatbox/input", ("hello", False, False))])
+
 
 class OscBridgeIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:

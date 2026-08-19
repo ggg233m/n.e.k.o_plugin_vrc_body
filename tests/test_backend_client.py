@@ -23,6 +23,47 @@ class BackendClientTests(unittest.TestCase):
         self.assertTrue(client.osc_config.enabled)
         self.assertEqual(client.osc_config.input_pulse_ms, 100)
 
+    def test_osc_service_propagates_failures_and_rejects_unsafe_values(self) -> None:
+        service = BackendService({}, Path.cwd())
+
+        class FailingOsc:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_axis(self, *args):
+                self.calls.append(args)
+                return False, "send failed"
+
+            def stop_axes(self, axes):
+                self.calls.append(("stop_axes", axes))
+                return True, None
+
+            def stop_all_axes(self):
+                self.calls.append(("stop_all_axes",))
+                return True, None
+
+        osc = FailingOsc()
+        service.osc = osc  # type: ignore[assignment]
+
+        failed = service.set_locomotion(1.0, 0.0, 1000)
+        self.assertEqual(failed, (False, "send failed"))
+        self.assertIn(("stop_axes", ("move_vertical", "move_horizontal")), osc.calls)
+        self.assertFalse(service.set_locomotion(float("nan"), 0.0, 1000)[0])
+        self.assertFalse(service.set_locomotion(1.0, 0.0, -1)[0])
+        self.assertFalse(service.set_turn(0.0, float("inf"))[0])
+        self.assertFalse(service.pulse_input("grab", "right", float("nan"))[0])
+        self.assertFalse(service.pulse_input("grab", "right", -1)[0])
+
+    def test_osc_service_propagates_stop_result(self) -> None:
+        service = BackendService({}, Path.cwd())
+
+        class Osc:
+            def stop_all_axes(self):
+                return False, "zero packet failed"
+
+        service.osc = Osc()  # type: ignore[assignment]
+        self.assertEqual(service.stop_movement(), (False, "zero packet failed"))
+
     def test_scheduler_snapshot_contains_safe_awareness_when_backend_is_down(self) -> None:
         class DownClient:
             def request(self, *_args, **_kwargs):

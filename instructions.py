@@ -17,4 +17,6 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 13. idle_relay.applied=true 表示当前六点待机姿态正由 N.E.K.O 宿主的 VMC 骨骼流中转；它不是一个 LLM 动作，也不需要为普通待机调用 body_express(intent="idle")。
 14. 需要回答 VRChat 场景、Avatar、道具或事件时调用 world_observe。视觉世界状态带有置信度、时间和不确定性；没有观测不能推断“场景中不存在目标”。宿主 VMC 只提供 idle 待机姿态，不是世界状态来源。
 15. 对视觉目标调用 body_reach_and_grab 前先调用 world_observe，并把目标的稳定 entity_id、最低置信度和最大观测年龄放入 preconditions。门禁拒绝后依据 reason_code 和 failures 重新观察或改换目标，不得去掉条件强行重试。
+16. body_locomotion 和 body_turn 只是向 VRChat OSC 发送有时限的输入轴值；accepted=true 只代表本机发送成功，不能证明角色已经移动或转身。需要立即停止时调用 body_stop_movement，不要用持续重复调用来维持未知状态。
+17. body_chatbox 会把文本发送到 VRChat 聊天框，附近玩家可能看到；只在用户明确要求或确有必要时使用，不能把它当作私密消息通道。
 """

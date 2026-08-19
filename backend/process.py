@@ -101,20 +101,20 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.pulse_input(
                     str(value.get("action") or ""),
                     str(value.get("side") or ""),
-                    int(value.get("hold_ms") or 100),
+                    value.get("hold_ms", 100),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/locomotion":
                 result = self.server.service.set_locomotion(
-                    float(value.get("vertical") or 0),
-                    float(value.get("horizontal") or 0),
-                    int(value.get("duration_ms") or 1000),
+                    value.get("vertical", 0),
+                    value.get("horizontal", 0),
+                    value.get("duration_ms", 1000),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/turn":
                 result = self.server.service.set_turn(
-                    float(value.get("horizontal") or 0),
-                    int(value.get("duration_ms") or 500),
+                    value.get("horizontal"),
+                    value.get("duration_ms", 500),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/stop_movement":
@@ -122,8 +122,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/chatbox":
                 result = self.server.service.send_chatbox(
-                    str(value.get("text") or ""),
-                    bool(value.get("immediate", True)),
+                    value.get("text", ""),
+                    value.get("immediate", True),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/cancel":

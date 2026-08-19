@@ -37,6 +37,10 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("body_express", commands)
         self.assertIn("body_avatar_parameter", commands)
         self.assertIn("body_vrchat_input", commands)
+        self.assertIn("body_locomotion", commands)
+        self.assertIn("body_turn", commands)
+        self.assertIn("body_stop_movement", commands)
+        self.assertIn("body_chatbox", commands)
 
         plugin_class = next(
             node for node in tree.body

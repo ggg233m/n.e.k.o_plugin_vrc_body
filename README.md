@@ -21,6 +21,8 @@
 - 用 `body_awareness` 读取 LLM 可理解的当前/上一动作、切换关系、完成状态、剩余时间和实际语义姿态。
 - 用 `body_avatar_parameter` 触发当前 Avatar 已配置的 Bool、Int 或 Float Animator 参数。
 - 用 `body_vrchat_input` 安全脉冲 Grab、Use 或 Drop，并自动发送释放值。
+- 用 `body_locomotion`、`body_turn` 发送有时限的 VRChat 移动/转身轴值，或用 `body_stop_movement` 立即归零。
+- 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
 - 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status` 与 `body_awareness`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
 - 独立线程以 60 Hz 向 `127.0.0.1:39570` 发送完整 UDP 帧。
@@ -125,9 +127,13 @@ awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", 
 body_avatar_parameter(name="NEKO_Action", value=2)
 body_avatar_parameter(name="NEKO_ActionActive", value=true)
 body_vrchat_input(action="grab", side="right", hold_ms=100)
+body_locomotion(vertical=1.0, horizontal=0.0, duration_ms=1000)
+body_turn(horizontal=-0.5, duration_ms=500)
+body_stop_movement()
+body_chatbox(text="你好", immediate=true)
 ```
 
-传入不存在的 Avatar 参数时，OSC 数据报仍可能成功发送，但 VRChat 不会产生对应动作。`body_reach_and_grab` 会在动作最后 15% 自动安排同侧 `/input/GrabLeft` 或 `/input/GrabRight` 脉冲；动作被替换时守卫会阻止尚未发生的按下，急停、取消、复位、禁用和插件关闭都会清空定时输入并发送释放值。
+传入不存在的 Avatar 参数时，OSC 数据报仍可能成功发送，但 VRChat 不会产生对应动作。VRChat 的移动轴必须使用 -1..1 的浮点数并在结束时归零；本插件对每次移动/转身设置 100–10000 ms 的自动归零超时，`body_stop_movement` 会同时归零三条轴。`accepted=true` 只代表本机 UDP 发送成功，不代表 VRChat 已移动或转身。`body_reach_and_grab` 会在动作最后 15% 自动安排同侧 `/input/GrabLeft` 或 `/input/GrabRight` 脉冲；动作被替换时守卫会阻止尚未发生的按下，急停、取消、复位、禁用和插件关闭都会清空定时输入并发送释放值。聊天框不是私密通道，附近玩家可能看到。
 
 ## 调试 UI
 

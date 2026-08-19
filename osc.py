@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import heapq
 import itertools
@@ -29,6 +30,8 @@ _AXIS_ADDRESSES = {
     "move_vertical": "/input/Vertical",
     "move_horizontal": "/input/Horizontal",
     "look_horizontal": "/input/LookHorizontal",
+}
+_BUTTON_ADDRESSES = {
     "move_forward": "/input/MoveForward",
     "move_backward": "/input/MoveBackward",
     "move_left": "/input/MoveLeft",
@@ -38,6 +41,8 @@ _AXIS_ADDRESSES = {
     "run": "/input/Run",
     "jump": "/input/Jump",
 }
+_INPUT_HOLD_MIN_MS = 20
+_INPUT_HOLD_MAX_MS = 1000
 
 
 class OscProtocolError(ValueError):
@@ -251,7 +256,11 @@ class VrchatOscBridge:
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
         self._held_inputs: set[tuple[str, str]] = set()
-        self._active_axes: dict[str, tuple[float, float]] = {}  # {axis: (value, expires_at)}
+        self._held_buttons: set[str] = set()
+        # {axis: (value, expires_at, generation)}.  The generation prevents
+        # an old expiry callback from zeroing a newer command for the same axis.
+        self._active_axes: dict[str, tuple[float, float, int]] = {}
+        self._axis_generation = itertools.count()
         self._receiver_listening = False
         self._sent_packets = 0
         self._send_failures = 0
@@ -295,7 +304,6 @@ class VrchatOscBridge:
 
     def stop(self, timeout: float = 2.0) -> None:
         if self.config.enabled and self._send_socket is not None:
-            self.stop_all_axes()
             self.cancel_scheduled_inputs(release=True)
         self._stop_event.set()
         self._wake_event.set()
@@ -352,24 +360,26 @@ class VrchatOscBridge:
 
     def send_chatbox(self, text: Any, *, immediate: bool = True) -> tuple[bool, str | None]:
         """通过 /chatbox/input 发送聊天框文本。"""
-        if text is None:
-            return False, "text is required"
-        message = str(text).replace("\x00", "").strip()
-        if not message:
-            return False, "text is required"
-        if len(message) > 144:
-            message = message[:144]
-        return self._send("/chatbox/input", (message, bool(immediate), False))
+        if not isinstance(text, str):
+            return False, "text must be a string"
+        if not isinstance(immediate, bool):
+            return False, "immediate must be a boolean"
+        message = text.replace("\x00", "").strip()
+        if not message or len(message) > 144:
+            return False, "text must be between 1 and 144 characters"
+        return self._send("/chatbox/input", (message, immediate, False))
 
     def send_input(self, action: str, side: str, pressed: bool) -> tuple[bool, str | None]:
+        if not isinstance(pressed, bool):
+            return False, "pressed must be a boolean"
         normalized_action = str(action).strip().lower()
         normalized_side = str(side).strip().lower()
         address = _INPUT_ADDRESSES.get((normalized_action, normalized_side))
         if address is None:
             return False, "action/side must identify grab, use, or drop for left or right"
-        sent, reason = self._send(address, (1 if pressed else 0,))
-        if sent:
-            with self._lock:
+        with self._lock:
+            sent, reason = self._send(address, (1 if pressed else 0,))
+            if sent:
                 key = (normalized_action, normalized_side)
                 if pressed:
                     self._held_inputs.add(key)
@@ -377,12 +387,59 @@ class VrchatOscBridge:
                     self._held_inputs.discard(key)
         return sent, reason
 
+    def send_button(self, button: str, pressed: bool) -> tuple[bool, str | None]:
+        """Send one of VRChat's button-style input addresses.
+
+        Button inputs require OSC integers (1/0), whereas movement axes use
+        floats.  Keeping this path separate prevents callers from accidentally
+        sending a float to e.g. ``/input/Jump``.
+        """
+        if not isinstance(pressed, bool):
+            return False, "pressed must be a boolean"
+        normalized = str(button).strip().lower().replace("-", "_")
+        address = _BUTTON_ADDRESSES.get(normalized)
+        if address is None:
+            return False, f"unknown button: {button}"
+        with self._lock:
+            sent, reason = self._send(address, (1 if pressed else 0,))
+            if sent:
+                if pressed:
+                    self._held_buttons.add(normalized)
+                else:
+                    self._held_buttons.discard(normalized)
+        return sent, reason
+
+    @staticmethod
+    def _normalize_hold_ms(value: Any, default: int) -> int | None:
+        if value is None:
+            value = default
+        if isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(numeric)
+            or not numeric.is_integer()
+            or not _INPUT_HOLD_MIN_MS <= numeric <= _INPUT_HOLD_MAX_MS
+        ):
+            return None
+        return int(numeric)
+
     def pulse_input(self, action: str, side: str, hold_ms: int | None = None) -> tuple[bool, str | None]:
-        duration_ms = self.config.input_pulse_ms if hold_ms is None else hold_ms
+        duration_ms = self._normalize_hold_ms(hold_ms, self.config.input_pulse_ms)
+        if duration_ms is None:
+            return False, f"hold_ms must be an integer between {_INPUT_HOLD_MIN_MS} and {_INPUT_HOLD_MAX_MS}"
         sent, reason = self.send_input(action, side, True)
         if not sent:
             return False, reason
-        self._schedule_input(action, side, False, duration_ms / 1000.0)
+        try:
+            self._schedule_input(action, side, False, duration_ms / 1000.0)
+        except (TypeError, ValueError) as exc:
+            # Do not leave a pressed VRChat input behind if scheduling fails.
+            self.send_input(action, side, False)
+            return False, str(exc)
         return True, None
 
     def schedule_input_pulse(
@@ -396,14 +453,24 @@ class VrchatOscBridge:
     ) -> bool:
         if not self.config.enabled or self._send_socket is None:
             return False
-        duration_ms = self.config.input_pulse_ms if hold_ms is None else hold_ms
+        if isinstance(delay_s, bool):
+            return False
+        try:
+            delay = float(delay_s)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(delay) or delay < 0.0:
+            return False
+        duration_ms = self._normalize_hold_ms(hold_ms, self.config.input_pulse_ms)
+        if duration_ms is None:
+            return False
         pulse_id = next(self._pulse_sequence)
-        self._schedule_input(action, side, True, max(0.0, delay_s), guard=guard, pulse_id=pulse_id)
+        self._schedule_input(action, side, True, delay, guard=guard, pulse_id=pulse_id)
         self._schedule_input(
             action,
             side,
             False,
-            max(0.0, delay_s) + duration_ms / 1000.0,
+            delay + duration_ms / 1000.0,
             pulse_id=pulse_id,
         )
         return True
@@ -440,56 +507,167 @@ class VrchatOscBridge:
             self._scheduled.clear()
             self._started_pulses.clear()
             held = tuple(self._held_inputs)
+            held_buttons = tuple(self._held_buttons)
         if release:
             # Release known pressed inputs, then send all supported releases so
             # a lost local state update can never leave a VRChat button stuck.
             keys = set(held) | set(_INPUT_ADDRESSES)
             for action, side in sorted(keys):
                 self.send_input(action, side, False)
+            # Release button-style movement inputs too.  This is intentionally
+            # separate from axis zeroing because VRChat expects integer 0 for
+            # buttons and float 0.0 for axes.
+            buttons = set(held_buttons) | set(_BUTTON_ADDRESSES)
+            for button in sorted(buttons):
+                self.send_button(button, False)
             self.stop_all_axes()
         self._wake_event.set()
 
-    def set_axis(self, axis: str, value: float, duration_s: float = 0.0) -> tuple[bool, str | None]:
-        """持续设置移动/转向轴。duration_s=0 表示立即归零，>0 表示保持后自动归零。"""
-        normalized_axis = str(axis).strip().lower().replace("-", "_")
-        address = _AXIS_ADDRESSES.get(normalized_axis)
-        if address is None:
-            return False, f"unknown axis: {axis}"
-        clamped = max(-1.0, min(1.0, float(value)))
-        sent, reason = self._send(address, (clamped,))
-        if sent:
-            with self._lock:
-                if duration_s > 0.0:
-                    self._active_axes[normalized_axis] = (clamped, self._clock() + duration_s)
-                else:
-                    self._active_axes.pop(normalized_axis, None)
-            self._wake_event.set()
-        return sent, reason
+    @staticmethod
+    def _normalize_axis_value(value: Any, name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be a finite number") from exc
+        if not math.isfinite(numeric) or not -1.0 <= numeric <= 1.0:
+            raise ValueError(f"{name} must be between -1 and 1")
+        return numeric
 
-    def stop_all_axes(self) -> None:
-        """立即归零所有移动轴。"""
+    @staticmethod
+    def _normalize_axis_name(axis: Any) -> str:
+        normalized = str(axis).strip().lower().replace("-", "_")
+        if normalized not in _AXIS_ADDRESSES:
+            raise ValueError(f"unknown axis: {axis}")
+        return normalized
+
+    def set_axes(
+        self,
+        values: Mapping[str, Any],
+        duration_s: float = 0.0,
+    ) -> tuple[bool, str | None]:
+        """Set several float axes as one serialized command.
+
+        Validation, packets, active-state bookkeeping, and rollback all happen
+        under one lock. This prevents an emergency stop from landing between
+        the two packets of a diagonal locomotion command.
+        """
+        if not isinstance(values, Mapping) or not values:
+            return False, "axis values must be a non-empty object"
+        if isinstance(duration_s, bool):
+            return False, "axis duration must be a finite non-negative number"
+        try:
+            duration = float(duration_s)
+        except (TypeError, ValueError, OverflowError):
+            return False, "axis duration must be a finite non-negative number"
+        if not math.isfinite(duration) or duration < 0.0:
+            return False, "axis duration must be finite and non-negative"
+
+        normalized: list[tuple[str, float]] = []
+        try:
+            for raw_axis, raw_value in values.items():
+                axis = self._normalize_axis_name(raw_axis)
+                numeric = self._normalize_axis_value(raw_value, "axis value")
+                if duration == 0.0 and numeric != 0.0:
+                    return False, "a non-zero axis value requires a positive duration"
+                normalized.append((axis, numeric))
+        except ValueError as exc:
+            return False, str(exc)
+
+        failures: list[str] = []
         with self._lock:
-            axes = list(self._active_axes.keys())
-            self._active_axes.clear()
-        for axis in axes:
-            address = _AXIS_ADDRESSES.get(axis)
-            if address:
-                self._send(address, (0.0,))
+            for axis, numeric in normalized:
+                sent, reason = self._send(_AXIS_ADDRESSES[axis], (numeric,))
+                if not sent:
+                    failures.append(f"{axis}: {reason or 'send failed'}")
+                    break
+
+            if failures:
+                # Release every requested axis, including the one whose
+                # non-zero packet failed, and retain bookkeeping when a zero
+                # packet itself cannot be sent.
+                for axis in dict.fromkeys(item[0] for item in normalized):
+                    released, release_reason = self._send(_AXIS_ADDRESSES[axis], (0.0,))
+                    if released:
+                        self._active_axes.pop(axis, None)
+                    else:
+                        failures.append(f"{axis} rollback: {release_reason or 'send failed'}")
+            else:
+                expires_at = self._clock() + duration
+                for axis, numeric in normalized:
+                    if duration > 0.0:
+                        self._active_axes[axis] = (
+                            numeric,
+                            expires_at,
+                            next(self._axis_generation),
+                        )
+                    else:
+                        self._active_axes.pop(axis, None)
+
         self._wake_event.set()
+        if failures:
+            return False, "; ".join(failures)[:500]
+        return True, None
+
+    def set_axis(self, axis: str, value: float, duration_s: float = 0.0) -> tuple[bool, str | None]:
+        """持续设置一个移动/转向轴。"""
+        return self.set_axes({axis: value}, duration_s)
+
+    def stop_axes(self, axes: Iterable[str] | None = None) -> tuple[bool, str | None]:
+        """立即归零指定的轴；没有指定时归零全部已知轴。
+
+        Zero packets are sent while holding the state lock so a concurrent
+        command cannot be inserted between state clearing and the safety
+        release. Failed releases for active axes remain tracked and are
+        retried by the expiry loop or a subsequent stop call.
+        """
+        if axes is None:
+            requested = list(_AXIS_ADDRESSES)
+        else:
+            requested = []
+            for raw_axis in axes:
+                normalized = str(raw_axis).strip().lower().replace("-", "_")
+                if normalized not in _AXIS_ADDRESSES:
+                    return False, f"unknown axis: {raw_axis}"
+                if normalized not in requested:
+                    requested.append(normalized)
+        failures: list[str] = []
+        with self._lock:
+            for axis in requested:
+                address = _AXIS_ADDRESSES[axis]
+                sent, reason = self._send(address, (0.0,))
+                if sent:
+                    self._active_axes.pop(axis, None)
+                else:
+                    failures.append(f"{axis}: {reason or 'send failed'}")
+        self._wake_event.set()
+        if failures:
+            return False, "; ".join(failures)[:500]
+        return True, None
+
+    def stop_all_axes(self) -> tuple[bool, str | None]:
+        """立即归零所有已知移动轴."""
+        return self.stop_axes()
 
     def _run_axis_expirations(self) -> None:
         """检查并归零过期的轴。"""
         now = self._clock()
-        expired: list[str] = []
+        expired: list[tuple[str, int]] = []
         with self._lock:
-            for axis, (value, expires_at) in list(self._active_axes.items()):
+            for axis, (_value, expires_at, generation) in list(self._active_axes.items()):
                 if now >= expires_at:
-                    expired.append(axis)
-                    del self._active_axes[axis]
-        for axis in expired:
-            address = _AXIS_ADDRESSES.get(axis)
-            if address:
-                self._send(address, (0.0,))
+                    expired.append((axis, generation))
+            # Keep the lock while sending the release.  This makes the
+            # generation check and the physical zero packet one atomic action
+            # relative to set_axis().
+            for axis, generation in expired:
+                current = self._active_axes.get(axis)
+                if current is None or current[2] != generation:
+                    continue
+                sent, _reason = self._send(_AXIS_ADDRESSES[axis], (0.0,))
+                if sent:
+                    self._active_axes.pop(axis, None)
 
     def _run_due_inputs(self) -> None:
         now = self._clock()
@@ -607,13 +785,14 @@ class VrchatOscBridge:
                 "avatar_changed_at_unix": self._avatar_changed_at_unix,
                 "parameter_count": len(self._parameters),
                 "held_inputs": [f"{action}_{side}" for action, side in sorted(self._held_inputs)],
+                "held_buttons": sorted(self._held_buttons),
                 "scheduled_inputs": len(self._scheduled),
                 "active_axes": {
                     axis: {
                         "value": value,
                         "remaining_ms": max(0.0, (expires_at - now) * 1000.0),
                     }
-                    for axis, (value, expires_at) in sorted(self._active_axes.items())
+                    for axis, (value, expires_at, _generation) in sorted(self._active_axes.items())
                 },
                 "sent_packets": self._sent_packets,
                 "send_failures": self._send_failures,
