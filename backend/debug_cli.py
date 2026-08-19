@@ -145,8 +145,20 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=48912)
     parser.add_argument("--token", required=True)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("health", "snapshot", "awareness", "cognition", "shutdown"):
+    for name in ("health", "snapshot", "awareness", "cognition", "perception", "autonomy-status", "shutdown"):
         sub.add_parser(name)
+    world_delta = sub.add_parser("world-delta", help="long-poll world changes")
+    world_delta.add_argument("--after-revision", type=int, default=0)
+    world_delta.add_argument("--wait-ms", type=int, default=250)
+    autonomy_arm = sub.add_parser("autonomy-arm", help="manually arm the current session")
+    autonomy_arm.add_argument("--ttl-s", type=float, default=None)
+    autonomy_disarm = sub.add_parser("autonomy-disarm")
+    autonomy_disarm.add_argument("--reason", default="manual_disarm")
+    autonomy_goal = sub.add_parser("autonomy-goal")
+    autonomy_goal.add_argument("--goal", required=True)
+    autonomy_goal.add_argument("--kind", default="explore")
+    autonomy_stop = sub.add_parser("autonomy-stop")
+    autonomy_stop.add_argument("--reason", default="autonomy_stop")
     action = sub.add_parser("action")
     action.add_argument("--kind", required=True)
     action.add_argument("--json", default=None)
@@ -182,6 +194,15 @@ def main() -> int:
     turn.add_argument("--horizontal", type=float, required=True)
     turn.add_argument("--duration-ms", type=int, default=500)
     sub.add_parser("stop-movement", help="zero VRChat movement and turn axes")
+    controller = sub.add_parser("controller", help="send a virtual Index stick or button input")
+    controller.add_argument("--side", choices=("left", "right"), required=True)
+    controller.add_argument("--control", choices=("stick", "trigger", "grip", "menu", "a", "b"), required=True)
+    controller.add_argument("--x", type=float, default=0.0)
+    controller.add_argument("--y", type=float, default=0.0)
+    controller.add_argument("--pressed", action="store_true", default=True)
+    controller.add_argument("--release", action="store_false", dest="pressed")
+    controller.add_argument("--value", type=float, default=1.0)
+    controller.add_argument("--duration-ms", type=int, default=250)
     chatbox = sub.add_parser("chatbox", help="send text to the VRChat chatbox")
     chatbox.add_argument("--text", required=True)
     chatbox.add_argument(
@@ -204,6 +225,23 @@ def main() -> int:
             result = request(args.host, args.port, args.token, "GET", "/awareness")
         elif args.command == "cognition":
             result = request(args.host, args.port, args.token, "GET", "/cognition")
+        elif args.command == "perception":
+            result = request(args.host, args.port, args.token, "GET", "/perception")
+        elif args.command == "autonomy-status":
+            result = request(args.host, args.port, args.token, "GET", "/autonomy")
+        elif args.command == "world-delta":
+            result = request(
+                args.host, args.port, args.token, "GET",
+                f"/world/delta?after_revision={args.after_revision}&wait_ms={args.wait_ms}",
+            )
+        elif args.command == "autonomy-arm":
+            result = request(args.host, args.port, args.token, "POST", "/autonomy/arm", {} if args.ttl_s is None else {"ttl_s": args.ttl_s})
+        elif args.command == "autonomy-disarm":
+            result = request(args.host, args.port, args.token, "POST", "/autonomy/disarm", {"reason": args.reason})
+        elif args.command == "autonomy-goal":
+            result = request(args.host, args.port, args.token, "POST", "/autonomy/goal", {"text": args.goal, "kind": args.kind})
+        elif args.command == "autonomy-stop":
+            result = request(args.host, args.port, args.token, "POST", "/autonomy/stop", {"reason": args.reason})
         elif args.command == "shutdown":
             result = request(args.host, args.port, args.token, "POST", "/shutdown", {})
         elif args.command == "plan":
@@ -284,6 +322,13 @@ def main() -> int:
             )
         elif args.command == "stop-movement":
             result = request(args.host, args.port, args.token, "POST", "/osc/stop_movement", {})
+        elif args.command == "controller":
+            result = request(
+                args.host, args.port, args.token, "POST", "/input/axes" if args.control == "stick" else "/input/button",
+                ({"side": args.side, "x": args.x, "y": args.y, "duration_ms": args.duration_ms}
+                 if args.control == "stick" else
+                 {"side": args.side, "button": args.control, "pressed": args.pressed, "value": args.value, "hold_ms": args.duration_ms}),
+            )
         elif args.command == "chatbox":
             result = request(
                 args.host,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -21,7 +22,19 @@ from .adapters import (
     resolve_expression,
 )
 from .cognition import CognitionRuntime
-from .vision import FrameDetector, FrameSource, VisionObservation, VisionRuntime, VisionWorker
+from .autonomy import AutonomyRuntime
+from .vision import (
+    DesktopMirrorFrameSource,
+    DxcamFrameSource,
+    FrameDetector,
+    FrameSource,
+    OpenVinoLocalDetector,
+    OpenAICompatibleSemanticBackend,
+    MssFrameSource,
+    VisionObservation,
+    VisionRuntime,
+    VisionWorker,
+)
 from .world_state import WorldStateStore
 
 
@@ -45,6 +58,19 @@ def _osc_axis_value(value: Any, name: str) -> float:
         raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(numeric) or not _OSC_AXIS_MIN <= numeric <= _OSC_AXIS_MAX:
         raise ValueError(f"{name} must be between {_OSC_AXIS_MIN:g} and {_OSC_AXIS_MAX:g}")
+    return numeric
+
+
+def _controller_value(value: Any, name: str) -> float:
+    """Normalize trigger/grip values (AnyaDance protocol uses 0..1)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
     return numeric
 
 
@@ -88,6 +114,20 @@ def _osc_hold_ms(value: Any, default: int) -> int:
     return int(numeric)
 
 
+def _controller_hold_ms(value: Any, default: int, maximum: int) -> int:
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError("hold_ms must be an integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("hold_ms must be an integer") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer() or not 20 <= numeric <= maximum:
+        raise ValueError(f"hold_ms must be an integer between 20 and {maximum}")
+    return int(numeric)
+
+
 class _DryRunDatagramTransport:
     """只记录帧数、不触碰网络的调度器传输层。"""
 
@@ -120,14 +160,43 @@ class BackendService:
         self.config_dir = Path(config_dir)
         self.logger = logger
         self.dry_run = bool(dry_run)
+        if vision_source is None and self.config.vision.enabled and self.config.vision.source != "external" and self.config.vision.capture in {
+            "desktop_mirror", "dxcam", "mss"
+        }:
+            # Capture/model dependencies remain optional and are instantiated
+            # only when vision is explicitly enabled.
+            if self.config.vision.capture == "mss" or self.config.vision.source == "mss":
+                vision_source = MssFrameSource()
+            elif self.config.vision.capture == "dxcam":
+                vision_source = DxcamFrameSource()
+            else:
+                vision_source = DesktopMirrorFrameSource()
         self._vision_source = vision_source
+        if vision_detector is None and self.config.vision.enabled and self.config.vision.local_backend == "openvino":
+            vision_detector = OpenVinoLocalDetector(model_path=os.getenv("VRC_OPENVINO_MODEL"))
+        vision_semantic: Any | None = None
+        if self.config.vision.enabled and self.config.vision.semantic_backend == "openai_compatible":
+            endpoint = os.getenv("VRC_VLM_ENDPOINT") or os.getenv("OPENAI_BASE_URL")
+            model = os.getenv("VRC_VLM_MODEL") or os.getenv("OPENAI_VLM_MODEL") or "gpt-4o-mini"
+            if endpoint:
+                vision_semantic = OpenAICompatibleSemanticBackend(
+                    endpoint=endpoint,
+                    model=model,
+                    max_per_minute=self.config.vision.semantic_max_per_minute,
+                )
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
         self.world_state = WorldStateStore(
             lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
+            persistence_path=self.config_dir / "world_memory.json",
+            # Keep library/test callers isolated unless the section is
+            # explicitly present; the shipped plugin.toml enables it.
+            persist_world=self.config.world_memory.persist_world and "world_memory" in config_data,
+            persist_players=self.config.world_memory.persist_players and "world_memory" in config_data,
         )
         self.vision = VisionRuntime(
             self.world_state,
             detector=vision_detector,
+            semantic=vision_semantic,
             observation_callback=self._on_vision_observation,
         )
         self.vision_worker: VisionWorker | None = None
@@ -145,6 +214,11 @@ class BackendService:
         self._last_error: str | None = None
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
+        self.autonomy = AutonomyRuntime(
+            world_provider=lambda: self.world_state.snapshot(),
+            release_inputs=self._release_all_inputs,
+            session_ttl_s=self.config.autonomy.session_ttl_minutes * 60.0,
+        )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
             "count": 0,
@@ -219,6 +293,28 @@ class BackendService:
             },
             "vision_worker": worker,
         }
+
+    def _apply_driver_sender_conflict(self, body: dict[str, Any], driver: Mapping[str, Any]) -> None:
+        """Use driver telemetry to detect another writer of UDP latest-state."""
+        senders = [str(item) for item in (driver.get("senders") or ()) if item]
+        local_port = (body.get("udp") or {}).get("local_port")
+        others: list[str] = []
+        for sender in senders:
+            try:
+                sender_port = int(sender.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                sender_port = None
+            if local_port is None or sender_port != int(local_port):
+                others.append(sender)
+        udp = body.setdefault("udp", {})
+        udp["other_senders"] = others
+        if others:
+            body["concurrent_sender_detection"] = "concurrent"
+            state = self.autonomy.snapshot()
+            if state.get("armed"):
+                self.autonomy.disarm("another AnyaDance UDP sender detected")
+        else:
+            body["concurrent_sender_detection"] = "none" if senders else "unsupported"
 
     def start(self) -> None:
         with self._lock:
@@ -320,6 +416,12 @@ class BackendService:
 
     def stop(self) -> None:
         with self._lock:
+            # Disarming first releases both the virtual controller overlay and
+            # OSC fallback before worker/socket teardown.
+            try:
+                self.autonomy.disarm("backend_stopped")
+            except Exception:
+                pass
             self._stop_vmc_calibration()
             if self.vision_worker:
                 self.vision_worker.stop()
@@ -340,6 +442,54 @@ class BackendService:
             self.host_vmc = None
             self.vmc_idle = None
             self._started = False
+
+    def _release_all_inputs(self) -> None:
+        """Best-effort emergency release used by autonomy and shutdown paths."""
+        scheduler = self.scheduler
+        if scheduler is not None:
+            try:
+                scheduler.submit("input_release", {"side": "all"})
+            except Exception:
+                pass
+        osc = self.osc
+        if osc is not None:
+            try:
+                osc.cancel_scheduled_inputs()
+            except Exception:
+                pass
+            try:
+                osc.stop_all_axes()
+            except Exception:
+                pass
+
+    def autonomy_snapshot(self) -> dict[str, Any]:
+        return self.autonomy.snapshot()
+
+    def autonomy_arm(self, ttl_s: Any = None) -> dict[str, Any]:
+        try:
+            normalized = None if ttl_s is None else float(ttl_s)
+        except (TypeError, ValueError, OverflowError):
+            return {"accepted": False, "reason": "ttl_s must be a number", **self.autonomy.snapshot()}
+        return {"accepted": True, **self.autonomy.arm(ttl_s=normalized)}
+
+    def autonomy_disarm(self, reason: Any = "manual_disarm") -> dict[str, Any]:
+        return {"accepted": True, **self.autonomy.disarm(str(reason or "manual_disarm"))}
+
+    def autonomy_goal(self, text: Any, kind: Any = "explore") -> dict[str, Any]:
+        normalized_kind = str(kind or "explore").strip().lower()
+        if normalized_kind in {"approach", "follow", "interact", "socialize"}:
+            vision = self.vision.snapshot().get("vision") or {}
+            semantic = vision.get("semantic") if isinstance(vision, Mapping) else {}
+            if isinstance(semantic, Mapping) and semantic.get("last_error"):
+                return {
+                    "accepted": False,
+                    "reason": "semantic vision is degraded; only safe exploration is allowed",
+                    **self.autonomy.snapshot(),
+                }
+        return self.autonomy.submit_goal(text, kind)
+
+    def autonomy_stop(self, reason: Any = "autonomy_stop") -> dict[str, Any]:
+        return {"accepted": True, **self.autonomy.stop(str(reason or "autonomy_stop"))}
 
     def attach_vision(self, source: FrameSource, detector: FrameDetector) -> dict[str, Any]:
         """注入外部 detector；模型包和采集实现由调用方负责。"""
@@ -501,10 +651,12 @@ class BackendService:
             "current_action": None,
             "queue_length": 0,
         }
+        driver_log = self.driver_log.snapshot() if self.driver_log else {"enabled": False}
+        self._apply_driver_sender_conflict(body, driver_log)
         return {
             "body": body,
             "vrchat_osc": self.osc.snapshot() if self.osc else {"enabled": False},
-            "driver_log": self.driver_log.snapshot() if self.driver_log else {"enabled": False},
+            "driver_log": driver_log,
             "idle_relay": self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False},
             "host_vmc": self.host_vmc.snapshot() if self.host_vmc else {"managed": False, "active": False},
             "world": self.vision.snapshot(),
@@ -514,6 +666,7 @@ class BackendService:
                 "reason": "not_configured",
             },
             "cognition": self.cognition.snapshot(),
+            "autonomy": self.autonomy.snapshot(),
             "control_latency": self.control_metrics_snapshot(),
             "backend": {
                 "started": self._started,
@@ -557,6 +710,22 @@ class BackendService:
         awareness["vrchat_osc"] = self.osc.awareness() if self.osc else {"enabled": False}
         return awareness
 
+    def world_delta(self, after_revision: Any = 0, *, wait_ms: Any = 250, limit: Any = 16) -> dict[str, Any]:
+        """Long-poll the world store without entering the body control path."""
+        result = self.world_state.delta(after_revision, wait_ms=wait_ms, limit=limit)
+        self.autonomy.update_world(result.get("world"))
+        return result
+
+    def perception(self) -> dict[str, Any]:
+        return {
+            "world": self.vision.snapshot(),
+            "worker": self.vision_worker.status() if self.vision_worker else {
+                "enabled": False,
+                "running": False,
+                "reason": "not_configured",
+            },
+        }
+
     def send_avatar_parameter(self, name: str, value: Any) -> tuple[bool, str | None]:
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
@@ -567,9 +736,34 @@ class BackendService:
             normalized_hold = _osc_hold_ms(hold_ms, self.config.vrchat_osc.input_pulse_ms)
         except ValueError as exc:
             return False, str(exc)
+        normalized_action = str(action or "").strip().lower()
+        normalized_side = str(side or "").strip().lower()
+        if normalized_action not in {"grab", "use", "drop"} or normalized_side not in {"left", "right"}:
+            return False, "action/side must identify grab, use, or drop for left or right"
+
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            if normalized_action == "drop":
+                result = self.scheduler.submit(
+                    "input_button",
+                    {"side": normalized_side, "button": "grip", "pressed": False},
+                )
+            else:
+                result = self.scheduler.submit(
+                    "input_button",
+                    {
+                        "side": normalized_side,
+                        "button": "grip" if normalized_action == "grab" else "trigger",
+                        "pressed": True,
+                        "value": 1.0,
+                        "hold_ms": normalized_hold,
+                    },
+                )
+            if result.get("accepted") or not self.config.input.osc_fallback:
+                return bool(result.get("accepted")), result.get("reason")
+
         if self.osc is None:
-            return False, "VRChat OSC bridge is not initialized"
-        return self.osc.pulse_input(action, side, normalized_hold)
+            return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
+        return self.osc.pulse_input(normalized_action, normalized_side, normalized_hold)
 
     def set_locomotion(self, vertical: Any, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
         try:
@@ -578,8 +772,20 @@ class BackendService:
             normalized_duration = _osc_duration_ms(duration_ms, 1000)
         except ValueError as exc:
             return False, str(exc)
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            result = self.scheduler.submit(
+                "input_axes",
+                {
+                    "side": "left",
+                    "x": normalized_horizontal,
+                    "y": normalized_vertical,
+                    "duration_ms": min(normalized_duration, self.config.input.max_hold_ms),
+                },
+            )
+            if result.get("accepted") or not self.config.input.osc_fallback:
+                return bool(result.get("accepted")), result.get("reason")
         if self.osc is None:
-            return False, "VRChat OSC bridge is not initialized"
+            return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
         duration_s = normalized_duration / 1000.0
         set_axes = getattr(self.osc, "set_axes", None)
         if callable(set_axes):
@@ -616,8 +822,20 @@ class BackendService:
             normalized_duration = _osc_duration_ms(duration_ms, 500)
         except ValueError as exc:
             return False, str(exc)
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            result = self.scheduler.submit(
+                "input_axes",
+                {
+                    "side": "right",
+                    "x": normalized_horizontal,
+                    "y": 0.0,
+                    "duration_ms": min(normalized_duration, self.config.input.max_hold_ms),
+                },
+            )
+            if result.get("accepted") or not self.config.input.osc_fallback:
+                return bool(result.get("accepted")), result.get("reason")
         if self.osc is None:
-            return False, "VRChat OSC bridge is not initialized"
+            return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
         return self.osc.set_axis(
             "look_horizontal",
             normalized_horizontal,
@@ -625,9 +843,117 @@ class BackendService:
         )
 
     def stop_movement(self) -> tuple[bool, str | None]:
-        if self.osc is None:
-            return False, "VRChat OSC bridge is not initialized"
-        return self.osc.stop_all_axes()
+        direct_ok = False
+        direct_reason: str | None = None
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            result = self.scheduler.submit("input_release", {"side": "all"})
+            direct_ok = bool(result.get("accepted"))
+            direct_reason = result.get("reason")
+        osc_ok = True
+        osc_reason: str | None = None
+        if self.osc is not None:
+            osc_ok, osc_reason = self.osc.stop_all_axes()
+        if direct_ok or osc_ok:
+            return True, None
+        return False, direct_reason or osc_reason or "movement release failed"
+
+    def set_controller_axes(self, side: Any, x: Any, y: Any, duration_ms: Any) -> tuple[bool, str | None]:
+        normalized_side = str(side or "").strip().lower()
+        if normalized_side not in {"left", "right"}:
+            return False, "side must be left or right"
+        try:
+            normalized_x = _osc_axis_value(x, "x")
+            normalized_y = _osc_axis_value(y, "y")
+            normalized_duration = _osc_duration_ms(
+                duration_ms,
+                1000,
+                name="duration_ms",
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            result = self.scheduler.submit(
+                "input_axes",
+                {
+                    "side": normalized_side,
+                    "x": normalized_x,
+                    "y": normalized_y,
+                    "duration_ms": min(normalized_duration, self.config.input.max_hold_ms),
+                },
+            )
+            if result.get("accepted") or not self.config.input.osc_fallback:
+                return bool(result.get("accepted")), result.get("reason")
+        if not self.config.input.osc_fallback or self.osc is None:
+            return False, "AnyaDance scheduler is not initialized"
+        if normalized_side == "left":
+            return self.set_locomotion(normalized_y, normalized_x, normalized_duration)
+        return self.set_turn(normalized_x, normalized_duration)
+
+    def set_controller_button(
+        self,
+        side: Any,
+        button: Any,
+        pressed: Any,
+        hold_ms: Any,
+        value: Any = 1.0,
+    ) -> tuple[bool, str | None]:
+        normalized_side = str(side or "").strip().lower()
+        normalized_button = str(button or "").strip().lower()
+        if normalized_side not in {"left", "right"}:
+            return False, "side must be left or right"
+        if normalized_button not in {"trigger", "grip", "menu", "a", "b"}:
+            return False, "unsupported controller button"
+        if not isinstance(pressed, bool):
+            return False, "pressed must be a boolean"
+        try:
+            normalized_value = _controller_value(value, "value")
+            normalized_hold = _controller_hold_ms(
+                hold_ms,
+                self.config.vrchat_osc.input_pulse_ms,
+                self.config.input.max_hold_ms,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+        if self.config.input.primary == "anyadance" and self.scheduler is not None:
+            result = self.scheduler.submit(
+                "input_button",
+                {
+                    "side": normalized_side,
+                    "button": normalized_button,
+                    "pressed": pressed,
+                    "value": normalized_value if pressed else 0.0,
+                    "hold_ms": min(normalized_hold, self.config.input.max_hold_ms),
+                },
+            )
+            if result.get("accepted") or not self.config.input.osc_fallback:
+                return bool(result.get("accepted")), result.get("reason")
+        if not self.config.input.osc_fallback or self.osc is None:
+            return False, "AnyaDance scheduler is not initialized"
+        osc_action = {"grip": "grab", "trigger": "use"}.get(normalized_button)
+        if osc_action is None:
+            return False, "VRChat OSC fallback does not expose this Index button"
+        return self.osc.pulse_input(
+            osc_action if pressed else "drop",
+            normalized_side,
+            min(normalized_hold, _OSC_HOLD_MAX_MS),
+        )
+
+    def release_controller_inputs(self, side: Any = "all") -> tuple[bool, str | None]:
+        normalized_side = str(side or "all").strip().lower()
+        if normalized_side not in {"left", "right", "all"}:
+            return False, "side must be left, right, or all"
+        direct_ok = False
+        direct_reason: str | None = None
+        if self.scheduler is not None:
+            result = self.scheduler.submit("input_release", {"side": normalized_side})
+            direct_ok = bool(result.get("accepted"))
+            direct_reason = result.get("reason")
+        if direct_ok or not self.config.input.osc_fallback:
+            return direct_ok, direct_reason
+        if self.osc is not None:
+            osc_ok, osc_reason = self.osc.stop_all_axes()
+            return osc_ok, osc_reason
+        return False, direct_reason or "AnyaDance scheduler is not initialized"
 
     def send_osc_batch(self, commands: Any) -> dict[str, Any]:
         """Apply a bounded batch of low-latency OSC commands.
@@ -806,6 +1132,7 @@ class BackendService:
             observed_at=observation.observed_at,
             frame_id=observation.frame_id,
         )
+        self.autonomy.update_world(self.vision.snapshot())
 
     def ingest_world(
         self,
@@ -814,6 +1141,7 @@ class BackendService:
         ack_only: bool = False,
     ) -> dict[str, Any]:
         result = self.vision.ingest(observation)
+        self.autonomy.update_world(result)
         if not ack_only:
             return result
         changes = result.get("changes") if isinstance(result.get("changes"), Mapping) else {}

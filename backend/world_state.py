@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import json
 import math
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
@@ -257,6 +259,9 @@ class WorldStateStore:
         event_history_size: int = 64,
         default_ttl_s: float = 2.0,
         clock: Any = time.monotonic,
+        persistence_path: str | Path | None = None,
+        persist_world: bool = False,
+        persist_players: bool = False,
     ) -> None:
         if (
             max_entities < 1
@@ -275,13 +280,19 @@ class WorldStateStore:
         self.event_history_size = event_history_size
         self.default_ttl_s = min(60.0, max(0.1, float(default_ttl_s)))
         self._clock = clock
+        self._persistence_path = Path(persistence_path) if persistence_path else None
+        self._persist_world = bool(persist_world and self._persistence_path)
+        self._persist_players = bool(persist_players)
         self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
         self._entities: dict[str, WorldEntity] = {}
         self._events: deque[WorldEvent] = deque(maxlen=event_history_size)
         self._backend: dict[str, dict[str, Any]] = {}
         self._last_observation_at: float | None = None
+        self._uncertainties: list[str] = []
         self._observation_count = 0
         self._revision = 0
+        self._last_changes: dict[str, Any] = {"removed_entity_ids": [], "removed_entity_count": 0}
         # 精确的生命周期删除和来源/世界重置都会留下水印；
         # 否则延迟的检测器帧可能会复活已离场的实体。
         self._delete_watermarks: dict[tuple[str, str], float] = {}
@@ -291,6 +302,72 @@ class WorldStateStore:
         # 按所有者索引的视图使高频实体检查无需扫描
         # 无关来源的重置围栏
         self._source_reset_index: dict[str, dict[str | None, float]] = {}
+        if self._persist_world:
+            self._load_persisted()
+
+    def _persist_allowed_entity(self, entity: WorldEntity) -> bool:
+        if self._persist_players:
+            return True
+        return not entity.id.startswith(VRCHAT_PLAYER_ID_PREFIX) and not any(
+            source.startswith("vrchat_player") or source == VRCHAT_LOG_SOURCE
+            for source in entity.source
+        )
+
+    def _persist_allowed_event(self, event: WorldEvent) -> bool:
+        if self._persist_players:
+            return True
+        kind = event.kind.lower()
+        return "chat" not in kind and not kind.startswith("player_") and not (
+            event.target_id or ""
+        ).startswith(VRCHAT_PLAYER_ID_PREFIX)
+
+    def _persist_locked(self) -> None:
+        path = self._persistence_path
+        if not self._persist_world or path is None:
+            return
+        try:
+            now = self._clock()
+            entities = [
+                item.to_dict(now=now)
+                for item in self._entities.values()
+                if self._persist_allowed_entity(item)
+            ][: self.max_entities]
+            events = [
+                item.to_dict(now=now)
+                for item in self._events
+                if self._persist_allowed_event(item)
+            ][: self.event_history_size]
+            payload = {"version": 1, "entities": entities, "events": events}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            temporary.replace(path)
+        except Exception:
+            # Persistence is advisory and must never interfere with control or
+            # perception updates.
+            return
+
+    def _load_persisted(self) -> None:
+        path = self._persistence_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            now = self._clock()
+            for raw in (payload.get("entities") or ())[: self.max_entities]:
+                if not isinstance(raw, Mapping):
+                    continue
+                entity = WorldEntity.from_mapping(raw, now=now, default_source="world_memory", default_ttl_s=max(30.0, self.default_ttl_s))
+                if self._persist_allowed_entity(entity):
+                    self._entities[entity.id] = entity
+            for raw in (payload.get("events") or ())[: self.event_history_size]:
+                if not isinstance(raw, Mapping):
+                    continue
+                event = WorldEvent.from_mapping(raw, now=now, default_source="world_memory")
+                if self._persist_allowed_event(event):
+                    self._events.append(event)
+        except Exception:
+            return
 
     def set_backend_status(self, name: str, status: Mapping[str, Any]) -> None:
         backend_name = _text(name, default="unknown", limit=48) or "unknown"
@@ -411,6 +488,7 @@ class WorldStateStore:
         observed_at: float | None = None,
         remove_entity_ids: Iterable[Any] = (),
         remove_source: str | None = None,
+        uncertainties: Iterable[Any] = (),
     ) -> dict[str, Any]:
         """写入观测，并可在同一批次撤销明确声明的实体生命周期。
 
@@ -476,6 +554,10 @@ class WorldStateStore:
                 continue
             normalized_events.append(event)
         normalized_remove_ids = self._normalize_remove_ids(remove_entity_ids)
+        normalized_uncertainties = [
+            _text(item, limit=160) for item in (uncertainties or ())
+            if _text(item, limit=160)
+        ][:16]
         remove_source_name: str | None = None
         if remove_source is not None:
             remove_source_name = self._normalize_remove_source(remove_source)
@@ -542,14 +624,21 @@ class WorldStateStore:
             self._events.extend(normalized_events)
             self._prune_lifecycle_watermarks()
             self._last_observation_at = max(self._last_observation_at or now, now)
+            self._uncertainties = normalized_uncertainties
             self._observation_count += 1
             self._revision += 1
             snapshot = self.snapshot(now=received_at)
-        if normalized_remove_ids:
-            snapshot["changes"] = {
-                "removed_entity_ids": removed_entity_ids,
-                "removed_entity_count": len(removed_entity_ids),
-            }
+            if normalized_remove_ids:
+                snapshot["changes"] = {
+                    "removed_entity_ids": removed_entity_ids,
+                    "removed_entity_count": len(removed_entity_ids),
+                }
+            self._last_changes = dict(snapshot.get("changes") or {
+                "removed_entity_ids": [],
+                "removed_entity_count": 0,
+            })
+            self._persist_locked()
+            self._changed.notify_all()
         return snapshot
 
     def remove_entities(
@@ -698,6 +787,12 @@ class WorldStateStore:
             self._last_observation_at = max(self._last_observation_at or reset_at, reset_at)
             self._observation_count += 1
             self._revision += 1
+            self._last_changes = {
+                "removed_entity_ids": list(removed),
+                "removed_entity_count": len(removed),
+            }
+            self._persist_locked()
+            self._changed.notify_all()
             return len(removed)
 
     def clear(self) -> None:
@@ -710,8 +805,12 @@ class WorldStateStore:
             self._source_reset_event_times.clear()
             self._source_reset_index.clear()
             self._last_observation_at = None
+            self._uncertainties = []
             self._observation_count = 0
             self._revision += 1
+            self._last_changes = {"removed_entity_ids": [], "removed_entity_count": 0}
+            self._persist_locked()
+            self._changed.notify_all()
 
     def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
         timestamp = self._clock() if now is None else now
@@ -732,7 +831,7 @@ class WorldStateStore:
                 "available": bool(visible or recent_events),
                 "entities": [item.to_dict(now=timestamp) for item in visible],
                 "events": recent_events,
-                "uncertainties": [] if visible else ["no_recent_visual_observation"],
+                "uncertainties": list(self._uncertainties) if self._uncertainties else ([] if visible else ["no_recent_visual_observation"]),
                 "status": {
                     "entity_count": len(visible),
                     "event_count": len(recent_events),
@@ -744,6 +843,73 @@ class WorldStateStore:
                     ),
                 },
                 "backends": {key: dict(value) for key, value in self._backend.items()},
+                "memory": {
+                    "persist_world": self._persist_world,
+                    "persist_players": self._persist_players,
+                    "raw_frames_persisted": False,
+                    "chat_persisted": False,
+                },
+            }
+
+    def delta(
+        self,
+        after_revision: int = 0,
+        *,
+        wait_ms: int = 250,
+        limit: int = 16,
+    ) -> dict[str, Any]:
+        """Wait for a newer revision and return a bounded world delta.
+
+        The store does not retain raw frames or player history.  When a caller
+        falls behind, the latest bounded snapshot is returned with
+        ``coalesced=true``; callers use the revision cursor to avoid replaying
+        it.  Waiting happens on a condition variable and never touches the
+        120 Hz body scheduler.
+        """
+        try:
+            cursor = max(0, int(after_revision))
+        except (TypeError, ValueError, OverflowError):
+            cursor = 0
+        try:
+            timeout_s = min(2.0, max(0.0, float(wait_ms) / 1000.0))
+        except (TypeError, ValueError, OverflowError):
+            timeout_s = 0.25
+        try:
+            item_limit = min(64, max(1, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            item_limit = 16
+        deadline = self._clock() + timeout_s
+        with self._changed:
+            while self._revision <= cursor:
+                remaining = deadline - self._clock()
+                if remaining <= 0.0:
+                    break
+                self._changed.wait(timeout=remaining)
+            snapshot = self.snapshot()
+            revision = int((snapshot.get("status") or {}).get("revision", self._revision))
+            change_payload = dict(self._last_changes)
+            return {
+                "revision": revision,
+                "after_revision": cursor,
+                "changed": revision > cursor,
+                "coalesced": revision > cursor + 1,
+                "world": snapshot,
+                "navigation": {
+                    "status": "unknown",
+                    "safe_navigation": bool(snapshot.get("available")) and not bool(snapshot.get("uncertainties")),
+                },
+                "social": {
+                    "status": "unknown",
+                    "players_persisted": False,
+                    "chat_persisted": False,
+                },
+                "uncertainty": list(snapshot.get("uncertainties") or ()),
+                "changes": {
+                    "entities": list(snapshot.get("entities") or [])[:item_limit],
+                    "events": list(snapshot.get("events") or [])[:item_limit],
+                    "removed_entity_ids": list(change_payload.get("removed_entity_ids") or ())[: self.max_removals],
+                    "removed_entity_count": int(change_payload.get("removed_entity_count", 0) or 0),
+                },
             }
 
 

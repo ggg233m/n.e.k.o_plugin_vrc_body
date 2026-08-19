@@ -32,7 +32,7 @@ auto_start = false
 [anyadance]
 host = "127.0.0.1"
 port = 39570
-rate_hz = 60
+rate_hz = 120
 
 [body_profile]
 height_m = 1.50
@@ -73,6 +73,21 @@ input_pulse_ms = 100
 parameter_cache_size = 256
 awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding"]
 
+[input]
+primary = "anyadance"
+rate_hz = 120
+osc_fallback = true
+max_hold_ms = 10000
+emergency_release_ms = 50
+
+[autonomy]
+manual_arm = true
+session_ttl_minutes = 30
+
+[world_memory]
+persist_world = true
+persist_players = false
+
 # 订阅 AnyaDance 驱动的遥测多播，用于确认驱动是否真的收到了命令。
 # 需要驱动支持该通道（steamvr.vrsettings 的 driver_anyadance.command_log_enabled）；
 # 旧版驱动下监听器会正常启动但收不到数据，相关字段回落为 unknown/unsupported。
@@ -89,6 +104,10 @@ history_size = 64
 [vision]
 enabled = false
 source = "none"
+capture = "desktop_mirror"
+local_backend = "openvino"
+semantic_backend = "openai_compatible"
+semantic_max_per_minute = 30
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096

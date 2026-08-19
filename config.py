@@ -128,11 +128,42 @@ class DriverLogConfig:
 
 
 @dataclass(frozen=True)
+class ControllerInputConfig:
+    """Routing and safety limits for virtual AnyaDance controller input."""
+
+    primary: str = "anyadance"
+    rate_hz: int = 120
+    osc_fallback: bool = True
+    max_hold_ms: int = 10000
+    emergency_release_ms: int = 50
+
+
+@dataclass(frozen=True)
+class AutonomyConfig:
+    """Session authorization defaults; arming is never implicit."""
+
+    manual_arm: bool = True
+    session_ttl_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class WorldMemoryConfig:
+    """Only reusable world facts may be persisted by the world store."""
+
+    persist_world: bool = True
+    persist_players: bool = False
+
+
+@dataclass(frozen=True)
 class VisionConfig:
     """模型无关的感知 worker 配置；具体 detector 由后端注入。"""
 
     enabled: bool = False
     source: str = "none"
+    capture: str = "desktop_mirror"
+    local_backend: str = "openvino"
+    semantic_backend: str = "openai_compatible"
+    semantic_max_per_minute: int = 30
     interval_ms: int = 100
     queue_size: int = 1
     lifecycle_watermark_limit: int = 4096
@@ -153,6 +184,9 @@ class PluginConfig:
     vmc_idle: VmcIdleConfig = VmcIdleConfig()
     vrchat_osc: VrchatOscConfig = VrchatOscConfig()
     driver_log: DriverLogConfig = DriverLogConfig()
+    input: ControllerInputConfig = ControllerInputConfig()
+    autonomy: AutonomyConfig = AutonomyConfig()
+    world_memory: WorldMemoryConfig = WorldMemoryConfig()
     vision: VisionConfig = VisionConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
@@ -168,6 +202,9 @@ class PluginConfig:
         vmc_idle = _section(root, "vmc_idle")
         vrchat_osc = _section(root, "vrchat_osc")
         driver_log = _section(root, "driver_log")
+        input_config = _section(root, "input")
+        autonomy = _section(root, "autonomy")
+        world_memory = _section(root, "world_memory")
         vision = _section(root, "vision")
         safety = _section(root, "safety")
 
@@ -244,12 +281,73 @@ class PluginConfig:
             stale_after_ms=_bounded_int(driver_log.get("stale_after_ms"), 3000, minimum=100, maximum=60000, name="driver_log.stale_after_ms"),
             history_size=_bounded_int(driver_log.get("history_size"), 64, minimum=8, maximum=512, name="driver_log.history_size"),
         )
+        primary_input = str(input_config.get("primary", "anyadance")).strip().lower() or "anyadance"
+        if primary_input not in {"anyadance", "osc"}:
+            raise ValueError("input.primary must be anyadance or osc")
+        controller_input_config = ControllerInputConfig(
+            primary=primary_input,
+            rate_hz=_bounded_int(
+                input_config.get("rate_hz"),
+                _bounded_int(anyadance.get("rate_hz"), 60, minimum=10, maximum=120, name="anyadance.rate_hz"),
+                minimum=10,
+                maximum=120,
+                name="input.rate_hz",
+            ),
+            osc_fallback=_boolean(input_config.get("osc_fallback"), True, name="input.osc_fallback"),
+            max_hold_ms=_bounded_int(
+                input_config.get("max_hold_ms"),
+                10000,
+                minimum=100,
+                maximum=30000,
+                name="input.max_hold_ms",
+            ),
+            emergency_release_ms=_bounded_int(
+                input_config.get("emergency_release_ms"),
+                50,
+                minimum=20,
+                maximum=500,
+                name="input.emergency_release_ms",
+            ),
+        )
+        autonomy_config = AutonomyConfig(
+            manual_arm=_boolean(autonomy.get("manual_arm"), True, name="autonomy.manual_arm"),
+            session_ttl_minutes=_bounded_int(
+                autonomy.get("session_ttl_minutes"),
+                30,
+                minimum=1,
+                maximum=240,
+                name="autonomy.session_ttl_minutes",
+            ),
+        )
+        world_memory_config = WorldMemoryConfig(
+            persist_world=_boolean(world_memory.get("persist_world"), True, name="world_memory.persist_world"),
+            persist_players=_boolean(world_memory.get("persist_players"), False, name="world_memory.persist_players"),
+        )
         vision_source = str(vision.get("source", "none")).strip().lower() or "none"
-        if vision_source not in {"none", "mss", "external"}:
-            raise ValueError("vision.source must be none, mss, or external")
+        if vision_source not in {"none", "mss", "dxcam", "desktop_mirror", "external"}:
+            raise ValueError("vision.source must be none, mss, dxcam, desktop_mirror, or external")
+        capture_backend = str(vision.get("capture", "desktop_mirror")).strip().lower() or "desktop_mirror"
+        if capture_backend not in {"desktop_mirror", "mss", "dxcam", "external"}:
+            raise ValueError("vision.capture must be desktop_mirror, mss, dxcam, or external")
+        local_backend = str(vision.get("local_backend", "openvino")).strip().lower() or "openvino"
+        if local_backend not in {"openvino", "none", "external"}:
+            raise ValueError("vision.local_backend must be openvino, none, or external")
+        semantic_backend = str(vision.get("semantic_backend", "openai_compatible")).strip().lower() or "openai_compatible"
+        if semantic_backend not in {"openai_compatible", "none", "external"}:
+            raise ValueError("vision.semantic_backend must be openai_compatible, none, or external")
         vision_config = VisionConfig(
             enabled=_boolean(vision.get("enabled"), False, name="vision.enabled"),
             source=vision_source,
+            capture=capture_backend,
+            local_backend=local_backend,
+            semantic_backend=semantic_backend,
+            semantic_max_per_minute=_bounded_int(
+                vision.get("semantic_max_per_minute"),
+                30,
+                minimum=1,
+                maximum=30,
+                name="vision.semantic_max_per_minute",
+            ),
             interval_ms=_bounded_int(
                 vision.get("interval_ms"),
                 100,
@@ -354,7 +452,7 @@ class PluginConfig:
         return cls(
             host=host,
             port=_bounded_int(anyadance.get("port"), 39570, minimum=1, maximum=65535, name="anyadance.port"),
-            rate_hz=_bounded_int(anyadance.get("rate_hz"), 60, minimum=10, maximum=120, name="anyadance.rate_hz"),
+            rate_hz=controller_input_config.rate_hz,
             default_duration_ms=_bounded_int(motion.get("default_duration_ms"), 600, minimum=100, maximum=safety_config.max_action_duration_ms, name="motion.default_duration_ms"),
             max_queue_size=_bounded_int(motion.get("max_queue_size"), 8, minimum=1, maximum=64, name="motion.max_queue_size"),
             clip_directory=clip_directory,
@@ -365,6 +463,9 @@ class PluginConfig:
             vmc_idle=vmc_idle_config,
             vrchat_osc=osc_config,
             driver_log=driver_log_config,
+            input=controller_input_config,
+            autonomy=autonomy_config,
+            world_memory=world_memory_config,
             vision=vision_config,
             profile=body_profile,
             safety=safety_config,

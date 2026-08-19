@@ -5,7 +5,7 @@
 
 # N.E.K.O VRC Body
 
-这是一个独立的 N.E.K.O 插件：待机时把宿主公开的 VMC 骨骼流转换为 AnyaDance 六点姿态，显式动作时由 LLM 通过受控语义工具接管，并通过 VRChat OSC 控制 Avatar 参数和交互输入。
+这是一个独立的 N.E.K.O 插件：待机时把宿主公开的 VMC 骨骼流转换为 AnyaDance 六点姿态，显式动作时由 LLM 通过受控语义工具接管；VRChat 移动和 Index 控制器输入优先走 AnyaDance 虚拟设备，Avatar 参数、聊天和兼容回退继续走 VRChat OSC。
 
 ## 姿态能力
 
@@ -23,9 +23,11 @@
 - 用 `body_vrchat_input` 安全脉冲 Grab、Use 或 Drop，并自动发送释放值。
 - 用 `body_locomotion`、`body_turn` 发送有时限的 VRChat 移动/转身轴值，或用 `body_stop_movement` 立即归零。
 - 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
+- 用 `vrc_controller_input`、`vrc_menu_navigate` 和 `vrc_jump` 发送有限时长的虚拟 Index 摇杆、按钮和跳跃脉冲。
+- 用 `vrc_autonomy_status`、`vrc_autonomy_goal`、`vrc_autonomy_stop` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
 - 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status` 与 `body_awareness`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
-- 独立线程以 60 Hz 向 `127.0.0.1:39570` 发送完整 UDP 帧。
+- 单一发送线程以配置的 120 Hz（默认）向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
 
 “拿东西”只表示手移动到语义目标并发送握持输入。VRChat OSC 不提供通用物体位置或 Pickup 附着确认，因此插件始终把 `object_held` 报告为 `unknown`。
 
@@ -34,7 +36,7 @@
 1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
 2. `body_stop` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作；调用 `body_reset` 才能恢复。
 3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_awareness.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
-4. 插件不会阻止 AnyaDance UI 或其他程序同时向 39570 发送。多发送者数据报会按到达顺序覆盖，可能造成抖动；启用且收到驱动遥测时，`concurrent_sender_detection` 会报告其他活跃来源，否则为 `unsupported` 或 `detected_unattributed`。
+4. 插件假设接管期间 AnyaDance UI 不再向 39570 发送。驱动遥测发现其他活跃来源时会报告冲突、解除自主授权并释放输入；否则为 `unsupported` 或 `detected_unattributed`。
 5. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
 6. OSC 同样使用 UDP。`delivery_confirmed=false` 只表示本机完成发送；只有收到 9001 回传时 `connection` 才显示 `detected`，没有回传时为 `unknown`，不能据此断言 VRChat 离线。
 7. 默认只有一个程序能独占监听 `127.0.0.1:9001`。若已有 OSC 路由器占用该端口，应修改 `listen_port`，并让路由器或 VRChat 向新端口转发。
@@ -80,9 +82,9 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 ## 视觉世界状态（第一阶段）
 
-插件新增 `world_observe` 工具；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层和可插拔的采集 worker。它们不进入 AnyaDance 的 60 Hz 调度线程，也不替代宿主 VMC 待机中转。当前仓库暂不内置 YOLO/MediaPipe 模型，未来模型后端通过 `FrameDetector` 接口注入。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
+插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
 
-当前版本只提供无第三方依赖的后端协议和安全状态缓存。YOLO、VRChat 画面采集及 VLM 适配器将在后续按运行环境启用；未配置后端时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
+当前版本默认不加载第三方模型，但已经提供 DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 的可选适配器；未配置依赖时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
 世界日志若以后启用，只能作为低置信度辅助来源。玩家实体应使用
 `vrchat:player:<user_id>` 这样的稳定 ID；收到 `player_left` 时，适配器必须在同一
@@ -90,9 +92,9 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 玩家退出后不会残留幽灵实体，也不会误删视觉检测器发布的同名对象；后端还会用接收
 水位拒绝保留窗口内迟到的旧帧，避免删除后幽灵复活。换世界时只清理日志来源的玩家实体；
 若适配器会积压超长离线队列，应提高视觉水位上限。
-当前仓库不接入世界日志解析器、Contact/Autonomy、浏览器视觉桥，也不安装动作生成
-模型；未来模型通过独立 detector 或 sidecar 接口接入，并由配置显式启用，不把未启用
-功能的状态塞进插件主流程。
+当前仓库不接入世界日志解析器或 Contact 总线，也不安装动作生成模型；自主运行时只
+管理手动授权、世界新鲜度和安全释放，不自动执行好友、邀请或世界切换。模型通过独立
+detector 或 sidecar 接口接入，并由配置显式启用，不把未启用功能的状态塞进插件主流程。
 
 ## N.E.K.O VMC 待机中转
 
@@ -151,7 +153,7 @@ body_chatbox(text="你好", immediate=true)
 
 面板包括：
 
-- AnyaDance 60 Hz 发送频率、丢帧、数据包和当前动作进度。
+- AnyaDance 120 Hz 发送频率、丢帧、控制器释放延迟、数据包和当前动作进度。
 - VRChat OSC 9000/9001 状态、Avatar ID、收发计数、错误和参数回传。
 - 启用、平滑禁用、复位与急停。
 - 手臂角度/方位/伸展/掌心调节，手型、程序化手势和伸手抓取测试。

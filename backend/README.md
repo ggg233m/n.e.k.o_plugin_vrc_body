@@ -14,15 +14,20 @@
 - `debug_cli.py` 是不依赖 SDK 的实时调试命令行，可以读取状态、注入世界观测、
   提交动作、创建高层计划、注入反馈和停止后端。
 - `cognition.py` 保存有界的观测、状态新鲜度/置信度、严格计划 JSON 和执行反馈；
-  它不进入 AnyaDance 的 60 Hz 控制线程，未来的 LLM 只需要生成同一计划格式。
+  它不进入 AnyaDance 的 120 Hz 控制线程，主 LLM 通过世界 delta 桥接接收主动摘要。
+- `autonomy.py` 只管理手动授权、会话 TTL、世界新鲜度和急停释放；它不会绕过
+  调度器盲目移动，也不会自动执行好友、邀请或世界切换。
 - `adapters.py` 是唯一的宿主项目集成接缝，负责把后端映射到当前项目的调度器、
   VMC、OSC、遥测、配置和动作片段库。
 - `vision.py` 与 `world_state.py` 是无模型依赖的感知状态基础模块；其中
-  `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。当前不内置
-  YOLO/MediaPipe 模型，未来 detector 只需实现 `status()` 与
+  `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。`DesktopMirrorFrameSource`
+  会优先尝试 DXcam、再回退 MSS；`OpenVinoLocalDetector` 和
+  `OpenAICompatibleSemanticBackend` 是可插拔的 YOLOX/depth/OCR/VLM 接缝，不会在缺少
+  依赖时伪造检测。外部 detector 只需实现 `status()` 与
   `observe(frame, now=...)`，再通过 `BackendService.attach_vision()` 注入。
-  worker 使用有界 latest-frame 队列，掉帧优先于堆积，不进入 60 Hz 控制线程。
-- `MssFrameSource` 是可选的纯 mss 桌面采集器，依赖懒加载；没有 mss/Pillow/numpy
+  worker 使用有界 latest-frame 队列，掉帧优先于堆积，不进入 120 Hz 控制线程。
+- `MssFrameSource`/`DxcamFrameSource` 是可选桌面采集器，依赖懒加载；没有捕获库或
+  Pillow/numpy
   时后端仍可启动并报告 `available=false`。不要从兄弟插件项目导入截图服务，避免
   把 SDK 依赖带回独立后端。
 
@@ -63,6 +68,10 @@ python backend/debug_cli.py --port 48912 --token dev input --action grab --side 
 python backend/debug_cli.py --port 48912 --token dev parameter --name NEKO_Action --value 1
 python backend/debug_cli.py --port 48912 --token dev chatbox --text '你好'
 python backend/debug_cli.py --port 48912 --token dev stop-movement
+python backend/debug_cli.py --port 48912 --token dev controller --side left --control stick --y 0.35 --duration-ms 600
+python backend/debug_cli.py --port 48912 --token dev autonomy-arm
+python backend/debug_cli.py --port 48912 --token dev autonomy-goal --goal "探索附近的入口"
+python backend/debug_cli.py --port 48912 --token dev autonomy-stop
 ```
 
 需要同时更新多个控制量时，可使用最多 8 条命令的批量接口；同一轴在批次内以后
@@ -80,7 +89,7 @@ Bool、Int 和 Float 发送；`chatbox` 默认立即显示，使用 `--deferred`
 ## 低延迟路径
 
 Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控制连接，避免每次
-命令重新建立回环 TCP 连接；后端快照/意识状态从 60 Hz 身体控制线程中降到约 10 Hz
+命令重新建立回环 TCP 连接；后端快照/意识状态从 120 Hz 身体控制线程中降到约 10 Hz
 发布，不会让状态深拷贝阻塞姿态帧。`debug_cli.py` 的单次命令仍适合人工调试，不
 适合高频循环；高频调用可以使用常驻 JSON-lines 控制会话：
 
@@ -97,6 +106,12 @@ python backend/debug_cli.py --port 48912 --token dev shell
 ```
 
 输入 `quit` 或 `exit` 结束会话。
+
+AnyaDance 虚拟 Index 输入使用 `POST /input/axes`、`POST /input/button` 和
+`POST /input/release`；同一 UDP 发送线程将控制器叠加到 VMC/动作帧，旧输入采用
+latest-wins，轴和按钮到期自动释放。`GET /autonomy`、`POST /autonomy/arm`、
+`POST /autonomy/disarm`、`POST /autonomy/goal`、`POST /autonomy/stop` 管理手动授权；
+`GET /world/delta?after_revision=N&wait_ms=250` 用 revision 长轮询世界变化。
 
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
@@ -150,19 +165,25 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 旧版 `{event, detail, at_unix}` 结构不能直接提交，否则会被当作 `unknown` 事件，
 也不会触发玩家删除。
 
-配置段默认关闭：
+配置段默认关闭；随插件部署的 `plugin.toml` 将 AnyaDance 发送频率设为 120 Hz，并
+打开虚拟控制器主路由（OSC 仍是回退）：
 
 ```toml
 [vision]
 enabled = false
 source = "none" # none / mss / external
+capture = "desktop_mirror"
+local_backend = "openvino"
+semantic_backend = "openai_compatible"
+semantic_max_per_minute = 30
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096
 ```
 
-配置只描述 worker，不下载或加载模型。YOLO 后端交付后再把它作为外部
-`FrameDetector` 接入；当前仓库不会安装 Ultralytics、Torch 或模型权重。
+配置只描述 worker，不下载或加载模型。OpenVINO 模型包、VLM endpoint 和 API key
+由部署环境提供（VLM endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），
+没有依赖时状态会明确标记为 unavailable。
 
 当前核心不内置 Contact 事件总线、Autonomy 反射规划、浏览器视觉桥或动作生成
 模型，也不会为这些未启用功能在插件里维护隐式状态。将来接入时应各自实现独立
@@ -205,6 +226,6 @@ lifecycle_watermark_limit = 4096
 ```
 
 失败响应包含 `reason_code: "world_precondition_failed"`、`replan_required: true`
-及逐项 `precondition_check.failures`。门禁只读取世界状态快照，不进入或阻塞 60 Hz
+及逐项 `precondition_check.failures`。门禁只读取世界状态快照，不进入或阻塞 120 Hz
 身体调度线程。多步计划在创建时只预检当前第一步；后续每一步仍须在提交执行时携带
 自身的 `preconditions`，以免把前一步尚未产生的世界变化误判为失败。

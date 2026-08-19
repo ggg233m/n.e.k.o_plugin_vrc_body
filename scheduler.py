@@ -16,7 +16,13 @@ from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
 from .behavior import BehaviorStateMachine, expression_admission
 from .config import PluginConfig
-from .model import CONTROLLER_IDS, FrameState, neutral_frame, neutralize_inputs
+from .model import (
+    CONTROLLER_IDS,
+    ControllerInputOverlay,
+    FrameState,
+    neutral_frame,
+    neutralize_inputs,
+)
 from .nya import NyaClip, sample_clip
 from .motion import (
     GESTURE_DURATIONS,
@@ -128,6 +134,7 @@ class BodyScheduler:
         "arm_pose", "hand", "move_hand", "reach_and_grab", "gesture", "sequence", "play_clip",
         "express", "semantic_clip",
     }
+    INPUT_COMMANDS = {"input_axes", "input_button", "input_release"}
 
     def __init__(
         self,
@@ -153,6 +160,12 @@ class BodyScheduler:
         self._submit_lock = threading.Lock()
         self._urgent_lock = threading.Lock()
         self._urgent_stop: Optional[BodyCommand] = None
+        self._urgent_input_release: Optional[Dict[str, Any]] = None
+        self._pending_input_axes: Dict[str, Dict[str, Any]] = {}
+        self._input_release_requested_at: Optional[float] = None
+        self._input_release_count = 0
+        self._last_input_release_latency_ms = 0.0
+        self._max_input_release_latency_ms = 0.0
         self._snapshot_lock = threading.Lock()
         self._snapshot: Dict[str, Any] = self._initial_snapshot()
         # 快照构建会深拷贝感知、行为与状态。供 UI/LLM 消费者使用，但不应置于 60Hz 控制路径上，因此以受限的 10Hz 发布。
@@ -190,6 +203,7 @@ class BodyScheduler:
         self._last_expression: Optional[Dict[str, Any]] = None
         self._idle_relay_applied = False
         self._idle_relay_error: Optional[str] = None
+        self._input_overlay = ControllerInputOverlay()
         self._behavior = BehaviorStateMachine(
             history_size=self.config.behavior.transition_history_size
         )
@@ -244,6 +258,17 @@ class BodyScheduler:
             "last_error": None,
             "error_count": 0,
             "concurrent_sender_detection": "unsupported",
+            "controller_input": {
+                "mode": self.config.input.primary,
+                "axes": {},
+                "buttons": {},
+                "release_metrics": {
+                    "count": 0,
+                    "last_latency_ms": 0.0,
+                    "max_latency_ms": 0.0,
+                    "target_ms": self.config.input.emergency_release_ms,
+                },
+            },
         }
 
     def start(self) -> None:
@@ -279,7 +304,7 @@ class BodyScheduler:
             return self._rejection(action_id, state, f"invalid command parameters: {exc}")
         if not self.thread_alive:
             return self._rejection(action_id, state, "scheduler is not running")
-        if kind in self.NORMAL_COMMANDS and state in {"disabled", "stopped_latched", "fault_latched", "shutdown"}:
+        if (kind in self.NORMAL_COMMANDS or kind in self.INPUT_COMMANDS) and state in {"disabled", "stopped_latched", "fault_latched", "shutdown"}:
             return self._rejection(action_id, state, f"body output cannot accept motions while state is {state}")
         if kind == "reset" and state == "disabled":
             return self._rejection(action_id, state, "body output is disabled; call body_enable first")
@@ -301,6 +326,8 @@ class BodyScheduler:
 
         if kind == "stop":
             priority = 0
+        elif kind in self.INPUT_COMMANDS:
+            priority = 2
         elif kind in {"disable", "reset", "enable", "cancel"}:
             priority = 1
         elif kind in {"express", "semantic_clip"}:
@@ -319,6 +346,36 @@ class BodyScheduler:
                 "accepted": True,
                 "action_id": action_id,
                 "state": predicted,
+                "normalized_params": public_params,
+                "target_pose_summary": self._target_pose_summary(kind, public_params),
+                "reason": None,
+                "safety_state": current["safety_state"],
+            }
+        if kind == "input_release":
+            # Release is a safety edge, not ordinary work: keep only the
+            # newest side request and handle it before the bounded queue.
+            with self._urgent_lock:
+                self._urgent_input_release = params
+                self._input_release_requested_at = self._clock()
+            return {
+                "accepted": True,
+                "action_id": action_id,
+                "state": "queued",
+                "normalized_params": public_params,
+                "target_pose_summary": self._target_pose_summary(kind, public_params),
+                "reason": None,
+                "safety_state": current["safety_state"],
+            }
+        if kind == "input_axes":
+            # Axis updates are state, not work items. Overwrite the previous
+            # side value so a delayed HTTP caller cannot create a stale burst.
+            side = str(params.get("side") or "").strip().lower()
+            with self._urgent_lock:
+                self._pending_input_axes[side] = params
+            return {
+                "accepted": True,
+                "action_id": action_id,
+                "state": "queued",
                 "normalized_params": public_params,
                 "target_pose_summary": self._target_pose_summary(kind, public_params),
                 "reason": None,
@@ -427,6 +484,7 @@ class BodyScheduler:
                     self._sample_active_motion(now)
                     self._sample_idle_relay()
                     self._sample_expression_motion(now)
+                    self._apply_controller_input_overlay(now)
                     if self._enabled:
                         self._send_current_frame(now)
                         if self._disable_frames_remaining > 0:
@@ -447,8 +505,30 @@ class BodyScheduler:
         with self._urgent_lock:
             urgent = self._urgent_stop
             self._urgent_stop = None
+            urgent_release = self._urgent_input_release
+            self._urgent_input_release = None
+            pending_axes = next(iter(self._pending_input_axes.values()), None)
+            if pending_axes is not None:
+                self._pending_input_axes.pop(str(pending_axes.get("side") or "").strip().lower(), None)
         if urgent is not None:
             self._handle_stop(urgent, now)
+            return
+        if urgent_release is not None:
+            side = urgent_release.get("side")
+            if side in {None, "", "all"}:
+                self._input_overlay.clear()
+            else:
+                self._input_overlay.clear_side(str(side))
+            requested_at = self._input_release_requested_at
+            if requested_at is not None:
+                latency_ms = max(0.0, (now - requested_at) * 1000.0)
+                self._last_input_release_latency_ms = latency_ms
+                self._max_input_release_latency_ms = max(self._max_input_release_latency_ms, latency_ms)
+                self._input_release_count += 1
+                self._input_release_requested_at = None
+            return
+        if pending_axes is not None:
+            self._apply_input_axes_command(pending_axes, now)
             return
         try:
             item = self._commands.get_nowait()
@@ -457,6 +537,19 @@ class BodyScheduler:
         try:
             command = item.command
             kind = command.kind
+            if kind == "input_axes":
+                self._apply_input_axes_command(command.params, now)
+                return
+            if kind == "input_button":
+                self._apply_input_button_command(command.params, now)
+                return
+            if kind == "input_release":
+                side = command.params.get("side")
+                if side in {None, "", "all"}:
+                    self._input_overlay.clear()
+                else:
+                    self._input_overlay.clear_side(str(side))
+                return
             if kind == "stop":
                 self._handle_stop(command, now)
                 return
@@ -470,15 +563,18 @@ class BodyScheduler:
                 self._clear_current_action(now, "replaced")
                 self._last_error = None
                 self._drop_expression_overlays(now, "replaced")
+                self._input_overlay.clear()
                 self._behavior.reset(now=now, outcome="replaced")
                 return
             if kind == "disable":
                 self._clear_commands()
+                self._input_overlay.clear()
                 self._drop_expression_overlays(now, "replaced")
                 self._start_target_motion(command, now, neutral_frame(), completion="disable")
                 return
             if kind == "reset":
                 self._clear_commands()
+                self._input_overlay.clear()
                 self._drop_expression_overlays(now, "replaced")
                 self._safety_state = "normal"
                 self._last_error = None
@@ -605,8 +701,103 @@ class BodyScheduler:
         finally:
             self._commands.task_done()
 
+    @staticmethod
+    def _side_name(value: Any) -> str:
+        side = str(value or "").strip().lower()
+        if side not in {"left", "right"}:
+            raise CommandRejected("controller side must be left or right")
+        return side
+
+    def _apply_input_axes_command(self, params: Mapping[str, Any], now: float) -> None:
+        side = self._side_name(params.get("side"))
+        x = float(params.get("x", 0.0))
+        y = float(params.get("y", 0.0))
+        if not math.isfinite(x) or not math.isfinite(y) or not -1.0 <= x <= 1.0 or not -1.0 <= y <= 1.0:
+            raise CommandRejected("controller axes must be finite values between -1 and 1")
+        duration_ms = int(params.get("duration_ms", 1000))
+        if duration_ms < 100 or duration_ms > self.config.input.max_hold_ms:
+            raise CommandRejected(f"duration_ms must be between 100 and {self.config.input.max_hold_ms}")
+        self._input_overlay.axes[side] = (x, y)
+        self._input_overlay.axis_expires_at[side] = now + duration_ms / 1000.0
+
+    def _apply_input_button_command(self, params: Mapping[str, Any], now: float) -> None:
+        side = self._side_name(params.get("side"))
+        button = str(params.get("button") or "").strip().lower()
+        if button not in {"trigger", "grip", "menu", "a", "b"}:
+            raise CommandRejected("unsupported controller button")
+        pressed_value = params.get("pressed", True)
+        if not isinstance(pressed_value, bool):
+            raise CommandRejected("pressed must be a boolean")
+        pressed = pressed_value
+        value = float(params.get("value", 1.0 if pressed else 0.0))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise CommandRejected("button value must be between 0 and 1")
+        if not pressed:
+            self._input_overlay.buttons.pop((side, button), None)
+            return
+        duration_ms = int(params.get("hold_ms", self.config.vrchat_osc.input_pulse_ms))
+        if duration_ms < 20 or duration_ms > self.config.input.max_hold_ms:
+            raise CommandRejected(f"hold_ms must be between 20 and {self.config.input.max_hold_ms}")
+        self._input_overlay.buttons[(side, button)] = (True, now + duration_ms / 1000.0, value)
+
+    def _apply_controller_input_overlay(self, now: float) -> None:
+        for side in tuple(self._input_overlay.axes):
+            expires = self._input_overlay.axis_expires_at.get(side, 0.0)
+            if now >= expires:
+                self._input_overlay.axes.pop(side, None)
+                self._input_overlay.axis_expires_at.pop(side, None)
+                continue
+            x, y = self._input_overlay.axes[side]
+            controller = self._output_frame.controllers[side + "_controller"]
+            controller.joystick_x = x
+            controller.joystick_y = y
+            controller.trackpad_x = x
+            controller.trackpad_y = y
+
+        for key in tuple(self._input_overlay.buttons):
+            pressed, expires, value = self._input_overlay.buttons[key]
+            if expires is not None and now >= expires:
+                self._input_overlay.buttons.pop(key, None)
+                continue
+            side, button = key
+            controller = self._output_frame.controllers[side + "_controller"]
+            if button == "trigger":
+                controller.trigger_click = pressed
+                controller.trigger_value = value
+            elif button == "grip":
+                controller.grip_click = pressed
+                controller.grip_value = value
+            elif button == "menu":
+                controller.menu_click = pressed
+            elif button == "a":
+                controller.a_click = pressed
+            elif button == "b":
+                controller.b_click = pressed
+
+    def controller_input_snapshot(self) -> dict[str, Any]:
+        """Return a cheap, JSON-safe view of the scheduler-owned input state."""
+        return {
+            "mode": self.config.input.primary,
+            "axes": {side: {"x": round(x, 4), "y": round(y, 4)} for side, (x, y) in self._input_overlay.axes.items()},
+            "buttons": {
+                f"{side}:{button}": {"pressed": pressed, "value": round(value, 4)}
+                for (side, button), (pressed, _expires, value) in self._input_overlay.buttons.items()
+            },
+            "release_metrics": {
+                "count": self._input_release_count,
+                "last_latency_ms": round(self._last_input_release_latency_ms, 3),
+                "max_latency_ms": round(self._max_input_release_latency_ms, 3),
+                "target_ms": self.config.input.emergency_release_ms,
+            },
+        }
+
     def _handle_stop(self, command: BodyCommand, now: float) -> None:
         self._clear_commands()
+        with self._urgent_lock:
+            self._pending_input_axes.clear()
+            self._urgent_input_release = None
+            self._input_release_requested_at = None
+        self._input_overlay.clear()
         self._active = None
         self._drop_expression_overlays(now, "stopped")
         neutralize_inputs(self._frame)
@@ -1168,6 +1359,7 @@ class BodyScheduler:
         self._drop_expression_overlays(now, "faulted")
         self._frame = neutral_frame()
         self._output_frame = self._frame.clone()
+        self._input_overlay.clear()
         neutralize_inputs(self._frame)
         self._state = "fault_latched" if self._enabled else "disabled"
         self._safety_state = "fault" if self._enabled else "normal"
@@ -1178,6 +1370,7 @@ class BodyScheduler:
 
     def _shutdown_output(self, period: float) -> None:
         if self._enabled and self._transport is not None:
+            self._input_overlay.clear()
             self._frame = neutral_frame()
             self._output_frame = self._frame.clone()
             for _ in range(6):
@@ -1201,6 +1394,8 @@ class BodyScheduler:
         self._publish_snapshot()
 
     def _clear_commands(self) -> None:
+        with self._urgent_lock:
+            self._pending_input_axes.clear()
         while True:
             try:
                 self._commands.get_nowait()
@@ -1482,6 +1677,7 @@ class BodyScheduler:
             "last_error": self._last_error,
             "error_count": self._error_count,
             "concurrent_sender_detection": "unsupported",
+            "controller_input": self.controller_input_snapshot(),
         }
         with self._snapshot_lock:
             self._snapshot = snapshot

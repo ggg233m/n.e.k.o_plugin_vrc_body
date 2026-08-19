@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections import deque
+import base64
 import importlib.util
+import json
+import os
 from queue import Empty, Full, Queue
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Protocol
+from urllib.request import Request, urlopen
 
 from .world_state import WorldEntity, WorldEvent, WorldStateStore
 
@@ -34,6 +39,7 @@ class VisionObservation:
     # compatible with the original observation protocol.
     remove_entity_ids: tuple[str, ...] = ()
     remove_source: str | None = None
+    uncertainties: tuple[str, ...] = ()
 
 
 class FrameDetector(Protocol):
@@ -69,6 +75,7 @@ def optional_dependency_status() -> dict[str, bool]:
     return {
         "opencv": importlib.util.find_spec("cv2") is not None,
         "mss": importlib.util.find_spec("mss") is not None,
+        "dxcam": importlib.util.find_spec("dxcam") is not None,
         "PIL": importlib.util.find_spec("PIL") is not None,
         "numpy": importlib.util.find_spec("numpy") is not None,
         "ultralytics": importlib.util.find_spec("ultralytics") is not None,
@@ -175,6 +182,291 @@ class MssFrameSource:
                 pass
 
 
+class DxcamFrameSource:
+    """Optional Windows desktop-mirror capture using DXcam.
+
+    DXcam is intentionally imported lazily so the plugin remains usable on
+    machines without the optional capture package. ``grab`` is latest-frame
+    only; no frame queue is retained here.
+    """
+
+    name = "dxcam"
+
+    def __init__(self, *, region: Mapping[str, Any] | None = None, output_idx: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._camera: Any = None
+        self._region = None
+        self._closed = False
+        self._frames = 0
+        self._last_error: str | None = None
+        try:
+            import dxcam  # type: ignore[import-not-found]
+
+            self._camera = dxcam.create(output_idx=int(output_idx), output_color="RGB")
+            if region is not None:
+                self._region = tuple(int(region.get(key, 0)) for key in ("left", "top", "right", "bottom"))
+                if self._region[2] <= self._region[0] or self._region[3] <= self._region[1]:
+                    raise ValueError("DXcam region must have positive width and height")
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+
+    def status(self) -> Mapping[str, Any]:
+        with self._lock:
+            return {
+                "available": self._camera is not None and not self._closed,
+                "name": self.name,
+                "region": self._region,
+                "frames": self._frames,
+                "last_error": self._last_error,
+            }
+
+    def read(self) -> Any:
+        with self._lock:
+            camera, region, closed = self._camera, self._region, self._closed
+        if camera is None or closed:
+            return None
+        try:
+            frame = camera.grab(region=region) if region is not None else camera.grab()
+            with self._lock:
+                self._frames += 1
+                self._last_error = None
+            return frame
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            return None
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            camera = self._camera
+            self._camera = None
+        if camera is not None:
+            try:
+                camera.stop()
+            except Exception:
+                pass
+            try:
+                camera.release()
+            except Exception:
+                pass
+
+
+class DesktopMirrorFrameSource:
+    """Select DXcam first and fall back to MSS without changing the worker API."""
+
+    name = "desktop_mirror"
+
+    def __init__(self, *, region: Mapping[str, Any] | None = None) -> None:
+        dx = DxcamFrameSource(region=region)
+        if bool(dx.status().get("available")):
+            self._source: FrameSource = dx
+        else:
+            dx.close()
+            self._source = MssFrameSource(region=region)
+
+    def status(self) -> Mapping[str, Any]:
+        result = dict(self._source.status())
+        result["name"] = self.name
+        result["backend"] = getattr(self._source, "name", "unknown")
+        return result
+
+    def read(self) -> Any:
+        return self._source.read()
+
+    def close(self) -> None:
+        self._source.close()
+
+
+class OpenVinoLocalDetector:
+    """Safe OpenVINO adapter seam for YOLOX/depth/OCR model bundles.
+
+    Model-specific preprocessing is deliberately injected through ``infer``;
+    an absent model or runtime never fabricates detections and reports an
+    explicit unavailable status instead. This keeps inference off the 120 Hz
+    control thread while allowing a deployed bundle to provide real results.
+    """
+
+    name = "openvino"
+
+    def __init__(self, *, model_path: str | None = None, infer: Callable[[Any], Mapping[str, Any]] | None = None) -> None:
+        self._model_path = model_path
+        self._infer = infer
+        self._compiled = False
+        self._last_error: str | None = None
+        self._frames = 0
+        if infer is not None:
+            self._compiled = True
+        elif importlib.util.find_spec("openvino") is None:
+            self._last_error = "openvino is not installed"
+        elif not model_path or not os.path.exists(model_path):
+            self._last_error = "YOLOX-Tiny model_path is not configured"
+        else:
+            # The concrete YOLOX/depth/OCR graph is deployment-specific. Keep
+            # the adapter unavailable until a validated infer callable is
+            # supplied instead of loading an untrusted arbitrary graph.
+            self._last_error = "model bundle requires a validated infer adapter"
+
+    def status(self) -> Mapping[str, Any]:
+        return {
+            "available": self._compiled,
+            "name": self.name,
+            "models": ["yolox_tiny", "depth", "ocr"],
+            "frames": self._frames,
+            "last_error": self._last_error,
+        }
+
+    def observe(self, frame: Any, *, now: float) -> VisionObservation:
+        if not self._compiled or self._infer is None:
+            raise RuntimeError(self._last_error or "OpenVINO detector is unavailable")
+        self._frames += 1
+        payload = self._infer(frame)
+        if not isinstance(payload, Mapping):
+            raise ValueError("OpenVINO infer adapter must return an object")
+        return VisionObservation(
+            entities=tuple(payload.get("entities") or ()),
+            events=tuple(payload.get("events") or ()),
+            source=str(payload.get("source") or "openvino"),
+            observed_at=now,
+            frame_id=str(payload.get("frame_id")) if payload.get("frame_id") is not None else None,
+            remove_entity_ids=tuple(payload.get("remove_entity_ids") or ()),
+            remove_source=payload.get("remove_source"),
+            uncertainties=tuple(str(item)[:160] for item in (payload.get("uncertainties") or ())[:16]),
+        )
+
+
+class OpenAICompatibleSemanticBackend:
+    """Change-triggered structured VLM adapter with a 30/minute hard cap."""
+
+    name = "openai_compatible"
+
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        api_key: str | None = None,
+        max_per_minute: int = 30,
+        timeout_s: float = 8.0,
+        request_fn: Callable[[Request, float], Any] | None = None,
+    ) -> None:
+        self.endpoint = str(endpoint).strip()
+        self.model = str(model).strip()
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+        self.max_per_minute = min(30, max(1, int(max_per_minute)))
+        self.timeout_s = min(30.0, max(1.0, float(timeout_s)))
+        self._request_fn = request_fn
+        self._calls: deque[float] = deque(maxlen=30)
+        self._lock = threading.Lock()
+        self._last_error: str | None = None
+        self._last_call_at: float | None = None
+
+    def status(self) -> Mapping[str, Any]:
+        with self._lock:
+            return {
+                "available": bool(self.endpoint and self.model),
+                "name": self.name,
+                "model": self.model,
+                "max_per_minute": self.max_per_minute,
+                "calls_last_minute": len(self._calls),
+                "last_call_age_ms": None if self._last_call_at is None else round(max(0.0, (time.monotonic() - self._last_call_at) * 1000.0), 1),
+                "last_error": self._last_error,
+            }
+
+    @staticmethod
+    def _frame_data(frame: Any) -> str:
+        if isinstance(frame, bytes):
+            return base64.b64encode(frame).decode("ascii")
+        save = getattr(frame, "save", None)
+        if callable(save):
+            from io import BytesIO
+            buf = BytesIO()
+            save(buf, format="JPEG", quality=70)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        # numpy-like arrays are encoded only when Pillow is available.
+        try:
+            from PIL import Image  # type: ignore[import-not-found]
+            import numpy as np  # type: ignore[import-not-found]
+            image = Image.fromarray(np.asarray(frame).astype(np.uint8))
+            from io import BytesIO
+            buf = BytesIO()
+            image.save(buf, format="JPEG", quality=70)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as exc:
+            raise ValueError(f"frame cannot be encoded: {exc}") from exc
+
+    def _call(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = Request(
+            self.endpoint,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
+            },
+            method="POST",
+        )
+        response = self._request_fn(request, self.timeout_s) if self._request_fn else urlopen(request, timeout=self.timeout_s)
+        raw = response.read() if hasattr(response, "read") else response
+        result = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
+        if not isinstance(result, Mapping):
+            raise ValueError("semantic backend response must be an object")
+        return result
+
+    def observe(self, frame: Any, *, world: Mapping[str, Any], now: float) -> VisionObservation:
+        current = time.monotonic()
+        with self._lock:
+            while self._calls and current - self._calls[0] >= 60.0:
+                self._calls.popleft()
+            if len(self._calls) >= self.max_per_minute:
+                self._last_error = "semantic rate limit reached"
+                raise RuntimeError(self._last_error)
+            self._calls.append(current)
+            self._last_call_at = current
+        schema = {
+            "type": "object",
+            "properties": {
+                "entities": {"type": "array"},
+                "events": {"type": "array"},
+                "uncertainties": {"type": "array"},
+            },
+            "required": ["entities", "events", "uncertainties"],
+            "additionalProperties": False,
+        }
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "vrc_world", "strict": True, "schema": schema}},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe only observable VRChat world entities, interactions, spatial relations and events. Do not identify players or reproduce chat."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + self._frame_data(frame)}},
+            ]}],
+        }
+        try:
+            result = self._call(payload)
+            choices = result.get("choices") if isinstance(result, Mapping) else None
+            content = ((choices or [{}])[0] or {}).get("message", {}).get("content", "{}") if isinstance(choices, list) else "{}"
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text", "")) for item in content
+                    if isinstance(item, Mapping)
+                ) or "{}"
+            structured = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(structured, Mapping):
+                raise ValueError("semantic response content must be a JSON object")
+            self._last_error = None
+            return VisionObservation(
+                entities=tuple(structured.get("entities") or ()),
+                events=tuple(structured.get("events") or ()),
+                source="openai_vlm",
+                observed_at=now,
+                frame_id=f"vlm-{int(current * 1000)}",
+                uncertainties=tuple(str(item)[:160] for item in (structured.get("uncertainties") or ())[:16]),
+            )
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            raise
+
+
 @dataclass(frozen=True)
 class CapturedFrame:
     frame: Any
@@ -225,9 +517,24 @@ class VisionWorker:
         with self._lock:
             if self._running:
                 return True
-            detector = self.runtime.detector or self.runtime.semantic
-            if detector is None:
+            candidates = [item for item in (self.runtime.detector, self.runtime.semantic) if item is not None]
+            if not candidates:
                 self._last_error = "no detector or semantic backend is configured"
+                return False
+            available = False
+            errors: list[str] = []
+            for candidate in candidates:
+                try:
+                    status = candidate.status()
+                    if not isinstance(status, Mapping) or status.get("available") is not False:
+                        available = True
+                        break
+                    errors.append(str(status.get("last_error") or status.get("reason") or "unavailable"))
+                except Exception:
+                    available = True
+                    break
+            if not available:
+                self._last_error = "; ".join(errors)[:256] or "configured vision backends are unavailable"
                 return False
             self._stop.clear()
             self._running = True
@@ -440,6 +747,7 @@ class VisionRuntime:
                 observation,
                 remove_entity_ids=normalized_remove_ids,
                 remove_source=normalized_remove_source,
+                uncertainties=tuple(str(item)[:160] for item in (observation.uncertainties or ())[:16]),
             )
         else:
             if not isinstance(observation, Mapping):
@@ -460,11 +768,14 @@ class VisionRuntime:
                 source=str(observation.get("source") or "vision"),
                 observed_at=observation.get("observed_at"),
                 frame_id=str(observation.get("frame_id")) if observation.get("frame_id") is not None else None,
+                uncertainties=tuple(str(item)[:160] for item in (observation.get("uncertainties") or ())[:16]),
             )
         ingest_kwargs: dict[str, Any] = {
             "source": value.source,
             "observed_at": value.observed_at,
         }
+        if value.uncertainties:
+            ingest_kwargs["uncertainties"] = value.uncertainties
         if value.remove_entity_ids or value.remove_source is not None:
             ingest_kwargs["remove_entity_ids"] = value.remove_entity_ids
             ingest_kwargs["remove_source"] = value.remove_source
@@ -499,7 +810,17 @@ class VisionRuntime:
         detector = self.detector
         semantic = self.semantic
         try:
+            detector_available = detector is not None
             if detector is not None:
+                try:
+                    detector_status = detector.status()
+                    detector_available = not (
+                        isinstance(detector_status, Mapping)
+                        and detector_status.get("available") is False
+                    )
+                except Exception:
+                    detector_available = True
+            if detector_available and detector is not None:
                 self.ingest(detector.observe(frame, now=observation_now))
             if semantic is not None:
                 with self._lock:
@@ -536,7 +857,11 @@ __all__ = [
     "CapturedFrame",
     "FrameDetector",
     "FrameSource",
+    "DxcamFrameSource",
+    "DesktopMirrorFrameSource",
     "MssFrameSource",
+    "OpenVinoLocalDetector",
+    "OpenAICompatibleSemanticBackend",
     "SemanticBackend",
     "VisionObservation",
     "VisionRuntime",

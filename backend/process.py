@@ -84,6 +84,29 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/cognition":
             self._json(200, self.server.service.cognition.snapshot())
             return
+        if self.path == "/perception":
+            self._json(200, self.server.service.perception())
+            return
+        if self.path == "/autonomy":
+            self._json(200, self.server.service.autonomy_snapshot())
+            return
+        if self.path.startswith("/world/delta"):
+            from urllib.parse import parse_qs, urlsplit
+            query = parse_qs(urlsplit(self.path).query)
+            def query_int(name: str, default: int) -> int:
+                try:
+                    return int(query.get(name, [default])[0])
+                except (TypeError, ValueError, OverflowError):
+                    return default
+            self._json(
+                200,
+                self.server.service.world_delta(
+                    query_int("after_revision", 0),
+                    wait_ms=query_int("wait_ms", 250),
+                    limit=query_int("limit", 16),
+                ),
+            )
+            return
         self._json(404, {"error": "unknown endpoint"})
 
     def do_POST(self) -> None:
@@ -136,6 +159,34 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/osc/cancel":
                 self.server.service.cancel_inputs()
                 result = {"accepted": True}
+            elif self.path == "/input/axes":
+                result = self.server.service.set_controller_axes(
+                    value.get("side"),
+                    value.get("x", 0.0),
+                    value.get("y", 0.0),
+                    value.get("duration_ms", 1000),
+                )
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/input/button":
+                result = self.server.service.set_controller_button(
+                    value.get("side"),
+                    value.get("button"),
+                    value.get("pressed", True),
+                    value.get("hold_ms", 100),
+                    value.get("value", 1.0),
+                )
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/input/release":
+                result = self.server.service.release_controller_inputs(value.get("side", "all"))
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/autonomy/arm":
+                result = self.server.service.autonomy_arm(value.get("ttl_s"))
+            elif self.path == "/autonomy/disarm":
+                result = self.server.service.autonomy_disarm(value.get("reason"))
+            elif self.path == "/autonomy/goal":
+                result = self.server.service.autonomy_goal(value.get("text"), value.get("kind", "explore"))
+            elif self.path == "/autonomy/stop":
+                result = self.server.service.autonomy_stop(value.get("reason"))
             elif self.path == "/clips/list":
                 result = self.server.service.list_clips()
             elif self.path == "/semantic_express":
@@ -155,7 +206,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "unknown endpoint"})
                 return
-            if self.path.startswith("/osc/"):
+            if self.path.startswith("/osc/") or self.path.startswith("/input/") or self.path.startswith("/autonomy/"):
                 dispatch_latency_ms = self.server.service.record_control_dispatch(self.path, started_at)
                 if isinstance(result, dict):
                     result = dict(result)

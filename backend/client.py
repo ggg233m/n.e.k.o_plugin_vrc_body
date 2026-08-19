@@ -75,6 +75,8 @@ class BackendClient:
         )
         self.scheduler = RemoteScheduler(self)
         self.osc = RemoteOsc(self)
+        self.controller_input = RemoteControllerInput(self)
+        self.autonomy = RemoteAutonomy(self)
         self.driver_log = RemoteDriverLog(self)
         self.vmc_idle = RemoteVmcIdle(self)
         self.host_vmc = RemoteHostVmc(self)
@@ -545,6 +547,101 @@ class RemoteOsc:
             return
 
 
+class RemoteControllerInput:
+    """Fast IPC proxy for the AnyaDance virtual Index controller inputs."""
+
+    def __init__(self, client: BackendClient) -> None:
+        self.client = client
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            return self.client.request("GET", "/snapshot").get("body", {}).get("controller_input", {})
+        except BackendUnavailable as exc:
+            return {"mode": "unknown", "axes": {}, "buttons": {}, "error": str(exc)}
+
+    def set_axes(self, side: str, x: float, y: float, duration_ms: int) -> tuple[bool, str | None]:
+        try:
+            result = _control_request(
+                self.client,
+                "POST",
+                "/input/axes",
+                {"side": side, "x": x, "y": y, "duration_ms": duration_ms},
+            )
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+    def set_button(
+        self,
+        side: str,
+        button: str,
+        pressed: bool = True,
+        hold_ms: int = 100,
+        value: float = 1.0,
+    ) -> tuple[bool, str | None]:
+        try:
+            result = _control_request(
+                self.client,
+                "POST",
+                "/input/button",
+                {
+                    "side": side,
+                    "button": button,
+                    "pressed": pressed,
+                    "hold_ms": hold_ms,
+                    "value": value,
+                },
+            )
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+    def release(self, side: str = "all") -> tuple[bool, str | None]:
+        try:
+            result = _control_request(self.client, "POST", "/input/release", {"side": side})
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+
+class RemoteAutonomy:
+    """Authorization and goal proxy; arming is intentionally explicit."""
+
+    def __init__(self, client: BackendClient) -> None:
+        self.client = client
+
+    def snapshot(self) -> dict[str, Any]:
+        try:
+            return self.client.request("GET", "/autonomy")
+        except BackendUnavailable as exc:
+            return {"state": "disarmed", "armed": False, "reason": str(exc)}
+
+    def arm(self, ttl_s: float | None = None) -> dict[str, Any]:
+        try:
+            payload = {} if ttl_s is None else {"ttl_s": ttl_s}
+            return _control_request(self.client, "POST", "/autonomy/arm", payload)
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
+    def disarm(self, reason: str = "manual_disarm") -> dict[str, Any]:
+        try:
+            return _control_request(self.client, "POST", "/autonomy/disarm", {"reason": reason})
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
+    def goal(self, text: str, kind: str = "explore") -> dict[str, Any]:
+        try:
+            return _control_request(self.client, "POST", "/autonomy/goal", {"text": text, "kind": kind})
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
+    def stop(self, reason: str = "autonomy_stop") -> dict[str, Any]:
+        try:
+            return _control_request(self.client, "POST", "/autonomy/stop", {"reason": reason})
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
+
 class RemoteDriverLog:
     def __init__(self, client: BackendClient) -> None:
         self.client = client
@@ -587,6 +684,33 @@ class RemoteVision:
             return self.client.request("GET", "/snapshot").get("world", {})
         except BackendUnavailable as exc:
             return {"available": False, "uncertainties": ["backend_unavailable"], "error": str(exc)}
+
+    def perception(self) -> dict[str, Any]:
+        try:
+            return self.client.request("GET", "/perception")
+        except BackendUnavailable as exc:
+            return {"world": self.snapshot(), "worker": {"enabled": False, "error": str(exc)}}
+
+    def delta(self, after_revision: int = 0, *, wait_ms: int = 250, limit: int = 16) -> dict[str, Any]:
+        try:
+            return self.client.request(
+                "GET",
+                f"/world/delta?after_revision={int(after_revision)}&wait_ms={int(wait_ms)}&limit={int(limit)}",
+                timeout_s=max(1.0, min(5.0, wait_ms / 1000.0 + 1.0)),
+            )
+        except BackendUnavailable as exc:
+            return {
+                "revision": int(after_revision),
+                "after_revision": int(after_revision),
+                "changed": False,
+                "coalesced": False,
+                "world": {"available": False, "uncertainties": ["backend_unavailable"]},
+                "navigation": {"status": "unknown", "safe_navigation": False},
+                "social": {"status": "unknown", "players_persisted": False, "chat_persisted": False},
+                "uncertainty": ["backend_unavailable"],
+                "changes": {"entities": [], "events": [], "removed_entity_ids": [], "removed_entity_count": 0},
+                "error": str(exc),
+            }
 
     def ingest(
         self,

@@ -56,6 +56,33 @@ class ControllerState:
 
 
 @dataclass
+class ControllerInputOverlay:
+    """Latest-wins virtual controller input layered over a body frame.
+
+    The overlay intentionally contains only controller controls.  Device poses
+    and finger bends remain owned by the body/motion scheduler.  ``expires_at``
+    values use the scheduler's monotonic clock and are cleared lazily when a
+    frame is sampled, so an HTTP caller never touches the real-time frame.
+    """
+
+    axes: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    axis_expires_at: Dict[str, float] = field(default_factory=dict)
+    buttons: Dict[Tuple[str, str], Tuple[bool, float | None, float | None]] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.axes.clear()
+        self.axis_expires_at.clear()
+        self.buttons.clear()
+
+    def clear_side(self, side: str) -> None:
+        self.axes.pop(side, None)
+        self.axis_expires_at.pop(side, None)
+        for key in tuple(self.buttons):
+            if key[0] == side:
+                self.buttons.pop(key, None)
+
+
+@dataclass
 class FrameState:
     devices: Dict[str, DeviceState]
     controllers: Dict[str, ControllerState]
@@ -97,4 +124,3 @@ def normalized_quat(quat: Quat) -> Quat:
 
 def all_finite(values: Iterable[float]) -> bool:
     return all(math.isfinite(value) for value in values)
-

@@ -250,7 +250,7 @@ BODY_AVATAR_PARAMETER = {
 
 BODY_VRCHAT_INPUT = {
     "name": "body_vrchat_input",
-    "description": "通过 VRChat OSC 安全脉冲一次左/右手 Grab、Use 或 Drop 输入，并自动释放按钮。仅 VR 模式下的部分输入有效，无法确认 Pickup 结果。",
+    "description": "通过 AnyaDance 虚拟 Index 控制器优先发送一次左/右手 Grab、Use 或 Drop 输入；没有可用驱动时回退到 VRChat OSC，并自动释放按钮。无法确认 Pickup 结果。",
     "parameters": {
         "type": "object",
         "properties": {
@@ -260,6 +260,73 @@ BODY_VRCHAT_INPUT = {
         },
         "required": ["action", "side"],
     },
+}
+
+VRC_CONTROLLER_INPUT = {
+    "name": "vrc_controller_input",
+    "description": "直接设置 AnyaDance 虚拟 Index 控制器的摇杆或按钮。输入经过有限时长和范围保护，返回的是本机调度接受结果，不代表 VRChat 已执行绑定动作。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "side": {"type": "string", "enum": ["left", "right"]},
+            "control": {"type": "string", "enum": ["stick", "trigger", "grip", "menu", "a", "b"]},
+            "x": {"type": "number", "minimum": -1, "maximum": 1},
+            "y": {"type": "number", "minimum": -1, "maximum": 1},
+            "pressed": {"type": "boolean", "default": True},
+            "value": {"type": "number", "minimum": 0, "maximum": 1, "default": 1},
+            "duration_ms": {"type": "integer", "minimum": 20, "maximum": 10000, "default": 250},
+        },
+        "required": ["side", "control"],
+    },
+}
+
+VRC_MENU_NAVIGATE = {
+    "name": "vrc_menu_navigate",
+    "description": "用右侧虚拟 Index 摇杆短暂导航 VRChat 快捷菜单；x/y 为 -1 到 1，超时自动回中。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "x": {"type": "number", "minimum": -1, "maximum": 1, "default": 0},
+            "y": {"type": "number", "minimum": -1, "maximum": 1, "default": 0},
+            "duration_ms": {"type": "integer", "minimum": 50, "maximum": 2000, "default": 250},
+        },
+        "required": [],
+    },
+}
+
+VRC_JUMP = {
+    "name": "vrc_jump",
+    "description": "通过右侧虚拟 Index A 键发送一次跳跃脉冲。无法确认 VRChat 当前绑定是否使用 A 键跳跃。",
+    "parameters": {
+        "type": "object",
+        "properties": {"hold_ms": {"type": "integer", "minimum": 20, "maximum": 1000, "default": 100}},
+        "required": [],
+    },
+}
+
+VRC_AUTONOMY_STATUS = {
+    "name": "vrc_autonomy_status",
+    "description": "读取 VRChat 自主控制授权、降级原因、当前目标和世界 revision。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+VRC_AUTONOMY_GOAL = {
+    "name": "vrc_autonomy_goal",
+    "description": "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "minLength": 1, "maxLength": 256},
+            "kind": {"type": "string", "enum": ["explore", "approach", "follow", "interact", "socialize"]},
+        },
+        "required": ["goal"],
+    },
+}
+
+VRC_AUTONOMY_STOP = {
+    "name": "vrc_autonomy_stop",
+    "description": "停止自主目标并释放 AnyaDance 控制器输入。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 BODY_STOP = {
@@ -298,7 +365,7 @@ WORLD_OBSERVE = {
 
 BODY_LOCOMOTION = {
     "name": "body_locomotion",
-    "description": "通过 VRChat OSC 持续发送 Vertical/Horizontal 轴值实现移动，直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",
+    "description": "优先通过 AnyaDance 虚拟 Index 左摇杆实现移动，没有可用驱动时回退到 VRChat OSC；直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",
     "parameters": {
         "type": "object",
         "properties": {
@@ -312,7 +379,7 @@ BODY_LOCOMOTION = {
 
 BODY_TURN = {
     "name": "body_turn",
-    "description": "通过 VRChat OSC 持续发送 LookHorizontal 轴值实现转身，直到超时或下一次调用。正值向右转，负值向左转。",
+    "description": "优先通过 AnyaDance 虚拟 Index 右摇杆水平轴实现转身，没有可用驱动时回退到 VRChat OSC；正值向右转，负值向左转。",
     "parameters": {
         "type": "object",
         "properties": {

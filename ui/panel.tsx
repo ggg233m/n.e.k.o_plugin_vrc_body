@@ -142,6 +142,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const driverLog = state.driver_log || {}
   const idleRelay = body.idle_relay || awareness.idle_relay || {}
   const hostVmc = state.host_vmc || {}
+  const autonomy = state.autonomy || {}
   const metrics = body.metrics || {}
   const udp = body.udp || {}
   const currentAction = body.current_action || null
@@ -270,6 +271,9 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             宿主 VMC {hostVmc.active ? "enabled" : "disabled"}
           </StatusBadge>
           <StatusBadge tone="info">行为 {behavior.mode || "disabled"}</StatusBadge>
+          <StatusBadge tone={autonomy.armed ? "success" : "warning"}>
+            自主 {autonomy.state || "disarmed"}
+          </StatusBadge>
           {busy ? <StatusBadge tone="info">命令执行中</StatusBadge> : null}
         </ToolbarGroup>
         <ToolbarGroup>
@@ -334,6 +338,23 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               { key: "sendFailures", label: "发送失败", value: `${udp.send_failures || 0} / ${osc.send_failures || 0}` },
             ]}
           />
+        </Card>
+
+        <Card title="自主控制授权">
+          <Stack>
+            <Text>{autonomy.reason || "必须手动授权；世界观测失败会自动降级。"}</Text>
+            <KeyValue items={[
+              { key: "state", label: "状态", value: autonomy.state || "disarmed" },
+              { key: "ttl", label: "剩余授权", value: autonomy.remaining_seconds == null ? "—" : `${fixed(autonomy.remaining_seconds, 0)} 秒` },
+              { key: "revision", label: "世界 revision", value: autonomy.world_revision ?? 0 },
+              { key: "goal", label: "当前目标", value: autonomy.goal?.text || "无" },
+            ]} />
+            <ButtonGroup>
+              <Button tone="success" disabled={busy || autonomy.armed} onClick={() => run("vrc_autonomy_arm")}>手动授权 30 分钟</Button>
+              <Button tone="danger" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_disarm")}>解除授权并释放</Button>
+              <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_stop")}>停止自主目标</Button>
+            </ButtonGroup>
+          </Stack>
         </Card>
       </Grid>
 
