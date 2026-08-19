@@ -121,6 +121,49 @@ class BackendClientTests(unittest.TestCase):
         service.osc = Osc()  # type: ignore[assignment]
         self.assertEqual(service.stop_movement(), (False, "zero packet failed"))
 
+    def test_osc_batch_is_bounded_and_records_dispatch_latency(self) -> None:
+        service = BackendService({}, Path.cwd())
+
+        class Osc:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_axes(self, values, duration):
+                self.calls.append(("axes", values, duration))
+                return True, None
+
+            def set_axis(self, axis, value, duration):
+                self.calls.append(("axis", axis, value, duration))
+                return True, None
+
+            def stop_all_axes(self):
+                self.calls.append(("stop",))
+                return True, None
+
+            def send_parameter(self, name, value):
+                self.calls.append(("parameter", name, value))
+                return True, None
+
+        osc = Osc()
+        service.osc = osc  # type: ignore[assignment]
+        result = service.send_osc_batch([
+            {"kind": "locomotion", "vertical": 0.4, "horizontal": 0.0, "duration_ms": 500},
+            {"kind": "turn", "horizontal": -0.2, "duration_ms": 300},
+            {"kind": "parameter", "name": "NEKO_Action", "value": 1},
+        ])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(len(result["results"]), 3)
+        self.assertEqual(osc.calls[0][0], "axes")
+        self.assertEqual(osc.calls[1][0], "axis")
+        self.assertEqual(osc.calls[2][0], "parameter")
+
+        self.assertFalse(service.send_osc_batch([{"kind": "noop"}] * 9)["accepted"])
+        service.record_control_dispatch("/osc/batch", 0.0)
+        metrics = service.control_metrics_snapshot()
+        self.assertEqual(metrics["count"], 1)
+        self.assertEqual(metrics["last_operation"], "/osc/batch")
+        self.assertIn("/osc/batch", metrics["by_operation"])
+
     def test_scheduler_snapshot_contains_safe_awareness_when_backend_is_down(self) -> None:
         class DownClient:
             def request(self, *_args, **_kwargs):
@@ -321,6 +364,17 @@ class BackendClientTests(unittest.TestCase):
         try:
             client.start(timeout_s=8.0)
             self.assertTrue(client.request("GET", "/health")["ok"])
+            self.assertTrue(client.fast_request("GET", "/health")["ok"])
+            fast_connection = client._fast_connection
+            self.assertIsNotNone(fast_connection)
+            self.assertTrue(client.fast_request("GET", "/health")["ok"])
+            self.assertIs(client._fast_connection, fast_connection)
+            batch = client.request(
+                "POST",
+                "/osc/batch",
+                {"commands": [{"kind": "stop_movement"}]},
+            )
+            self.assertIn("dispatch_latency_ms", batch)
             self.assertEqual(client.scheduler.snapshot()["state"], "disabled")
             self.assertFalse(client.vision.snapshot()["available"])
             invalid_lifecycle = client.vision.ingest({"remove_entity_ids": ["button"]})

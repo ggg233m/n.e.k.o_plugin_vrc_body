@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import math
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,14 @@ class BackendService:
         self._last_error: str | None = None
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
+        self._control_metrics_lock = threading.Lock()
+        self._control_metrics = {
+            "count": 0,
+            "last_operation": None,
+            "last_latency_ms": None,
+            "max_latency_ms": 0.0,
+            "by_operation": {},
+        }
         self.cognition = CognitionRuntime(
             self._cognition_sources,
             world_provider=lambda: self.world_state.snapshot(),
@@ -505,6 +514,7 @@ class BackendService:
                 "reason": "not_configured",
             },
             "cognition": self.cognition.snapshot(),
+            "control_latency": self.control_metrics_snapshot(),
             "backend": {
                 "started": self._started,
                 "dry_run": self.dry_run,
@@ -512,6 +522,34 @@ class BackendService:
                 "pid": __import__("os").getpid(),
             },
         }
+
+    def record_control_dispatch(self, operation: str, started_at: float) -> float:
+        """Record server-side dispatch latency for a control-plane request."""
+        elapsed_ms = max(0.0, (time.perf_counter() - float(started_at)) * 1000.0)
+        name = str(operation or "unknown")
+        with self._control_metrics_lock:
+            by_operation = self._control_metrics["by_operation"]
+            record = by_operation.setdefault(name, {"count": 0, "last_latency_ms": None, "max_latency_ms": 0.0})
+            record["count"] += 1
+            record["last_latency_ms"] = round(elapsed_ms, 3)
+            record["max_latency_ms"] = round(max(record["max_latency_ms"], elapsed_ms), 3)
+            self._control_metrics["count"] += 1
+            self._control_metrics["last_operation"] = name
+            self._control_metrics["last_latency_ms"] = round(elapsed_ms, 3)
+            self._control_metrics["max_latency_ms"] = round(
+                max(self._control_metrics["max_latency_ms"], elapsed_ms),
+                3,
+            )
+        return round(elapsed_ms, 3)
+
+    def control_metrics_snapshot(self) -> dict[str, Any]:
+        with self._control_metrics_lock:
+            result = dict(self._control_metrics)
+            result["by_operation"] = {
+                name: dict(record)
+                for name, record in self._control_metrics["by_operation"].items()
+            }
+            return result
 
     def awareness(self) -> dict[str, Any]:
         body = self.snapshot()["body"]
@@ -590,6 +628,70 @@ class BackendService:
         if self.osc is None:
             return False, "VRChat OSC bridge is not initialized"
         return self.osc.stop_all_axes()
+
+    def send_osc_batch(self, commands: Any) -> dict[str, Any]:
+        """Apply a bounded batch of low-latency OSC commands.
+
+        Axis commands are latest-wins inside the batch.  If any command fails
+        after an axis was touched, all movement axes are released before the
+        error is returned.
+        """
+        if not isinstance(commands, list) or not commands:
+            return {"accepted": False, "results": [], "reason": "commands must be a non-empty array"}
+        if len(commands) > 8:
+            return {"accepted": False, "results": [], "reason": "commands must contain at most 8 items"}
+        results: list[dict[str, Any]] = []
+        axis_touched = False
+        for index, command in enumerate(commands):
+            if not isinstance(command, Mapping):
+                reason = f"commands[{index}] must be an object"
+                if axis_touched:
+                    self.stop_movement()
+                return {"accepted": False, "results": results, "reason": reason}
+            kind = str(command.get("kind") or "").strip().lower()
+            if kind == "locomotion":
+                result = self.set_locomotion(
+                    command.get("vertical", 0),
+                    command.get("horizontal", 0),
+                    command.get("duration_ms", 1000),
+                )
+                axis_touched = True
+            elif kind == "turn":
+                result = self.set_turn(
+                    command.get("horizontal"),
+                    command.get("duration_ms", 500),
+                )
+                axis_touched = True
+            elif kind == "stop_movement":
+                result = self.stop_movement()
+                axis_touched = True
+            elif kind == "parameter":
+                result = self.send_avatar_parameter(command.get("name", ""), command.get("value"))
+            elif kind == "input":
+                result = self.pulse_input(
+                    command.get("action", ""),
+                    command.get("side", ""),
+                    command.get("hold_ms", 100),
+                )
+            elif kind == "chatbox":
+                result = self.send_chatbox(
+                    command.get("text", ""),
+                    command.get("immediate", True),
+                )
+            else:
+                result = (False, f"unknown batch command kind: {kind or '<empty>'}")
+            accepted, reason = result
+            results.append({"index": index, "kind": kind, "accepted": accepted, "reason": reason})
+            if not accepted:
+                if axis_touched:
+                    self.stop_movement()
+                return {
+                    "accepted": False,
+                    "results": results,
+                    "failed_index": index,
+                    "reason": reason or "batch command failed",
+                }
+        return {"accepted": True, "results": results, "reason": None}
 
     def send_chatbox(self, text: Any, immediate: Any) -> tuple[bool, str | None]:
         if not isinstance(text, str):

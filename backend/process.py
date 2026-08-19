@@ -18,6 +18,7 @@ import secrets
 import signal
 import sys
 import threading
+import time
 import tomllib
 from typing import Any
 import types
@@ -39,6 +40,9 @@ BackendService = importlib.import_module(f"{PACKAGE_NAME}.backend.service").Back
 
 class BackendRequestHandler(BaseHTTPRequestHandler):
     server: "BackendHttpServer"
+    # Keep the loopback control connection alive so repeated OSC/action calls
+    # do not pay a TCP handshake for every command.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -86,6 +90,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(401, {"error": "unauthorized"})
             return
+        started_at = time.perf_counter()
         try:
             value = self._read_json()
             if self.path == "/action":
@@ -126,6 +131,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("immediate", True),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/osc/batch":
+                result = self.server.service.send_osc_batch(value.get("commands"))
             elif self.path == "/osc/cancel":
                 self.server.service.cancel_inputs()
                 result = {"accepted": True}
@@ -148,6 +155,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "unknown endpoint"})
                 return
+            if self.path.startswith("/osc/"):
+                dispatch_latency_ms = self.server.service.record_control_dispatch(self.path, started_at)
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result["dispatch_latency_ms"] = dispatch_latency_ms
             self._json(200, result)
         except Exception as exc:
             self._json(400, {"error": f"{type(exc).__name__}: {exc}"[:500]})

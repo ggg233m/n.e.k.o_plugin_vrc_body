@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import base64
+import http.client
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,10 @@ class BackendClient:
         self.process: subprocess.Popen[Any] | None = None
         self._stderr_lines: deque[str] = deque(maxlen=64)
         self._stderr_thread: threading.Thread | None = None
+        # The Hosted plugin sends frequent control commands.  Keep one local
+        # HTTP/1.1 connection for that fast path instead of paying a TCP
+        # handshake for every OSC/action request.
+        self._fast_connection: http.client.HTTPConnection | None = None
         osc = self.config_data.get("vrchat_osc")
         osc_mapping = osc if isinstance(osc, Mapping) else {}
         raw_enabled = osc_mapping.get("enabled", True)
@@ -93,11 +98,14 @@ class BackendClient:
         command = [
             sys.executable,
             str(backend_dir / "process.py"),
-            "--host", "127.0.0.1",
-            "--port", str(self.port),
-            "--token", self.token,
-            "--config-dir", self.config_dir,
-            "--config-json", encoded_config,
+            "--host=127.0.0.1",
+            f"--port={self.port}",
+            # ``urlsafe_b64encode`` can legally start with ``-``.  Passing
+            # values with ``--name=value`` prevents argparse from treating
+            # such a token/config blob as another option.
+            f"--token={self.token}",
+            f"--config-dir={self.config_dir}",
+            f"--config-json={encoded_config}",
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.process = subprocess.Popen(
@@ -170,6 +178,7 @@ class BackendClient:
         process = self.process
         self.process = None
         if process is None:
+            self._close_fast_connection()
             return
         try:
             if process.poll() is None:
@@ -190,8 +199,87 @@ class BackendClient:
                 stderr_thread.join(timeout=1.0)
             self._stderr_thread = None
         finally:
+            self._close_fast_connection()
             self.port = 0
             self.token = ""
+
+    def _close_fast_connection(self) -> None:
+        connection = self._fast_connection
+        self._fast_connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def fast_request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout_s: float = 1.0,
+    ) -> dict[str, Any]:
+        """Send a latency-sensitive local request over a reused connection.
+
+        The regular ``request`` method intentionally keeps its urllib-based
+        behavior for compatibility and diagnostics.  Control-plane callers
+        use this method so repeated OSC/action commands avoid reconnecting to
+        the loopback HTTP server.  A stale keep-alive socket is retried once.
+        """
+        if not self.port or not self.token:
+            raise BackendUnavailable("backend is not started")
+        body = None if payload is None else json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+            "X-Neko-Backend-Token": self.token,
+        }
+        with self._request_lock:
+            for attempt in range(2):
+                try:
+                    connection = self._fast_connection
+                    if connection is None:
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1",
+                            self.port,
+                            timeout=timeout_s,
+                        )
+                        self._fast_connection = connection
+                    else:
+                        connection.timeout = timeout_s
+                    connection.request(method, path, body=body, headers=headers)
+                    response = connection.getresponse()
+                    raw = response.read()
+                    try:
+                        value = json.loads(raw.decode("utf-8"))
+                    except (UnicodeError, ValueError) as exc:
+                        raise BackendUnavailable("backend returned invalid JSON") from exc
+                    if not isinstance(value, dict):
+                        raise BackendUnavailable("backend returned a non-object response")
+                    if response.status >= 400:
+                        message = value.get("error") or f"HTTP {response.status}"
+                        if response.status in {400, 422}:
+                            raise BackendRejected(str(message), status_code=response.status)
+                        raise BackendUnavailable(str(message))
+                    if "error" in value and len(value) == 1:
+                        raise BackendUnavailable(str(value["error"]))
+                    return value
+                except BackendUnavailable:
+                    raise
+                except BackendRejected:
+                    raise
+                except (
+                    OSError,
+                    TimeoutError,
+                    http.client.HTTPException,
+                ) as exc:
+                    self._close_fast_connection()
+                    if attempt == 0:
+                        continue
+                    raise BackendUnavailable(str(exc)) from exc
+        raise BackendUnavailable("fast backend request failed")
 
     def semantic_express(self, params: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -270,6 +358,19 @@ class BackendClient:
         return value
 
 
+def _control_request(
+    client: Any,
+    method: str,
+    path: str,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Use the persistent control channel when the client provides it."""
+    fast_request = getattr(client, "fast_request", None)
+    if callable(fast_request):
+        return fast_request(method, path, payload)
+    return client.request(method, path, payload)
+
+
 class RemoteScheduler:
     def __init__(self, client: BackendClient) -> None:
         self.client = client
@@ -292,7 +393,7 @@ class RemoteScheduler:
                 # 保留原 JSON 类型，让后端严格 schema 统一生成结构化拒绝；
                 # 在客户端 list(...) 会让标量异常逃出动作结果协议。
                 payload["preconditions"] = preconditions
-            return self.client.request("POST", "/action", payload)
+            return _control_request(self.client, "POST", "/action", payload)
         except BackendUnavailable as exc:
             return {
                 "accepted": False,
@@ -305,7 +406,11 @@ class RemoteScheduler:
 
     def snapshot(self) -> dict[str, Any]:
         try:
-            return self.client.request("GET", "/snapshot").get("body", {})
+            response = self.client.request("GET", "/snapshot")
+            body = dict(response.get("body", {}))
+            if "control_latency" in response:
+                body["control_latency"] = response["control_latency"]
+            return body
         except BackendUnavailable:
             return {
                 "state": "backend_unavailable",
@@ -319,6 +424,13 @@ class RemoteScheduler:
                     "transition": None,
                     "pose": {},
                     "summary": "独立后端不可用，身体状态未知。",
+                },
+                "control_latency": {
+                    "count": 0,
+                    "last_operation": None,
+                    "last_latency_ms": None,
+                    "max_latency_ms": 0.0,
+                    "by_operation": {},
                 },
             }
 
@@ -356,56 +468,79 @@ class RemoteOsc:
 
     def send_parameter(self, name: str, value: Any) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/parameter", {"name": name, "value": value})
+            result = _control_request(self.client, "POST", "/osc/parameter", {"name": name, "value": value})
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
     def pulse_input(self, action: str, side: str, hold_ms: int) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/input", {"action": action, "side": side, "hold_ms": hold_ms})
+            result = _control_request(
+                self.client,
+                "POST",
+                "/osc/input",
+                {"action": action, "side": side, "hold_ms": hold_ms},
+            )
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
     def set_locomotion(self, vertical: float, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/locomotion", {
-                "vertical": vertical,
-                "horizontal": horizontal,
-                "duration_ms": duration_ms,
-            })
+            result = _control_request(
+                self.client,
+                "POST",
+                "/osc/locomotion",
+                {
+                    "vertical": vertical,
+                    "horizontal": horizontal,
+                    "duration_ms": duration_ms,
+                },
+            )
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
     def set_turn(self, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/turn", {
-                "horizontal": horizontal,
-                "duration_ms": duration_ms,
-            })
+            result = _control_request(
+                self.client,
+                "POST",
+                "/osc/turn",
+                {"horizontal": horizontal, "duration_ms": duration_ms},
+            )
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
     def stop_movement(self) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/stop_movement", {})
+            result = _control_request(self.client, "POST", "/osc/stop_movement", {})
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
+    def batch(self, commands: list[Mapping[str, Any]]) -> dict[str, Any]:
+        try:
+            return _control_request(self.client, "POST", "/osc/batch", {"commands": commands})
+        except BackendUnavailable as exc:
+            return {"accepted": False, "results": [], "reason": str(exc)}
+
     def send_chatbox(self, text: str, immediate: bool = True) -> tuple[bool, str | None]:
         try:
-            result = self.client.request("POST", "/osc/chatbox", {"text": text, "immediate": immediate})
+            result = _control_request(
+                self.client,
+                "POST",
+                "/osc/chatbox",
+                {"text": text, "immediate": immediate},
+            )
             return bool(result.get("accepted")), result.get("reason")
         except BackendUnavailable as exc:
             return False, str(exc)
 
     def cancel_scheduled_inputs(self, *, release: bool = True) -> None:
         try:
-            self.client.request("POST", "/osc/cancel", {})
+            _control_request(self.client, "POST", "/osc/cancel", {})
         except BackendUnavailable:
             return
 

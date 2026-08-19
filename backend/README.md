@@ -65,10 +65,38 @@ python backend/debug_cli.py --port 48912 --token dev chatbox --text '你好'
 python backend/debug_cli.py --port 48912 --token dev stop-movement
 ```
 
+需要同时更新多个控制量时，可使用最多 8 条命令的批量接口；同一轴在批次内以后
+出现的值为准，轴命令失败时会自动归零：
+
+```powershell
+python backend/debug_cli.py --port 48912 --token dev batch --json '{"commands":[{"kind":"locomotion","vertical":0.35,"horizontal":0.0,"duration_ms":600},{"kind":"turn","horizontal":-0.4,"duration_ms":400}]}'
+```
+
 `parameter --value` 使用 JSON 标量解析，因此 `true`、`1` 和 `0.5` 会分别作为
 Bool、Int 和 Float 发送；`chatbox` 默认立即显示，使用 `--deferred` 可改为仅在
 输入时显示。所有移动轴都有时限，结束时会自动归零；`stop-movement` 和
 `cancel-inputs` 可用于手动释放状态。
+
+## 低延迟路径
+
+Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控制连接，避免每次
+命令重新建立回环 TCP 连接；后端快照/意识状态从 60 Hz 身体控制线程中降到约 10 Hz
+发布，不会让状态深拷贝阻塞姿态帧。`debug_cli.py` 的单次命令仍适合人工调试，不
+适合高频循环；高频调用可以使用常驻 JSON-lines 控制会话：
+
+```powershell
+python backend/debug_cli.py --port 48912 --token dev shell
+```
+
+然后逐行发送 JSON（每行都会立即返回一行 JSON）：
+
+```json
+{"path":"/osc/locomotion","payload":{"vertical":0.35,"horizontal":0.0,"duration_ms":600}}
+{"path":"/osc/turn","payload":{"horizontal":-0.4,"duration_ms":400}}
+{"path":"/osc/stop_movement","payload":{}}
+```
+
+输入 `quit` 或 `exit` 结束会话。
 
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；

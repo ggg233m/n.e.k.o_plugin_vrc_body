@@ -134,6 +134,24 @@ class OscProtocolTests(unittest.TestCase):
         )
         self.assertEqual(bridge.snapshot()["active_axes"], {})
 
+    def test_newer_axis_command_wins_over_older_expiration(self) -> None:
+        now = [0.0]
+        sent: list[tuple[str, tuple[object, ...]]] = []
+        bridge = VrchatOscBridge(VrchatOscConfig(), clock=lambda: now[0])
+        bridge._send = lambda address, arguments: (
+            sent.append((address, tuple(arguments))) or (True, None)
+        )  # type: ignore[method-assign]
+
+        self.assertTrue(bridge.set_axis("move_vertical", 0.25, 1.0)[0])
+        now[0] = 0.5
+        self.assertTrue(bridge.set_axis("move_vertical", 0.75, 3.0)[0])
+        now[0] = 1.1
+        bridge._run_axis_expirations()
+
+        active = bridge.snapshot()["active_axes"]["move_vertical"]
+        self.assertEqual(active["value"], 0.75)
+        self.assertEqual(sent[-1], ("/input/Vertical", (0.75,)))
+
     def test_stop_all_axes_resets_known_axes_without_active_state(self) -> None:
         sent: list[tuple[str, tuple[object, ...]]] = []
         bridge = VrchatOscBridge(VrchatOscConfig())

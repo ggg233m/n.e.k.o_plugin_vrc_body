@@ -75,6 +75,42 @@ class DebugCliTests(unittest.TestCase):
         self.assertEqual(calls[0][0][4], "/osc/chatbox")
         self.assertEqual(calls[0][0][5], {"text": "hello", "immediate": False})
 
+    def test_persistent_shell_reuses_one_session(self) -> None:
+        class FakeClient:
+            def __init__(self, host, port, token):
+                self.args = (host, port, token)
+                self.calls = []
+                self.closed = False
+
+            def request(self, method, path, payload):
+                self.calls.append((method, path, payload))
+                return {"accepted": True}
+
+            def close(self):
+                self.closed = True
+
+        fake = FakeClient("127.0.0.1", 48912, "dev")
+        stdin = io.StringIO(
+            '{"path":"/osc/locomotion","payload":{"vertical":0.2}}\n'
+            '{"path":"/osc/stop_movement","payload":{}}\n'
+            "quit\n"
+        )
+        with patch.object(debug_cli, "_PersistentHttpClient", return_value=fake), patch.object(
+            sys, "stdin", stdin
+        ):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(debug_cli._run_shell("127.0.0.1", 48912, "dev"), 0)
+
+        self.assertEqual(
+            fake.calls,
+            [
+                ("POST", "/osc/locomotion", {"vertical": 0.2}),
+                ("POST", "/osc/stop_movement", {}),
+            ],
+        )
+        self.assertTrue(fake.closed)
+        self.assertIn('"ready": true', output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

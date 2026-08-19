@@ -1,4 +1,4 @@
-"""Single-owner real-time scheduler for AnyaDance body output."""
+"""AnyaDance 身体输出的单所有者实时调度器。"""
 
 from __future__ import annotations
 
@@ -155,6 +155,9 @@ class BodyScheduler:
         self._urgent_stop: Optional[BodyCommand] = None
         self._snapshot_lock = threading.Lock()
         self._snapshot: Dict[str, Any] = self._initial_snapshot()
+        # 快照构建会深拷贝感知、行为与状态。供 UI/LLM 消费者使用，但不应置于 60Hz 控制路径上，因此以受限的 10Hz 发布。
+        self._snapshot_interval_s = 0.1
+        self._last_snapshot_at: Optional[float] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -433,7 +436,7 @@ class BodyScheduler:
                                 self._state = "disabled"
                                 self._active = None
                                 self._clear_current_action(now, "completed")
-                    self._publish_snapshot()
+                    self._publish_snapshot_if_due(now)
                 except Exception as exc:  # scheduler must fail safe instead of dying
                     self._enter_fault(exc)
                     self._publish_snapshot()
@@ -1482,3 +1485,9 @@ class BodyScheduler:
         }
         with self._snapshot_lock:
             self._snapshot = snapshot
+        self._last_snapshot_at = now
+
+    def _publish_snapshot_if_due(self, now: float) -> None:
+        """Publish telemetry without adding deep-copy work to every frame."""
+        if self._last_snapshot_at is None or now - self._last_snapshot_at >= self._snapshot_interval_s:
+            self._publish_snapshot()

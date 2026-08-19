@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 from pathlib import Path
 import sys
@@ -33,6 +34,80 @@ def _scalar_arg(value: str) -> object:
     if isinstance(parsed, (dict, list)):
         raise ValueError("value must be a scalar")
     return parsed
+
+
+class _PersistentHttpClient:
+    """Small JSON-lines shell transport that reuses one loopback connection."""
+
+    def __init__(self, host: str, port: int, token: str) -> None:
+        self.host = host
+        self.port = port
+        self.token = token
+        self.connection: http.client.HTTPConnection | None = None
+
+    def close(self) -> None:
+        connection = self.connection
+        self.connection = None
+        if connection is not None:
+            connection.close()
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+            "X-Neko-Backend-Token": self.token,
+        }
+        for attempt in range(2):
+            try:
+                if self.connection is None:
+                    self.connection = http.client.HTTPConnection(self.host, self.port, timeout=5.0)
+                self.connection.request(method, path, body=body, headers=headers)
+                response = self.connection.getresponse()
+                raw = response.read()
+                value = json.loads(raw.decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise RuntimeError("backend returned a non-object response")
+                if response.status >= 400:
+                    raise RuntimeError(str(value.get("error") or f"HTTP {response.status}"))
+                return value
+            except (OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
+                self.close()
+                if attempt:
+                    raise RuntimeError(str(exc)) from exc
+        raise RuntimeError("persistent request failed")
+
+
+def _run_shell(host: str, port: int, token: str) -> int:
+    """Run a persistent JSON-lines control session for high-frequency callers."""
+    client = _PersistentHttpClient(host, port, token)
+    print(json.dumps({"ready": True, "protocol": "jsonl"}, ensure_ascii=False), flush=True)
+    try:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.lower() in {"exit", "quit"}:
+                break
+            try:
+                command = json.loads(line)
+                if not isinstance(command, dict):
+                    raise ValueError("command must be a JSON object")
+                path = str(command.get("path") or "")
+                if not path.startswith("/"):
+                    raise ValueError("path must start with '/'")
+                method = str(command.get("method") or "POST").upper()
+                payload = command.get("payload")
+                if payload is not None and not isinstance(payload, dict):
+                    raise ValueError("payload must be a JSON object")
+                result = client.request(method, path, payload)
+            except (ValueError, RuntimeError, OSError) as exc:
+                result = {"accepted": False, "error": str(exc)}
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
+    finally:
+        client.close()
+    return 0
 
 
 def request(host: str, port: int, token: str, method: str, path: str, payload: dict | None = None) -> dict:
@@ -85,6 +160,13 @@ def main() -> int:
     feedback = sub.add_parser("feedback")
     feedback.add_argument("--json", default=None)
     feedback.add_argument("--file", type=Path, default=None)
+    sub.add_parser(
+        "shell",
+        help="persistent JSON-lines control session (one HTTP connection)",
+    )
+    batch = sub.add_parser("batch", help="send a bounded batch of OSC commands")
+    batch.add_argument("--json", default=None)
+    batch.add_argument("--file", type=Path, default=None)
     parameter = sub.add_parser("parameter", help="send one VRChat Avatar parameter")
     parameter.add_argument("--name", required=True)
     parameter.add_argument("--value", required=True, help="JSON scalar such as true, 1, or 0.5")
@@ -111,6 +193,8 @@ def main() -> int:
     chatbox.set_defaults(immediate=True)
     sub.add_parser("cancel-inputs", help="cancel pending inputs and release buttons")
     args = parser.parse_args()
+    if args.command == "shell":
+        return _run_shell(args.host, args.port, args.token)
     try:
         if args.command == "health":
             result = request(args.host, args.port, args.token, "GET", "/health")
@@ -157,6 +241,15 @@ def main() -> int:
                 "POST",
                 "/osc/parameter",
                 {"name": args.name, "value": _scalar_arg(args.value)},
+            )
+        elif args.command == "batch":
+            result = request(
+                args.host,
+                args.port,
+                args.token,
+                "POST",
+                "/osc/batch",
+                _json_arg(args.json, args.file),
             )
         elif args.command == "input":
             result = request(
