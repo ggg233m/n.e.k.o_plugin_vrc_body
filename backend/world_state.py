@@ -79,6 +79,22 @@ def _sources(value: Any, default: str) -> tuple[str, ...]:
     return tuple(result or [default])
 
 
+def stable_entity_id(source: Any, label: Any, track_id: Any) -> str:
+    """生成跨帧稳定的实体 ID，供外部 detector 统一采用。"""
+    parts: list[str] = []
+    for name, value, limit in (
+        ("source", source, 48),
+        ("label", label, 64),
+        ("track_id", track_id, 96),
+    ):
+        text = _text(value, limit=limit)
+        if not text:
+            raise ValueError(f"stable entity id requires {name}")
+        # 冒号是协议分隔符；替换掉输入中的冒号，避免产生歧义 ID。
+        parts.append(text.replace(":", "_"))
+    return ":".join(parts)
+
+
 @dataclass(frozen=True)
 class WorldEntity:
     """一个有界的视觉世界实体假设。"""
@@ -103,9 +119,13 @@ class WorldEntity:
         default_source: str = "vision",
         default_ttl_s: float = 2.0,
     ) -> "WorldEntity":
+        source = _sources(value.get("source"), default_source)
+        label = _text(value.get("label"), default="unknown", limit=64) or "unknown"
         entity_id = _text(value.get("id"), limit=96)
+        if not entity_id and value.get("track_id") is not None:
+            entity_id = stable_entity_id(source[0], label, value.get("track_id"))
         if not entity_id:
-            raise ValueError("world entity id must not be empty")
+            raise ValueError("world entity id or track_id must not be empty")
         attributes = value.get("attributes")
         safe_attributes = (
             {str(key)[:64]: _safe_value(item) for key, item in list(attributes.items())[:24]}
@@ -125,13 +145,13 @@ class WorldEntity:
         observed_at = min(now, _finite(value.get("observed_at"), now))
         return cls(
             id=entity_id,
-            label=_text(value.get("label"), default="unknown", limit=64) or "unknown",
+            label=label,
             confidence=_confidence(value.get("confidence")),
             bbox=_bbox(value.get("bbox")),
             state=_text(value.get("state"), default="unknown", limit=64) or "unknown",
             attributes=safe_attributes,
             relations=relations,
-            source=_sources(value.get("source"), default_source),
+            source=source,
             observed_at=observed_at,
             ttl_s=ttl_s,
         )
@@ -345,4 +365,4 @@ class WorldStateStore:
             }
 
 
-__all__ = ["WorldEntity", "WorldEvent", "WorldStateStore"]
+__all__ = ["WorldEntity", "WorldEvent", "WorldStateStore", "stable_entity_id"]

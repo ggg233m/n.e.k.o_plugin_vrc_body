@@ -316,7 +316,7 @@ class WorldPreconditionGate:
                     (item for item in entities if str(item.get("id") or "") == condition.entity_id),
                     None,
                 )
-                if entity is None or entity.get("visible") is False:
+                if entity is None or entity.get("visible") is not True:
                     failures.append(self._failure(
                         index,
                         condition,
@@ -774,10 +774,17 @@ class CognitionRuntime:
 
     def check_preconditions(self, value: Any) -> dict[str, Any]:
         """检查动作前置条件；无条件时不读取世界状态。"""
-        try:
-            conditions = self.precondition_gate.normalize(value)
-        except ValueError:
-            return self.precondition_gate.evaluate(value, {})
+        if isinstance(value, (list, tuple)) and all(
+            isinstance(item, WorldPrecondition) for item in value
+        ):
+            # Planner 已经完成严格规范化；直接复用对象，避免
+            # to_dict -> from_mapping 往返重新套默认值。
+            conditions = tuple(value)
+        else:
+            try:
+                conditions = self.precondition_gate.normalize(value)
+            except ValueError:
+                return self.precondition_gate.evaluate(value, {})
         if not conditions:
             return self.precondition_gate.evaluate_normalized(conditions, {})
         try:

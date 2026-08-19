@@ -78,6 +78,22 @@ class CognitionTests(unittest.TestCase):
         }], world)
         self.assertEqual(missing["failures"][0]["code"], "entity_not_visible")
 
+        missing_visibility_flag = gate.evaluate([{
+            "kind": "entity_visible",
+            "entity_id": "yolo:cup:7",
+        }], {
+            **world,
+            "entities": [{
+                key: value
+                for key, value in world["entities"][0].items()
+                if key != "visible"
+            }],
+        })
+        self.assertEqual(
+            missing_visibility_flag["failures"][0]["code"],
+            "entity_not_visible",
+        )
+
         default_confidence = gate.evaluate([{
             "kind": "entity_visible",
             "entity_id": "yolo:cup:7",

@@ -75,6 +75,26 @@ class PluginSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transition_history_size"):
             PluginConfig.from_mapping({"behavior": {"transition_history_size": 2}})
 
+    def test_vision_config_is_disabled_and_bounded_by_default(self) -> None:
+        default = PluginConfig.from_mapping({})
+        self.assertFalse(default.vision.enabled)
+        self.assertEqual(default.vision.source, "none")
+        configured = PluginConfig.from_mapping({
+            "vision": {
+                "enabled": True,
+                "source": "external",
+                "interval_ms": 50,
+                "queue_size": 2,
+            }
+        })
+        self.assertTrue(configured.vision.enabled)
+        self.assertEqual(configured.vision.interval_ms, 50)
+        self.assertEqual(configured.vision.queue_size, 2)
+        with self.assertRaisesRegex(ValueError, "vision.source"):
+            PluginConfig.from_mapping({"vision": {"source": "unknown"}})
+        with self.assertRaisesRegex(ValueError, "vision.interval_ms"):
+            PluginConfig.from_mapping({"vision": {"interval_ms": 5}})
+
     def test_integer_config_values_are_not_silently_truncated(self) -> None:
         with self.assertRaisesRegex(ValueError, "anyadance.port"):
             PluginConfig.from_mapping({"anyadance": {"port": 39570.5}})

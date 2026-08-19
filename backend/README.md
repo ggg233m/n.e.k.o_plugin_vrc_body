@@ -17,8 +17,14 @@
   它不进入 AnyaDance 的 60 Hz 控制线程，未来的 LLM 只需要生成同一计划格式。
 - `adapters.py` 是唯一的宿主项目集成接缝，负责把后端映射到当前项目的调度器、
   VMC、OSC、遥测、配置和动作片段库。
-- `vision.py` 与 `world_state.py` 是无第三方依赖的感知状态基础模块；可以挂接
-  模型或采集适配器而不改变控制循环。
+- `vision.py` 与 `world_state.py` 是无模型依赖的感知状态基础模块；其中
+  `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。当前不内置
+  YOLO/MediaPipe 模型，未来 detector 只需实现 `status()` 与
+  `observe(frame, now=...)`，再通过 `BackendService.attach_vision()` 注入。
+  worker 使用有界 latest-frame 队列，掉帧优先于堆积，不进入 60 Hz 控制线程。
+- `MssFrameSource` 是可选的纯 mss 桌面采集器，依赖懒加载；没有 mss/Pillow/numpy
+  时后端仍可启动并报告 `available=false`。不要从兄弟插件项目导入截图服务，避免
+  把 SDK 依赖带回独立后端。
 
 要将此后端适配到其他项目，请复制本目录，替换 `adapters.py` 中的调度器、VMC、
 OSC 和遥测映射，并保持进程协议与世界状态模块不变。进程入口会动态发现所在的
@@ -48,6 +54,27 @@ python backend/debug_cli.py --port 48912 --token dev shutdown
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
 执行仍必须经过 `/action` 或插件工具。
+
+`POST /world/ingest` 仍支持完整状态回包；高频外部发布者可设置
+`"ack_only": true`，只得到 source/frame_id、实体/事件计数和 observation_count，
+避免重复传输完整世界快照。后端内置 worker 直接写入 `WorldStateStore`，不经过 HTTP。
+
+外部 detector 应为每个持续跟踪目标使用稳定 ID，推荐调用
+`stable_entity_id(source, label, track_id)` 生成
+`{source}:{label}:{track_id}`；不要在未启用 tracking 时按帧生成随机 UUID。
+
+配置段默认关闭：
+
+```toml
+[vision]
+enabled = false
+source = "none" # none / mss / external
+interval_ms = 100
+queue_size = 1
+```
+
+配置只描述 worker，不下载或加载模型。YOLO 后端交付后再把它作为外部
+`FrameDetector` 接入；当前仓库不会安装 Ultralytics、Torch 或模型权重。
 
 ## 世界状态动作门禁
 

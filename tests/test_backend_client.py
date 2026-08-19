@@ -14,6 +14,7 @@ import unittest
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.client import BackendClient, BackendUnavailable, RemoteScheduler
 from neko_anyadance_body.backend.service import BackendService
+from neko_anyadance_body.backend.vision import VisionObservation
 
 
 class BackendClientTests(unittest.TestCase):
@@ -137,6 +138,77 @@ class BackendClientTests(unittest.TestCase):
         self.assertTrue(accepted["precondition_check"]["passed"])
         self.assertEqual(len(scheduler.submissions), 2)
 
+    def test_injected_vision_worker_is_owned_by_backend_lifecycle(self) -> None:
+        class Source:
+            name = "fake_source"
+
+            def __init__(self):
+                self.closed = False
+                self.count = 0
+
+            def status(self):
+                return {"available": not self.closed}
+
+            def read(self):
+                if self.closed:
+                    return None
+                self.count += 1
+                return self.count
+
+            def close(self):
+                self.closed = True
+
+        class Detector:
+            name = "fake_detector"
+
+            def __init__(self):
+                self.event = __import__("threading").Event()
+
+            def status(self):
+                return {"available": True, "backend": "test"}
+
+            def observe(self, frame, *, now):
+                self.event.set()
+                return VisionObservation(
+                    entities=({
+                        "track_id": 1,
+                        "label": "button",
+                        "confidence": 0.9,
+                        "ttl_s": 0.5,
+                    },),
+                    source="fake_detector",
+                    observed_at=now,
+                )
+
+        source = Source()
+        detector = Detector()
+        service = BackendService(
+            {
+                "vision": {"enabled": True, "interval_ms": 10},
+                "vmc_idle": {"enabled": False, "manage_host_output": False},
+                "vrchat_osc": {"enabled": False},
+                "driver_log": {"enabled": False},
+            },
+            Path.cwd(),
+            dry_run=True,
+            vision_source=source,
+            vision_detector=detector,
+        )
+        try:
+            service.start()
+            self.assertTrue(detector.event.wait(1.0))
+            deadline = time.monotonic() + 1.0
+            snapshot = service.snapshot()
+            while snapshot["vision_worker"]["frames_processed"] < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                snapshot = service.snapshot()
+            self.assertTrue(snapshot["world"]["available"])
+            self.assertGreaterEqual(snapshot["vision_worker"]["frames_processed"], 1)
+            self.assertEqual(snapshot["world"]["entities"][0]["id"], "fake_detector:button:1")
+        finally:
+            service.stop()
+        self.assertTrue(source.closed)
+
     def test_standalone_backend_process_health_and_shutdown(self) -> None:
         root = Path(__file__).resolve().parents[1]
         client = BackendClient(
@@ -166,6 +238,19 @@ class BackendClientTests(unittest.TestCase):
             )
             self.assertTrue(world["available"])
             self.assertEqual(world["entities"][0]["id"], "button")
+            ack = client.request(
+                "POST",
+                "/world/ingest",
+                {
+                    "source": "test_detector",
+                    "frame_id": "frame-ack",
+                    "entities": [{"id": "button", "label": "button", "confidence": 0.9}],
+                    "ack_only": True,
+                },
+            )
+            self.assertTrue(ack["accepted"])
+            self.assertEqual(ack["frame_id"], "frame-ack")
+            self.assertNotIn("entities", ack)
             gated = client.scheduler.submit(
                 "arm_pose",
                 {"side": "right", "elevation_deg": 90},

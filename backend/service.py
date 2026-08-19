@@ -20,7 +20,7 @@ from .adapters import (
     resolve_expression,
 )
 from .cognition import CognitionRuntime
-from .vision import VisionRuntime
+from .vision import FrameDetector, FrameSource, VisionObservation, VisionRuntime, VisionWorker
 from .world_state import WorldStateStore
 
 
@@ -54,14 +54,24 @@ class BackendService:
         *,
         logger: Any = None,
         dry_run: bool = False,
+        vision_source: FrameSource | None = None,
+        vision_detector: FrameDetector | None = None,
     ) -> None:
         self.config = PluginConfig.from_mapping(config_data)
         self.config_dir = Path(config_dir)
         self.logger = logger
         self.dry_run = bool(dry_run)
+        self._vision_source = vision_source
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
         self.world_state = WorldStateStore()
-        self.vision = VisionRuntime(self.world_state)
+        self.vision = VisionRuntime(
+            self.world_state,
+            detector=vision_detector,
+            observation_callback=self._on_vision_observation,
+        )
+        self.vision_worker: VisionWorker | None = None
+        if self.config.vision.enabled and vision_source is not None and vision_detector is not None:
+            self.vision_worker = self._new_vision_worker(vision_source)
         self.scheduler: BodyScheduler | None = None
         self.osc: VrchatOscBridge | None = None
         self.driver_log: DriverLogListener | None = None
@@ -79,6 +89,14 @@ class BackendService:
             world_provider=lambda: self.world_state.snapshot(),
         )
 
+    def _new_vision_worker(self, source: FrameSource) -> VisionWorker:
+        return VisionWorker(
+            self.vision,
+            source,
+            interval_s=self.config.vision.interval_ms / 1000.0,
+            queue_size=self.config.vision.queue_size,
+        )
+
     def _cognition_sources(self) -> dict[str, dict[str, Any]]:
         """暴露各数据源健康状况，且不会递归调用 ``snapshot``。"""
         body = self.scheduler.snapshot() if self.scheduler else {"state": "shutdown"}
@@ -86,6 +104,11 @@ class BackendService:
         driver = self.driver_log.snapshot() if self.driver_log else {"enabled": False}
         vmc = self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False}
         world = self.vision.snapshot()
+        worker = self.vision_worker.status() if self.vision_worker else {
+            "enabled": False,
+            "running": False,
+            "reason": "not_configured",
+        }
         return {
             "body": {
                 "state": body.get("state"),
@@ -125,6 +148,7 @@ class BackendService:
                 "last_observation_age_ms": (world.get("status") or {}).get("last_observation_age_ms"),
                 "vision_enabled": (world.get("vision") or {}).get("enabled", False),
             },
+            "vision_worker": worker,
         }
 
     def start(self) -> None:
@@ -149,6 +173,8 @@ class BackendService:
                 self.osc.start()
                 self.driver_log = DriverLogListener(self.config.driver_log, logger=self.logger)
                 self.driver_log.start()
+                if self.vision_worker is not None:
+                    self.vision_worker.start()
                 self._started = True
                 self._last_error = None
             except Exception as exc:
@@ -226,6 +252,9 @@ class BackendService:
     def stop(self) -> None:
         with self._lock:
             self._stop_vmc_calibration()
+            if self.vision_worker:
+                self.vision_worker.stop()
+            self.vision_worker = None
             if self.driver_log:
                 self.driver_log.stop()
             if self.osc:
@@ -242,6 +271,21 @@ class BackendService:
             self.host_vmc = None
             self.vmc_idle = None
             self._started = False
+
+    def attach_vision(self, source: FrameSource, detector: FrameDetector) -> dict[str, Any]:
+        """注入外部 detector；模型包和采集实现由调用方负责。"""
+        with self._lock:
+            if self.vision_worker:
+                self.vision_worker.stop()
+            self._vision_source = source
+            self.vision.set_backends(detector=detector)
+            self.vision_worker = self._new_vision_worker(source)
+            started = self._started and self.vision_worker.start()
+        return {
+            "attached": True,
+            "started": bool(started),
+            "worker": self.vision_worker.status(),
+        }
 
     def submit(
         self,
@@ -395,6 +439,11 @@ class BackendService:
             "idle_relay": self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False},
             "host_vmc": self.host_vmc.snapshot() if self.host_vmc else {"managed": False, "active": False},
             "world": self.vision.snapshot(),
+            "vision_worker": self.vision_worker.status() if self.vision_worker else {
+                "enabled": False,
+                "running": False,
+                "reason": "not_configured",
+            },
             "cognition": self.cognition.snapshot(),
             "backend": {
                 "started": self._started,
@@ -488,42 +537,58 @@ class BackendService:
             self._expression_side_count += 1
         return result
 
-    def ingest_world(self, observation: Mapping[str, Any]) -> dict[str, Any]:
-        result = self.vision.ingest(observation)
-        confidence = observation.get("confidence")
-        if confidence is None:
-            def normalize_confidence(value: Any) -> float:
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError, OverflowError):
-                    return 0.0
-                if not math.isfinite(numeric):
-                    return 0.0
-                return min(1.0, max(0.0, numeric))
+    def _on_vision_observation(
+        self,
+        observation: VisionObservation,
+        _result: Mapping[str, Any],
+    ) -> None:
+        def confidence(item: Any) -> float:
+            raw = item.get("confidence") if isinstance(item, Mapping) else getattr(item, "confidence", 0.0)
+            try:
+                numeric = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return min(1.0, max(0.0, numeric)) if math.isfinite(numeric) else 0.0
 
-            candidates = [
-                normalize_confidence(item.get("confidence"))
-                for item in (observation.get("entities") or ())
-                if isinstance(item, Mapping)
-            ] + [
-                normalize_confidence(item.get("confidence"))
-                for item in (observation.get("events") or ())
-                if isinstance(item, Mapping)
-            ]
-            confidence = max(candidates, default=0.0)
+        normalized_entities = [
+            item for item in (_result.get("entities") or ()) if isinstance(item, Mapping)
+        ]
+        normalized_events = [
+            item for item in (_result.get("events") or ()) if isinstance(item, Mapping)
+        ]
+        candidates = [confidence(item) for item in normalized_entities]
+        candidates.extend(confidence(item) for item in normalized_events)
         self.cognition.observe(
-            str(observation.get("source") or "world"),
+            observation.source,
             "world_observation",
             {
-                "entity_count": len(result.get("entities") or []),
-                "event_count": len(result.get("events") or []),
-                "available": bool(result.get("available")),
+                "entity_count": len(normalized_entities),
+                "event_count": len(normalized_events),
+                "available": bool(_result.get("available")),
             },
-            confidence=confidence,
-            observed_at=observation.get("observed_at"),
-            frame_id=str(observation.get("frame_id")) if observation.get("frame_id") is not None else None,
+            confidence=max(candidates, default=0.0),
+            observed_at=observation.observed_at,
+            frame_id=observation.frame_id,
         )
-        return result
+
+    def ingest_world(
+        self,
+        observation: Mapping[str, Any],
+        *,
+        ack_only: bool = False,
+    ) -> dict[str, Any]:
+        result = self.vision.ingest(observation)
+        if not ack_only:
+            return result
+        return {
+            "accepted": True,
+            "source": str(observation.get("source") or "vision"),
+            "frame_id": str(observation.get("frame_id")) if observation.get("frame_id") is not None else None,
+            "available": bool(result.get("available")),
+            "entity_count": len(result.get("entities") or ()),
+            "event_count": len(result.get("events") or ()),
+            "observation_count": (result.get("status") or {}).get("observation_count", 0),
+        }
 
     def plan(self, goal: Mapping[str, Any] | None) -> dict[str, Any]:
         return self.cognition.plan(goal)

@@ -78,7 +78,7 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 ## 视觉世界状态（第一阶段）
 
-插件新增 `world_observe` 工具；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层。它们不进入 AnyaDance 的 60 Hz 调度线程，也不替代宿主 VMC 待机中转。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
+插件新增 `world_observe` 工具；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层和可插拔的采集 worker。它们不进入 AnyaDance 的 60 Hz 调度线程，也不替代宿主 VMC 待机中转。当前仓库暂不内置 YOLO/MediaPipe 模型，未来模型后端通过 `FrameDetector` 接口注入。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
 
 当前版本只提供无第三方依赖的后端协议和安全状态缓存。YOLO、VRChat 画面采集及 VLM 适配器将在后续按运行环境启用；未配置后端时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 

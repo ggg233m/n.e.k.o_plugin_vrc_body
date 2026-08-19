@@ -128,6 +128,16 @@ class DriverLogConfig:
 
 
 @dataclass(frozen=True)
+class VisionConfig:
+    """模型无关的感知 worker 配置；具体 detector 由后端注入。"""
+
+    enabled: bool = False
+    source: str = "none"
+    interval_ms: int = 100
+    queue_size: int = 1
+
+
+@dataclass(frozen=True)
 class PluginConfig:
     host: str = "127.0.0.1"
     port: int = 39570
@@ -142,6 +152,7 @@ class PluginConfig:
     vmc_idle: VmcIdleConfig = VmcIdleConfig()
     vrchat_osc: VrchatOscConfig = VrchatOscConfig()
     driver_log: DriverLogConfig = DriverLogConfig()
+    vision: VisionConfig = VisionConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
 
@@ -156,6 +167,7 @@ class PluginConfig:
         vmc_idle = _section(root, "vmc_idle")
         vrchat_osc = _section(root, "vrchat_osc")
         driver_log = _section(root, "driver_log")
+        vision = _section(root, "vision")
         safety = _section(root, "safety")
 
         host = str(anyadance.get("host", "127.0.0.1")).strip()
@@ -230,6 +242,27 @@ class PluginConfig:
             interface_host=interface_host,
             stale_after_ms=_bounded_int(driver_log.get("stale_after_ms"), 3000, minimum=100, maximum=60000, name="driver_log.stale_after_ms"),
             history_size=_bounded_int(driver_log.get("history_size"), 64, minimum=8, maximum=512, name="driver_log.history_size"),
+        )
+        vision_source = str(vision.get("source", "none")).strip().lower() or "none"
+        if vision_source not in {"none", "mss", "external"}:
+            raise ValueError("vision.source must be none, mss, or external")
+        vision_config = VisionConfig(
+            enabled=_boolean(vision.get("enabled"), False, name="vision.enabled"),
+            source=vision_source,
+            interval_ms=_bounded_int(
+                vision.get("interval_ms"),
+                100,
+                minimum=10,
+                maximum=2000,
+                name="vision.interval_ms",
+            ),
+            queue_size=_bounded_int(
+                vision.get("queue_size"),
+                1,
+                minimum=1,
+                maximum=4,
+                name="vision.queue_size",
+            ),
         )
         behavior_config = BehaviorConfig(
             default_crossfade_ms=_bounded_int(
@@ -324,6 +357,7 @@ class PluginConfig:
             vmc_idle=vmc_idle_config,
             vrchat_osc=osc_config,
             driver_log=driver_log_config,
+            vision=vision_config,
             profile=body_profile,
             safety=safety_config,
         )

@@ -1,13 +1,43 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from tests import _bootstrap  # noqa: F401
-from neko_anyadance_body.backend.vision import VisionObservation, VisionRuntime
-from neko_anyadance_body.backend.world_state import WorldEntity, WorldEvent, WorldStateStore
+from neko_anyadance_body.backend.vision import (
+    MssFrameSource,
+    VisionObservation,
+    VisionRuntime,
+    VisionWorker,
+    optional_dependency_status,
+)
+from neko_anyadance_body.backend.world_state import (
+    WorldEntity,
+    WorldEvent,
+    WorldStateStore,
+    stable_entity_id,
+)
 
 
 class WorldStateStoreTests(unittest.TestCase):
+    def test_stable_entity_id_and_track_id_fallback(self) -> None:
+        self.assertEqual(stable_entity_id("yolo", "cup", 7), "yolo:cup:7")
+        self.assertEqual(stable_entity_id("yolo", "cup:large", 7), "yolo:cup_large:7")
+        with self.assertRaises(ValueError):
+            stable_entity_id("yolo", "cup", "")
+
+        store = WorldStateStore(clock=lambda: 10.0)
+        snapshot = store.ingest(
+            entities=[{
+                "track_id": 7,
+                "label": "cup",
+                "confidence": 0.9,
+            }],
+            source="yolo",
+        )
+        self.assertEqual(snapshot["entities"][0]["id"], "yolo:cup:7")
+
     def test_entity_is_bounded_and_expires(self) -> None:
         now = [10.0]
         store = WorldStateStore(clock=lambda: now[0], default_ttl_s=1.0)
@@ -152,7 +182,94 @@ class _Semantic:
         )
 
 
+class _FrameSource:
+    name = "fake_source"
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.frames = 0
+
+    def status(self):
+        return {"available": not self.closed, "frames": self.frames}
+
+    def read(self):
+        if self.closed:
+            return None
+        self.frames += 1
+        return {"frame": self.frames}
+
+    def close(self):
+        self.closed = True
+
+
+class _WorkerDetector:
+    name = "fake_detector"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.first_result = threading.Event()
+
+    def status(self):
+        return {"available": True, "backend": "test"}
+
+    def observe(self, frame, *, now):
+        self.calls += 1
+        self.first_result.set()
+        return VisionObservation(
+            entities=({
+                "track_id": 7,
+                "label": "cup",
+                "confidence": 0.9,
+                "ttl_s": 0.5,
+            },),
+            source=self.name,
+            observed_at=now,
+            frame_id=str(frame["frame"]),
+        )
+
+
 class VisionRuntimeTests(unittest.TestCase):
+    def test_optional_mss_source_degrades_without_model_dependencies(self) -> None:
+        source = MssFrameSource()
+        status = source.status()
+        self.assertIn("available", status)
+        if not optional_dependency_status()["mss"]:
+            self.assertFalse(status["available"])
+        source.close()
+
+    def test_callback_and_worker_keep_capture_outside_control_path(self) -> None:
+        observed = []
+        store = WorldStateStore()
+        runtime = VisionRuntime(
+            store,
+            detector=_WorkerDetector(),
+            observation_callback=lambda item, result: observed.append((item, result)),
+        )
+        source = _FrameSource()
+        detector = runtime.detector
+        worker = VisionWorker(runtime, source, interval_s=0.01, queue_size=1)
+        self.assertTrue(worker.start())
+        self.assertTrue(detector.first_result.wait(1.0))
+        worker.stop()
+
+        status = worker.status()
+        self.assertFalse(status["running"])
+        self.assertGreaterEqual(status["frames_captured"], 1)
+        self.assertGreaterEqual(status["frames_processed"], 1)
+        self.assertTrue(source.closed)
+        self.assertTrue(observed)
+        snapshot = store.snapshot()
+        self.assertEqual(snapshot["entities"][0]["id"], "fake_detector:cup:7")
+        self.assertEqual(snapshot["entities"][0]["source"], ["fake_detector"])
+
+    def test_worker_without_detector_does_not_start(self) -> None:
+        source = _FrameSource()
+        runtime = VisionRuntime(WorldStateStore())
+        worker = VisionWorker(runtime, source, interval_s=0.01)
+        self.assertFalse(worker.start())
+        self.assertIn("no detector", worker.status()["last_error"])
+        worker.stop()
+
     def test_detector_runs_every_frame_and_semantic_backend_is_rate_limited(self) -> None:
         now = [0.0]
         detector = _Detector()

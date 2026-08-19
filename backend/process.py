@@ -112,7 +112,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/semantic_express":
                 result = self.server.service.semantic_express(value)
             elif self.path == "/world/ingest":
-                result = self.server.service.ingest_world(value)
+                result = self.server.service.ingest_world(
+                    value,
+                    ack_only=bool(value.get("ack_only")),
+                )
             elif self.path == "/cognition/plan":
                 result = self.server.service.plan(value)
             elif self.path == "/cognition/feedback":
@@ -175,6 +178,8 @@ def main() -> int:
             for section in ("vmc_idle", "vrchat_osc", "driver_log"):
                 config_data.setdefault(section, {})["enabled"] = False
             config_data.setdefault("vmc_idle", {})["manage_host_output"] = False
+            config_data.setdefault("vision", {})["enabled"] = False
+            config_data.setdefault("vision", {})["source"] = "none"
         token = str(args.token or secrets.token_urlsafe(24))
         service = BackendService(config_data, args.config_dir, dry_run=offline)
         server: BackendHttpServer | None = None

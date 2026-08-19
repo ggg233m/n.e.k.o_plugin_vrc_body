@@ -84,6 +84,14 @@ interface_host = "127.0.0.1"
 stale_after_ms = 3000
 history_size = 64
 
+# 模型无关的视觉 worker；具体 FrameSource/FrameDetector 由独立后端注入。
+# 默认关闭，未接入外部 detector 时不会抓屏或加载模型。
+[vision]
+enabled = false
+source = "none"
+interval_ms = 100
+queue_size = 1
+
 [clips]
 directory = "motions"
 max_file_bytes = 67108864
