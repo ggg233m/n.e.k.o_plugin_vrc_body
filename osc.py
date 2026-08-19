@@ -25,6 +25,19 @@ _INPUT_ADDRESSES = {
     ("drop", "left"): "/input/DropLeft",
     ("drop", "right"): "/input/DropRight",
 }
+_AXIS_ADDRESSES = {
+    "move_vertical": "/input/Vertical",
+    "move_horizontal": "/input/Horizontal",
+    "look_horizontal": "/input/LookHorizontal",
+    "move_forward": "/input/MoveForward",
+    "move_backward": "/input/MoveBackward",
+    "move_left": "/input/MoveLeft",
+    "move_right": "/input/MoveRight",
+    "look_left": "/input/LookLeft",
+    "look_right": "/input/LookRight",
+    "run": "/input/Run",
+    "jump": "/input/Jump",
+}
 
 
 class OscProtocolError(ValueError):
@@ -238,6 +251,7 @@ class VrchatOscBridge:
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
         self._held_inputs: set[tuple[str, str]] = set()
+        self._active_axes: dict[str, tuple[float, float]] = {}  # {axis: (value, expires_at)}
         self._receiver_listening = False
         self._sent_packets = 0
         self._send_failures = 0
@@ -281,6 +295,7 @@ class VrchatOscBridge:
 
     def stop(self, timeout: float = 2.0) -> None:
         if self.config.enabled and self._send_socket is not None:
+            self.stop_all_axes()
             self.cancel_scheduled_inputs(release=True)
         self._stop_event.set()
         self._wake_event.set()
@@ -334,6 +349,17 @@ class VrchatOscBridge:
         parameter = validate_parameter_name(name)
         normalized = normalize_parameter_value(value)
         return self._send(f"/avatar/parameters/{parameter}", (normalized,))
+
+    def send_chatbox(self, text: Any, *, immediate: bool = True) -> tuple[bool, str | None]:
+        """通过 /chatbox/input 发送聊天框文本。"""
+        if text is None:
+            return False, "text is required"
+        message = str(text).replace("\x00", "").strip()
+        if not message:
+            return False, "text is required"
+        if len(message) > 144:
+            message = message[:144]
+        return self._send("/chatbox/input", (message, bool(immediate), False))
 
     def send_input(self, action: str, side: str, pressed: bool) -> tuple[bool, str | None]:
         normalized_action = str(action).strip().lower()
@@ -420,7 +446,50 @@ class VrchatOscBridge:
             keys = set(held) | set(_INPUT_ADDRESSES)
             for action, side in sorted(keys):
                 self.send_input(action, side, False)
+            self.stop_all_axes()
         self._wake_event.set()
+
+    def set_axis(self, axis: str, value: float, duration_s: float = 0.0) -> tuple[bool, str | None]:
+        """持续设置移动/转向轴。duration_s=0 表示立即归零，>0 表示保持后自动归零。"""
+        normalized_axis = str(axis).strip().lower().replace("-", "_")
+        address = _AXIS_ADDRESSES.get(normalized_axis)
+        if address is None:
+            return False, f"unknown axis: {axis}"
+        clamped = max(-1.0, min(1.0, float(value)))
+        sent, reason = self._send(address, (clamped,))
+        if sent:
+            with self._lock:
+                if duration_s > 0.0:
+                    self._active_axes[normalized_axis] = (clamped, self._clock() + duration_s)
+                else:
+                    self._active_axes.pop(normalized_axis, None)
+            self._wake_event.set()
+        return sent, reason
+
+    def stop_all_axes(self) -> None:
+        """立即归零所有移动轴。"""
+        with self._lock:
+            axes = list(self._active_axes.keys())
+            self._active_axes.clear()
+        for axis in axes:
+            address = _AXIS_ADDRESSES.get(axis)
+            if address:
+                self._send(address, (0.0,))
+        self._wake_event.set()
+
+    def _run_axis_expirations(self) -> None:
+        """检查并归零过期的轴。"""
+        now = self._clock()
+        expired: list[str] = []
+        with self._lock:
+            for axis, (value, expires_at) in list(self._active_axes.items()):
+                if now >= expires_at:
+                    expired.append(axis)
+                    del self._active_axes[axis]
+        for axis in expired:
+            address = _AXIS_ADDRESSES.get(axis)
+            if address:
+                self._send(address, (0.0,))
 
     def _run_due_inputs(self) -> None:
         now = self._clock()
@@ -516,6 +585,7 @@ class VrchatOscBridge:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             self._run_due_inputs()
+            self._run_axis_expirations()
             self._receive_once()
         with self._lock:
             self._receiver_listening = False
@@ -538,6 +608,13 @@ class VrchatOscBridge:
                 "parameter_count": len(self._parameters),
                 "held_inputs": [f"{action}_{side}" for action, side in sorted(self._held_inputs)],
                 "scheduled_inputs": len(self._scheduled),
+                "active_axes": {
+                    axis: {
+                        "value": value,
+                        "remaining_ms": max(0.0, (expires_at - now) * 1000.0),
+                    }
+                    for axis, (value, expires_at) in sorted(self._active_axes.items())
+                },
                 "sent_packets": self._sent_packets,
                 "send_failures": self._send_failures,
                 "received_packets": self._received_packets,

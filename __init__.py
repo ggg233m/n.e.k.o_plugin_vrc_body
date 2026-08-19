@@ -24,12 +24,14 @@ from .tool_defs import (
     BODY_AVATAR_PARAMETER,
     BODY_AWARENESS,
     BODY_CANCEL,
+    BODY_CHATBOX,
     BODY_DISABLE,
     BODY_ENABLE,
     BODY_EXPRESS,
     BODY_GESTURE,
     BODY_HAND,
     BODY_LIST_CLIPS,
+    BODY_LOCOMOTION,
     BODY_MOVE_HAND,
     BODY_PLAY_CLIP,
     BODY_REACH_AND_GRAB,
@@ -37,6 +39,8 @@ from .tool_defs import (
     BODY_SEQUENCE,
     BODY_STATUS,
     BODY_STOP,
+    BODY_STOP_MOVEMENT,
+    BODY_TURN,
     BODY_VRCHAT_INPUT,
     WORLD_OBSERVE,
 )
@@ -1030,6 +1034,137 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "uncertainties": ["backend_unavailable"],
             })
         return Ok(await asyncio.to_thread(self._vision.snapshot))
+
+    @llm_tool(**BODY_LOCOMOTION)
+    async def body_locomotion(
+        self,
+        *,
+        vertical: Any = 0.0,
+        horizontal: Any = 0.0,
+        duration_ms: Any = 1000,
+        **_: Any,
+    ):
+        try:
+            normalized = {
+                "vertical": _number("vertical", vertical, minimum=-1.0, maximum=1.0),
+                "horizontal": _number("horizontal", horizontal, minimum=-1.0, maximum=1.0),
+                "duration_ms": _integer("duration_ms", duration_ms, minimum=100, maximum=10000),
+            }
+        except ValueError as exc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params={},
+                reason=str(exc),
+            ))
+        if not self._osc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params=normalized,
+                reason="VRChat OSC bridge is not initialized",
+            ))
+        accepted, reason = await asyncio.to_thread(
+            self._osc.set_locomotion,
+            normalized["vertical"],
+            normalized["horizontal"],
+            normalized["duration_ms"],
+        )
+        return Ok(await self._osc_result(
+            accepted=accepted,
+            normalized_params=normalized,
+            reason=reason,
+        ))
+
+    @llm_tool(**BODY_TURN)
+    async def body_turn(
+        self,
+        *,
+        horizontal: Any = None,
+        duration_ms: Any = 500,
+        **_: Any,
+    ):
+        try:
+            if horizontal is None:
+                raise ValueError("horizontal is required")
+            normalized = {
+                "horizontal": _number("horizontal", horizontal, minimum=-1.0, maximum=1.0),
+                "duration_ms": _integer("duration_ms", duration_ms, minimum=100, maximum=10000),
+            }
+        except ValueError as exc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params={},
+                reason=str(exc),
+            ))
+        if not self._osc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params=normalized,
+                reason="VRChat OSC bridge is not initialized",
+            ))
+        accepted, reason = await asyncio.to_thread(
+            self._osc.set_turn,
+            normalized["horizontal"],
+            normalized["duration_ms"],
+        )
+        return Ok(await self._osc_result(
+            accepted=accepted,
+            normalized_params=normalized,
+            reason=reason,
+        ))
+
+    @llm_tool(**BODY_STOP_MOVEMENT)
+    async def body_stop_movement(self, **_: Any):
+        if not self._osc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params={},
+                reason="VRChat OSC bridge is not initialized",
+            ))
+        accepted, reason = await asyncio.to_thread(self._osc.stop_movement)
+        return Ok(await self._osc_result(
+            accepted=accepted,
+            normalized_params={},
+            reason=reason,
+        ))
+
+    @llm_tool(**BODY_CHATBOX)
+    async def body_chatbox(
+        self,
+        *,
+        text: Any = "",
+        immediate: Any = True,
+        **_: Any,
+    ):
+        try:
+            message = str(text or "").strip()
+            if not message or len(message) > 144:
+                raise ValueError("text must be between 1 and 144 characters")
+            normalized = {
+                "text": message,
+                "immediate": _boolean("immediate", immediate),
+            }
+        except ValueError as exc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params={},
+                reason=str(exc),
+            ))
+        if not self._osc:
+            return Ok(await self._osc_result(
+                accepted=False,
+                normalized_params=normalized,
+                reason="VRChat OSC bridge is not initialized",
+            ))
+        accepted, reason = await asyncio.to_thread(
+            self._osc.send_chatbox,
+            normalized["text"],
+            normalized["immediate"],
+        )
+        return Ok(await self._osc_result(
+            accepted=accepted,
+            normalized_params=normalized,
+            reason=reason,
+        ))
 
 
 __all__ = ["NekoAnyadanceBodyPlugin"]

@@ -469,6 +469,31 @@ class BackendService:
             return False, "VRChat OSC bridge is not initialized"
         return self.osc.pulse_input(action, side, hold_ms)
 
+    def set_locomotion(self, vertical: float, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+        if self.osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        duration_s = duration_ms / 1000.0
+        self.osc.set_axis("move_vertical", vertical, duration_s)
+        self.osc.set_axis("move_horizontal", horizontal, duration_s)
+        return True, None
+
+    def set_turn(self, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+        if self.osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        self.osc.set_axis("look_horizontal", horizontal, duration_ms / 1000.0)
+        return True, None
+
+    def stop_movement(self) -> tuple[bool, str | None]:
+        if self.osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        self.osc.stop_all_axes()
+        return True, None
+
+    def send_chatbox(self, text: str, immediate: bool) -> tuple[bool, str | None]:
+        if self.osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        return self.osc.send_chatbox(text, immediate=immediate)
+
     def cancel_inputs(self) -> None:
         if self.osc:
             self.osc.cancel_scheduled_inputs(release=True)

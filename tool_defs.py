@@ -295,3 +295,49 @@ WORLD_OBSERVE = {
     "description": "读取最近的视觉世界状态。结果来自可选的 VRChat 画面检测器/VLM，包含目标、事件、置信度和不确定性；没有新观测时必须按 unknown 处理，不能把空结果当成世界为空。",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
+
+BODY_LOCOMOTION = {
+    "name": "body_locomotion",
+    "description": "通过 VRChat OSC 持续发送 Vertical/Horizontal 轴值实现移动，直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "vertical": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0, "description": "前后轴：1.0=前进，-1.0=后退"},
+            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0, "description": "左右轴：-1.0=左移，1.0=右移"},
+            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 1000, "description": "持续时间；超时后自动归零"},
+        },
+        "required": [],
+    },
+}
+
+BODY_TURN = {
+    "name": "body_turn",
+    "description": "通过 VRChat OSC 持续发送 LookHorizontal 轴值实现转身，直到超时或下一次调用。正值向右转，负值向左转。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "转身速度：-1.0=最快左转，1.0=最快右转"},
+            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 500, "description": "持续时间；超时后自动归零"},
+        },
+        "required": ["horizontal"],
+    },
+}
+
+BODY_STOP_MOVEMENT = {
+    "name": "body_stop_movement",
+    "description": "立即停止所有移动和转身轴，将所有 locomotion 轴归零。不影响手臂姿态和手部动作。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+BODY_CHATBOX = {
+    "name": "body_chatbox",
+    "description": "通过 VRChat OSC /chatbox/input 发送文本到聊天框，周围玩家可见。文本限制 144 字符。immediate=true 时立即显示；false 时仅在打字时显示。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 144},
+            "immediate": {"type": "boolean", "default": True, "description": "true=立即显示，false=仅打字时显示"},
+        },
+        "required": ["text"],
+    },
+}

@@ -104,6 +104,28 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     int(value.get("hold_ms") or 100),
                 )
                 result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/osc/locomotion":
+                result = self.server.service.set_locomotion(
+                    float(value.get("vertical") or 0),
+                    float(value.get("horizontal") or 0),
+                    int(value.get("duration_ms") or 1000),
+                )
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/osc/turn":
+                result = self.server.service.set_turn(
+                    float(value.get("horizontal") or 0),
+                    int(value.get("duration_ms") or 500),
+                )
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/osc/stop_movement":
+                result = self.server.service.stop_movement()
+                result = {"accepted": result[0], "reason": result[1]}
+            elif self.path == "/osc/chatbox":
+                result = self.server.service.send_chatbox(
+                    str(value.get("text") or ""),
+                    bool(value.get("immediate", True)),
+                )
+                result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/cancel":
                 self.server.service.cancel_inputs()
                 result = {"accepted": True}

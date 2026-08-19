@@ -345,6 +345,41 @@ class RemoteOsc:
         except BackendUnavailable as exc:
             return False, str(exc)
 
+    def set_locomotion(self, vertical: float, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+        try:
+            result = self.client.request("POST", "/osc/locomotion", {
+                "vertical": vertical,
+                "horizontal": horizontal,
+                "duration_ms": duration_ms,
+            })
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+    def set_turn(self, horizontal: float, duration_ms: int) -> tuple[bool, str | None]:
+        try:
+            result = self.client.request("POST", "/osc/turn", {
+                "horizontal": horizontal,
+                "duration_ms": duration_ms,
+            })
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+    def stop_movement(self) -> tuple[bool, str | None]:
+        try:
+            result = self.client.request("POST", "/osc/stop_movement", {})
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
+    def send_chatbox(self, text: str, immediate: bool = True) -> tuple[bool, str | None]:
+        try:
+            result = self.client.request("POST", "/osc/chatbox", {"text": text, "immediate": immediate})
+            return bool(result.get("accepted")), result.get("reason")
+        except BackendUnavailable as exc:
+            return False, str(exc)
+
     def cancel_scheduled_inputs(self, *, release: bool = True) -> None:
         try:
             self.client.request("POST", "/osc/cancel", {})
