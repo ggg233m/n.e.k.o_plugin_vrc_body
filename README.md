@@ -86,6 +86,11 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 当前版本默认不加载第三方模型，但已经提供 DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 的可选适配器；未配置依赖时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
+自主目标不会直接把主 LLM 接入身体控制线程。后端的 `LocalNavigator` 会在会话手动
+授权后，以约 10 Hz 根据新鲜视觉实体生成受限的短摇杆脉冲；目标不可见、方位或距离
+未知、观测过期或世界带不确定性时立即释放输入。主 LLM 只负责目标和行为选择，
+AnyaDance 调度器仍以 120 Hz 发送最新姿态与控制器状态。
+
 世界日志若以后启用，只能作为低置信度辅助来源。玩家实体应使用
 `vrchat:player:<user_id>` 这样的稳定 ID；收到 `player_left` 时，适配器必须在同一
 批次提交 `remove_entity_ids` 和离开事件，并用 `remove_source` 限制删除范围。这样

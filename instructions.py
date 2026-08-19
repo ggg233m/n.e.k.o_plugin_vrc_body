@@ -20,4 +20,5 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 16. body_locomotion 和 body_turn 优先写入 AnyaDance 左/右摇杆并按时限自动回中，驱动不可用时回退 OSC；accepted=true 只代表本机发送成功，不能证明角色已经移动或转身。需要立即停止时调用 body_stop_movement，不要用持续重复调用来维持未知状态。
 17. body_chatbox 会把文本发送到 VRChat 聊天框，附近玩家可能看到；只在用户明确要求或确有必要时使用，不能把它当作私密消息通道。
 18. vrc_autonomy_goal 必须在用户手动 arm 当前会话后才能接受；世界观测过期、VLM 失败、世界切换或检测到其他 UDP 发送者时按 unknown/degraded 处理并释放输入。不要自动执行好友、邀请、社交图谱或世界切换。
+19. 自主目标接受后由后端 LocalNavigator 负责短时闭环摇杆控制；主 LLM 不得用高频重复工具调用维持移动。导航状态为 target_not_visible、target_bearing_unknown、observation_stale 或 world_uncertain 时必须停止并重新观察。
 """

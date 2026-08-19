@@ -23,6 +23,7 @@ from .adapters import (
 )
 from .cognition import CognitionRuntime
 from .autonomy import AutonomyRuntime
+from .navigator import LocalNavigator
 from .vision import (
     DesktopMirrorFrameSource,
     DxcamFrameSource,
@@ -219,6 +220,15 @@ class BackendService:
             release_inputs=self._release_all_inputs,
             session_ttl_s=self.config.autonomy.session_ttl_minutes * 60.0,
         )
+        # The navigator is a local, bounded control loop.  It is deliberately
+        # separate from the LLM and vision workers; it only emits short
+        # AnyaDance axis updates after a fresh, visible target is observed.
+        self.navigator = LocalNavigator(
+            world_provider=lambda: self.world_state.snapshot(),
+            goal_provider=lambda: self.autonomy.snapshot(),
+            send_axes=self._navigator_send_axes,
+            release_inputs=self._navigator_release_inputs,
+        )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
             "count": 0,
@@ -340,6 +350,7 @@ class BackendService:
                 self.driver_log.start()
                 if self.vision_worker is not None:
                     self.vision_worker.start()
+                self.navigator.start()
                 self._started = True
                 self._last_error = None
             except Exception as exc:
@@ -422,6 +433,7 @@ class BackendService:
                 self.autonomy.disarm("backend_stopped")
             except Exception:
                 pass
+            self.navigator.stop()
             self._stop_vmc_calibration()
             if self.vision_worker:
                 self.vision_worker.stop()
@@ -463,7 +475,9 @@ class BackendService:
                 pass
 
     def autonomy_snapshot(self) -> dict[str, Any]:
-        return self.autonomy.snapshot()
+        result = self.autonomy.snapshot()
+        result["navigation"] = self.navigator.snapshot()
+        return result
 
     def autonomy_arm(self, ttl_s: Any = None) -> dict[str, Any]:
         try:
@@ -667,6 +681,7 @@ class BackendService:
             },
             "cognition": self.cognition.snapshot(),
             "autonomy": self.autonomy.snapshot(),
+            "navigation": self.navigator.snapshot(),
             "control_latency": self.control_metrics_snapshot(),
             "backend": {
                 "started": self._started,
@@ -719,12 +734,29 @@ class BackendService:
     def perception(self) -> dict[str, Any]:
         return {
             "world": self.vision.snapshot(),
+            "navigation": self.navigator.snapshot(),
             "worker": self.vision_worker.status() if self.vision_worker else {
                 "enabled": False,
                 "running": False,
                 "reason": "not_configured",
             },
         }
+
+    def _navigator_send_axes(self, side: str, x: float, y: float, duration_ms: int) -> bool:
+        """Send only the primary AnyaDance command; never fall back to OSC."""
+        scheduler = self.scheduler
+        if scheduler is None or self.config.input.primary != "anyadance":
+            return False
+        result = scheduler.submit(
+            "input_axes",
+            {"side": side, "x": x, "y": y, "duration_ms": duration_ms},
+        )
+        return bool(result.get("accepted"))
+
+    def _navigator_release_inputs(self, side: str = "all") -> None:
+        scheduler = self.scheduler
+        if scheduler is not None:
+            scheduler.submit("input_release", {"side": side})
 
     def send_avatar_parameter(self, name: str, value: Any) -> tuple[bool, str | None]:
         if self.osc is None:

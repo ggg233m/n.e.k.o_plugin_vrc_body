@@ -93,6 +93,12 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 发布，不会让状态深拷贝阻塞姿态帧。`debug_cli.py` 的单次命令仍适合人工调试，不
 适合高频循环；高频调用可以使用常驻 JSON-lines 控制会话：
 
+自主目标被接受后，`LocalNavigator` 以约 10 Hz 运行在后端本地。它只接受新鲜、可见、
+置信度足够且带方位提示的世界实体；每次只发送 220 ms 左右的受限摇杆脉冲，并在
+目标丢失、观测过期、世界不确定、会话解除或后端停止时释放输入。它不会调用 LLM、
+等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
+和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
+
 ```powershell
 python backend/debug_cli.py --port 48912 --token dev shell
 ```
