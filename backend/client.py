@@ -57,9 +57,8 @@ class BackendClient:
         self.process: subprocess.Popen[Any] | None = None
         self._stderr_lines: deque[str] = deque(maxlen=64)
         self._stderr_thread: threading.Thread | None = None
-        # The Hosted plugin sends frequent control commands.  Keep one local
-        # HTTP/1.1 connection for that fast path instead of paying a TCP
-        # handshake for every OSC/action request.
+        # 宿主插件会频繁发送控制命令。为快速路径保留一个本地 HTTP/1.1 连接，
+        # 避免每次 OSC/动作请求都重新进行 TCP 握手。
         self._fast_connection: http.client.HTTPConnection | None = None
         osc = self.config_data.get("vrchat_osc")
         osc_mapping = osc if isinstance(osc, Mapping) else {}
@@ -102,9 +101,9 @@ class BackendClient:
             str(backend_dir / "process.py"),
             "--host=127.0.0.1",
             f"--port={self.port}",
-            # ``urlsafe_b64encode`` can legally start with ``-``.  Passing
-            # values with ``--name=value`` prevents argparse from treating
-            # such a token/config blob as another option.
+            # ``urlsafe_b64encode`` 可能合法地以 ``-`` 开头。使用
+            # ``--name=value`` 形式传参，避免 argparse 把这类令牌/配置内容
+            # 误当成另一个选项。
             f"--token={self.token}",
             f"--config-dir={self.config_dir}",
             f"--config-json={encoded_config}",
@@ -159,6 +158,13 @@ class BackendClient:
         if stderr_thread is not None:
             stderr_thread.join(timeout=1.0)
         self._stderr_thread = None
+        # Popen 不会替调用方关闭 PIPE；启动失败时也要显式释放读取端，避免
+        # 重试或测试结束后留下 BufferedReader 警告。
+        if process is not None and process.stderr is not None:
+            try:
+                process.stderr.close()
+            except OSError:
+                pass
         child_error = "".join(self._stderr_lines).strip()
         detail = child_error or str(last_error or "process exited")
         # Windows 可能在探测和子进程绑定之间暂时占用临时端口；使用新端口重试，
@@ -200,6 +206,11 @@ class BackendClient:
             if stderr_thread is not None:
                 stderr_thread.join(timeout=1.0)
             self._stderr_thread = None
+            if process.stderr is not None:
+                try:
+                    process.stderr.close()
+                except OSError:
+                    pass
         finally:
             self._close_fast_connection()
             self.port = 0
@@ -222,12 +233,11 @@ class BackendClient:
         *,
         timeout_s: float = 1.0,
     ) -> dict[str, Any]:
-        """Send a latency-sensitive local request over a reused connection.
+        """通过复用连接发送低延迟本地请求。
 
-        The regular ``request`` method intentionally keeps its urllib-based
-        behavior for compatibility and diagnostics.  Control-plane callers
-        use this method so repeated OSC/action commands avoid reconnecting to
-        the loopback HTTP server.  A stale keep-alive socket is retried once.
+        普通 ``request`` 方法刻意保留基于 urllib 的行为，以兼容旧调用和诊断。
+        控制面调用方使用本方法，使重复的 OSC/动作命令无需重新连接回环 HTTP
+        服务。过期的 keep-alive 套接字会重试一次。
         """
         if not self.port or not self.token:
             raise BackendUnavailable("backend is not started")
@@ -342,9 +352,8 @@ class BackendClient:
                     status_code = int(exc.code)
                 except (AttributeError, TypeError, ValueError, OverflowError):
                     status_code = None
-                # 400/422 are the backend's structured schema/lifecycle errors.
-                # Keep auth, routing, and rate-limit failures on the unavailable
-                # path so callers do not mislabel them as bad observations.
+                # 400/422 是后端返回的结构化 schema/生命周期错误。认证、路由和
+                # 速率限制失败仍走 unavailable 路径，避免调用方把它们误标成坏观测。
                 if status_code in {400, 422}:
                     raise BackendRejected(
                         message or str(exc),
@@ -366,7 +375,7 @@ def _control_request(
     path: str,
     payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use the persistent control channel when the client provides it."""
+    """客户端提供持久控制通道时，优先使用该通道。"""
     fast_request = getattr(client, "fast_request", None)
     if callable(fast_request):
         return fast_request(method, path, payload)
@@ -548,7 +557,7 @@ class RemoteOsc:
 
 
 class RemoteControllerInput:
-    """Fast IPC proxy for the AnyaDance virtual Index controller inputs."""
+    """AnyaDance 虚拟 Index 控制器输入的快速 IPC 代理。"""
 
     def __init__(self, client: BackendClient) -> None:
         self.client = client
@@ -605,7 +614,7 @@ class RemoteControllerInput:
 
 
 class RemoteAutonomy:
-    """Authorization and goal proxy; arming is intentionally explicit."""
+    """授权与目标代理；启用授权必须显式执行。"""
 
     def __init__(self, client: BackendClient) -> None:
         self.client = client
@@ -690,6 +699,37 @@ class RemoteVision:
             return self.client.request("GET", "/perception")
         except BackendUnavailable as exc:
             return {"world": self.snapshot(), "worker": {"enabled": False, "error": str(exc)}}
+
+    def start(self) -> dict[str, Any]:
+        """使用新的 FrameSource 启动或重启采集 worker。"""
+        try:
+            return _control_request(self.client, "POST", "/vision/start", {})
+        except BackendUnavailable as exc:
+            return {
+                "accepted": False,
+                "started": False,
+                "running": False,
+                "reason": str(exc),
+                "worker": {"enabled": False, "running": False, "reason": "backend_unavailable"},
+            }
+
+    def stop(self, reason: str = "manual_stop") -> dict[str, Any]:
+        """停止采集并释放底层操作系统采集句柄。"""
+        try:
+            return _control_request(
+                self.client,
+                "POST",
+                "/vision/stop",
+                {"reason": str(reason or "manual_stop")},
+            )
+        except BackendUnavailable as exc:
+            return {
+                "accepted": False,
+                "stopped": False,
+                "running": False,
+                "reason": str(exc),
+                "worker": {"enabled": False, "running": False, "reason": "backend_unavailable"},
+            }
 
     def delta(self, after_revision: int = 0, *, wait_ms: int = 250, limit: int = 16) -> dict[str, Any]:
         try:

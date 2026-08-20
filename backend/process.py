@@ -40,8 +40,7 @@ BackendService = importlib.import_module(f"{PACKAGE_NAME}.backend.service").Back
 
 class BackendRequestHandler(BaseHTTPRequestHandler):
     server: "BackendHttpServer"
-    # Keep the loopback control connection alive so repeated OSC/action calls
-    # do not pay a TCP handshake for every command.
+    # 保持回环控制连接，避免重复的 OSC/动作调用每次都进行 TCP 握手。
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -187,6 +186,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.autonomy_goal(value.get("text"), value.get("kind", "explore"))
             elif self.path == "/autonomy/stop":
                 result = self.server.service.autonomy_stop(value.get("reason"))
+            elif self.path == "/vision/start":
+                result = self.server.service.vision_start()
+            elif self.path == "/vision/stop":
+                result = self.server.service.vision_stop(value.get("reason"))
             elif self.path == "/clips/list":
                 result = self.server.service.list_clips()
             elif self.path == "/semantic_express":
@@ -206,7 +209,12 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "unknown endpoint"})
                 return
-            if self.path.startswith("/osc/") or self.path.startswith("/input/") or self.path.startswith("/autonomy/"):
+            if (
+                self.path.startswith("/osc/")
+                or self.path.startswith("/input/")
+                or self.path.startswith("/autonomy/")
+                or self.path.startswith("/vision/")
+            ):
                 dispatch_latency_ms = self.server.service.record_control_dispatch(self.path, started_at)
                 if isinstance(result, dict):
                     result = dict(result)

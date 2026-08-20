@@ -36,8 +36,7 @@ class VisionObservation:
     source: str = "vision"
     observed_at: float | None = None
     frame_id: str | None = None
-    # Keep lifecycle fields at the end so existing positional constructors remain
-    # compatible with the original observation protocol.
+    # 将生命周期字段放在末尾，保持与原观测协议的已有位置参数兼容。
     remove_entity_ids: tuple[str, ...] = ()
     remove_source: str | None = None
     uncertainties: tuple[str, ...] = ()
@@ -71,17 +70,31 @@ class SemanticBackend(Protocol):
     def observe(self, frame: Any, *, world: Mapping[str, Any], now: float) -> VisionObservation: ...
 
 
-def optional_dependency_status() -> dict[str, bool]:
+_OPTIONAL_STATUS_CACHE: dict[str, bool] | None = None
+_OPTIONAL_STATUS_AT = 0.0
+_OPTIONAL_STATUS_LOCK = threading.Lock()
+_OPTIONAL_STATUS_TTL_S = 5.0
+
+
+def optional_dependency_status(*, refresh: bool = False) -> dict[str, bool]:
     """不导入重量级模型包，只报告可选能力是否存在。"""
-    # ``find_spec`` raises ``ModuleNotFoundError`` for a nested module when its
-    # parent package is absent (for example on non-Windows hosts).  Keep this
-    # probe best-effort so a missing WinRT wheel never prevents the backend
-    # from starting.  The granular keys are useful to explain why DXcam's
-    # WinRT candidate was or was not added to the capture probe list.
+    global _OPTIONAL_STATUS_CACHE, _OPTIONAL_STATUS_AT
+    now = time.monotonic()
+    with _OPTIONAL_STATUS_LOCK:
+        if (
+            not refresh
+            and _OPTIONAL_STATUS_CACHE is not None
+            and now - _OPTIONAL_STATUS_AT < _OPTIONAL_STATUS_TTL_S
+        ):
+            return dict(_OPTIONAL_STATUS_CACHE)
+    # 父包不存在时（例如非 Windows 主机），``find_spec`` 对嵌套模块会抛出
+    # ``ModuleNotFoundError``。这里采用尽力探测，不能让缺少 WinRT wheel
+    # 阻止后端启动；细分状态键用于解释 DXcam 的 WinRT 候选为何被加入或
+    # 未被加入采集探测列表。
     dxcam_available = _module_available("dxcam")
     winrt_available = _module_available("winrt")
     winrt_capture_available = _module_available("winrt.windows.graphics.capture")
-    return {
+    result = {
         "opencv": importlib.util.find_spec("cv2") is not None,
         "mss": importlib.util.find_spec("mss") is not None,
         "dxcam": dxcam_available,
@@ -95,10 +108,14 @@ def optional_dependency_status() -> dict[str, bool]:
         "onnxruntime": importlib.util.find_spec("onnxruntime") is not None,
         "torch": importlib.util.find_spec("torch") is not None,
     }
+    with _OPTIONAL_STATUS_LOCK:
+        _OPTIONAL_STATUS_CACHE = dict(result)
+        _OPTIONAL_STATUS_AT = now
+    return result
 
 
 def _module_available(module_name: str) -> bool:
-    """Return whether an optional module can be resolved without importing it."""
+    """返回可选模块是否可以在不导入的情况下被解析。"""
     try:
         return importlib.util.find_spec(module_name) is not None
     except (ImportError, ModuleNotFoundError, ValueError):
@@ -108,10 +125,9 @@ def _module_available(module_name: str) -> bool:
 class MssFrameSource:
     """可选的纯 mss 桌面采集器，不依赖插件 SDK 或模型包。
 
-    ``mss`` exposes monitor ``0`` as the virtual desktop and monitors
-    ``1..N`` as physical outputs.  A BitBlt failure can be output-specific,
-    so the source probes physical outputs and rotates to the next one after a
-    failed grab instead of getting stuck on the first monitor forever.
+    ``mss`` 将监视器 ``0`` 暴露为虚拟桌面，将 ``1..N`` 暴露为物理输出。
+    BitBlt 失败可能只影响某个输出，因此采集器会探测物理输出，并在抓取失败
+    后切换到下一个输出，不会永远卡在第一个监视器上。
     """
 
     name = "mss"
@@ -168,7 +184,7 @@ class MssFrameSource:
                 if not preferred:
                     self._last_error = f"requested monitor index {int(monitor_index)} is unavailable; probing all outputs"
             else:
-                # Prefer an actual output over MSS's virtual-desktop entry.
+                # 优先选择实际输出，而不是 MSS 的虚拟桌面条目。
                 self._candidate_indices = physical + ([0] if normalized else [])
             if not self._candidate_indices:
                 raise RuntimeError("mss reported no usable monitor regions")
@@ -264,11 +280,10 @@ class MssFrameSource:
 
 
 class DxcamFrameSource:
-    """Optional Windows desktop-mirror capture using DXcam.
+    """使用 DXcam 的可选 Windows 桌面镜像采集器。
 
-    DXcam is intentionally imported lazily so the plugin remains usable on
-    machines without the optional capture package. ``grab`` is latest-frame
-    only; no frame queue is retained here.
+    这里刻意延迟导入 DXcam，使未安装可选采集包的机器仍可使用插件。
+    ``grab`` 只读取最新帧，本类不保留帧队列。
     """
 
     name = "dxcam"
@@ -299,10 +314,8 @@ class DxcamFrameSource:
         self._candidate_pos = 0
         self._candidate_errors: dict[str, str] = {}
         self._dxcam: Any = None
-        # Keep this separate from the selected backend: ``auto`` may begin on
-        # DXGI and only switch to WinRT after a failed grab.  Exposing the
-        # capability in status makes that fallback diagnosable before the
-        # first frame arrives.
+        # 将能力状态与当前后端分开：``auto`` 可能先使用 DXGI，抓取失败后
+        # 才切换到 WinRT。这样 status 可以在首帧到达前说明回退原因。
         self._winrt_available = _module_available("winrt.windows.graphics.capture")
         try:
             import dxcam  # type: ignore[import-not-found]
@@ -344,16 +357,15 @@ class DxcamFrameSource:
             }
         else:
             outputs_by_device = {
-                # ``None`` and output 0 both normally mean the primary
-                # display; avoid probing the same output twice.
+                # ``None`` 和输出 0 通常都表示主显示器，避免重复探测同一输出。
                 device: [None, *[
                     index for index in sorted(set(output_map.get(device, [0])))
                     if index != 0
                 ]]
                 for device in devices
             }
-            # When output_info is unavailable, retain a small bounded probe
-            # instead of silently trusting only the primary output.
+            # output_info 不可用时，保留一个小型有界探测列表，不要默默只信任
+            # 主输出。
             if not output_map:
                 outputs_by_device = {device: [None, 0, 1, 2, 3] for device in devices}
         if self._requested_backend != "auto":
@@ -393,10 +405,9 @@ class DxcamFrameSource:
                 backend=backend,
             )
         except TypeError:
-            # Older DXcam releases do not expose the backend selector.  It is
-            # safe to retry only for the historical/default DXGI path.  An
-            # explicit WinRT request must not silently produce a DXGI camera
-            # while reporting ``backend=winrt`` in status.
+            # 较旧的 DXcam 版本不暴露后端选择参数。仅对历史默认的 DXGI 路径
+            # 重试是安全的；显式请求 WinRT 时不能偷偷创建 DXGI 摄像头，却在
+            # status 中报告 ``backend=winrt``。
             if backend != "dxgi":
                 raise
             return self._dxcam.create(
@@ -490,10 +501,10 @@ class DxcamFrameSource:
 
 
 class DesktopMirrorFrameSource:
-    """Select DXcam first and fall back to MSS without changing the worker API.
+    """优先选择 DXcam，失败时回退到 MSS，且不改变 worker 接口。
 
-    Both backends stay alive during probing.  This matters on systems where
-    DXGI is denied for one GPU while GDI/MSS can still capture another output.
+    探测期间两个后端都保持可用。这对某些系统很重要：一个 GPU 可能拒绝
+    DXGI，而 GDI/MSS 仍能采集另一个输出。
     """
 
     name = "desktop_mirror"
@@ -560,12 +571,11 @@ class DesktopMirrorFrameSource:
 
 
 class OpenVinoLocalDetector:
-    """Safe OpenVINO adapter seam for YOLOX/depth/OCR model bundles.
+    """面向 YOLOX/深度/OCR 模型包的安全 OpenVINO 适配接口。
 
-    Model-specific preprocessing is deliberately injected through ``infer``;
-    an absent model or runtime never fabricates detections and reports an
-    explicit unavailable status instead. This keeps inference off the 120 Hz
-    control thread while allowing a deployed bundle to provide real results.
+    特定模型的预处理通过 ``infer`` 显式注入；模型或运行时缺失时不会伪造
+    检测结果，而是报告明确的不可用状态。这样可以让推理脱离 120 Hz 控制
+    线程，同时允许已部署的模型包提供真实结果。
     """
 
     name = "openvino"
@@ -583,9 +593,8 @@ class OpenVinoLocalDetector:
         elif not model_path or not os.path.exists(model_path):
             self._last_error = "YOLOX-Tiny model_path is not configured"
         else:
-            # The concrete YOLOX/depth/OCR graph is deployment-specific. Keep
-            # the adapter unavailable until a validated infer callable is
-            # supplied instead of loading an untrusted arbitrary graph.
+            # 具体的 YOLOX/深度/OCR 图取决于部署环境。应等待经过验证的 infer
+            # 可调用对象，而不是加载不可信的任意图；在此之前保持适配器不可用。
             self._last_error = "model bundle requires a validated infer adapter"
 
     def status(self) -> Mapping[str, Any]:
@@ -617,7 +626,7 @@ class OpenVinoLocalDetector:
 
 
 class OpenAICompatibleSemanticBackend:
-    """Change-triggered structured VLM adapter with a 30/minute hard cap."""
+    """按变化触发的结构化 VLM 适配器，每分钟最多调用 30 次。"""
 
     name = "openai_compatible"
 
@@ -664,7 +673,7 @@ class OpenAICompatibleSemanticBackend:
             buf = BytesIO()
             save(buf, format="JPEG", quality=70)
             return base64.b64encode(buf.getvalue()).decode("ascii")
-        # numpy-like arrays are encoded only when Pillow is available.
+        # 只有 Pillow 可用时，才编码类 numpy 的数组。
         try:
             from PIL import Image  # type: ignore[import-not-found]
             import numpy as np  # type: ignore[import-not-found]
@@ -816,11 +825,19 @@ class VisionWorker:
                 except Exception:
                     available = True
                     break
-            if candidates and not available:
+            if candidates and not available and not self.capture_only:
                 self._last_error = "; ".join(errors)[:256] or "configured vision backends are unavailable"
                 return False
+            if candidates and not available:
+                # 显式请求的仅采集 worker 在部署模型期间仍可持续传递最新帧。
+                # ``VisionRuntime.process_frame`` 会跳过不可用后端，因此这条
+                # 路径不会伪造实体。
+                self._last_error = "; ".join(errors)[:256] or "configured vision backends are unavailable"
             self._stop.clear()
             self._running = True
+            # 新建采集源等待首帧期间，不要暴露旧的世界快照。采集循环只有在
+            # 收到真实帧后才打开这个门控。
+            self.runtime.set_capture_state(False, "awaiting_first_frame")
             self._producer = threading.Thread(
                 target=self._capture_loop,
                 name="neko-vision-capture",
@@ -836,6 +853,9 @@ class VisionWorker:
             return True
 
     def stop(self, timeout_s: float = 2.0) -> None:
+        # 关闭采集源前先标记为过期。即使生产者/消费者线程需要一点时间退出，
+        # 或旧观测仍在 TTL 内，消费者也会立即看到未知世界。
+        self.runtime.set_capture_state(False, "stopped")
         self._stop.set()
         try:
             self.source.close()
@@ -863,11 +883,22 @@ class VisionWorker:
             self._last_error = f"{type(exc).__name__}: {exc}"[:256]
 
     def _capture_loop(self) -> None:
+        activated = False
         while not self._stop.is_set():
             captured_at = self._clock()
             try:
                 frame = self.source.read()
                 if frame is not None:
+                    # read() 可能在 close() 后才返回；停止后的帧必须丢弃，
+                    # 否则会把生命周期门重新打开并把旧画面送入推理队列。
+                    with self._lock:
+                        stopped_after_read = self._stop.is_set()
+                        if not stopped_after_read and not activated:
+                            self.runtime.set_capture_state(True, "running")
+                            activated = True
+                    if stopped_after_read:
+                        _release_frame(frame)
+                        break
                     with self._lock:
                         self._sequence += 1
                         sequence = self._sequence
@@ -963,13 +994,92 @@ class VisionRuntime:
         self._lock = threading.Lock()
         self._last_semantic_at: float | None = None
         self._last_error: str | None = None
+        # 采集生命周期与检测器可用性分离。将门控放在运行时中，可让所有消费者
+        # （HTTP、世界桥、自主控制和导航器）统一认定已停止的来源为未知，即使
+        # 有界世界存储中仍保留最近一帧。
+        self._capture_active = True
+        self._capture_reason = "active"
         self.store.set_backend_status("vision_runtime", self.status())
+
+    def set_capture_state(self, active: bool, reason: str | None = None) -> None:
+        """发布世界消费者是否可以使用新鲜帧。
+
+        本方法不会删除持久化世界记忆，也不会伪造删除事件；它只会在新帧到达前
+        屏蔽瞬时观测。关闭或重建采集句柄时，这一点尤其重要。
+        """
+        with self._lock:
+            self._capture_active = bool(active)
+            self._capture_reason = (
+                "active" if active else (str(reason or "capture_stopped").strip()[:160] or "capture_stopped")
+            )
+        self.store.set_backend_status("vision_runtime", self.status())
+
+    def capture_state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "active": self._capture_active,
+                "reason": self._capture_reason,
+            }
+
+    def _mask_stopped_snapshot(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        """返回未知视图，同时不修改持久化世界存储。"""
+        with self._lock:
+            active = self._capture_active
+            reason = self._capture_reason
+        result = dict(snapshot)
+        result["capture_active"] = active
+        result["capture_reason"] = reason
+        if active:
+            return result
+        result["available"] = False
+        result["entities"] = []
+        result["events"] = []
+        uncertainties = [str(item)[:160] for item in (result.get("uncertainties") or ())]
+        if "visual_capture_stopped" not in uncertainties:
+            uncertainties.append("visual_capture_stopped")
+        result["uncertainties"] = uncertainties[:16]
+        status = dict(result.get("status") or {})
+        status["entity_count"] = 0
+        status["event_count"] = 0
+        result["status"] = status
+        return result
+
+    def _mask_stopped_delta(self, delta: Mapping[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            active = self._capture_active
+            reason = self._capture_reason
+        result = dict(delta)
+        result["capture_active"] = active
+        result["capture_reason"] = reason
+        if active:
+            return result
+        world = result.get("world")
+        if isinstance(world, Mapping):
+            result["world"] = self._mask_stopped_snapshot(world)
+        else:
+            result["world"] = self._mask_stopped_snapshot({})
+        result["navigation"] = {"status": "unknown", "safe_navigation": False}
+        result["social"] = {
+            "status": "unknown",
+            "players_persisted": False,
+            "chat_persisted": False,
+        }
+        result["uncertainty"] = list(result["world"].get("uncertainties") or ())
+        result["changes"] = {
+            "entities": [],
+            "events": [],
+            "removed_entity_ids": [],
+            "removed_entity_count": 0,
+        }
+        return result
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             detector = self.detector
             semantic = self.semantic
             last_error = self._last_error
+            capture_active = self._capture_active
+            capture_reason = self._capture_reason
         def backend_status(backend: Any, *, label: str) -> Mapping[str, Any]:
             if backend is None:
                 return {"available": False, "reason": "not_configured"}
@@ -986,6 +1096,8 @@ class VisionRuntime:
                 }
         return {
             "enabled": detector is not None or semantic is not None,
+            "capture_active": capture_active,
+            "capture_reason": capture_reason,
             "detector": backend_status(detector, label="detector"),
             "semantic": backend_status(semantic, label="semantic"),
             "optional_dependencies": optional_dependency_status(),
@@ -1003,7 +1115,12 @@ class VisionRuntime:
             self.semantic = semantic
         self.store.set_backend_status("vision_runtime", self.status())
 
-    def ingest(self, observation: VisionObservation | Mapping[str, Any]) -> dict[str, Any]:
+    def ingest(
+        self,
+        observation: VisionObservation | Mapping[str, Any],
+        *,
+        _reactivate: bool = True,
+    ) -> dict[str, Any]:
         def array_field(mapping: Mapping[str, Any], name: str) -> tuple[Any, ...]:
             raw = mapping.get(name)
             if raw is None:
@@ -1063,6 +1180,15 @@ class VisionRuntime:
         if value.remove_entity_ids or value.remove_source is not None:
             ingest_kwargs["remove_entity_ids"] = value.remove_entity_ids
             ingest_kwargs["remove_source"] = value.remove_source
+        capture_active = self.capture_state()["active"]
+        # 明确的外部观测可以重新打开世界视图；采集 worker 的过期帧绝不
+        # 能在 stop 之后写入存储，即使它已经越过了 process_frame 的首个检查。
+        if not capture_active:
+            if not _reactivate:
+                result = self._mask_stopped_snapshot(self.store.snapshot())
+                result["vision"] = self.status()
+                return result
+            self.set_capture_state(True, "external_observation")
         result = self.store.ingest(value.entities, value.events, **ingest_kwargs)
         callback = self._observation_callback
         if callback is not None:
@@ -1087,12 +1213,19 @@ class VisionRuntime:
         到期时运行。
         """
         processing_now = self._clock()
+        if not self.capture_state()["active"]:
+            result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
+            result["vision"] = self.status()
+            return result
         try:
             observation_now = min(processing_now, float(observed_at)) if observed_at is not None else processing_now
         except (TypeError, ValueError, OverflowError):
             observation_now = processing_now
-        detector = self.detector
-        semantic = self.semantic
+        # attach_vision/set_backends 可能与采集线程并行；在锁内取得稳定引用，
+        # 后续推理不持有运行时锁，避免阻塞生命周期控制。
+        with self._lock:
+            detector = self.detector
+            semantic = self.semantic
         try:
             detector_available = detector is not None
             if detector is not None:
@@ -1104,9 +1237,9 @@ class VisionRuntime:
                     )
                 except Exception:
                     detector_available = True
-            if detector_available and detector is not None:
-                self.ingest(detector.observe(frame, now=observation_now))
-            if semantic is not None:
+            if detector_available and detector is not None and self.capture_state()["active"]:
+                self.ingest(detector.observe(frame, now=observation_now), _reactivate=False)
+            if semantic is not None and self.capture_state()["active"]:
                 with self._lock:
                     semantic_due = (
                         force_semantic
@@ -1120,21 +1253,39 @@ class VisionRuntime:
                         frame,
                         world=self.store.snapshot(now=processing_now),
                         now=observation_now,
-                    ))
+                    ), _reactivate=False)
             with self._lock:
                 self._last_error = None
         except Exception as exc:
             with self._lock:
                 self._last_error = f"{type(exc).__name__}: {exc}"[:500]
         self.store.set_backend_status("vision_runtime", self.status())
-        result = self.store.snapshot(now=processing_now)
+        result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
         result["vision"] = self.status()
         return result
 
     def snapshot(self) -> dict[str, Any]:
-        result = self.store.snapshot()
+        result = self._mask_stopped_snapshot(self.store.snapshot())
         result["vision"] = self.status()
         return result
+
+    def delta(
+        self,
+        after_revision: int = 0,
+        *,
+        wait_ms: int = 250,
+        limit: int = 16,
+    ) -> dict[str, Any]:
+        """返回受采集生命周期门控的世界增量。"""
+        return self._mask_stopped_delta(
+            self.store.delta(after_revision, wait_ms=wait_ms, limit=limit)
+        )
+
+
+# 原有适配器保留在上方，以兼容源码级引用；实际部署实现位于面向模型的模块中。
+# 在此导入可以避免循环依赖：``local_perception`` 使用的所有协议/数据类定义
+# 已经完成初始化。
+from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # noqa: E402,F401
 
 
 __all__ = [

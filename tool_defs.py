@@ -363,6 +363,28 @@ WORLD_OBSERVE = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+VRC_VISION_STATUS = {
+    "name": "vrc_vision_status",
+    "description": "读取本地视觉采集器、检测器和世界状态的运行情况；没有帧或检测器时必须按 unknown 处理。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+VRC_VISION_START = {
+    "name": "vrc_vision_start",
+    "description": "启动或重启独立 VRChat 屏幕捕获与本地感知线程。只启动观察，不会启用身体输出或自主移动。",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+VRC_VISION_STOP = {
+    "name": "vrc_vision_stop",
+    "description": "停止独立 VRChat 屏幕捕获、释放捕获句柄并停止世界上下文推送；不会关闭 AnyaDance 后端。",
+    "parameters": {
+        "type": "object",
+        "properties": {"reason": {"type": "string", "maxLength": 160}},
+        "required": [],
+    },
+}
+
 BODY_LOCOMOTION = {
     "name": "body_locomotion",
     "description": "优先通过 AnyaDance 虚拟 Index 左摇杆实现移动，没有可用驱动时回退到 VRChat OSC；直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",

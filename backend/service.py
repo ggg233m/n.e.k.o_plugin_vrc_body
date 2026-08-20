@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import math
 import os
 import threading
@@ -63,7 +63,7 @@ def _osc_axis_value(value: Any, name: str) -> float:
 
 
 def _controller_value(value: Any, name: str) -> float:
-    """Normalize trigger/grip values (AnyaDance protocol uses 0..1)."""
+    """归一化扳机/握把数值（AnyaDance 协议范围为 0..1）。"""
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
     try:
@@ -156,36 +156,41 @@ class BackendService:
         dry_run: bool = False,
         vision_source: FrameSource | None = None,
         vision_detector: FrameDetector | None = None,
+        vision_source_factory: Callable[[], FrameSource] | None = None,
     ) -> None:
         self.config = PluginConfig.from_mapping(config_data)
         self.config_dir = Path(config_dir)
         self.logger = logger
         self.dry_run = bool(dry_run)
-        if vision_source is None and self.config.vision.enabled and self.config.vision.source != "external" and self.config.vision.capture in {
-            "desktop_mirror", "dxcam", "mss"
-        }:
-            # Capture/model dependencies remain optional and are instantiated
-            # only when vision is explicitly enabled.
-            if self.config.vision.capture == "mss" or self.config.vision.source == "mss":
-                vision_source = MssFrameSource(
-                    monitor_index=self.config.vision.monitor_index,
-                )
-            elif self.config.vision.capture == "dxcam":
-                vision_source = DxcamFrameSource(
-                    device_idx=self.config.vision.dxcam_device_idx,
-                    output_idx=self.config.vision.dxcam_output_idx,
-                    backend=self.config.vision.dxcam_backend,
-                )
-            else:
-                vision_source = DesktopMirrorFrameSource(
-                    monitor_index=self.config.vision.monitor_index,
-                    dxcam_device_idx=self.config.vision.dxcam_device_idx,
-                    dxcam_output_idx=self.config.vision.dxcam_output_idx,
-                    dxcam_backend=self.config.vision.dxcam_backend,
-                )
+        # FrameSource 持有操作系统句柄，调用 ``close()`` 后刻意不再复用。
+        # 为已配置的来源保留工厂，使视觉停止/启动接口可以销毁并重新创建句柄。
+        # 注入的来源只保证一个生命周期；测试或旁路进程可显式提供工厂来重复创建。
+        self._vision_source_factory = vision_source_factory
+        self._vision_source_external = vision_source is not None and vision_source_factory is None
+        self._vision_stop_reason = "not_configured"
+        if vision_source is None:
+            vision_source = self._build_configured_vision_source()
         self._vision_source = vision_source
         if vision_detector is None and self.config.vision.enabled and self.config.vision.local_backend == "openvino":
-            vision_detector = OpenVinoLocalDetector(model_path=os.getenv("VRC_OPENVINO_MODEL"))
+            configured_model = self.config.vision.model_path or os.getenv("VRC_OPENVINO_MODEL")
+            configured_labels = self.config.vision.labels_path or os.getenv("VRC_OPENVINO_LABELS")
+            # plugin.toml 中的路径相对于后端配置目录，而不是进程工作目录。
+            # 未配置路径时，环境变量覆盖仍保持历史上的绝对/相对路径行为。
+            if configured_model and not Path(configured_model).is_absolute() and self.config.vision.model_path:
+                configured_model = str(self.config_dir / configured_model)
+            if configured_labels and not Path(configured_labels).is_absolute() and self.config.vision.labels_path:
+                configured_labels = str(self.config_dir / configured_labels)
+            vision_detector = OpenVinoLocalDetector(
+                model_path=configured_model,
+                labels_path=configured_labels,
+                device=self.config.vision.device,
+                confidence_threshold=self.config.vision.confidence_threshold,
+                input_width=self.config.vision.input_width,
+                input_height=self.config.vision.input_height,
+                horizontal_fov_deg=self.config.vision.horizontal_fov_deg,
+                max_detections=self.config.vision.max_detections,
+                fallback_backend=self.config.vision.fallback_backend,
+            )
         vision_semantic: Any | None = None
         if self.config.vision.enabled and self.config.vision.semantic_backend == "openai_compatible":
             endpoint = os.getenv("VRC_VLM_ENDPOINT") or os.getenv("OPENAI_BASE_URL")
@@ -200,8 +205,8 @@ class BackendService:
         self.world_state = WorldStateStore(
             lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
             persistence_path=self.config_dir / "world_memory.json",
-            # Keep library/test callers isolated unless the section is
-            # explicitly present; the shipped plugin.toml enables it.
+            # 除非调用方明确提供该配置段，否则隔离库/测试调用方；随插件发布的
+            # plugin.toml 会启用持久化配置段。
             persist_world=self.config.world_memory.persist_world and "world_memory" in config_data,
             persist_players=self.config.world_memory.persist_players and "world_memory" in config_data,
         )
@@ -214,6 +219,14 @@ class BackendService:
         self.vision_worker: VisionWorker | None = None
         if self.config.vision.enabled and vision_source is not None:
             self.vision_worker = self._new_vision_worker(vision_source)
+            self._vision_stop_reason = "configured"
+            # 后端进程尚未启动 worker，不要把持久化或最近的世界数据当成新帧暴露。
+            self.vision.set_capture_state(False, "not_started")
+        else:
+            self.vision.set_capture_state(
+                False,
+                "disabled_in_config" if not self.config.vision.enabled else "not_configured",
+            )
         self.scheduler: BodyScheduler | None = None
         self.osc: VrchatOscBridge | None = None
         self.driver_log: DriverLogListener | None = None
@@ -227,15 +240,14 @@ class BackendService:
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
         self.autonomy = AutonomyRuntime(
-            world_provider=lambda: self.world_state.snapshot(),
+            world_provider=lambda: self.vision.snapshot(),
             release_inputs=self._release_all_inputs,
             session_ttl_s=self.config.autonomy.session_ttl_minutes * 60.0,
         )
-        # The navigator is a local, bounded control loop.  It is deliberately
-        # separate from the LLM and vision workers; it only emits short
-        # AnyaDance axis updates after a fresh, visible target is observed.
+        # 导航器是本地有界控制环，刻意与 LLM 和视觉 worker 分离；只有观察到
+        # 新鲜且可见的目标后，才发送短时 AnyaDance 轴更新。
         self.navigator = LocalNavigator(
-            world_provider=lambda: self.world_state.snapshot(),
+            world_provider=lambda: self.vision.snapshot(),
             goal_provider=lambda: self.autonomy.snapshot(),
             send_axes=self._navigator_send_axes,
             release_inputs=self._navigator_release_inputs,
@@ -250,17 +262,101 @@ class BackendService:
         }
         self.cognition = CognitionRuntime(
             self._cognition_sources,
-            world_provider=lambda: self.world_state.snapshot(),
+            world_provider=lambda: self.vision.snapshot(),
         )
 
     def _new_vision_worker(self, source: FrameSource) -> VisionWorker:
+        # 已配置的检测器对象可能存在，但可选模型不可用（例如未部署 OpenVINO
+        # IR 模型包）。此时采集路径仍应可用：帧可以计数和诊断，但不能发布猜测的实体。
+        candidates = [item for item in (self.vision.detector, self.vision.semantic) if item is not None]
+        backend_available = False
+        for candidate in candidates:
+            try:
+                status = candidate.status()
+                if not isinstance(status, Mapping) or status.get("available") is not False:
+                    backend_available = True
+                    break
+            except Exception:
+                # 遵循 VisionWorker 的保守策略：探测后端时若抛出异常，视为可能可用，
+                # 交给处理循环报告，而不是直接禁用采集。
+                backend_available = True
+                break
         return VisionWorker(
             self.vision,
             source,
             interval_s=self.config.vision.interval_ms / 1000.0,
             queue_size=self.config.vision.queue_size,
-            capture_only=self.vision.detector is None and self.vision.semantic is None,
+            capture_only=not backend_available,
         )
+
+    def _build_configured_vision_source(self) -> FrameSource | None:
+        """创建一个新的已配置采集源。
+
+        本函数只负责构造来源。初始化和每次启动视觉 worker 时都会调用它，
+        因此关闭后的 DXcam/MSS/WinRT 对象不会被交给新的 worker。
+        """
+        vision = self.config.vision
+        if not vision.enabled or vision.source == "external" or vision.capture == "external":
+            return None
+        if vision.capture == "mss" or vision.source == "mss":
+            return MssFrameSource(monitor_index=vision.monitor_index)
+        if vision.capture == "dxcam":
+            return DxcamFrameSource(
+                device_idx=vision.dxcam_device_idx,
+                output_idx=vision.dxcam_output_idx,
+                backend=vision.dxcam_backend,
+            )
+        if vision.capture == "desktop_mirror":
+            return DesktopMirrorFrameSource(
+                monitor_index=vision.monitor_index,
+                dxcam_device_idx=vision.dxcam_device_idx,
+                dxcam_output_idx=vision.dxcam_output_idx,
+                dxcam_backend=vision.dxcam_backend,
+            )
+        return None
+
+    def _fresh_vision_source(self) -> FrameSource | None:
+        """返回新分配的来源；无法重启时返回 ``None``。"""
+        factory = self._vision_source_factory
+        if factory is not None:
+            source = factory()
+            if source is None:
+                raise RuntimeError("vision source factory returned no source")
+            return source
+        if self._vision_source_external:
+            return None
+        return self._build_configured_vision_source()
+
+    @staticmethod
+    def _vision_worker_not_configured(reason: str = "not_configured") -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "running": False,
+            "capture_only": False,
+            "reason": reason,
+        }
+
+    def _vision_worker_status(self) -> dict[str, Any]:
+        worker = self.vision_worker
+        if worker is None:
+            return self._vision_worker_not_configured(self._vision_stop_reason)
+        return worker.status()
+
+    def _stop_vision_worker_locked(self, *, reason: str = "stopped") -> None:
+        """在持有 ``_lock`` 时停止并丢弃 worker 及其来源。"""
+        worker = self.vision_worker
+        if worker is not None:
+            try:
+                worker.stop()
+            finally:
+                # ``VisionWorker.stop`` 会关闭来源，不能把已关闭的对象留给后续启动。
+                self.vision_worker = None
+        # 即使没有 worker 对象（例如重复停止或来源创建失败），也要让运行时门控
+        # 保持权威。VisionWorker 的直接调用使用通用停止原因，这里恢复控制面原因，
+        # 让 `/perception` 能解释采集为何结束。
+        self.vision.set_capture_state(False, str(reason or "stopped"))
+        self._vision_source = None
+        self._vision_stop_reason = str(reason or "stopped")
 
     def _cognition_sources(self) -> dict[str, dict[str, Any]]:
         """暴露各数据源健康状况，且不会递归调用 ``snapshot``。"""
@@ -269,11 +365,7 @@ class BackendService:
         driver = self.driver_log.snapshot() if self.driver_log else {"enabled": False}
         vmc = self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False}
         world = self.vision.snapshot()
-        worker = self.vision_worker.status() if self.vision_worker else {
-            "enabled": False,
-            "running": False,
-            "reason": "not_configured",
-        }
+        worker = self._vision_worker_status()
         return {
             "body": {
                 "state": body.get("state"),
@@ -317,7 +409,7 @@ class BackendService:
         }
 
     def _apply_driver_sender_conflict(self, body: dict[str, Any], driver: Mapping[str, Any]) -> None:
-        """Use driver telemetry to detect another writer of UDP latest-state."""
+        """利用驱动遥测检测是否有其他进程写入 UDP 最新状态。"""
         senders = [str(item) for item in (driver.get("senders") or ()) if item]
         local_port = (body.get("udp") or {}).get("local_port")
         others: list[str] = []
@@ -360,8 +452,14 @@ class BackendService:
                 self.osc.start()
                 self.driver_log = DriverLogListener(self.config.driver_log, logger=self.logger)
                 self.driver_log.start()
+                if self.vision_worker is None and self.config.vision.enabled:
+                    source = self._fresh_vision_source()
+                    if source is not None:
+                        self._vision_source = source
+                        self.vision_worker = self._new_vision_worker(source)
                 if self.vision_worker is not None:
-                    self.vision_worker.start()
+                    if self.vision_worker.start():
+                        self._vision_stop_reason = "running"
                 self.navigator.start()
                 self._started = True
                 self._last_error = None
@@ -439,17 +537,14 @@ class BackendService:
 
     def stop(self) -> None:
         with self._lock:
-            # Disarming first releases both the virtual controller overlay and
-            # OSC fallback before worker/socket teardown.
+            # 先解除授权，释放虚拟控制器叠加层和 OSC 回退，再拆除 worker/套接字。
             try:
                 self.autonomy.disarm("backend_stopped")
             except Exception:
                 pass
             self.navigator.stop()
             self._stop_vmc_calibration()
-            if self.vision_worker:
-                self.vision_worker.stop()
-            self.vision_worker = None
+            self._stop_vision_worker_locked(reason="backend_stopped")
             if self.driver_log:
                 self.driver_log.stop()
             if self.osc:
@@ -468,7 +563,7 @@ class BackendService:
             self._started = False
 
     def _release_all_inputs(self) -> None:
-        """Best-effort emergency release used by autonomy and shutdown paths."""
+        """用于自主控制和关闭路径的尽力急停释放。"""
         scheduler = self.scheduler
         if scheduler is not None:
             try:
@@ -520,17 +615,181 @@ class BackendService:
     def attach_vision(self, source: FrameSource, detector: FrameDetector) -> dict[str, Any]:
         """注入外部 detector；模型包和采集实现由调用方负责。"""
         with self._lock:
-            if self.vision_worker:
-                self.vision_worker.stop()
+            self._stop_vision_worker_locked(reason="replaced")
+            self._vision_source_factory = None
+            self._vision_source_external = True
             self._vision_source = source
             self.vision.set_backends(detector=detector)
-            self.vision_worker = self._new_vision_worker(source)
-            started = self._started and self.vision_worker.start()
+            worker: VisionWorker | None = None
+            try:
+                worker = self._new_vision_worker(source)
+                self.vision_worker = worker
+                started = self._started and worker.start()
+                if self._started and not started:
+                    # 后端已运行时，启动失败代表这次注入没有接管成功；关闭
+                    # source 并清掉 worker，避免后续 start() 复用坏对象。
+                    failure_status = worker.status()
+                    worker.stop()
+                    self.vision_worker = None
+                    self._vision_source = None
+                    self._vision_stop_reason = "attach_start_failed"
+                    self.vision.set_capture_state(False, "attach_start_failed")
+                    return {
+                        "attached": False,
+                        "started": False,
+                        "reason": failure_status.get("last_error") or "vision worker failed to start",
+                        "worker": failure_status,
+                    }
+                if started:
+                    self._vision_stop_reason = "running"
+            except Exception as exc:
+                # 注入失败时立即释放外部 source，避免句柄泄漏或半初始化 worker
+                # 在下一次 start/stop 中继续被复用。
+                if worker is not None:
+                    try:
+                        worker.stop()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                self.vision_worker = None
+                self._vision_source = None
+                self._vision_stop_reason = "attach_failed"
+                self.vision.set_capture_state(False, "attach_failed")
+                return {
+                    "attached": False,
+                    "started": False,
+                    "reason": f"{type(exc).__name__}: {exc}"[:500],
+                    "worker": self._vision_worker_status(),
+                }
         return {
             "attached": True,
             "started": bool(started),
-            "worker": self.vision_worker.status(),
+            "worker": worker.status() if worker is not None else self._vision_worker_status(),
         }
+
+    def vision_start(self) -> dict[str, Any]:
+        """使用新来源启动采集。
+
+        来源是资源所有权对象：停止 worker 会关闭其 DXcam、WinRT 或 MSS 句柄。
+        重启时本方法总是分配新来源，不会尝试复用已经关闭的实例。
+        """
+        with self._lock:
+            if not self.config.vision.enabled:
+                self._vision_stop_reason = "disabled_in_config"
+                return {
+                    "accepted": False,
+                    "started": False,
+                    "running": False,
+                    "reason": "vision is disabled in configuration",
+                    "worker": self._vision_worker_status(),
+                }
+            if self.vision_worker is not None:
+                current = self.vision_worker.status()
+                if current.get("running"):
+                    return {
+                        "accepted": True,
+                        "started": True,
+                        "running": True,
+                        "changed": False,
+                        "reason": "already_running",
+                        "worker": current,
+                    }
+                # 失败或过期的 worker 可能持有已关闭或不可用的来源，重建前先拆除。
+                self._stop_vision_worker_locked(reason="restarting")
+            try:
+                source = self._fresh_vision_source()
+            except Exception as exc:
+                self._vision_stop_reason = "source_create_failed"
+                return {
+                    "accepted": False,
+                    "started": False,
+                    "running": False,
+                    "reason": f"{type(exc).__name__}: {exc}"[:500],
+                    "worker": self._vision_worker_status(),
+                }
+            if source is None:
+                self._vision_stop_reason = "external_source_requires_attach"
+                return {
+                    "accepted": False,
+                    "started": False,
+                    "running": False,
+                    "reason": "vision source is external; attach a fresh source before starting",
+                    "worker": self._vision_worker_status(),
+                }
+            self._vision_source = source
+            worker = self._new_vision_worker(source)
+            self.vision_worker = worker
+            if not self._started:
+                self._vision_stop_reason = "prepared"
+                return {
+                    "accepted": True,
+                    "started": False,
+                    "running": False,
+                    "changed": True,
+                    "reason": "backend_not_started",
+                    "worker": worker.status(),
+                }
+            try:
+                started = worker.start()
+            except Exception as exc:
+                failure_status = worker.status()
+                self._stop_vision_worker_locked(reason="start_failed")
+                self._vision_stop_reason = "start_failed"
+                return {
+                    "accepted": False,
+                    "started": False,
+                    "running": False,
+                    "changed": True,
+                    "reason": f"{type(exc).__name__}: {exc}"[:500],
+                    "worker": failure_status,
+                }
+            if not started:
+                failure_status = worker.status()
+                # 启动失败时可能已经打开采集句柄。现在关闭并丢弃它，让调用方重试
+                # 时获得新来源，避免积累过期的操作系统资源。
+                self._stop_vision_worker_locked(reason="start_failed")
+                self._vision_stop_reason = "start_failed"
+                return {
+                    "accepted": False,
+                    "started": False,
+                    "running": False,
+                    "changed": True,
+                    "reason": failure_status.get("last_error") or "vision worker failed to start",
+                    "worker": failure_status,
+                }
+            self._vision_stop_reason = "running"
+            return {
+                "accepted": True,
+                "started": True,
+                "running": True,
+                "changed": True,
+                "reason": "started",
+                "worker": worker.status(),
+            }
+
+    def vision_stop(self, reason: Any = "manual_stop") -> dict[str, Any]:
+        """停止采集并释放操作系统资源，但不停止后端。"""
+        with self._lock:
+            was_running = bool(self.vision_worker and self.vision_worker.status().get("running"))
+            # 没有新鲜视觉来源时绝不能继续自主导航。解除授权还会在可能阻塞于
+            # 采集/VLM 线程之前释放任何活动中的控制器叠加层。
+            try:
+                self.autonomy.disarm("vision_stopped")
+            except Exception:
+                pass
+            self._stop_vision_worker_locked(reason=str(reason or "manual_stop"))
+            return {
+                "accepted": True,
+                "stopped": True,
+                "running": False,
+                "changed": was_running,
+                "reason": str(reason or "manual_stop"),
+                "worker": self._vision_worker_status(),
+            }
 
     def submit(
         self,
@@ -686,11 +945,7 @@ class BackendService:
             "idle_relay": self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False},
             "host_vmc": self.host_vmc.snapshot() if self.host_vmc else {"managed": False, "active": False},
             "world": self.vision.snapshot(),
-            "vision_worker": self.vision_worker.status() if self.vision_worker else {
-                "enabled": False,
-                "running": False,
-                "reason": "not_configured",
-            },
+            "vision_worker": self._vision_worker_status(),
             "cognition": self.cognition.snapshot(),
             "autonomy": self.autonomy.snapshot(),
             "navigation": self.navigator.snapshot(),
@@ -704,7 +959,7 @@ class BackendService:
         }
 
     def record_control_dispatch(self, operation: str, started_at: float) -> float:
-        """Record server-side dispatch latency for a control-plane request."""
+        """记录控制面请求在服务端的分发延迟。"""
         elapsed_ms = max(0.0, (time.perf_counter() - float(started_at)) * 1000.0)
         name = str(operation or "unknown")
         with self._control_metrics_lock:
@@ -738,8 +993,8 @@ class BackendService:
         return awareness
 
     def world_delta(self, after_revision: Any = 0, *, wait_ms: Any = 250, limit: Any = 16) -> dict[str, Any]:
-        """Long-poll the world store without entering the body control path."""
-        result = self.world_state.delta(after_revision, wait_ms=wait_ms, limit=limit)
+        """长轮询世界存储，不进入身体控制路径。"""
+        result = self.vision.delta(after_revision, wait_ms=wait_ms, limit=limit)
         self.autonomy.update_world(result.get("world"))
         return result
 
@@ -747,15 +1002,11 @@ class BackendService:
         return {
             "world": self.vision.snapshot(),
             "navigation": self.navigator.snapshot(),
-            "worker": self.vision_worker.status() if self.vision_worker else {
-                "enabled": False,
-                "running": False,
-                "reason": "not_configured",
-            },
+            "worker": self._vision_worker_status(),
         }
 
     def _navigator_send_axes(self, side: str, x: float, y: float, duration_ms: int) -> bool:
-        """Send only the primary AnyaDance command; never fall back to OSC."""
+        """只发送主 AnyaDance 命令，绝不回退到 OSC。"""
         scheduler = self.scheduler
         if scheduler is None or self.config.input.primary != "anyadance":
             return False
@@ -851,8 +1102,7 @@ class BackendService:
         horizontal_result = self.osc.set_axis("move_horizontal", normalized_horizontal, duration_s)
         if horizontal_result[0]:
             return True, None
-        # A partial locomotion command is unsafe: release both movement axes
-        # so a caller never gets an apparently successful half-command.
+        # 部分移动命令不安全：释放两个移动轴，避免调用方收到看似成功的半条命令。
         rollback = getattr(self.osc, "stop_axes", None)
         if callable(rollback):
             rollback(("move_vertical", "move_horizontal"))
@@ -1000,11 +1250,10 @@ class BackendService:
         return False, direct_reason or "AnyaDance scheduler is not initialized"
 
     def send_osc_batch(self, commands: Any) -> dict[str, Any]:
-        """Apply a bounded batch of low-latency OSC commands.
+        """应用一批有界的低延迟 OSC 命令。
 
-        Axis commands are latest-wins inside the batch.  If any command fails
-        after an axis was touched, all movement axes are released before the
-        error is returned.
+        批次内轴命令采用最新值优先。如果某条命令失败且此前已经修改过轴，
+        则在返回错误前释放所有移动轴。
         """
         if not isinstance(commands, list) or not commands:
             return {"accepted": False, "results": [], "reason": "commands must be a non-empty array"}
@@ -1198,9 +1447,8 @@ class BackendService:
             "event_count": len(result.get("events") or ()),
             "observation_count": (result.get("status") or {}).get("observation_count", 0),
             "revision": (result.get("status") or {}).get("revision", 0),
-            # WorldStateStore bounds this list with max_removals; do not apply a
-            # smaller transport-side slice that makes an otherwise atomic ack
-            # impossible to reconcile.
+            # WorldStateStore 已用 max_removals 限制此列表；传输层不要再使用更小
+            # 的切片，否则原本原子的确认结果将无法对账。
             "removed_entity_ids": list(changes.get("removed_entity_ids") or ()),
             "removed_entity_count": int(changes.get("removed_entity_count", 0) or 0),
         }

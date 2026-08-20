@@ -295,8 +295,7 @@ class WorldStateStoreTests(unittest.TestCase):
             source="vrchat_log",
         )
 
-        # The log event was observed at 90 but arrived after a newer detector
-        # frame. It must not erase the newer state.
+        # 日志事件在 90 时刻观测到，但在更新的检测帧之后才到达，不能擦除新状态。
         now[0] = 101.0
         result = store.ingest(
             events=[{
@@ -496,6 +495,22 @@ class _FrameSource:
         self.closed = True
 
 
+class _LateFrameSource(_FrameSource):
+    """模拟 close() 后才返回一帧的采集源，用于验证停止竞态。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_entered = threading.Event()
+        self.release_read = threading.Event()
+
+    def read(self):
+        self.read_entered.set()
+        self.release_read.wait(2.0)
+        # 即使 close() 已经被调用，也故意返回一帧迟到画面。
+        self.frames += 1
+        return {"frame": self.frames}
+
+
 class _WorkerDetector:
     name = "fake_detector"
 
@@ -605,6 +620,39 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(status["frames_captured"], 1)
         self.assertEqual(store.snapshot()["entities"], [])
 
+    def test_late_frame_after_stop_cannot_reactivate_capture_or_write_world(self) -> None:
+        source = _LateFrameSource()
+        store = WorldStateStore()
+        runtime = VisionRuntime(store, detector=_WorkerDetector())
+        worker = VisionWorker(runtime, source, interval_s=0.01)
+        self.assertTrue(worker.start())
+        self.assertTrue(source.read_entered.wait(1.0))
+
+        stopper = threading.Thread(target=worker.stop)
+        stopper.start()
+        # 让 stop() 先设置停止门，再释放阻塞的 read()。
+        time.sleep(0.02)
+        source.release_read.set()
+        stopper.join(2.0)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(runtime.capture_state()["active"])
+        self.assertEqual(store.snapshot()["entities"], [])
+
+    def test_stopped_worker_frame_is_rejected_by_runtime_ingest(self) -> None:
+        store = WorldStateStore()
+        runtime = VisionRuntime(store)
+        runtime.set_capture_state(False, "manual_stop")
+        result = runtime.ingest(
+            VisionObservation(
+                source="late_detector",
+                entities=({"id": "stale", "label": "stale", "confidence": 0.9},),
+            ),
+            _reactivate=False,
+        )
+        self.assertFalse(result["available"])
+        self.assertEqual(store.snapshot()["entities"], [])
+
     def test_detector_runs_every_frame_and_semantic_backend_is_rate_limited(self) -> None:
         now = [0.0]
         detector = _Detector()
@@ -639,6 +687,31 @@ class VisionRuntimeTests(unittest.TestCase):
         runtime = VisionRuntime(detector=BrokenDetector())
         snapshot = runtime.process_frame(object())
         self.assertIn("detector offline", snapshot["vision"]["last_error"])
+
+    def test_stopped_capture_masks_stale_world_without_deleting_store(self) -> None:
+        store = WorldStateStore()
+        runtime = VisionRuntime(store)
+        runtime.ingest(VisionObservation(
+            source="test_detector",
+            entities=({"id": "button", "label": "button", "confidence": 0.9},),
+        ))
+        self.assertTrue(runtime.snapshot()["available"])
+
+        runtime.set_capture_state(False, "manual_stop")
+        masked = runtime.snapshot()
+        self.assertFalse(masked["available"])
+        self.assertEqual(masked["entities"], [])
+        self.assertIn("visual_capture_stopped", masked["uncertainties"])
+        self.assertEqual(masked["capture_reason"], "manual_stop")
+        self.assertEqual(store.snapshot()["entities"][0]["id"], "button")
+
+        delta = runtime.delta(after_revision=0, wait_ms=0)
+        self.assertFalse(delta["world"]["available"])
+        self.assertEqual(delta["changes"]["entities"], [])
+        self.assertFalse(delta["navigation"]["safe_navigation"])
+
+        runtime.set_capture_state(True, "running")
+        self.assertEqual(runtime.snapshot()["entities"][0]["id"], "button")
 
 
 if __name__ == "__main__":

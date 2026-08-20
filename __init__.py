@@ -48,6 +48,9 @@ from .tool_defs import (
     VRC_CONTROLLER_INPUT,
     VRC_JUMP,
     VRC_MENU_NAVIGATE,
+    VRC_VISION_START,
+    VRC_VISION_STATUS,
+    VRC_VISION_STOP,
     WORLD_OBSERVE,
 )
 
@@ -120,6 +123,9 @@ _DEBUG_COMMAND_NAMES = (
     "vrc_autonomy_stop",
     "vrc_autonomy_arm",
     "vrc_autonomy_disarm",
+    "vrc_vision_status",
+    "vrc_vision_start",
+    "vrc_vision_stop",
 )
 
 @neko_plugin
@@ -182,7 +188,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._vmc_idle = self._backend_client.vmc_idle
             self._host_vmc = self._backend_client.host_vmc
             self._vision = self._backend_client.vision
-            self._start_world_context_bridge()
+            # 后端进程已重建，世界修订号从新实例重新开始。
+            self._start_world_context_bridge(reset_cursor=True)
         else:
             self._scheduler = None
             self._osc = None
@@ -250,12 +257,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._vision = None
         return Ok({"status": "stopped"})
 
-    def _start_world_context_bridge(self) -> None:
+    def _start_world_context_bridge(self, *, reset_cursor: bool = False) -> None:
         if self._world_bridge_task is not None and not self._world_bridge_task.done():
             return
         if self._vision is None:
             return
-        self._world_bridge_revision = 0
+        if reset_cursor:
+            self._world_bridge_revision = 0
         self._world_bridge_signature = None
         self._world_bridge_task = asyncio.create_task(
             self._world_context_loop(),
@@ -331,9 +339,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             if not isinstance(delta, Mapping):
                 await asyncio.sleep(0.25)
                 continue
-            revision = int(delta.get("revision", self._world_bridge_revision) or self._world_bridge_revision)
-            changed = bool(delta.get("changed")) and revision > self._world_bridge_revision
-            self._world_bridge_revision = max(self._world_bridge_revision, revision)
+            previous_revision = self._world_bridge_revision
+            revision = int(delta.get("revision", previous_revision) or previous_revision)
+            # 即使捕获暂时停止，也要推进游标；否则重启后会把旧历史重新注入
+            # 主 LLM。停止期间只保留游标，不发布任何世界内容。
+            self._world_bridge_revision = max(previous_revision, revision)
+            if delta.get("capture_active") is False:
+                self._world_bridge_signature = None
+                await asyncio.sleep(0.1)
+                continue
+            changed = bool(delta.get("changed")) and revision > previous_revision
             if not changed:
                 await asyncio.sleep(0.05)
                 continue
@@ -358,6 +373,19 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             wait_s = max(0.0, 0.5 - (now - last_push))
             if wait_s:
                 await asyncio.sleep(wait_s)
+            # 后端可能在限速等待期间被直接停止；再次读取门控状态，避免
+            # 把已经失效的观测推送到主 LLM。
+            try:
+                current_world = await asyncio.to_thread(vision.snapshot)
+                if isinstance(current_world, Mapping) and current_world.get("capture_active") is False:
+                    self._world_bridge_signature = None
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 推送本身仍会在后端不可用时失败；不要因状态探测异常而
+                # 伪造“已停止”，继续沿用当前 delta 的保守内容。
+                pass
             try:
                 self.push_message(
                     source="neko_anyadance_body.world",
@@ -367,6 +395,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 )
                 last_push = time.monotonic()
             except Exception as exc:
+                # 失败的事件不能永久占用去重签名；下一次轮询应允许重试。
+                self._world_bridge_signature = None
                 self.logger.warning("World context bridge push failed: %s", exc)
                 await asyncio.sleep(1.0)
 
@@ -1217,6 +1247,37 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "uncertainties": ["backend_unavailable"],
             })
         return Ok(await asyncio.to_thread(self._vision.snapshot))
+
+    @llm_tool(**VRC_VISION_STATUS)
+    async def vrc_vision_status(self, **_: Any):
+        """读取采集器/检测器状态，不改变生命周期状态。"""
+        if self._vision is None:
+            return Ok({
+                "available": False,
+                "worker": {"enabled": False, "running": False, "reason": "backend_unavailable"},
+                "uncertainties": ["backend_unavailable"],
+            })
+        return Ok(await asyncio.to_thread(self._vision.perception))
+
+    @llm_tool(**VRC_VISION_START)
+    async def vrc_vision_start(self, **_: Any):
+        """只启动视觉采集；身体输出仍由独立门控控制。"""
+        if self._vision is None:
+            return Ok({"accepted": False, "started": False, "running": False, "reason": "backend_unavailable"})
+        result = await asyncio.to_thread(self._vision.start)
+        if isinstance(result, Mapping) and result.get("started"):
+            self._start_world_context_bridge()
+        return Ok(result)
+
+    @llm_tool(**VRC_VISION_STOP)
+    async def vrc_vision_stop(self, *, reason: Any = "manual_stop", **_: Any):
+        """停止视觉采集并取消主动世界更新。"""
+        if self._vision is None:
+            return Ok({"accepted": False, "stopped": False, "running": False, "reason": "backend_unavailable"})
+        normalized_reason = str(reason or "manual_stop").replace("\x00", "").strip()[:160] or "manual_stop"
+        result = await asyncio.to_thread(self._vision.stop, normalized_reason)
+        await self._stop_world_context_bridge()
+        return Ok(result)
 
     @llm_tool(**BODY_LOCOMOTION)
     async def body_locomotion(

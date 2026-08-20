@@ -82,7 +82,7 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 ## 视觉世界状态（第一阶段）
 
-插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
+插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable；启用采集但没有模型时只运行 capture-only 诊断，不发布猜测实体。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
 
 当前版本默认不加载第三方模型，但已经提供 DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 的可选适配器；未配置依赖时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
@@ -100,6 +100,12 @@ python -m pip install --user "dxcam[winrt]"
 
 安装后保持 `dxcam_backend = "auto"`；DXGI 被拒绝时会自动切换到 WinRT。该依赖仍是
 可选的，未安装时插件会继续使用 DXGI/MSS，并在 `/perception` 报告缺失原因。
+
+视觉捕获也可以独立于身体控制链路启停：调用后端 `POST /vision/stop` 会释放当前
+DXcam/WinRT/MSS 句柄并解除自主导航，`POST /vision/start` 会创建全新的
+`FrameSource` 后恢复采集；不会复用已经关闭的捕获对象。插件客户端提供对应的
+`client.vision.stop()` / `client.vision.start()` 方法。配置为外部 source 时，停止后
+需要重新注入外部采集器，不能直接重用旧对象。
 
 自主目标不会直接把主 LLM 接入身体控制线程。后端的 `LocalNavigator` 会在会话手动
 授权后，以约 10 Hz 根据新鲜视觉实体生成受限的短摇杆脉冲；目标不可见、方位或距离

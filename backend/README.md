@@ -121,6 +121,27 @@ latest-wins，轴和按钮到期自动释放。`GET /autonomy`、`POST /autonomy
 `POST /autonomy/disarm`、`POST /autonomy/goal`、`POST /autonomy/stop` 管理手动授权；
 `GET /world/delta?after_revision=N&wait_ms=250` 用 revision 长轮询世界变化。
 
+视觉采集可以在后端运行期间独立启停，不需要重启 AnyaDance/OSC 控制链路：
+以下示例假定后端使用 `vision.enabled = true` 的配置启动；`--offline` 会按设计强制
+关闭视觉，调用 `start` 时会返回配置禁用原因。
+
+```powershell
+# 停止并释放 DXcam/WinRT/MSS 句柄，同时解除自主导航授权
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:48912/vision/stop `
+  -Headers @{"X-Neko-Backend-Token"="dev"} -Body '{"reason":"manual_stop"}' `
+  -ContentType 'application/json'
+
+# 重新创建 FrameSource 并启动 worker（不会复用已关闭的 source）
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:48912/vision/start `
+  -Headers @{"X-Neko-Backend-Token"="dev"} -Body '{}' `
+  -ContentType 'application/json'
+```
+
+插件侧对应 `client.vision.stop()` 与 `client.vision.start()`。`start` 返回的
+`worker` 状态包含实际后端和错误；配置为 `source = "external"` 时，必须先通过
+`BackendService.attach_vision()` 注入新的 source，不能把已经停止的外部对象再次使用。
+停止视觉会立即解除自主授权，避免没有新画面时继续导航；身体/OSC 后端保持运行。
+
 HTTP 端点对应为 `GET /cognition`、`POST /cognition/plan` 和
 `POST /cognition/feedback`。计划只做校验和记录，不会绕过现有安全调度器直接执行；
 执行仍必须经过 `/action` 或插件工具。
@@ -182,6 +203,15 @@ enabled = false
 source = "none" # none / mss / dxcam / desktop_mirror / external
 capture = "desktop_mirror"
 local_backend = "openvino"
+model_path = "models/yolox.xml" # 可选 XML/ONNX 路径，相对于配置目录
+labels_path = "models/labels.txt" # 可选；留空时使用 COCO 名称
+device = "AUTO" # AUTO / GPU / CPU，取决于已安装的 OpenVINO 插件
+fallback_backend = "none" # 显式设为 "opencv_hog" 可启用降级的仅人形模式
+confidence_threshold = 0.35
+input_width = 640
+input_height = 640
+horizontal_fov_deg = 90.0
+max_detections = 64
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
 # -1 自动探测；MSS 的 0 是虚拟桌面，物理显示器从 1 开始。
@@ -195,9 +225,17 @@ queue_size = 1
 lifecycle_watermark_limit = 4096
 ```
 
-配置只描述 worker，不下载或加载模型。OpenVINO 模型包、VLM endpoint 和 API key
-由部署环境提供（VLM endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），
-没有依赖时状态会明确标记为 unavailable。
+配置只描述 worker，不下载模型。启用视觉后，即使模型暂缺也可以用
+`capture_only=true` 运行采集诊断；这时世界仍是 unknown，不会产生实体。配置了
+`model_path` 后，后端会在独立视觉 worker
+中优先加载 OpenVINO IR/ONNX；当 OpenVINO 不可用且文件是 ONNX 时，会尝试 OpenCV
+DNN 导入。常见 YOLO/SSD 输出会被归一化为带稳定 track ID 的实体；
+`attributes.bearing_deg` 和屏幕几何关系可以供本地导航使用，但没有深度模型时距离
+仍然是 unknown。OpenVINO 模型包、VLM endpoint 和 API key 由部署环境提供（VLM
+endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行时或模型时
+`/perception` 会明确报告 `available=false`，不会注入占位实体。若暂时没有模型，
+只能显式设置 `fallback_backend = "opencv_hog"`；该路径仅检测行人并标记
+`degraded=true`，不识别玩家身份，也不产生通用物体或距离结论。
 
 Windows 上若 DXGI 返回 `0x80070005`，可安装 `dxcam[winrt]` 启用合成器捕获回退：
 

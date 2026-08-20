@@ -350,6 +350,192 @@ class BackendClientTests(unittest.TestCase):
             service.stop()
         self.assertTrue(source.closed)
 
+    def test_vision_stop_start_rebuilds_closed_source(self) -> None:
+        class Source:
+            name = "restartable_test_source"
+
+            def __init__(self, serial: int):
+                self.serial = serial
+                self.closed = False
+                self.count = 0
+
+            def status(self):
+                return {
+                    "available": not self.closed,
+                    "name": self.name,
+                    "serial": self.serial,
+                }
+
+            def read(self):
+                if self.closed:
+                    return None
+                self.count += 1
+                return self.count
+
+            def close(self):
+                self.closed = True
+
+        class Detector:
+            name = "restart_detector"
+
+            def status(self):
+                return {"available": True, "backend": "test"}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "restart:marker",
+                        "label": "marker",
+                        "confidence": 0.9,
+                        "ttl_s": 1.0,
+                    },),
+                    source="restart_detector",
+                    observed_at=now,
+                )
+
+        created: list[Source] = []
+
+        def factory() -> Source:
+            source = Source(len(created) + 1)
+            created.append(source)
+            return source
+
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "external",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "none",
+                    "interval_ms": 10,
+                },
+                "vmc_idle": {"enabled": False, "manage_host_output": False},
+                "vrchat_osc": {"enabled": False},
+                "driver_log": {"enabled": False},
+            },
+            Path.cwd(),
+            dry_run=True,
+            vision_detector=Detector(),
+            vision_source_factory=factory,
+        )
+        try:
+            service.start()
+            deadline = time.monotonic() + 1.0
+            while not created or created[0].count < 1:
+                if time.monotonic() >= deadline:
+                    self.fail("initial vision source did not capture")
+                time.sleep(0.01)
+            first = created[0]
+            stopped = service.vision_stop("test_stop")
+            self.assertTrue(stopped["accepted"])
+            self.assertFalse(stopped["running"])
+            self.assertTrue(first.closed)
+            self.assertEqual(service.perception()["worker"]["reason"], "test_stop")
+
+            started = service.vision_start()
+            self.assertTrue(started["accepted"])
+            self.assertTrue(started["running"])
+            self.assertGreaterEqual(len(created), 2)
+            second = created[-1]
+            self.assertIsNot(first, second)
+            self.assertFalse(second.closed)
+            deadline = time.monotonic() + 1.0
+            while second.count < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(second.count, 1)
+        finally:
+            service.stop()
+
+    def test_remote_vision_lifecycle_methods_use_control_routes(self) -> None:
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def fast_request(self, method, path, payload):
+                self.calls.append((method, path, payload))
+                return {"accepted": True, "running": path.endswith("start")}
+
+        fake = FakeClient()
+        remote = RemoteVision(fake)
+        self.assertTrue(remote.start()["accepted"])
+        self.assertTrue(remote.stop("user")["accepted"])
+        self.assertEqual(
+            fake.calls,
+            [
+                ("POST", "/vision/start", {}),
+                ("POST", "/vision/stop", {"reason": "user"}),
+            ],
+        )
+
+    def test_unavailable_optional_detector_keeps_capture_only_worker_running(self) -> None:
+        class Source:
+            name = "capture_only_source"
+
+            def __init__(self):
+                self.closed = False
+                self.frames = 0
+
+            def status(self):
+                return {"available": not self.closed, "name": self.name}
+
+            def read(self):
+                if self.closed:
+                    return None
+                self.frames += 1
+                return object()
+
+            def close(self):
+                self.closed = True
+
+        class UnavailableDetector:
+            name = "optional_detector"
+
+            def status(self):
+                return {"available": False, "last_error": "model is not installed"}
+
+            def observe(self, _frame, *, now):
+                raise AssertionError("unavailable detector must not be invoked")
+
+        sources: list[Source] = []
+
+        def factory() -> Source:
+            source = Source()
+            sources.append(source)
+            return source
+
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "external",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "none",
+                    "interval_ms": 10,
+                },
+                "vmc_idle": {"enabled": False, "manage_host_output": False},
+                "vrchat_osc": {"enabled": False},
+                "driver_log": {"enabled": False},
+            },
+            Path.cwd(),
+            dry_run=True,
+            vision_detector=UnavailableDetector(),
+            vision_source_factory=factory,
+        )
+        try:
+            service.start()
+            deadline = time.monotonic() + 1.0
+            while (not sources or sources[0].frames < 1) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(sources)
+            self.assertGreaterEqual(sources[0].frames, 1)
+            worker = service.perception()["worker"]
+            self.assertTrue(worker["running"])
+            self.assertTrue(worker["capture_only"])
+        finally:
+            service.stop()
+
     def test_standalone_backend_process_health_and_shutdown(self) -> None:
         root = Path(__file__).resolve().parents[1]
         client = BackendClient(
@@ -377,6 +563,12 @@ class BackendClientTests(unittest.TestCase):
             self.assertIn("dispatch_latency_ms", batch)
             self.assertEqual(client.scheduler.snapshot()["state"], "disabled")
             self.assertFalse(client.vision.snapshot()["available"])
+            vision_start = client.vision.start()
+            self.assertFalse(vision_start["accepted"])
+            self.assertIn("disabled", vision_start["reason"])
+            vision_stop = client.vision.stop("integration_test")
+            self.assertTrue(vision_stop["accepted"])
+            self.assertFalse(vision_stop["running"])
             invalid_lifecycle = client.vision.ingest({"remove_entity_ids": ["button"]})
             self.assertFalse(invalid_lifecycle["accepted"])
             self.assertEqual(invalid_lifecycle["reason_code"], "invalid_world_observation")
@@ -591,6 +783,8 @@ class BackendClientTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=1.0)
+                if process.stderr is not None:
+                    process.stderr.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Configuration parsing and validation for the AnyaDance body plugin."""
+"""AnyaDance 身体插件的配置解析与校验。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,7 @@ def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 def _finite_float(value: Any, default: float, *, minimum: float, maximum: float, name: str) -> float:
     if value is None:
-        # Some bounds are derived from other config sections, so the built-in
-        # default can fall outside the effective range.
+        # 某些边界由其他配置段派生，因此内置默认值可能落在有效范围之外。
         return min(maximum, max(minimum, default))
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
@@ -129,7 +128,7 @@ class DriverLogConfig:
 
 @dataclass(frozen=True)
 class ControllerInputConfig:
-    """Routing and safety limits for virtual AnyaDance controller input."""
+    """虚拟 AnyaDance 控制器输入的路由与安全限制。"""
 
     primary: str = "anyadance"
     rate_hz: int = 120
@@ -140,7 +139,7 @@ class ControllerInputConfig:
 
 @dataclass(frozen=True)
 class AutonomyConfig:
-    """Session authorization defaults; arming is never implicit."""
+    """会话授权默认值；绝不隐式启用。"""
 
     manual_arm: bool = True
     session_ttl_minutes: int = 30
@@ -148,7 +147,7 @@ class AutonomyConfig:
 
 @dataclass(frozen=True)
 class WorldMemoryConfig:
-    """Only reusable world facts may be persisted by the world store."""
+    """世界存储只允许持久化可复用的世界事实。"""
 
     persist_world: bool = True
     persist_players: bool = False
@@ -162,10 +161,21 @@ class VisionConfig:
     source: str = "none"
     capture: str = "desktop_mirror"
     local_backend: str = "openvino"
+    # 本地检测器必须显式部署：缺少模型时保持感知不可用，不发布猜测实体。
+    # ``model_path`` 可以指向 OpenVINO IR XML、ONNX 文件或包含其中之一的目录。
+    model_path: str | None = None
+    labels_path: str | None = None
+    device: str = "AUTO"
+    fallback_backend: str = "none"
+    confidence_threshold: float = 0.35
+    input_width: int = 640
+    input_height: int = 640
+    horizontal_fov_deg: float = 90.0
+    max_detections: int = 64
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
-    # -1 means automatic probing.  Physical monitors are preferred over the
-    # MSS virtual desktop, and DXcam probes all visible adapters/outputs.
+    # -1 表示自动探测。优先使用物理监视器而不是 MSS 虚拟桌面，DXcam 会探测
+    # 所有可见适配器/输出。
     monitor_index: int = -1
     dxcam_device_idx: int = -1
     dxcam_output_idx: int = -1
@@ -232,8 +242,8 @@ class PluginConfig:
             max_action_duration_ms=_bounded_int(safety.get("max_action_duration_ms"), 5000, minimum=100, maximum=30000, name="safety.max_action_duration_ms"),
         )
         if safety_config.max_y_m > safety_config.max_position_abs_m:
-            # The position bound is checked on every axis, so a Y ceiling above
-            # it would reject the very frames the .nya loader clamps to it.
+            # 每个轴都会检查位置边界；如果 Y 轴上限高于此值，就会拒绝 .nya
+            # 加载器已经限制到该边界的帧。
             raise ValueError(
                 "safety.max_y_m must not exceed safety.max_position_abs_m"
             )
@@ -338,6 +348,24 @@ class PluginConfig:
         local_backend = str(vision.get("local_backend", "openvino")).strip().lower() or "openvino"
         if local_backend not in {"openvino", "none", "external"}:
             raise ValueError("vision.local_backend must be openvino, none, or external")
+        def optional_path(name: str) -> str | None:
+            raw = vision.get(name)
+            if raw is None:
+                return None
+            value = str(raw).strip()
+            if not value:
+                return None
+            if len(value) > 1024 or "\x00" in value:
+                raise ValueError(f"vision.{name} is too long or contains NUL")
+            return value
+        model_path = optional_path("model_path")
+        labels_path = optional_path("labels_path")
+        device = str(vision.get("device", "AUTO")).strip() or "AUTO"
+        if len(device) > 32 or "\x00" in device:
+            raise ValueError("vision.device must be a short non-empty string")
+        fallback_backend = str(vision.get("fallback_backend", "none")).strip().lower() or "none"
+        if fallback_backend not in {"none", "opencv_hog"}:
+            raise ValueError("vision.fallback_backend must be none or opencv_hog")
         semantic_backend = str(vision.get("semantic_backend", "openai_compatible")).strip().lower() or "openai_compatible"
         if semantic_backend not in {"openai_compatible", "none", "external"}:
             raise ValueError("vision.semantic_backend must be openai_compatible, none, or external")
@@ -349,6 +377,45 @@ class PluginConfig:
             source=vision_source,
             capture=capture_backend,
             local_backend=local_backend,
+            model_path=model_path,
+            labels_path=labels_path,
+            device=device,
+            fallback_backend=fallback_backend,
+            confidence_threshold=_finite_float(
+                vision.get("confidence_threshold"),
+                0.35,
+                minimum=0.0,
+                maximum=1.0,
+                name="vision.confidence_threshold",
+            ),
+            input_width=_bounded_int(
+                vision.get("input_width"),
+                640,
+                minimum=32,
+                maximum=4096,
+                name="vision.input_width",
+            ),
+            input_height=_bounded_int(
+                vision.get("input_height"),
+                640,
+                minimum=32,
+                maximum=4096,
+                name="vision.input_height",
+            ),
+            horizontal_fov_deg=_finite_float(
+                vision.get("horizontal_fov_deg"),
+                90.0,
+                minimum=1.0,
+                maximum=180.0,
+                name="vision.horizontal_fov_deg",
+            ),
+            max_detections=_bounded_int(
+                vision.get("max_detections"),
+                64,
+                minimum=1,
+                maximum=512,
+                name="vision.max_detections",
+            ),
             semantic_backend=semantic_backend,
             semantic_max_per_minute=_bounded_int(
                 vision.get("semantic_max_per_minute"),

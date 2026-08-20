@@ -42,6 +42,9 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(tool_defs.BODY_AVATAR_PARAMETER["name"], "body_avatar_parameter")
         self.assertEqual(tool_defs.BODY_VRCHAT_INPUT["name"], "body_vrchat_input")
         self.assertEqual(tool_defs.WORLD_OBSERVE["name"], "world_observe")
+        self.assertEqual(tool_defs.VRC_VISION_STATUS["name"], "vrc_vision_status")
+        self.assertEqual(tool_defs.VRC_VISION_START["name"], "vrc_vision_start")
+        self.assertEqual(tool_defs.VRC_VISION_STOP["name"], "vrc_vision_stop")
         self.assertEqual(tool_defs.BODY_EXPRESS["name"], "body_express")
         reach_preconditions = tool_defs.BODY_REACH_AND_GRAB["parameters"]["properties"]["preconditions"]
         self.assertEqual(reach_preconditions["maxItems"], 16)
@@ -163,8 +166,8 @@ class PluginSmokeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "max_y_m"):
             PluginConfig.from_mapping({"safety": {"max_y_m": 25.1}})
-        # A Y ceiling above the all-axis position bound would make the .nya
-        # loader clamp to a value the frame validator then rejects.
+        # Y 轴上限高于全轴位置边界时，.nya 加载器会限制到一个随后被帧校验器
+        # 拒绝的数值。
         with self.assertRaisesRegex(ValueError, "max_position_abs_m"):
             PluginConfig.from_mapping({"safety": {"max_y_m": 10.0}})
 
