@@ -26,6 +26,12 @@ if TYPE_CHECKING:
 from .world_state import stable_track_entity_id
 
 
+# 帧内 NMS 的候选上限。裸 YOLO 输出可能有上千个框过阈值，而贪心抑制是
+# O(n^2)；先按置信度截到这个上限再抑制，把最坏情况钉死在固定开销内。取值
+# 远大于 max_detections 的默认值，正常场景不会触及。
+_NMS_CANDIDATE_LIMIT = 256
+
+
 # COCO 名称适用于常见的 YOLOX/YOLO 导出格式。调用方可以提供标签文件替换它们；
 # 未知索引会保留为明确的 ``class_<n>`` 标签，不会被静默映射成错误物体。
 _COCO_LABELS: tuple[str, ...] = (
@@ -185,6 +191,7 @@ class OpenVinoLocalDetector:
         input_height: int = 640,
         horizontal_fov_deg: float = 90.0,
         max_detections: int = 64,
+        nms_iou_threshold: float = 0.45,
         track_iou_threshold: float = 0.25,
         track_ttl_s: float = 1.5,
         fallback_backend: str = "none",
@@ -203,6 +210,9 @@ class OpenVinoLocalDetector:
         self._input_height = min(4096, max(32, int(input_height)))
         self._horizontal_fov_deg = min(180.0, max(1.0, float(horizontal_fov_deg)))
         self._max_detections = min(512, max(1, int(max_detections)))
+        # 0 会把所有同类框合成一个，1 等于完全不抑制；两端都不是有用的部署
+        # 取值，因此钳到留有余量的区间内。
+        self._nms_iou_threshold = min(0.95, max(0.1, float(nms_iou_threshold)))
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
         self._infer = infer
         # 模型推理和跟踪器都不是默认线程安全的；旁路调用也必须按帧串行化，
@@ -445,6 +455,7 @@ class OpenVinoLocalDetector:
                 "confidence_threshold": self._confidence_threshold,
                 "input_size": [self._input_width, self._input_height],
                 "max_detections": self._max_detections,
+                "nms_iou_threshold": self._nms_iou_threshold,
                 "frames": self._frames,
                 "last_inference_ms": self._last_inference_ms,
                 "uncertainties": list(dict.fromkeys(self._uncertainties)),
@@ -537,6 +548,39 @@ class OpenVinoLocalDetector:
         except Exception:
             return []
 
+    def _suppress_overlaps(self, detections: list[_Detection]) -> list[_Detection]:
+        """按置信度排序并做类内非极大值抑制，返回截断到上限的检测。
+
+        裸 YOLO 输出（YOLOv8 的 ``[1,84,8400]``、YOLOv5 的 ``[1,25200,85]``）
+        对同一个目标会给出一簇高分 anchor。仅按置信度排序截断留下的正是同一
+        目标的重复框：实测两个人会变成 48 个实体，进而污染跟踪器 ID、生成
+        O(n^2) 条关系，并让世界状态谎报房间里的人数。
+
+        只在同类之间抑制——不同类别的目标本就可能重叠（人拿着杯子）。对已经
+        做过 NMS 的输出（后处理六列格式、SSD、``nms=True`` 导出）这一步是
+        幂等的，不会改变结果。
+        """
+        ordered = sorted(detections, key=lambda item: item.confidence, reverse=True)
+        if len(ordered) < 2:
+            return ordered[: self._max_detections]
+        ordered = ordered[:_NMS_CANDIDATE_LIMIT]
+        # 同时缓存分组键，避免在内层循环里对每个已保留框反复重算。
+        kept: list[tuple[_Detection, Any]] = []
+        for candidate in ordered:
+            # class_index 缺失时（记录式适配器只给标签）退化为按标签分组。
+            key: Any = candidate.class_index if candidate.class_index >= 0 else candidate.label
+            duplicate = False
+            for accepted, accepted_key in kept:
+                if accepted_key == key and _iou(accepted.bbox, candidate.bbox) >= self._nms_iou_threshold:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            kept.append((candidate, key))
+            if len(kept) >= self._max_detections:
+                break
+        return [item for item, _key in kept]
+
     def _decode_rows(self, outputs: Any) -> list[_Detection]:
         detections: list[_Detection] = []
         if isinstance(outputs, Mapping):
@@ -567,8 +611,9 @@ class OpenVinoLocalDetector:
                         confidence=min(1.0, max(0.0, confidence)),
                         bbox=(left, top, right, bottom),
                     ))
-                detections.sort(key=lambda item: item.confidence, reverse=True)
-                return detections[: self._max_detections]
+                # 记录式适配器不保证已去重：OpenCV HOG 的 detectMultiScale
+                # 就会对同一个人输出多个重叠框。
+                return self._suppress_overlaps(detections)
         for row in self._as_rows(outputs):
             if len(row) < 6 or not all(math.isfinite(item) for item in row[: min(len(row), 8)]):
                 continue
@@ -643,8 +688,7 @@ class OpenVinoLocalDetector:
                 bbox=(left, top, right, bottom),
                 class_index=label_index,
             ))
-        detections.sort(key=lambda item: item.confidence, reverse=True)
-        return detections[: self._max_detections]
+        return self._suppress_overlaps(detections)
 
     def _entities(self, detections: list[_Detection], now: float) -> tuple[dict[str, Any], ...]:
         self._tracker.update(detections, now)

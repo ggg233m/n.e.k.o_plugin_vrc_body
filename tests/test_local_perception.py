@@ -63,10 +63,15 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertFalse(capabilities["ocr"])
 
     def test_small_post_nms_batch_is_not_transposed_as_channel_first(self) -> None:
+        # 这个测试的核心断言是矩阵方向正确：(4,6) 不被误判为 (6,4)。
+        # (6,4) 转置后的行长度为 4，会被解码器丢弃（六列检查失败），得到 0 个实体。
+        # (4,6) 保持不动，4 行全部过阈值；4 个相同位置的框是同一目标的重复——NMS
+        # 正确地合并成 1 个，而不是 0 个（转置错误）。
         rows = [[0.1, 0.1, 0.2, 0.2, 0.9, 0.0] for _ in range(4)]
         detector = OpenVinoLocalDetector(infer=lambda _frame: rows, confidence_threshold=0.5)
         observation = detector.observe(object(), now=1.2)
-        self.assertEqual(len(observation.entities), 4)
+        # 转置错误 -> 0；NMS 正确合并重复框 -> 1。
+        self.assertEqual(len(observation.entities), 1)
 
     @unittest.skipIf(np is None, "numpy is optional")
     def test_tensor_layout_is_keyed_on_row_width_not_detection_count(self) -> None:
@@ -148,6 +153,80 @@ class LocalPerceptionTests(unittest.TestCase):
         )
         attributes = detector.observe(object(), now=7.5).entities[0]["attributes"]
         self.assertTrue(attributes["apparent_height_clipped"])
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_raw_yolo_anchor_cluster_collapses_to_one_entity_per_object(self) -> None:
+        """裸 YOLO 输出的 anchor 簇必须被抑制成每个目标一个实体。
+
+        仅按置信度排序截断时，留下的是同一个目标的重复框——实测两个人会变成
+        48 个 person 实体、2256 条关系，等于向 LLM 谎报房间人数。
+        """
+        rng = np.random.default_rng(7)
+        anchors = []
+        for center_x, center_y in ((200.0, 320.0), (450.0, 330.0)):
+            for _ in range(24):
+                row = [0.0] * 84
+                row[0] = center_x + rng.normal(0, 6)
+                row[1] = center_y + rng.normal(0, 8)
+                row[2] = 90 + rng.normal(0, 7)
+                row[3] = 260 + rng.normal(0, 18)
+                row[4] = 0.55 + rng.random() * 0.4
+                anchors.append(row)
+        # 其余 anchor 低于阈值，应当在解码阶段就被丢弃。
+        for _ in range(300):
+            anchors.append([320.0, 320.0, 10.0, 10.0, 0.01] + [0.0] * 79)
+
+        channels_first = np.asarray(anchors, dtype=np.float32).T[None, ...]
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: channels_first,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+        )
+        observation = detector.observe(object(), now=1.0)
+        self.assertEqual(len(observation.entities), 2)
+        self.assertEqual({item["label"] for item in observation.entities}, {"person"})
+        # 两个实体互为左右关系，不应出现重复框带来的关系爆炸。
+        self.assertLessEqual(sum(len(item["relations"]) for item in observation.entities), 4)
+
+    def test_overlapping_distinct_classes_are_not_suppressed(self) -> None:
+        # 只在同类之间抑制：人拿着杯子时两个框本就高度重叠。
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    {"label": "person", "confidence": 0.9, "bbox": [0.30, 0.20, 0.70, 0.90]},
+                    {"label": "cup", "confidence": 0.8, "bbox": [0.31, 0.21, 0.69, 0.89]},
+                ],
+            },
+        )
+        observation = detector.observe(object(), now=2.0)
+        self.assertEqual({item["label"] for item in observation.entities}, {"person", "cup"})
+
+    def test_already_suppressed_output_is_unchanged(self) -> None:
+        # 后处理格式（或 nms=True 导出）已经去重，抑制必须是幂等的。
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: [
+                [0.05, 0.10, 0.25, 0.90, 0.90, 0.0],
+                [0.40, 0.10, 0.60, 0.90, 0.85, 0.0],
+                [0.70, 0.10, 0.95, 0.90, 0.80, 0.0],
+            ],
+            confidence_threshold=0.5,
+        )
+        observation = detector.observe(object(), now=2.5)
+        self.assertEqual(len(observation.entities), 3)
+
+    def test_suppression_keeps_the_highest_scoring_box_of_a_cluster(self) -> None:
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    {"label": "person", "confidence": 0.55, "bbox": [0.30, 0.20, 0.70, 0.90]},
+                    {"label": "person", "confidence": 0.95, "bbox": [0.32, 0.22, 0.72, 0.92]},
+                ],
+            },
+        )
+        observation = detector.observe(object(), now=3.0)
+        self.assertEqual(len(observation.entities), 1)
+        self.assertAlmostEqual(observation.entities[0]["confidence"], 0.95, places=5)
 
     def test_named_tensor_mapping_is_flattened_without_silent_drop(self) -> None:
         # OpenVINO/旁路适配器常用 {output_name: tensor} 形式返回结果。
