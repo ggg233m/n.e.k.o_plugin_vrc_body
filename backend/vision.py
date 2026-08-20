@@ -147,6 +147,40 @@ def find_window_region(title: str) -> dict[str, int] | None:
         return None
 
 
+def _normalize_region(region: Mapping[str, Any] | None) -> dict[str, int] | None:
+    """把采集区域补全成同时含 ``left/top/right/bottom/width/height`` 的形式。
+
+    ``find_window_region`` 返回 ``left/top/right/bottom``，而 MSS 的监视器字典用
+    ``left/top/width/height``。两边各认一半，结果是窗口裁剪在 MSS 路径上只改了
+    原点、尺寸仍是整块显示器。这里统一补齐，两种写法都能被两个采集器正确接受。
+    """
+    if region is None:
+        return None
+    try:
+        left = int(region["left"])
+        top = int(region["top"])
+        if "right" in region and "bottom" in region:
+            right = int(region["right"])
+            bottom = int(region["bottom"])
+        elif "width" in region and "height" in region:
+            right = left + int(region["width"])
+            bottom = top + int(region["height"])
+        else:
+            raise KeyError("right/bottom or width/height")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"capture region is missing usable bounds: {exc}") from exc
+    if right <= left or bottom <= top:
+        raise ValueError("capture region must have positive width and height")
+    return {
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "width": right - left,
+        "height": bottom - top,
+    }
+
+
 class MssFrameSource:
     """可选的纯 mss 桌面采集器，不依赖插件 SDK 或模型包。
 
@@ -180,6 +214,7 @@ class MssFrameSource:
         try:
             import mss  # type: ignore[import-not-found]
 
+            region = _normalize_region(region)
             factory = getattr(mss, "MSS", getattr(mss, "mss", None))
             if factory is None:
                 raise RuntimeError("mss does not expose a capture factory")
@@ -346,10 +381,9 @@ class DxcamFrameSource:
             import dxcam  # type: ignore[import-not-found]
 
             self._dxcam = dxcam
-            if region is not None:
-                self._region = tuple(int(region.get(key, 0)) for key in ("left", "top", "right", "bottom"))
-                if self._region[2] <= self._region[0] or self._region[3] <= self._region[1]:
-                    raise ValueError("DXcam region must have positive width and height")
+            normalized = _normalize_region(region)
+            if normalized is not None:
+                self._region = tuple(normalized[key] for key in ("left", "top", "right", "bottom"))
             self._candidate_specs = self._build_candidates(dxcam)
             self._activate_candidate_locked(0)
             if self._camera is None and self._last_error is None:
@@ -594,6 +628,136 @@ class DesktopMirrorFrameSource:
             source.close()
 
 
+class WindowTrackedFrameSource:
+    """按 TTL 重新解析目标窗口矩形，窗口移动或改分辨率后重建内部采集源。
+
+    DXcam 与 MSS 都在构造时就把区域固定下来，没有改区域的接口，所以这里只能
+    重建。重建 DXGI 复制会话是重操作，因此只在矩形**真的**变了之后才做，TTL
+    到点只是解析一次窗口坐标。
+
+    窗口暂时找不到时（最小化、切到别的桌面、VRChat 还没起来）保留上一次的矩形，
+    而不是立刻退回全屏：把整个桌面喂给检测器比暂时抓一块过期区域更糟。
+    """
+
+    name = "window_tracked"
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        factory: Callable[[Mapping[str, int] | None], FrameSource],
+        interval_s: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+        resolver: Callable[[str], dict[str, int] | None] = find_window_region,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._title = str(title)[:256]
+        self._factory = factory
+        self._interval_s = max(0.0, float(interval_s))
+        self._clock = clock
+        self._resolver = resolver
+        self._closed = False
+        self._rebuilds = 0
+        self._last_error: str | None = None
+        region = self._resolve()
+        self._region: dict[str, int] | None = region
+        self._window_found = region is not None
+        self._checked_at = clock()
+        self._source: FrameSource | None = factory(region)
+
+    def _resolve(self) -> dict[str, int] | None:
+        try:
+            return self._resolver(self._title)
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            return None
+
+    def _refresh(self) -> None:
+        if self._interval_s <= 0.0:
+            return
+        with self._lock:
+            now = self._clock()
+            if self._closed or now - self._checked_at < self._interval_s:
+                return
+            self._checked_at = now
+        region = self._resolve()
+        with self._lock:
+            self._window_found = region is not None
+            if region is None or region == self._region or self._closed:
+                return
+            old = self._source
+            self._region = region
+            # 先把旧采集源摘掉：同一输出上并存两个 DXGI 复制会话会直接失败，
+            # 因此必须先关旧的再建新的。这中间的 read() 返回 None，只掉一帧。
+            self._source = None
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        try:
+            replacement = self._factory(region)
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            return
+        with self._lock:
+            if self._closed:
+                stale = replacement
+            else:
+                self._source = replacement
+                self._rebuilds += 1
+                self._last_error = None
+                stale = None
+        if stale is not None:
+            try:
+                stale.close()
+            except Exception:
+                pass
+
+    def read(self) -> Any:
+        self._refresh()
+        with self._lock:
+            source = None if self._closed else self._source
+        if source is None:
+            return None
+        return source.read()
+
+    def status(self) -> Mapping[str, Any]:
+        with self._lock:
+            source = self._source
+            region = dict(self._region) if self._region else None
+            found = self._window_found
+            rebuilds = self._rebuilds
+            last_error = self._last_error
+        if source is None:
+            result: dict[str, Any] = {"available": False}
+        else:
+            try:
+                result = dict(source.status())
+            except Exception as exc:
+                result = {"available": False, "last_error": f"{type(exc).__name__}: {exc}"[:256]}
+        result["name"] = self.name
+        result["backend"] = getattr(source, "name", "unknown")
+        result["window_title"] = self._title
+        result["window_found"] = found
+        result["window_region"] = region
+        result["window_rebuilds"] = rebuilds
+        result["window_track_interval_ms"] = round(self._interval_s * 1000.0, 1)
+        if last_error and not result.get("last_error"):
+            result["last_error"] = last_error
+        return result
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            source = self._source
+            self._source = None
+        if source is not None:
+            source.close()
+
+
 class OpenVinoLocalDetector:
     """面向 YOLOX/深度/OCR 模型包的安全 OpenVINO 适配接口。
 
@@ -615,17 +779,22 @@ class OpenVinoLocalDetector:
         elif importlib.util.find_spec("openvino") is None:
             self._last_error = "openvino is not installed"
         elif not model_path or not os.path.exists(model_path):
-            self._last_error = "YOLOX-Tiny model_path is not configured"
+            self._last_error = "model_path is not configured"
         else:
             # 具体的 YOLOX/深度/OCR 图取决于部署环境。应等待经过验证的 infer
             # 可调用对象，而不是加载不可信的任意图；在此之前保持适配器不可用。
             self._last_error = "model bundle requires a validated infer adapter"
 
     def status(self) -> Mapping[str, Any]:
+        # 这里刻意不声明模型列表。本类只是注入式 ``infer`` 的适配壳，自己不加载
+        # 任何图；之前硬编码的 ``["yolox_tiny", "depth", "ocr"]`` 在没有 infer 时
+        # 是纯谎报，有 infer 时也无从得知对方真正跑的是什么。真实的本地检测器是
+        # ``local_perception.OpenVinoLocalDetector``，其 status 才带能力声明。
         return {
             "available": self._compiled,
             "name": self.name,
-            "models": ["yolox_tiny", "depth", "ocr"],
+            "adapter": "injected" if self._infer is not None else "none",
+            "model_path_configured": bool(self._model_path),
             "frames": self._frames,
             "last_error": self._last_error,
         }
@@ -1326,5 +1495,6 @@ __all__ = [
     "VisionObservation",
     "VisionRuntime",
     "VisionWorker",
+    "WindowTrackedFrameSource",
     "optional_dependency_status",
 ]

@@ -36,6 +36,7 @@ from .vision import (
     VisionObservation,
     VisionRuntime,
     VisionWorker,
+    WindowTrackedFrameSource,
 )
 from .world_state import WorldStateStore
 
@@ -190,6 +191,7 @@ class BackendService:
                 input_height=self.config.vision.input_height,
                 horizontal_fov_deg=self.config.vision.horizontal_fov_deg,
                 max_detections=self.config.vision.max_detections,
+                min_box_ratio=self.config.vision.min_box_ratio,
                 fallback_backend=self.config.vision.fallback_backend,
             )
         vision_semantic: Any | None = None
@@ -296,38 +298,48 @@ class BackendService:
         本函数只负责构造来源。初始化和每次启动视觉 worker 时都会调用它，
         因此关闭后的 DXcam/MSS/WinRT 对象不会被交给新的 worker。
 
-        若配置了 ``window_title``，在构造来源前先解析窗口坐标并将其作为
-        ``region`` 传入。窗口未找到时回落到无裁剪模式，以免采集完全停止。
+        若配置了 ``window_title``，采集区域取该窗口的屏幕坐标。窗口矩形不是
+        一次性的：窗口被拖动或改分辨率后旧坐标就会一直抓错位置，因此默认包一层
+        ``WindowTrackedFrameSource`` 按 ``window_track_interval_ms`` 重新解析。
+        窗口未找到时回落到无裁剪模式，以免采集完全停止。
         """
         vision = self.config.vision
         if not vision.enabled or vision.source == "external" or vision.capture == "external":
             return None
 
-        # 按标题定位窗口，取屏幕坐标作为采集区域。
-        region: dict[str, int] | None = None
-        if vision.window_title:
-            region = find_window_region(vision.window_title)
-            # 窗口未找到时不终止：允许 worker 启动并等待后续帧，错误会体现在
-            # 采集源自身的 last_error 中，而不是让整个视觉流水线无法初始化。
-
         if vision.capture == "mss" or vision.source == "mss":
-            return MssFrameSource(monitor_index=vision.monitor_index, region=region)
-        if vision.capture == "dxcam":
-            return DxcamFrameSource(
-                device_idx=vision.dxcam_device_idx,
-                output_idx=vision.dxcam_output_idx,
-                backend=vision.dxcam_backend,
-                region=region,
+            def build(region: Mapping[str, int] | None) -> FrameSource:
+                return MssFrameSource(monitor_index=vision.monitor_index, region=region)
+        elif vision.capture == "dxcam":
+            def build(region: Mapping[str, int] | None) -> FrameSource:
+                return DxcamFrameSource(
+                    device_idx=vision.dxcam_device_idx,
+                    output_idx=vision.dxcam_output_idx,
+                    backend=vision.dxcam_backend,
+                    region=region,
+                )
+        elif vision.capture == "desktop_mirror":
+            def build(region: Mapping[str, int] | None) -> FrameSource:
+                return DesktopMirrorFrameSource(
+                    monitor_index=vision.monitor_index,
+                    dxcam_device_idx=vision.dxcam_device_idx,
+                    dxcam_output_idx=vision.dxcam_output_idx,
+                    dxcam_backend=vision.dxcam_backend,
+                    region=region,
+                )
+        else:
+            return None
+
+        if not vision.window_title:
+            return build(None)
+        if vision.window_track_interval_ms > 0:
+            return WindowTrackedFrameSource(
+                title=vision.window_title,
+                factory=build,
+                interval_s=vision.window_track_interval_ms / 1000.0,
             )
-        if vision.capture == "desktop_mirror":
-            return DesktopMirrorFrameSource(
-                monitor_index=vision.monitor_index,
-                dxcam_device_idx=vision.dxcam_device_idx,
-                dxcam_output_idx=vision.dxcam_output_idx,
-                dxcam_backend=vision.dxcam_backend,
-                region=region,
-            )
-        return None
+        # 显式关闭跟踪：保持历史行为，只在启动时解析一次窗口坐标。
+        return build(find_window_region(vision.window_title))
 
     def _fresh_vision_source(self) -> FrameSource | None:
         """返回新分配的来源；无法重启时返回 ``None``。"""

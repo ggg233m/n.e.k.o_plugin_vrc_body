@@ -172,6 +172,9 @@ class VisionConfig:
     input_height: int = 640
     horizontal_fov_deg: float = 90.0
     max_detections: int = 64
+    # 检测框最短边占画面的最小比例，用于滤掉几十像素级别的高分假阳性。
+    # 0 表示关闭该过滤。
+    min_box_ratio: float = 0.02
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
     # -1 表示自动探测。优先使用物理监视器而不是 MSS 虚拟桌面，DXcam 会探测
@@ -186,6 +189,9 @@ class VisionConfig:
     # 按标题定位采集窗口，非空时将窗口屏幕坐标作为采集区域传给帧源。
     # 仅限 Windows；其他平台静默忽略。窗口未找到时回落到全屏采集。
     window_title: str = ""
+    # 重新解析窗口矩形的间隔。窗口被拖动、改分辨率或全屏切换后，启动时解析的
+    # 那份坐标就过期了，采集会一直抓错位置。0 表示只在启动时解析一次。
+    window_track_interval_ms: int = 5000
 
 
 @dataclass(frozen=True)
@@ -419,6 +425,13 @@ class PluginConfig:
                 maximum=512,
                 name="vision.max_detections",
             ),
+            min_box_ratio=_finite_float(
+                vision.get("min_box_ratio"),
+                0.02,
+                minimum=0.0,
+                maximum=0.5,
+                name="vision.min_box_ratio",
+            ),
             semantic_backend=semantic_backend,
             semantic_max_per_minute=_bounded_int(
                 vision.get("semantic_max_per_minute"),
@@ -471,6 +484,13 @@ class PluginConfig:
                 name="vision.lifecycle_watermark_limit",
             ),
             window_title=str(vision.get("window_title", "")).strip()[:256],
+            window_track_interval_ms=_bounded_int(
+                vision.get("window_track_interval_ms"),
+                5000,
+                minimum=0,
+                maximum=60000,
+                name="vision.window_track_interval_ms",
+            ),
         )
         behavior_config = BehaviorConfig(
             default_crossfade_ms=_bounded_int(

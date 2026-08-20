@@ -229,6 +229,7 @@ class OpenVinoLocalDetector:
         horizontal_fov_deg: float = 90.0,
         max_detections: int = 64,
         nms_iou_threshold: float = 0.45,
+        min_box_ratio: float = 0.02,
         track_iou_threshold: float = 0.25,
         track_ttl_s: float = 1.5,
         fallback_backend: str = "none",
@@ -258,6 +259,11 @@ class OpenVinoLocalDetector:
         # 0 会把所有同类框合成一个，1 等于完全不抑制；两端都不是有用的部署
         # 取值，因此钳到留有余量的区间内。
         self._nms_iou_threshold = min(0.95, max(0.1, float(nms_iou_threshold)))
+        # 框最短边占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性
+        # （1920 宽下约 1.4%），它们会被跟踪器当成真人并污染导航的距离闭环。
+        # 私人房里真人 avatar 至少占画面几个百分点，2% 足以滤掉噪点又不会误伤
+        # 远处的人。0 表示完全关闭该过滤。
+        self._min_box_ratio = min(0.5, max(0.0, _finite(min_box_ratio, 0.02)))
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
         self._infer = infer
         # 模型推理和跟踪器都不是默认线程安全的；旁路调用也必须按帧串行化，
@@ -627,6 +633,7 @@ class OpenVinoLocalDetector:
                 "input_size": [self._input_width, self._input_height],
                 "max_detections": self._max_detections,
                 "nms_iou_threshold": self._nms_iou_threshold,
+                "min_box_ratio": self._min_box_ratio,
                 "frames": self._frames,
                 "last_inference_ms": self._last_inference_ms,
                 "uncertainties": list(dict.fromkeys(self._uncertainties)),
@@ -815,6 +822,16 @@ class OpenVinoLocalDetector:
                 break
         return [item for item, _key in kept]
 
+    def _is_too_small(self, left: float, top: float, right: float, bottom: float) -> bool:
+        """归一化框的任一边小于 ``min_box_ratio`` 时判定为噪点。
+
+        用最短边而不是面积：细长的误检（例如墙缝、UI 边框）面积可能不小，
+        但没有任何一条边像人。两条边都要过关。
+        """
+        if self._min_box_ratio <= 0.0:
+            return False
+        return (right - left) < self._min_box_ratio or (bottom - top) < self._min_box_ratio
+
     def _decode_rows(self, outputs: Any) -> list[_Detection]:
         detections: list[_Detection] = []
         if isinstance(outputs, Mapping):
@@ -838,6 +855,8 @@ class OpenVinoLocalDetector:
                     left, top, right, bottom = (_clip(item) for item in values)
                     confidence = _finite(record.get("confidence"), 0.0)
                     if confidence < self._confidence_threshold or right <= left or bottom <= top:
+                        continue
+                    if self._is_too_small(left, top, right, bottom):
                         continue
                     label = str(record.get("label") or "unknown").strip()[:64] or "unknown"
                     detections.append(_Detection(
@@ -924,6 +943,8 @@ class OpenVinoLocalDetector:
                 values[3] /= max(1.0, float(self._input_height))
             left, top, right, bottom = (_clip(item) for item in values)
             if right <= left or bottom <= top:
+                continue
+            if self._is_too_small(left, top, right, bottom):
                 continue
             detections.append(_Detection(
                 label=self._label(label_index),

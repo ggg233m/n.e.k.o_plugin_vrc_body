@@ -23,8 +23,13 @@
   `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。`DesktopMirrorFrameSource`
   会自动探测 DXGI 适配器/输出，失败后按物理显示器回退 MSS；DXcam 还会在可用时尝试
   WinRT 后端。每个候选输出的错误会出现在 `/perception` 的 `source.backends` 和
-  `candidate_errors` 中，不再把所有失败压缩成一个 BitBlt 错误。`OpenVinoLocalDetector` 和
-  `OpenAICompatibleSemanticBackend` 是可插拔的 YOLOX/depth/OCR/VLM 接缝，不会在缺少
+  `candidate_errors` 中，不再把所有失败压缩成一个 BitBlt 错误。配置 `window_title`
+  后，`WindowTrackedFrameSource` 会按 `window_track_interval_ms` 重新解析窗口矩形，
+  只在矩形真的变化时重建内部采集源（DXcam/MSS 的区域在构造时固定，没有改区域的
+  接口）；窗口暂时找不到时保留上一次的矩形，不回退全屏。真正的本地检测器是
+  `local_perception.OpenVinoLocalDetector`；`vision.OpenVinoLocalDetector` 只是注入式
+  `infer` 的适配壳，自己不加载任何图，其 `status()` 因此不声明模型列表。
+  `OpenAICompatibleSemanticBackend` 是可插拔的 VLM 接缝，不会在缺少
   依赖时伪造检测。外部 detector 只需实现 `status()` 与
   `observe(frame, now=...)`，再通过 `BackendService.attach_vision()` 注入。
   worker 使用有界 latest-frame 队列，掉帧优先于堆积，不进入 120 Hz 控制线程。
@@ -212,6 +217,8 @@ input_width = 640
 input_height = 640
 horizontal_fov_deg = 90.0
 max_detections = 64
+# 检测框最短边占画面的最小比例，用于滤掉几十像素级的高分假阳性。0 关闭。
+min_box_ratio = 0.02
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
 # -1 自动探测；MSS 的 0 是虚拟桌面，物理显示器从 1 开始。
@@ -223,6 +230,10 @@ dxcam_backend = "auto" # auto / dxgi / winrt
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096
+# 非空时只采集该标题窗口的屏幕矩形，而不是整块显示器；仅限 Windows。
+window_title = ""
+# 重新解析窗口矩形的间隔（毫秒）；0 表示只在启动时解析一次。
+window_track_interval_ms = 5000
 ```
 
 配置只描述 worker，不下载模型。启用视觉后，即使模型暂缺也可以用
@@ -236,6 +247,12 @@ endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行
 `/perception` 会明确报告 `available=false`，不会注入占位实体。若暂时没有模型，
 只能显式设置 `fallback_backend = "opencv_hog"`；该路径仅检测行人并标记
 `degraded=true`，不识别玩家身份，也不产生通用物体或距离结论。
+
+检测结果在进入跟踪器之前会先过一道最小尺寸过滤（`min_box_ratio`，默认 2%）。
+实测真实帧里出现过 27×27 px 的 0.9 分框：跟踪器会给它分配实体 ID，导航器再用
+`apparent_height` 反推距离，于是把噪点当成一个站在很远处的人——比漏检更糟，因为
+它会主动驱动动作。排查漏检时可以把该值设为 0 关闭过滤。当前生效值会出现在
+`/perception` 的检测器状态里。
 
 Windows 上若 DXGI 返回 `0x80070005`，可安装 `dxcam[winrt]` 启用合成器捕获回退：
 

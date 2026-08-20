@@ -344,6 +344,58 @@ class LocalPerceptionTests(unittest.TestCase):
         # 预筛选是纯优化：唯一过阈值的 anchor 必须还在。
         self.assertTrue(any(abs(row[4] - 0.91) < 1e-5 for row in pruned))
 
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_tiny_high_confidence_boxes_are_dropped_as_noise(self) -> None:
+        """几十像素的高分框是假阳性，不是远处的人。
+
+        实测真实帧里出现过 27×27 px 的 0.9 分框。跟踪器会给它分配实体 ID，
+        导航器再用 ``apparent_height`` 反推距离，于是把噪点当成一个站在很远处
+        的人——比漏检更糟，因为它会主动驱动动作。
+        """
+        # 640 输入下 27 px ≈ 4.2%… 取更小的 12 px（1.9%）作为噪点，
+        # 同时给一个正常大小的框，确认过滤只吃掉小的那个。
+        rows = np.asarray([
+            [320.0, 320.0, 12.0, 12.0, 0.93],
+            [200.0, 300.0, 100.0, 260.0, 0.88],
+        ], dtype=np.float32)
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: None,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+            min_box_ratio=0.02,
+        )
+        decoded = detector._decode_rows(rows)
+        self.assertEqual([round(item.confidence, 2) for item in decoded], [0.88])
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_min_box_ratio_zero_disables_the_filter(self) -> None:
+        # 关掉过滤必须真的关掉：调低阈值是排查漏检的第一步，这条路径不能失效。
+        rows = np.asarray([[320.0, 320.0, 12.0, 12.0, 0.93]], dtype=np.float32)
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: None,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+            min_box_ratio=0.0,
+        )
+        self.assertEqual(len(detector._decode_rows(rows)), 1)
+
+    def test_min_box_ratio_also_applies_to_record_form_adapters(self) -> None:
+        # OpenCV HOG 的 detectMultiScale 同样会吐小框，记录式适配器不能绕过过滤。
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    {"label": "person", "confidence": 0.9, "bbox": [0.50, 0.50, 0.51, 0.51]},
+                    {"label": "person", "confidence": 0.8, "bbox": [0.10, 0.20, 0.30, 0.80]},
+                ],
+            },
+            min_box_ratio=0.02,
+        )
+        observation = detector.observe(object(), now=4.0)
+        self.assertEqual(len(observation.entities), 1)
+        self.assertAlmostEqual(observation.entities[0]["confidence"], 0.8, places=5)
+
     def test_record_form_is_supported_for_explicit_fallback_adapters(self) -> None:
         detector = OpenVinoLocalDetector(
             infer=lambda _frame: {

@@ -118,6 +118,9 @@ input_width = 640
 input_height = 640
 horizontal_fov_deg = 90.0
 max_detections = 64
+# 检测框最短边占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性，
+# 它们会被跟踪器当成真人并污染导航距离闭环。0 表示关闭该过滤。
+min_box_ratio = 0.02
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
 # -1 自动探测；物理显示器优先，0 表示 MSS 虚拟桌面。
@@ -133,6 +136,9 @@ lifecycle_watermark_limit = 4096
 # 按窗口标题限定采集区域。非空时通过 FindWindow 取窗口坐标后只采集该矩形
 # 区域，而不是整块显示器。窗口未找到时回落到全屏采集。
 window_title = "VRChat"
+# 重新解析窗口矩形的间隔（毫秒）。窗口被拖动、改分辨率或全屏切换后，启动时
+# 解析的坐标就过期了；矩形真的变了才会重建采集源。0 表示只在启动时解析一次。
+window_track_interval_ms = 5000
 
 [clips]
 directory = "motions"
