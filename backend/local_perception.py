@@ -141,31 +141,68 @@ class _IoUTracker:
             self._tracks[best_id] = _Track(best_id, detection.label, detection.bbox, now)
 
 
+class _LabelLoadError(Exception):
+    """标签文件存在但格式无法识别时抛出。"""
+
+
 def _load_labels(path: str | Path | None) -> tuple[str, ...]:
+    """从文件加载标签列表。
+
+    支持的格式：
+    - JSON 数组：``["person", "cat", ...]``
+    - JSON 对象（ultralytics yaml 风格）：``{"names": ["person", ...]}``
+      或 ``{"names": {"0": "person", ...}}``
+    - JSON 对象（deepghs booru_yolo 风格）：``{"labels": ["head", ...], ...}``
+    - JSON 对象（整数键映射）：``{"0": "person", "1": "cat", ...}``
+    - 纯文本：每行一个标签，``#`` 开头为注释
+
+    未提供路径时返回内置 COCO 标签。路径已提供但格式无法识别时抛出
+    ``_LabelLoadError``，而不是静默回落 COCO——静默回落会让模型用错误的
+    标签维度解码输出，产生满置信度的垃圾检测（见 deepghs/booru_yolo 的
+    meta.json 案例）。
+    """
     if not path:
         return _COCO_LABELS
     candidate = Path(path)
     try:
         raw = candidate.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _LabelLoadError(f"cannot read labels file {candidate}: {exc}") from exc
+    try:
         if candidate.suffix.lower() == ".json":
             value = json.loads(raw)
             if isinstance(value, Mapping):
-                # 同时支持 {"0": "person"} 和 {"names": [...]} 两种格式。
+                # {"labels": [...]} — deepghs/booru_yolo meta.json 格式
+                if "labels" in value and isinstance(value["labels"], (list, tuple)):
+                    seq = value["labels"]
+                    return tuple(str(item).strip() or f"class_{i}" for i, item in enumerate(seq))
+                # {"names": [...]} 或 {"names": {"0": "person", ...}}
                 names = value.get("names", value)
                 if isinstance(names, Mapping):
-                    ordered = sorted(names.items(), key=lambda item: int(item[0]))
+                    try:
+                        ordered = sorted(names.items(), key=lambda item: int(item[0]))
+                    except (ValueError, TypeError) as exc:
+                        raise _LabelLoadError(
+                            f"labels file {candidate}: cannot sort keys as integers"
+                        ) from exc
                     return tuple(str(item[1]).strip() or f"class_{item[0]}" for item in ordered)
                 value = names
             if isinstance(value, (list, tuple)):
-                return tuple(str(item).strip() or f"class_{index}" for index, item in enumerate(value))
-        lines = tuple(line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+                return tuple(str(item).strip() or f"class_{i}" for i, item in enumerate(value))
+            raise _LabelLoadError(
+                f"labels file {candidate}: JSON root must be a list or object, got {type(value).__name__}"
+            )
+        # 纯文本格式
+        lines = tuple(
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
         if lines:
             return lines
-    except Exception:
-        # 检测器构造时会在状态中报告问题；回退到 COCO 名称可避免格式错误的
-        # 可选标签文件使控制进程崩溃。
-        return _COCO_LABELS
-    return _COCO_LABELS
+        raise _LabelLoadError(f"labels file {candidate}: file is empty or contains only comments")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _LabelLoadError(f"labels file {candidate}: {exc}") from exc
 
 
 class OpenVinoLocalDetector:
@@ -203,7 +240,15 @@ class OpenVinoLocalDetector:
         self._clock = clock
         self._model_path = str(model_path).strip() if model_path else ""
         self._labels_path = str(labels_path).strip() if labels_path else ""
-        self._labels = _load_labels(self._labels_path or None)
+        try:
+            self._labels = _load_labels(self._labels_path or None)
+        except _LabelLoadError as _exc:
+            # 标签文件无法识别时回落 COCO，但把原因记录到状态，避免静默吞掉
+            # 满置信度的垃圾检测（错误的标签维度会让解码器命中错误的分支）。
+            self._labels = _COCO_LABELS
+            self._label_load_error: str = str(_exc)
+        else:
+            self._label_load_error = ""
         self._device = str(device or "AUTO").strip() or "AUTO"
         self._confidence_threshold = min(1.0, max(0.0, float(confidence_threshold)))
         self._input_width = min(4096, max(32, int(input_width)))
@@ -219,6 +264,7 @@ class OpenVinoLocalDetector:
         # 避免实体 ID 与帧计数被并发破坏。
         self._infer_lock = threading.Lock()
         self._compiled_model: Any | None = None
+        self._onnx_session: Any | None = None
         self._opencv_net: Any | None = None
         self._input_name: Any | None = None
         self._input_layout = "NCHW"
@@ -249,6 +295,15 @@ class OpenVinoLocalDetector:
         if not path.exists() or not path.is_file():
             self._last_error = f"OpenVINO model does not exist: {path}"
             return
+        # ONNX 优先交给 ONNX Runtime。它是三条路径里唯一能正确处理动态
+        # batch/宽高的：OpenCV 的 ONNX 导入器会在动态形状的 Concat 上形状
+        # 推断失败（实测 yolo11n 动态导出直接抛 ConcatLayer），而 OpenVINO
+        # wheel 在冻结宿主里根本不存在。显式注入 core 时跳过这里，避免旁路
+        # 掉调用方指定的运行时。
+        if supplied_core is None and path.suffix.lower() == ".onnx":
+            self._initialize_onnxruntime(path)
+            if self._available:
+                return
         try:
             core = supplied_core
             if core is None:
@@ -285,6 +340,47 @@ class OpenVinoLocalDetector:
             # 虚假的成功状态。
             if path.suffix.lower() == ".onnx":
                 self._initialize_opencv_dnn(path)
+
+    def _initialize_onnxruntime(self, path: Path) -> None:
+        """用 ONNX Runtime 加载 ONNX 模型。
+
+        只声明 CPU 提供者：宿主捆绑包只带了 ``onnxruntime.dll`` 和
+        ``onnxruntime_providers_shared.dll``，没有 CUDA/DirectML 提供者库，
+        请求它们只会得到警告和静默回退。
+        """
+        try:
+            import onnxruntime as ort  # type: ignore[import-not-found]
+
+            session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            inputs = session.get_inputs()
+            if not inputs:
+                raise RuntimeError("ONNX model has no inputs")
+            self._input_name = inputs[0].name
+            # 动态维度是字符串（'batch'、'height'）而非整数，_static_shape 会
+            # 因此返回 None，保留配置的输入尺寸——这正是动态导出想要的行为。
+            shape = self._static_shape(inputs[0].shape)
+            if shape and len(shape) == 4:
+                if shape[-1] in {1, 3, 4}:
+                    self._input_layout = "NHWC"
+                    self._input_height, self._input_width = shape[1], shape[2]
+                else:
+                    self._input_layout = "NCHW"
+                    self._input_height, self._input_width = shape[2], shape[3]
+            self._onnx_session = session
+            self._infer = self._run_onnxruntime
+            self._available = True
+            self._runtime = "onnxruntime"
+            self._source_name = "onnxruntime"
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = f"ONNX Runtime unavailable: {type(exc).__name__}: {exc}"[:500]
+
+    def _run_onnxruntime(self, frame: Any) -> Any:
+        session = self._onnx_session
+        if session is None:
+            raise RuntimeError("ONNX Runtime session is unavailable")
+        tensor = self._preprocess(frame)
+        return session.run(None, {self._input_name: tensor})
 
     def _initialize_opencv_dnn(self, path: Path) -> None:
         try:
@@ -363,20 +459,94 @@ class OpenVinoLocalDetector:
         except ImportError as exc:
             raise RuntimeError("numpy is required for local perception") from exc
 
+    @staticmethod
+    def _resize_bilinear(np: Any, array: Any, out_width: int, out_height: int) -> Any:
+        """纯 numpy 的抗混叠缩放，用于没有 cv2 的部署。
+
+        分两步：整数倍的均值降采样先把混叠压掉，剩余的非整数倍再用双线性
+        插值。只用最近邻会在大倍率降采样时丢掉细节，实测足以让检测器完全
+        看不见画面里的人。
+        """
+        height, width = array.shape[:2]
+        if height == out_height and width == out_width:
+            return array
+        source = array
+        # 先按整数因子做块平均：每个输出像素都参与了平均，而不是被抽样丢弃。
+        # 两个轴分别判断——1920x1080 -> 640x640 的因子是 (1, 3)，竖直方向无
+        # 可缩减但水平方向有。要求两轴都 >1 会退化成纯双线性并重新引入混叠
+        # （实测 MAE 0.98 -> 2.73）；而在非连续轴上做无意义的 1 倍归约又要
+        # 白花 130ms。只对真正 >1 的轴归约，两者都避开。
+        factor_y = max(1, int(height // out_height))
+        factor_x = max(1, int(width // out_width))
+        if factor_y > 1 or factor_x > 1:
+            trimmed_h = (height // factor_y) * factor_y
+            trimmed_w = (width // factor_x) * factor_x
+            source = source[:trimmed_h, :trimmed_w]
+            channels = source.shape[2] if source.ndim == 3 else 1
+            # uint8 的块和最大 255*factor；uint16 到 257 个像素都不会溢出。
+            accumulate = np.uint16 if source.dtype == np.uint8 and factor_y * factor_x < 257 else np.float32
+            if factor_x > 1:
+                source = source.reshape(trimmed_h, trimmed_w // factor_x, factor_x, channels).sum(
+                    axis=2, dtype=accumulate
+                )
+            if factor_y > 1:
+                source = source.reshape(
+                    trimmed_h // factor_y, factor_y, source.shape[1], channels
+                ).sum(axis=1, dtype=accumulate)
+            source = source.astype(np.float32, copy=False) * (1.0 / (factor_y * factor_x))
+            height, width = source.shape[:2]
+        else:
+            source = source.astype(np.float32, copy=False)
+        # 再做双线性插值补齐剩余比例；半像素中心对齐，与 cv2/PIL 的约定一致。
+        ys = np.clip((np.arange(out_height, dtype=np.float32) + 0.5) * height / out_height - 0.5, 0.0, height - 1.0)
+        xs = np.clip((np.arange(out_width, dtype=np.float32) + 0.5) * width / out_width - 0.5, 0.0, width - 1.0)
+        y0 = np.floor(ys).astype(np.int32)
+        x0 = np.floor(xs).astype(np.int32)
+        y1 = np.minimum(y0 + 1, height - 1)
+        x1 = np.minimum(x0 + 1, width - 1)
+        weight_y = (ys - y0).reshape(-1, 1, 1)
+        weight_x = (xs - x0).reshape(1, -1, 1)
+        top_left = source[y0][:, x0]
+        top_right = source[y0][:, x1]
+        bottom_left = source[y1][:, x0]
+        bottom_right = source[y1][:, x1]
+        top = top_left + (top_right - top_left) * weight_x
+        bottom = bottom_left + (bottom_right - bottom_left) * weight_x
+        return top + (bottom - top) * weight_y
+
     def _preprocess(self, frame: Any) -> Any:
         import numpy as np  # type: ignore[import-not-found]
 
         array = self._array(frame)
+        resized = None
         try:
             import cv2  # type: ignore[import-not-found]
 
             resized = cv2.resize(array, (self._input_width, self._input_height), interpolation=cv2.INTER_LINEAR)
         except Exception:
-            # 最近邻回退让适配器在只有 numpy 时仍可运行；精度属于部署问题，
-            # 不能因此伪造世界观测。
-            y_idx = np.linspace(0, array.shape[0] - 1, self._input_height).astype(int)
-            x_idx = np.linspace(0, array.shape[1] - 1, self._input_width).astype(int)
-            resized = array[y_idx][:, x_idx]
+            resized = None
+        if resized is None:
+            # 冻结宿主没有 cv2 但有 Pillow，所以这条才是生产路径。缩放质量
+            # 直接决定能否看见人：最近邻抽样会让 1161x766 的窗口降到 640x640
+            # 时，一个 person@0.51 的头像彻底消失、浣熊从 dog@0.84 变成
+            # fire hydrant@0.24。Pillow 的 C 实现在降采样时会按比例放大滤波
+            # 支撑域，既抗混叠又比手写 numpy 快一个数量级（22ms vs 233ms）。
+            try:
+                from PIL import Image  # type: ignore[import-not-found]
+
+                if array.ndim == 3 and array.shape[2] == 3 and array.dtype == np.uint8:
+                    resized = np.asarray(
+                        Image.fromarray(array).resize(
+                            (self._input_width, self._input_height), Image.BILINEAR
+                        ),
+                        dtype=np.float32,
+                    )
+            except Exception:
+                resized = None
+        if resized is None:
+            # 三个都没有时的最后兜底：纯 numpy 抗混叠缩放。比 Pillow 慢得多，
+            # 但仍然远好过最近邻——宁可掉帧，也不能让检测器瞎掉。
+            resized = self._resize_bilinear(np, array, self._input_width, self._input_height)
         tensor = resized.astype(np.float32) / 255.0
         if self._input_layout == "NCHW":
             tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
@@ -452,6 +622,7 @@ class OpenVinoLocalDetector:
                 "model_path_configured": bool(self._model_path),
                 "model_path": self._model_path[-160:] if self._model_path else None,
                 "labels_path_configured": bool(self._labels_path),
+                "label_load_error": self._label_load_error or None,
                 "confidence_threshold": self._confidence_threshold,
                 "input_size": [self._input_width, self._input_height],
                 "max_detections": self._max_detections,
@@ -470,14 +641,61 @@ class OpenVinoLocalDetector:
     def _row_widths(self) -> frozenset[int]:
         """检测器行的合法列宽。
 
+        ``5`` 是单类 YOLOv8 导出的 ``cx,cy,w,h,score``（无类别向量）；
         ``6`` 是 NMS 后的 ``x1,y1,x2,y2,score,class``；``7`` 是 OpenVINO
         SSD/DetectionOutput；``len(labels)+4`` 是无 objectness 的 YOLOv8；
         ``len(labels)+5`` 是带 objectness 的 YOLOX。
         """
         count = len(self._labels)
-        return frozenset({6, 7, count + 4, count + 5})
+        widths: frozenset[int] = frozenset({6, 7, count + 4, count + 5})
+        # 单类模型（count==1）的 YOLOv8 ONNX 导出列宽恰好为 5；此时 count+4==5
+        # 已被上面的集合包含。对多类模型也显式加入 5，以便 _as_rows 的布局判定
+        # 和 _score_upper_bound 的预筛选能正确处理该列宽而不依赖 count 的值。
+        return widths | frozenset({5})
 
-    def _as_rows(self, outputs: Any) -> list[list[float]]:
+    def _score_upper_bound(self, np: Any, array: Any) -> Any:
+        """逐行给出与格式无关的置信度上界。
+
+        ``_decode_rows`` 会按行宽和数值形态在四个分支里选一个解释方式，而这里
+        不做那个判断——只取所有分支的上界的最大值。低于阈值的行在任何分支下
+        都不可能产出检测，因此丢弃它们不会改变结果。
+        """
+        scores = array.astype(np.float32, copy=False)
+        width = scores.shape[-1]
+        with np.errstate(invalid="ignore"):
+            # SSD 分支的判定条件必须一并复制。裸 YOLO 的第 2 列是像素宽度
+            # （例如 90.0），不加这个门就会让每一行都"过阈值"，预筛选随即退化
+            # 成按框宽排序，真正的检测反而被丢掉。
+            if width >= 7:
+                ssd = np.where(
+                    (scores[:, 1] >= 0.0)
+                    & (np.abs(scores[:, 1] - np.round(scores[:, 1])) < 1e-6)
+                    & (scores[:, 2] >= 0.0)
+                    & (scores[:, 2] <= 1.0)
+                    & (scores[:, 3] <= scores[:, 5])
+                    & (scores[:, 4] <= scores[:, 6]),
+                    scores[:, 2],
+                    0.0,
+                )
+            else:
+                ssd = np.zeros(scores.shape[0], dtype=np.float32)
+            if width == 5:
+                # 单类 YOLOv8：[cx,cy,w,h,score]，第 4 列直接是置信度。
+                other = scores[:, 4]
+            elif width > 6:
+                # 与 _decode_rows 相同：用标签数区分 YOLOv8（无 objectness）
+                # 和 YOLOX（有 objectness）。
+                count = len(self._labels)
+                if width - 4 == count and width - 5 != count:
+                    other = scores[:, 4:].max(axis=1)
+                else:
+                    other = scores[:, 4] * scores[:, 5:].max(axis=1)
+            else:
+                # 六列既可能是 NMS 后的 score，也可能是 objectness * class。
+                other = np.maximum(scores[:, 4], scores[:, 4] * scores[:, 5])
+            return np.maximum(ssd, other)
+
+    def _as_rows(self, outputs: Any, *, prefilter: bool = False) -> list[list[float]]:
         try:
             import numpy as np  # type: ignore[import-not-found]
 
@@ -500,7 +718,7 @@ class OpenVinoLocalDetector:
                 if array.size == 0:
                     continue
                 if array.ndim == 1:
-                    if array.size >= 6:
+                    if array.size >= 5:
                         array = array.reshape(1, -1)
                     else:
                         continue
@@ -516,6 +734,22 @@ class OpenVinoLocalDetector:
                         axes[-2], axes[-1] = axes[-1], axes[-2]
                         array = np.transpose(array, axes)
                     array = array.reshape(-1, array.shape[-1])
+                if prefilter and array.ndim == 2 and array.shape[-1] >= 5 and array.shape[0] > _NMS_CANDIDATE_LIMIT:
+                    # 裸 YOLO 输出有 8400 个 anchor，其中过阈值的通常只有几十个。
+                    # 把每一行都转成 Python float 再逐行判断，光是转换就要上百
+                    # 毫秒——足以让 10 Hz 的采集循环退化到 3 Hz 并触发导航器的
+                    # observation_stale。阈值判断在 numpy 侧做，逐行解释仍然完全
+                    # 交给 _decode_rows，避免两处对格式的理解产生分歧。
+                    try:
+                        bound = self._score_upper_bound(np, array)
+                        keep = np.flatnonzero(bound >= self._confidence_threshold)
+                        if keep.size > _NMS_CANDIDATE_LIMIT:
+                            # 仍然远多于需要的数量时，只保留分数最高的一批。
+                            keep = keep[np.argsort(bound[keep])[::-1][:_NMS_CANDIDATE_LIMIT]]
+                        array = array[keep]
+                    except (TypeError, ValueError, IndexError, FloatingPointError):
+                        # 预筛选纯属优化；任何异常都退回全量逐行解码。
+                        pass
                 for row in array.tolist():
                     try:
                         rows.append([float(item) for item in row])
@@ -614,15 +848,24 @@ class OpenVinoLocalDetector:
                 # 记录式适配器不保证已去重：OpenCV HOG 的 detectMultiScale
                 # 就会对同一个人输出多个重叠框。
                 return self._suppress_overlaps(detections)
-        for row in self._as_rows(outputs):
-            if len(row) < 6 or not all(math.isfinite(item) for item in row[: min(len(row), 8)]):
+        for row in self._as_rows(outputs, prefilter=True):
+            if len(row) < 5 or not all(math.isfinite(item) for item in row[: min(len(row), 8)]):
                 continue
             label_index = -1
             confidence = 0.0
             coords: Sequence[float]
+            # 单类 YOLOv8 ONNX 导出：[cx, cy, w, h, score]。ultralytics 在只有
+            # 一个类别时省略类别向量，直接输出置信度，行宽因此是 5 而不是 6。
+            # 必须与下面的宽行分支共用归一化与钳制，否则模型空间的像素坐标会
+            # 被整体钳到 1.0，退化成 right <= left 而丢掉每一个检测。
+            if len(row) == 5:
+                label_index = 0
+                confidence = row[4]
+                cx, cy, width, height = row[:4]
+                coords = (cx - width / 2.0, cy - height / 2.0, cx + width / 2.0, cy + height / 2.0)
             # OpenVINO DetectionOutput / SSD：image_id、class_id、score、
             # xmin、ymin、xmax、ymax。
-            if (
+            elif (
                 len(row) >= 7
                 and row[1] >= 0.0
                 and abs(row[1] - round(row[1])) < 1e-6

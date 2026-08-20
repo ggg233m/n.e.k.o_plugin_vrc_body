@@ -102,14 +102,14 @@ history_size = 64
 # 模型无关的视觉 worker；具体 FrameSource/FrameDetector 由独立后端注入。
 # 默认关闭，未接入外部 detector 时不会抓屏或加载模型。
 [vision]
-enabled = false
+enabled = true
 source = "none"
 capture = "desktop_mirror"
 local_backend = "openvino"
 # OpenVINO IR XML/ONNX 模型和可选标签文件。留空表示未部署本地模型；此时感知
 # 会报告 unavailable，而不是进行猜测。
-model_path = ""
-labels_path = ""
+model_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_model.onnx"
+labels_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_labels.json"
 device = "AUTO"
 # none（默认），或显式启用降级的 OpenCV HOG 仅人形回退。
 fallback_backend = "none"
@@ -130,6 +130,9 @@ dxcam_backend = "auto"
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096
+# 按窗口标题限定采集区域。非空时通过 FindWindow 取窗口坐标后只采集该矩形
+# 区域，而不是整块显示器。窗口未找到时回落到全屏采集。
+window_title = "VRChat"
 
 [clips]
 directory = "motions"

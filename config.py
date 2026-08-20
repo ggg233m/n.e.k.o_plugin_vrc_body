@@ -183,6 +183,9 @@ class VisionConfig:
     interval_ms: int = 100
     queue_size: int = 1
     lifecycle_watermark_limit: int = 4096
+    # 按标题定位采集窗口，非空时将窗口屏幕坐标作为采集区域传给帧源。
+    # 仅限 Windows；其他平台静默忽略。窗口未找到时回落到全屏采集。
+    window_title: str = ""
 
 
 @dataclass(frozen=True)
@@ -467,6 +470,7 @@ class PluginConfig:
                 maximum=65536,
                 name="vision.lifecycle_watermark_limit",
             ),
+            window_title=str(vision.get("window_title", "")).strip()[:256],
         )
         behavior_config = BehaviorConfig(
             default_crossfade_ms=_bounded_int(

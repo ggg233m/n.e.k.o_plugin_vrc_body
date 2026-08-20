@@ -122,6 +122,31 @@ def _module_available(module_name: str) -> bool:
         return False
 
 
+def find_window_region(title: str) -> dict[str, int] | None:
+    """通过标题查找 Windows 顶层窗口并返回其屏幕坐标。
+
+    返回值是 ``{"left": x, "top": y, "right": x2, "bottom": y2}``，可直接
+    传给 ``DxcamFrameSource`` 或 ``MssFrameSource`` 的 ``region`` 参数。
+    仅在 Windows 上可用；其他平台返回 ``None``。非 Windows 或窗口未找到时
+    也返回 ``None``，不抛出异常。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return None
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return {"left": rect.left, "top": rect.top, "right": rect.right, "bottom": rect.bottom}
+    except Exception:
+        return None
+
+
 class MssFrameSource:
     """可选的纯 mss 桌面采集器，不依赖插件 SDK 或模型包。
 
@@ -397,24 +422,23 @@ class DxcamFrameSource:
         if self._dxcam is None:
             return None
         device, output, backend = spec
+        base = {"device_idx": device, "output_idx": output, "output_color": "RGB"}
+        # DXcam 的后处理默认走 cv2，而冻结宿主没有 cv2：默认路径下 grab() 会
+        # 永远返回 None，而 status 仍然报告 available=True。numpy 后端是
+        # Cython 加速路径且自带 cv2 兜底，因此无条件优先——开发机和宿主由此
+        # 走同一条路，不会再出现只在部署时才暴露的采集失败。
+        first_exc: TypeError | None = None
         try:
-            return self._dxcam.create(
-                device_idx=device,
-                output_idx=output,
-                output_color="RGB",
-                backend=backend,
-            )
-        except TypeError:
-            # 较旧的 DXcam 版本不暴露后端选择参数。仅对历史默认的 DXGI 路径
-            # 重试是安全的；显式请求 WinRT 时不能偷偷创建 DXGI 摄像头，却在
-            # status 中报告 ``backend=winrt``。
-            if backend != "dxgi":
-                raise
-            return self._dxcam.create(
-                device_idx=device,
-                output_idx=output,
-                output_color="RGB",
-            )
+            return self._dxcam.create(**base, backend=backend, processor_backend="numpy")
+        except TypeError as exc:
+            first_exc = exc
+        # 较旧的 DXcam 版本不暴露 backend 参数。仅对历史默认的 DXGI 路径重试是
+        # 安全的；显式请求 WinRT 时不能偷偷创建 DXGI 摄像头，却在 status 中
+        # 报告 ``backend=winrt``。
+        if backend != "dxgi":
+            raise first_exc  # type: ignore[misc]
+        # dxgi 的向后兼容回退：去掉 backend 参数，兼容不支持该参数的旧版 DXcam。
+        return self._dxcam.create(**base, processor_backend="numpy")
 
     def _activate_candidate_locked(self, position: int) -> bool:
         old_camera = self._camera
@@ -1290,6 +1314,7 @@ from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # 
 
 __all__ = [
     "CapturedFrame",
+    "find_window_region",
     "FrameDetector",
     "FrameSource",
     "DxcamFrameSource",

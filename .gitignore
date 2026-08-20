@@ -6,3 +6,4 @@ build/
 *.neko-plugin
 store.db
 tmp/
+.venv/

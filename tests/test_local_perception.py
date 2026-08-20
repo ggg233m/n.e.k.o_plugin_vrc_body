@@ -12,7 +12,11 @@ except ImportError:  # pragma: no cover - optional perception dependency
     np = None  # type: ignore[assignment]
 
 from tests import _bootstrap  # noqa: F401
-from neko_anyadance_body.backend.local_perception import OpenVinoLocalDetector
+from neko_anyadance_body.backend.local_perception import (
+    OpenVinoLocalDetector,
+    _LabelLoadError,
+    _load_labels,
+)
 from neko_anyadance_body.config import PluginConfig
 
 
@@ -266,6 +270,80 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertEqual(len(observation.entities), 1)
         self.assertEqual(observation.entities[0]["label"], "person")
 
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_single_class_yolov8_five_column_output_is_decoded(self) -> None:
+        """单类 YOLOv8 导出省略类别向量，行宽为 5：``[cx,cy,w,h,score]``。
+
+        deepghs/anime_person_detection 只有 ``person`` 一类，ONNX 输出形状是
+        ``[1,5,8400]``。解码器早先按 ``len(row) < 6`` 丢弃整批行，整个模型族
+        静默地产出零检测——可用性完全消失，却不报任何错误。
+        """
+        anchors = np.zeros((5, 8400), dtype=np.float32)
+        # 模型输入空间（640x640）的像素坐标，这正是 ultralytics ONNX 的约定。
+        anchors[:, 0] = [320.0, 320.0, 100.0, 260.0, 0.91]
+        raw = anchors[None, ...]
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: raw,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+        )
+        observation = detector.observe(object(), now=1.0)
+        self.assertEqual(len(observation.entities), 1)
+        entity = observation.entities[0]
+        self.assertEqual(entity["label"], "person")
+        self.assertAlmostEqual(entity["confidence"], 0.91, places=5)
+        # (320±50, 320±130) / 640 —— 像素坐标必须归一化，而不是被钳到 1.0。
+        self.assertEqual(
+            [round(value, 6) for value in entity["bbox"]],
+            [0.421875, 0.296875, 0.578125, 0.703125],
+        )
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_five_column_geometry_matches_the_wide_row_branch(self) -> None:
+        # 同一个框经 5 列分支和 84 列分支解码必须得到同一个 bbox；两条分支
+        # 对 cx/cy/w/h 的解释和归一化都相同，只有类别向量的有无不同。
+        box = [320.0, 320.0, 100.0, 260.0]
+        narrow = np.asarray([box + [0.91]], dtype=np.float32)
+        wide_row = box + [0.0] * 80
+        wide_row[4 + 0] = 0.91  # person
+        wide = np.asarray([wide_row], dtype=np.float32)
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: None,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+        )
+        (from_narrow,) = detector._decode_rows(narrow)
+        (from_wide,) = detector._decode_rows(wide)
+        self.assertEqual(from_narrow.label, from_wide.label)
+        self.assertEqual(
+            [round(v, 6) for v in from_narrow.bbox],
+            [round(v, 6) for v in from_wide.bbox],
+        )
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_five_column_anchor_grid_is_prefiltered_like_wider_rows(self) -> None:
+        """预筛选必须覆盖 5 列，否则 8400 个 anchor 会逐行进 Python。
+
+        逐行转换 8400 行要上百毫秒，足以把 10 Hz 采集压到 3 Hz 并触发导航器的
+        observation_stale——这正是预筛选存在的理由，单类模型不该被排除在外。
+        """
+        anchors = np.zeros((5, 8400), dtype=np.float32)
+        anchors[:, 0] = [320.0, 320.0, 100.0, 260.0, 0.91]
+        raw = anchors[None, ...]
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: None,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+        )
+        self.assertEqual(len(detector._as_rows(raw)), 8400)
+        pruned = detector._as_rows(raw, prefilter=True)
+        self.assertLess(len(pruned), 100)
+        # 预筛选是纯优化：唯一过阈值的 anchor 必须还在。
+        self.assertTrue(any(abs(row[4] - 0.91) < 1e-5 for row in pruned))
+
     def test_record_form_is_supported_for_explicit_fallback_adapters(self) -> None:
         detector = OpenVinoLocalDetector(
             infer=lambda _frame: {
@@ -351,6 +429,121 @@ class LocalPerceptionTests(unittest.TestCase):
             else:
                 sys.modules["cv2"] = previous
 
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_prefilter_never_changes_which_detections_are_decoded(self) -> None:
+        """预筛选是纯优化：过阈值的行必须与全量解码逐位一致。
+
+        裸 YOLO 的第 2 列是像素宽度，不是分数。曾经用无门限的 ``row[2]``
+        当上界，结果每一行都"过阈值"，截断退化成按框宽排序——实测真实模型
+        的 5 个检测被砍成 1 个。
+        """
+        rng = np.random.default_rng(11)
+        anchors = []
+        for center_x, center_y, class_index in ((160.0, 300.0, 0), (470.0, 330.0, 5)):
+            for _ in range(12):
+                row = [0.0] * 84
+                row[0] = center_x + rng.normal(0, 5)
+                row[1] = center_y + rng.normal(0, 6)
+                row[2] = 95 + rng.normal(0, 6)
+                row[3] = 250 + rng.normal(0, 15)
+                row[4 + class_index] = 0.6 + rng.random() * 0.35
+                anchors.append(row)
+        for _ in range(900):
+            row = [320.0, 320.0, 88.0, 240.0] + [0.0] * 80
+            row[4 + 0] = 0.02
+            anchors.append(row)
+        raw = np.asarray(anchors, dtype=np.float32).T[None, ...]
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: raw,
+            confidence_threshold=0.35,
+            input_width=640,
+            input_height=640,
+        )
+        full = detector._as_rows(raw)
+        pruned = detector._as_rows(raw, prefilter=True)
+        self.assertEqual(len(full), 924)
+        # 只有过阈值的 anchor 需要逐行解释，其余在 numpy 侧就被丢掉。
+        self.assertLess(len(pruned), 100)
+
+        def fingerprint(items):
+            return sorted(
+                (item.label, round(item.confidence, 6), tuple(round(v, 6) for v in item.bbox))
+                for item in items
+            )
+
+        with_prefilter = detector._decode_rows(raw)
+        original = type(detector)._as_rows
+        try:
+            type(detector)._as_rows = lambda self, outputs, *, prefilter=False: original(
+                self, outputs, prefilter=False
+            )
+            without_prefilter = detector._decode_rows(raw)
+        finally:
+            type(detector)._as_rows = original
+        self.assertEqual(fingerprint(with_prefilter), fingerprint(without_prefilter))
+        self.assertEqual({item.label for item in with_prefilter}, {"person", "bus"})
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_prefilter_keeps_ssd_rows_whose_score_column_is_a_real_score(self) -> None:
+        # 预筛选是保守上界：高分行的上界必须 ≥ 其真实分数（永不丢失）。
+        # 低分行的上界可以更高，只要高分行不被丢弃就够了。
+        # 只验证 "高分行不被预筛选丢弃" 这一正确性保证；
+        # 低分行能否被丢弃是优化，不是正确性要求。
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: None,
+            input_width=640,
+            input_height=640,
+            confidence_threshold=0.5,
+        )
+        rows = np.asarray(
+            [
+                [0, 1, 0.90, 64, 128, 320, 512],   # SSD 高分行，真实分数 0.90
+                [0, 2, 0.10, 10, 10, 100, 100],     # SSD 低分行，真实分数 0.10
+            ],
+            dtype=np.float32,
+        )
+        bound = detector._score_upper_bound(np, rows)
+        # 保守性保证：高分行的上界不得低于真实分数（否则会被误丢）。
+        self.assertGreaterEqual(float(bound[0]), 0.90)
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_onnxruntime_is_preferred_for_onnx_models(self) -> None:
+        # 宿主捆绑包带 onnxruntime 但没有 openvino/cv2；ONNX 必须走这条路。
+        class _Input:
+            name = "images"
+            shape = ["batch", 3, "height", "width"]
+
+        class _Session:
+            def __init__(self, path, providers=None):
+                self.providers = providers
+
+            def get_inputs(self):
+                return [_Input()]
+
+            def run(self, _outputs, _feed):
+                return [np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]], dtype=np.float32)]
+
+        fake_ort = types.SimpleNamespace(InferenceSession=_Session)
+        previous = sys.modules.get("onnxruntime")
+        sys.modules["onnxruntime"] = fake_ort  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                model = Path(directory) / "model.onnx"
+                model.write_bytes(b"fake")
+                detector = OpenVinoLocalDetector(model_path=str(model), confidence_threshold=0.5)
+                status = detector.status()
+                self.assertTrue(status["available"])
+                self.assertEqual(status["runtime"], "onnxruntime")
+                # 动态维度不能覆盖配置的输入尺寸。
+                self.assertEqual(status["input_size"], [640, 640])
+                observation = detector.observe(np.zeros((8, 8, 3), dtype=np.uint8), now=8.0)
+                self.assertEqual(len(observation.entities), 1)
+        finally:
+            if previous is None:
+                sys.modules.pop("onnxruntime", None)
+            else:
+                sys.modules["onnxruntime"] = previous
+
     def test_config_exposes_explicit_model_and_degraded_fallback_options(self) -> None:
         config = PluginConfig.from_mapping({
             "vision": {
@@ -371,6 +564,78 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertEqual(config.vision.fallback_backend, "opencv_hog")
         self.assertEqual(config.vision.input_width, 320)
         self.assertEqual(config.vision.max_detections, 12)
+
+
+class LabelLoadingTests(unittest.TestCase):
+    """标签文件解析。
+
+    错误的标签维度会让 ``_decode_rows`` 命中错误的分支（YOLOv8 vs YOLOX），
+    产出满置信度的垃圾类名——所以无法识别的格式必须报错，而不是静默回落。
+    """
+
+    def _write(self, directory: str, name: str, text: str) -> str:
+        path = Path(directory) / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_booru_meta_json_labels_key_is_recognised(self) -> None:
+        # deepghs/booru_yolo 的 meta.json 用 "labels" 而不是 "names"；早先只认
+        # "names"，26 类被静默换成 80 个 COCO 标签，解码出 class_3354 之类的垃圾。
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(
+                directory,
+                "meta.json",
+                '{"labels": ["head", "bust", "hcat"], "name": "booru_yolov8s_aa11"}',
+            )
+            self.assertEqual(_load_labels(path), ("head", "bust", "hcat"))
+
+    def test_ultralytics_names_forms_are_recognised(self) -> None:
+        cases = {
+            "list.json": ('{"names": ["person", "cat"]}', ("person", "cat")),
+            "map.json": ('{"names": {"1": "cat", "0": "person"}}', ("person", "cat")),
+            "bare_map.json": ('{"1": "cat", "0": "person"}', ("person", "cat")),
+            "array.json": ('["person", "cat"]', ("person", "cat")),
+            "plain.txt": ("person\n# comment\ncat\n", ("person", "cat")),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for name, (text, expected) in cases.items():
+                with self.subTest(name=name):
+                    self.assertEqual(_load_labels(self._write(directory, name, text)), expected)
+
+    def test_missing_path_falls_back_to_builtin_coco(self) -> None:
+        self.assertEqual(_load_labels(None)[0], "person")
+        self.assertEqual(len(_load_labels(None)), 80)
+
+    def test_unrecognisable_label_files_raise_instead_of_falling_back(self) -> None:
+        cases = {
+            "scalar.json": "42",
+            "broken.json": "{not json",
+            "empty.txt": "\n# only comments\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for name, text in cases.items():
+                with self.subTest(name=name):
+                    path = self._write(directory, name, text)
+                    with self.assertRaises(_LabelLoadError):
+                        _load_labels(path)
+            with self.assertRaises(_LabelLoadError):
+                _load_labels(str(Path(directory) / "does_not_exist.json"))
+
+    def test_bad_label_file_is_surfaced_in_status_not_swallowed(self) -> None:
+        # 回落 COCO 仍然发生（检测器可用），但原因必须出现在 status()，
+        # 否则运维只会看到一堆置信度 1.0 的错误类名而无从追查。
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "labels.json", "{not json")
+            detector = OpenVinoLocalDetector(labels_path=path)
+            status = detector.status()
+            self.assertIsNotNone(status["label_load_error"])
+            self.assertIn("labels.json", str(status["label_load_error"]))
+
+    def test_good_label_file_reports_no_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, "labels.json", '{"labels": ["person"]}')
+            detector = OpenVinoLocalDetector(labels_path=path)
+            self.assertIsNone(detector.status()["label_load_error"])
 
 
 if __name__ == "__main__":
