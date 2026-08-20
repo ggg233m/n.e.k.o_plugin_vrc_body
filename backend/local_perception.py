@@ -227,8 +227,6 @@ class OpenVinoLocalDetector:
             self._initialize_model(openvino_core)
         if not self._available and str(fallback_backend).strip().lower() in {"opencv_hog", "hog", "hog_person"}:
             self._initialize_hog()
-        if self._available:
-            self._uncertainties.extend(("depth_unavailable", "ocr_unavailable"))
 
     def _initialize_model(self, supplied_core: Any | None) -> None:
         if not self._model_path:
@@ -430,9 +428,15 @@ class OpenVinoLocalDetector:
                 "available": self._available,
                 "degraded": self._degraded,
                 "name": self.name,
-                # 保留旧调用方使用的公开能力清单；深度/OCR 属于可选模型头，
-                # 除非注入的 infer 适配器明确提供，否则始终标记为未知。
-                "models": ["yolox_tiny", "depth", "ocr"],
+                # 能力属于检测器状态，不属于逐帧不确定性：把永久性的能力边界
+                # 混进每帧观测，会让每一次世界推送都带上同样两条噪声。这里只
+                # 声明实际实现了的能力——本模块没有深度头，也完全没有 OCR。
+                "models": ["object_detection"],
+                "capabilities": {
+                    "object_detection": self._available,
+                    "depth": False,
+                    "ocr": False,
+                },
                 "runtime": self._runtime,
                 "device": self._device,
                 "model_path_configured": bool(self._model_path),
@@ -452,16 +456,33 @@ class OpenVinoLocalDetector:
             return self._labels[index][:64]
         return f"class_{index}"[:64]
 
-    @staticmethod
-    def _as_rows(outputs: Any) -> list[list[float]]:
+    def _row_widths(self) -> frozenset[int]:
+        """检测器行的合法列宽。
+
+        ``6`` 是 NMS 后的 ``x1,y1,x2,y2,score,class``；``7`` 是 OpenVINO
+        SSD/DetectionOutput；``len(labels)+4`` 是无 objectness 的 YOLOv8；
+        ``len(labels)+5`` 是带 objectness 的 YOLOX。
+        """
+        count = len(self._labels)
+        return frozenset({6, 7, count + 4, count + 5})
+
+    def _as_rows(self, outputs: Any) -> list[list[float]]:
         try:
             import numpy as np  # type: ignore[import-not-found]
 
             values = outputs.values() if isinstance(outputs, Mapping) else outputs
             if not isinstance(values, (list, tuple)):
-                # dict_values 直接交给 numpy 会变成 0 维 object 数组，导致
-                # 命名输出被静默丢弃；先展开为稳定的值列表。
-                values = list(values) if hasattr(values, "__iter__") and not isinstance(values, (str, bytes)) else (values,)
+                if hasattr(values, "ndim"):
+                    # 裸张量必须整体保留。交给 list() 会按第一轴拆成一维切片，
+                    # 从而绕过下面的布局判定：``[84, 8400]`` 会被当成 84 行，
+                    # 而同一张量包在 ``[arr]`` 或 ``{"out": arr}`` 里却正确解出
+                    # 8400 行。两条路径必须得到相同结果。
+                    values = (values,)
+                else:
+                    # dict_values 直接交给 numpy 会变成 0 维 object 数组，导致
+                    # 命名输出被静默丢弃；先展开为稳定的值列表。
+                    values = list(values) if hasattr(values, "__iter__") and not isinstance(values, (str, bytes)) else (values,)
+            widths = self._row_widths()
             rows: list[list[float]] = []
             for value in values:
                 array = np.asarray(value)
@@ -473,29 +494,16 @@ class OpenVinoLocalDetector:
                     else:
                         continue
                 elif array.ndim >= 2:
-                    # YOLOv8 风格的 ONNX 导出通常使用
-                    # ``[batch, channels, anchors]``（例如 ``[1,84,8400]``），
-                    # 而 YOLOX 使用 ``[batch, anchors, channels]``。将较小的
-                    # 第二维视为通道，并在展平前转置。
-                    if (
-                        array.ndim == 3
-                        and 4 <= array.shape[1] <= 256
-                        and (array.shape[1] < array.shape[2] or array.shape[2] <= 4)
-                    ):
-                        array = np.transpose(array, (0, 2, 1))
-                    elif (
-                        array.ndim == 2
-                        and 4 <= array.shape[0] <= 256
-                        and (
-                            (array.shape[0] >= 16 and array.shape[0] < array.shape[1])
-                            or (
-                                array.shape[0] in {6, 7, 8, 84, 85, 86}
-                                and array.shape[0] > array.shape[1]
-                            )
-                            or array.shape[1] <= 4
-                        )
-                    ):
-                        array = np.transpose(array, (1, 0))
+                    # 按已知列宽判定布局，而不是猜测形状大小。YOLOv8 的
+                    # ``[batch, channels, anchors]``（例如 ``[1,84,8400]``）
+                    # 需要转置，YOLOX 的 ``[batch, anchors, channels]`` 不需要。
+                    # 仅当倒数第二维命中列宽、且最后一维未命中时才转置：这样
+                    # 检测数恰好等于某个列宽（``(84,6)``、``(1,6,7)``）时不会
+                    # 被误判，而正确布局也不会因为检测数落在某个区间被破坏。
+                    if array.shape[-2] in widths and array.shape[-1] not in widths:
+                        axes = list(range(array.ndim))
+                        axes[-2], axes[-1] = axes[-1], axes[-2]
+                        array = np.transpose(array, axes)
                     array = array.reshape(-1, array.shape[-1])
                 for row in array.tolist():
                     try:
@@ -650,8 +658,14 @@ class OpenVinoLocalDetector:
             center_x = (left + right) / 2.0
             center_y = (top + bottom) / 2.0
             bearing = (center_x - 0.5) * self._horizontal_fov_deg
-            # 刻意不提供 ``distance_m``：二维检测器无法推断深度。除非深度
-            # 适配器提供该字段，否则导航器将其视为未知。
+            # 刻意不提供 ``distance_m``：二维检测器无法推断深度，而 VRChat
+            # avatar 身高跨度可达十倍，按固定身高反算米制距离的误差会大于
+            # 距离本身。改为发布实测的表观高度，让导航器直接闭环；深度适配器
+            # 仍可通过结构化输出提供真实 ``distance_m``。
+            apparent_height = bottom - top
+            # bbox 已被钳制到 [0,1]，因此贴边说明目标超出画面、真实高度不可测。
+            # 此时表观高度会饱和，不能再当作距离的单调函数使用。
+            clipped = top <= 0.001 or bottom >= 0.999
             entities.append({
                 "id": stable_track_entity_id(self._source_name, track_id),
                 "track_id": track_id,
@@ -665,6 +679,8 @@ class OpenVinoLocalDetector:
                     "screen_center": [round(center_x, 5), round(center_y, 5)],
                     "screen_size": [round(right - left, 5), round(bottom - top, 5)],
                     "bearing_deg": round(max(-fov_half, min(fov_half, bearing)), 3),
+                    "apparent_height": round(apparent_height, 5),
+                    "apparent_height_clipped": clipped,
                     "depth": "unknown",
                 },
             })

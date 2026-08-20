@@ -19,6 +19,28 @@ from typing import Any, Iterable, Mapping
 VRCHAT_LOG_SOURCE = "vrchat_log"
 VRCHAT_PLAYER_ID_PREFIX = "vrchat:player:"
 
+# 这些不确定性描述的是感知能力的永久边界，而不是当前观测不可信。检测器正常
+# 工作时它们会一直存在，所以不能让它们阻断移动：否则检测器越正常，导航越死。
+# 白名单之外的一切（世界切换、观测过期、并发发送者等）仍然阻断——未知的新
+# 编码默认按阻断处理，加检测器不会意外放松安全边界。
+INFORMATIONAL_UNCERTAINTIES = frozenset({
+    "depth_unavailable",
+    "ocr_unavailable",
+    "opencv_hog_person_only",
+})
+
+
+def blocking_uncertainties(values: Any) -> list[str]:
+    """过滤掉仅供参考的能力边界标记，返回真正应当停止移动的不确定性。"""
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    result: list[str] = []
+    for item in values:
+        text = _text(item, limit=160)
+        if text and text not in INFORMATIONAL_UNCERTAINTIES and text not in result:
+            result.append(text)
+    return result
+
 
 def _text(value: Any, *, default: str = "", limit: int = 128) -> str:
     result = str(value if value is not None else default).strip()
@@ -896,7 +918,10 @@ class WorldStateStore:
                 "world": snapshot,
                 "navigation": {
                     "status": "unknown",
-                    "safe_navigation": bool(snapshot.get("available")) and not bool(snapshot.get("uncertainties")),
+                    "safe_navigation": (
+                        bool(snapshot.get("available"))
+                        and not blocking_uncertainties(snapshot.get("uncertainties"))
+                    ),
                 },
                 "social": {
                     "status": "unknown",
@@ -914,11 +939,13 @@ class WorldStateStore:
 
 
 __all__ = [
+    "INFORMATIONAL_UNCERTAINTIES",
     "VRCHAT_LOG_SOURCE",
     "VRCHAT_PLAYER_ID_PREFIX",
     "WorldEntity",
     "WorldEvent",
     "WorldStateStore",
+    "blocking_uncertainties",
     "stable_entity_id",
     "stable_track_entity_id",
     "vrchat_player_entity_id",

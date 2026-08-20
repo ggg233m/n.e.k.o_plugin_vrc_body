@@ -16,6 +16,7 @@ from neko_anyadance_body.backend.world_state import (
     WorldEntity,
     WorldEvent,
     WorldStateStore,
+    blocking_uncertainties,
     stable_entity_id,
     stable_track_entity_id,
     vrchat_player_entity_id,
@@ -23,6 +24,36 @@ from neko_anyadance_body.backend.world_state import (
 
 
 class WorldStateStoreTests(unittest.TestCase):
+    def test_blocking_uncertainties_filters_capability_boundaries_only(self) -> None:
+        self.assertEqual(
+            blocking_uncertainties(["depth_unavailable", "ocr_unavailable", "opencv_hog_person_only"]),
+            [],
+        )
+        # 白名单之外默认阻断，包括尚未出现过的新编码。
+        self.assertEqual(
+            blocking_uncertainties(["depth_unavailable", "observation_stale"]),
+            ["observation_stale"],
+        )
+        self.assertEqual(blocking_uncertainties(["future_code"]), ["future_code"])
+        self.assertEqual(blocking_uncertainties(None), [])
+        self.assertEqual(blocking_uncertainties([]), [])
+
+    def test_safe_navigation_ignores_capability_boundary_uncertainties(self) -> None:
+        store = WorldStateStore()
+        store.ingest(
+            entities=[{"id": "person", "label": "person", "confidence": 0.9}],
+            source="openvino",
+            uncertainties=["depth_unavailable", "ocr_unavailable"],
+        )
+        self.assertTrue(store.delta(after_revision=0, wait_ms=0)["navigation"]["safe_navigation"])
+
+        store.ingest(
+            entities=[{"id": "person", "label": "person", "confidence": 0.9}],
+            source="openvino",
+            uncertainties=["depth_unavailable", "world_switched"],
+        )
+        self.assertFalse(store.delta(after_revision=0, wait_ms=0)["navigation"]["safe_navigation"])
+
     def test_stable_entity_id_and_track_id_fallback(self) -> None:
         self.assertEqual(stable_entity_id("yolo", "cup", 7), "yolo:cup:7")
         self.assertEqual(stable_entity_id("yolo", "cup:large", 7), "yolo:cup_large:7")

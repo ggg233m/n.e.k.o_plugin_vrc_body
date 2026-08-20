@@ -11,10 +11,17 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .world_state import blocking_uncertainties
+
 
 AxisSender = Callable[[str, float, float, int], bool]
 ReleaseSender = Callable[[str], None]
 SnapshotProvider = Callable[[], Mapping[str, Any]]
+
+# 目标贴到画面上下边时表观高度会饱和，无法再作为距离的单调函数。此时按一个
+# 更低的比例判定「已到达」，避免因为读数封顶而一直前进撞上对方。安全边界留在
+# 代码里而不是配置项。
+_CLIPPED_REACH_FACTOR = 0.6
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,10 @@ class NavigatorConfig:
     min_confidence: float = 0.55
     bearing_deadband_deg: float = 8.0
     target_distance_m: float = 1.25
+    # 表观高度（归一化检测框高度）是二维检测器唯一能实测的接近度指标。它随
+    # avatar 体型等比缩放，因此停止距离也随体型缩放，符合「个人空间随体型
+    # 变化」的直觉；而按固定身高反算的米制距离对矮/高 avatar 会差出数倍。
+    target_apparent_height: float = 0.55
     max_goal_age_s: float = 60.0
 
     def __post_init__(self) -> None:
@@ -48,6 +59,8 @@ class NavigatorConfig:
             raise ValueError("navigator.bearing_deadband_deg must be between 1 and 30")
         if not 0.25 <= float(self.target_distance_m) <= 5.0:
             raise ValueError("navigator.target_distance_m must be between 0.25 and 5")
+        if not 0.05 <= float(self.target_apparent_height) <= 0.95:
+            raise ValueError("navigator.target_apparent_height must be between 0.05 and 0.95")
         if not 5.0 <= float(self.max_goal_age_s) <= 600.0:
             raise ValueError("navigator.max_goal_age_s must be between 5 and 600")
 
@@ -100,12 +113,17 @@ def _mapping(value: Any) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
-def _spatial_hint(entity: Mapping[str, Any]) -> tuple[float | None, float | None]:
-    """Read a detector-neutral bearing/distance hint.
+def _spatial_hint(entity: Mapping[str, Any]) -> tuple[float | None, float | None, float | None, bool]:
+    """Read a detector-neutral bearing/distance/apparent-size hint.
 
-    Detectors should publish ``attributes.bearing_deg`` and
-    ``attributes.distance_m``.  Bboxes and relative positions are accepted as
-    conservative fallbacks so a new detector can be integrated incrementally.
+    Detectors should publish ``attributes.bearing_deg`` plus either
+    ``attributes.apparent_height`` (normalized bbox height, the only approach
+    metric a 2-D detector can actually measure) or ``attributes.distance_m``
+    when a depth adapter supplies real metric depth.  Bboxes and relative
+    positions are accepted as conservative fallbacks so a new detector can be
+    integrated incrementally.
+
+    Returns ``(bearing_deg, distance_m, apparent_height, apparent_clipped)``.
     """
 
     attributes = _mapping(entity.get("attributes")) or {}
@@ -152,11 +170,27 @@ def _spatial_hint(entity: Mapping[str, Any]) -> tuple[float | None, float | None
                 if -0.25 <= center <= 1.25:
                     bearing = (center - 0.5) * 90.0
 
+    apparent = _finite(attributes.get("apparent_height"))
+    clipped = bool(attributes.get("apparent_height_clipped"))
+    if apparent is None:
+        # Fall back to the bbox itself so a detector that only publishes boxes
+        # can still close the approach loop.  Pixel-scale boxes are rejected
+        # rather than guessed at.
+        bbox = entity.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            _left, top, _right, bottom = (_finite(item) for item in bbox)
+            if top is not None and bottom is not None and bottom >= top and bottom <= 1.25:
+                apparent = bottom - top
+                if not clipped:
+                    clipped = top <= 0.001 or bottom >= 0.999
+    if apparent is not None and not 0.0 < apparent <= 1.0:
+        apparent = None
+
     if bearing is not None:
         bearing = _clamp(bearing, -180.0, 180.0)
     if distance is not None and (distance < 0.0 or distance > 100.0):
         distance = None
-    return bearing, distance
+    return bearing, distance, apparent, clipped
 
 
 class LocalNavigator:
@@ -273,8 +307,8 @@ class LocalNavigator:
             return NavigationDecision("stop", "goal_expired")
         if not isinstance(world, Mapping) or not bool(world.get("available")):
             return NavigationDecision("stop", "world_unknown")
-        uncertainties = world.get("uncertainties")
-        if isinstance(uncertainties, (list, tuple)) and uncertainties:
+        uncertainties = blocking_uncertainties(world.get("uncertainties"))
+        if uncertainties:
             return NavigationDecision("stop", "world_uncertain")
         status = _mapping(world.get("status")) or {}
         revision = int(_finite(status.get("revision")) or 0)
@@ -289,7 +323,7 @@ class LocalNavigator:
         confidence = _finite(entity.get("confidence")) or 0.0
         if entity.get("visible") is False or confidence < self.config.min_confidence:
             return NavigationDecision("stop", "target_low_confidence", target_id=target_id, revision=revision, observed_age_ms=observed_age)
-        bearing, distance = _spatial_hint(entity)
+        bearing, distance, apparent, apparent_clipped = _spatial_hint(entity)
         if bearing is None:
             return NavigationDecision("stop", "target_bearing_unknown", target_id=target_id, revision=revision, observed_age_ms=observed_age)
         if abs(bearing) > self.config.bearing_deadband_deg:
@@ -307,6 +341,41 @@ class LocalNavigator:
                 "right",
                 turn,
                 0.0,
+                self.config.pulse_ms,
+                revision,
+                observed_age,
+            )
+        # 优先使用表观高度：这是二维检测器唯一实测得到的接近度指标。必须排在
+        # ``distance is None`` 之前，否则不带深度适配器的检测器永远走不到这里。
+        if apparent is not None:
+            target_apparent = self.config.target_apparent_height
+            reach_apparent = (
+                target_apparent * _CLIPPED_REACH_FACTOR if apparent_clipped else target_apparent
+            )
+            if apparent >= reach_apparent:
+                return NavigationDecision(
+                    "reached",
+                    "target_in_interaction_range",
+                    target_id,
+                    bearing,
+                    distance,
+                    revision=revision,
+                    observed_age_ms=observed_age,
+                )
+            forward = _clamp(
+                (target_apparent - apparent) / target_apparent * self.config.max_forward_axis,
+                0.05,
+                self.config.max_forward_axis,
+            )
+            return NavigationDecision(
+                "advance",
+                "target_centered",
+                target_id,
+                bearing,
+                distance,
+                "left",
+                0.0,
+                forward,
                 self.config.pulse_ms,
                 revision,
                 observed_age,

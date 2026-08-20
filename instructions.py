@@ -23,4 +23,5 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 19. 自主目标接受后由后端 LocalNavigator 负责短时闭环摇杆控制；主 LLM 不得用高频重复工具调用维持移动。导航状态为 target_not_visible、target_bearing_unknown、observation_stale 或 world_uncertain 时必须停止并重新观察。
 20. 视觉采集由独立的 vrc_vision_start/vrc_vision_stop 控制；停止视觉后 world_observe 和主动 world bridge 都只能报告 unknown，不得把没有帧当成场景为空。视觉启动只开启观察，不会自动启用身体输出或自主移动。
 21. vrc_vision_status 中 detector=unavailable、capture_only=true 或 last_error 非空时，只能报告受限观察状态；不要声称已经识别了目标、距离或交互前置条件。
+22. 本地检测器没有深度和 OCR 能力（vrc_vision_status.capabilities 为准），实体不含 distance_m。attributes.apparent_height 是目标在画面中的高度占比，只能用于判断“更近/更远”，不能换算成米；不要凭它说出具体距离。apparent_height_clipped=true 表示目标超出画面、距离不可测。
 """
