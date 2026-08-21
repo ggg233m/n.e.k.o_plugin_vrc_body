@@ -183,6 +183,15 @@ def find_window_region(title: str) -> dict[str, int] | None:
     传给 ``DxcamFrameSource`` 或 ``MssFrameSource`` 的 ``region`` 参数。
     仅在 Windows 上可用；其他平台返回 ``None``。非 Windows 或窗口未找到时
     也返回 ``None``，不抛出异常。
+
+    矩形会被夹到虚拟桌面范围内。窗口被拖出屏幕边缘时 ``GetWindowRect`` 会
+    返回越界坐标，而 DXcam 直接拒绝整块区域（``ValueError: Invalid Region``），
+    采集因此归零。夹取按**虚拟桌面**而不是主显示器：多屏时副屏坐标本就超出
+    主屏范围，按主屏夹会把副屏上的窗口整个裁掉。
+
+    被夹掉时额外返回 ``clamped_px``（四边各自被夹掉的像素数）与
+    ``clamped``。采集区域一变，FOV→``bearing_deg`` 的映射基准就跟着变，
+    这件事必须能被看见，不能默默发生。
     """
     try:
         import ctypes
@@ -196,7 +205,43 @@ def find_window_region(title: str) -> dict[str, int] | None:
             return None
         if rect.right <= rect.left or rect.bottom <= rect.top:
             return None
-        return {"left": rect.left, "top": rect.top, "right": rect.right, "bottom": rect.bottom}
+        # SM_XVIRTUALSCREEN=76, SM_YVIRTUALSCREEN=77,
+        # SM_CXVIRTUALSCREEN=78, SM_CYVIRTUALSCREEN=79
+        virtual_left = user32.GetSystemMetrics(76)
+        virtual_top = user32.GetSystemMetrics(77)
+        virtual_width = user32.GetSystemMetrics(78)
+        virtual_height = user32.GetSystemMetrics(79)
+        if virtual_width <= 0 or virtual_height <= 0:
+            # 取不到虚拟桌面尺寸时不猜：原样返回，让采集器自己报错，
+            # 好过按一个编造的边界把区域裁错。
+            return {
+                "left": rect.left,
+                "top": rect.top,
+                "right": rect.right,
+                "bottom": rect.bottom,
+            }
+        virtual_right = virtual_left + virtual_width
+        virtual_bottom = virtual_top + virtual_height
+        left = max(virtual_left, min(int(rect.left), virtual_right - 1))
+        top = max(virtual_top, min(int(rect.top), virtual_bottom - 1))
+        right = max(left + 1, min(int(rect.right), virtual_right))
+        bottom = max(top + 1, min(int(rect.bottom), virtual_bottom))
+        region: dict[str, int] = {
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+        }
+        clipped = {
+            "left": left - int(rect.left),
+            "top": top - int(rect.top),
+            "right": int(rect.right) - right,
+            "bottom": int(rect.bottom) - bottom,
+        }
+        if any(value for value in clipped.values()):
+            region["clamped"] = True
+            region["clamped_px"] = clipped
+        return region
     except Exception:
         return None
 
@@ -414,8 +459,14 @@ class DxcamFrameSource:
         self._camera: Any = None
         self._region = None
         self._closed = False
+        # 分开计「尝试」与「真的拿到帧」。DXcam 的 ``new_frame_only=True`` 在没有
+        # 新帧时合法返回 ``None``，把两者合成一个计数器会让「相机在线但一帧不产」
+        # 看起来和正常采集完全一样。
         self._frames = 0
+        self._grabs_attempted = 0
+        self._empty_grabs = 0
         self._last_error: str | None = None
+        self._exhausted_error: str | None = None
         self._requested_output_idx = int(output_idx)
         self._requested_device_idx = int(device_idx)
         self._requested_backend = str(backend).strip().lower() or "auto"
@@ -544,7 +595,12 @@ class DxcamFrameSource:
                 self._candidate_pos = candidate_pos
                 self._camera = camera
                 self._selected_device_idx, self._selected_output_idx, self._selected_backend = spec
-                self._last_error = None
+                # 构造成功不等于能采集：越界区域下每个 candidate 都能建出相机，
+                # 却在 grab 时抛同一个 ValueError。轮换一圈后如果每个 candidate
+                # 都留下过错误，就不能再把 _last_error 清空——否则 status() 会在
+                # 采集已经彻底不可用时报告 available=True、last_error=None，
+                # agent 看到的是「还没开始」而不是「已经坏了」。
+                self._last_error = self._exhausted_error_locked()
                 return True
             except Exception as exc:
                 self._candidate_errors[self._format_spec(spec)] = f"{type(exc).__name__}: {exc}"[:256]
@@ -554,6 +610,24 @@ class DxcamFrameSource:
         errors = list(self._candidate_errors.values())
         self._last_error = "; ".join(errors[-3:])[:500] or "DXcam could not initialize any candidate"
         return False
+
+    def _exhausted_error_locked(self) -> str | None:
+        """所有 candidate 都失败过时返回汇总错误，否则返回 ``None``。
+
+        判据是「每个 spec 都在 candidate_errors 里留过记录」，而不是「刚才这次失败了」：
+        单个 candidate 偶发失败后切到另一个能用的输出属于正常回退，不该报错。
+        """
+        if not self._candidate_specs:
+            return None
+        if any(
+            self._format_spec(spec) not in self._candidate_errors
+            for spec in self._candidate_specs
+        ):
+            return None
+        errors = list(self._candidate_errors.values())
+        return (
+            "all DXcam candidates failed: " + "; ".join(errors[-3:])
+        )[:500]
 
     @staticmethod
     def _format_spec(spec: tuple[int, int | None, str]) -> str:
@@ -576,9 +650,19 @@ class DxcamFrameSource:
                 "winrt_available": self._winrt_available,
                 "candidate_count": len(self._candidate_specs),
                 "candidate_errors": dict(self._candidate_errors),
+                # ``frames`` 保持原语义（成功产出的帧数）以兼容既有读取方；
+                # ``grabs_attempted``/``empty_grabs`` 用来区分「没在采」和
+                # 「在采但一帧都没出来」。
                 "frames": self._frames,
+                "grabs_attempted": self._grabs_attempted,
+                "empty_grabs": self._empty_grabs,
                 "last_error": self._last_error,
             }
+
+    # 连续拿到 ``None`` 多少次算「相机在线但不产帧」。默认采集间隔是 100 ms
+    # （``VisionConfig.interval_ms``），所以 30 次约等于 3 秒——足够跨过切场景、
+    # Alt-Tab 这类正常的短暂无新帧，又不至于让真正的故障沉默太久。
+    _EMPTY_GRAB_LIMIT = 30
 
     def read(self) -> Any:
         with self._lock:
@@ -588,11 +672,25 @@ class DxcamFrameSource:
         try:
             frame = camera.grab(region=region) if region is not None else camera.grab()
             with self._lock:
-                self._frames += 1
-                self._last_error = None
+                self._grabs_attempted += 1
+                if frame is None:
+                    # ``new_frame_only=True`` 时没有新帧就返回 None，这本身合法，
+                    # 不能当异常。但连续不产帧和采集坏掉在外部看来无法区分，
+                    # 所以计数并在越过阈值后明确报错——沉默才是这里真正的 bug。
+                    self._empty_grabs += 1
+                    if self._empty_grabs >= self._EMPTY_GRAB_LIMIT:
+                        self._last_error = (
+                            f"DXcam camera is live but produced no frame in "
+                            f"{self._empty_grabs} consecutive grabs"
+                        )
+                else:
+                    self._frames += 1
+                    self._empty_grabs = 0
+                    self._last_error = self._exhausted_error_locked()
             return frame
         except Exception as exc:
             with self._lock:
+                self._grabs_attempted += 1
                 message = f"{type(exc).__name__}: {exc}"[:256]
                 if self._candidate_specs:
                     spec = self._candidate_specs[self._candidate_pos]
@@ -797,6 +895,10 @@ class WindowTrackedFrameSource:
         result["window_title"] = self._title
         result["window_found"] = found
         result["window_region"] = region
+        # 夹取量单独抬到顶层。它藏在 window_region 里等于没报告——采集区域被裁掉
+        # 一块之后，FOV→bearing_deg 的映射基准就变了，读 status 的人必须一眼看到。
+        result["window_clamped"] = bool(region.get("clamped")) if region else False
+        result["window_clamped_px"] = dict(region.get("clamped_px") or {}) if region else {}
         result["window_rebuilds"] = rebuilds
         result["window_track_interval_ms"] = round(self._interval_s * 1000.0, 1)
         if last_error and not result.get("last_error"):

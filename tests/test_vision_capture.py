@@ -134,6 +134,190 @@ class RegionNormalizationTests(unittest.TestCase):
         self.assertIsNone(_normalize_region(None))
 
 
+class _StubCamera:
+    """按脚本返回帧或抛错的假相机。"""
+
+    def __init__(self, script) -> None:
+        self.script = list(script)
+        self.calls = 0
+
+    def grab(self, region=None):
+        self.calls += 1
+        item = self.script[min(self.calls - 1, len(self.script) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def stop(self):
+        pass
+
+    def release(self):
+        pass
+
+
+class DxcamSilentFailureTests(unittest.TestCase):
+    """采集坏掉必须被报告出来，不能表现成「还没开始」。
+
+    真机复现：窗口被拖出屏幕右边缘后 GetWindowRect 返回越界矩形，DXcam 的每个
+    candidate 都抛 ``ValueError: Invalid Region``，但旧代码里
+    ``_activate_candidate_locked`` 一构造出相机就把 ``_last_error`` 清空，于是
+    ``available`` 恒为 True、``last_error`` 恒为 None，agent 从 vrc_vision_status
+    看到的是 awaiting_first_frame——「还没开始」而不是「已经彻底坏了」。
+    """
+
+    def _source(self, *, specs, camera=None):
+        source = object.__new__(DxcamFrameSource)
+        source._lock = __import__("threading").Lock()
+        source._camera = camera
+        source._region = None
+        source._closed = False
+        source._frames = 0
+        source._grabs_attempted = 0
+        source._empty_grabs = 0
+        source._last_error = None
+        source._exhausted_error = None
+        source._requested_device_idx = -1
+        source._requested_output_idx = -1
+        source._requested_backend = "auto"
+        source._selected_device_idx = 0
+        source._selected_output_idx = None
+        source._selected_backend = "dxgi"
+        source._candidate_specs = list(specs)
+        source._candidate_pos = 0
+        source._candidate_errors = {}
+        source._dxcam = None
+        source._winrt_available = False
+        return source
+
+    def test_all_candidates_failing_is_reported_as_unavailable(self) -> None:
+        specs = [(0, None, "dxgi"), (0, None, "winrt")]
+        source = self._source(specs=specs)
+        # 两个 candidate 都留下错误，模拟越界区域下的轮换一圈。
+        for spec in specs:
+            source._candidate_errors[DxcamFrameSource._format_spec(spec)] = (
+                "ValueError: Invalid Region: Region should be in 1920x1080"
+            )
+        # 即使新相机能构造成功，也不能把错误清掉。
+        source._create_camera = lambda spec: "camera"
+        source._activate_candidate_locked(0)
+        status = source.status()
+        self.assertFalse(
+            status["available"],
+            "所有 candidate 都失败过时报告 available=True 就是伪造健康状态",
+        )
+        self.assertIsNotNone(status["last_error"])
+        self.assertIn("Invalid Region", status["last_error"])
+
+    def test_partial_candidate_failure_still_recovers_cleanly(self) -> None:
+        # 单个输出失败后切到另一个能用的输出属于正常回退，不该报错。
+        specs = [(0, None, "dxgi"), (0, 1, "dxgi")]
+        source = self._source(specs=specs)
+        source._candidate_errors[DxcamFrameSource._format_spec(specs[0])] = "ValueError: boom"
+        source._create_camera = lambda spec: "camera"
+        source._activate_candidate_locked(1)
+        self.assertTrue(source.status()["available"])
+        self.assertIsNone(source.status()["last_error"])
+
+    def test_empty_grabs_do_not_count_as_captured_frames(self) -> None:
+        """``frames`` 必须只计真正产出的帧。
+
+        DXcam 的 ``new_frame_only=True`` 在没有新帧时合法返回 None。旧代码无条件
+        ``_frames += 1``，于是「相机在线但一帧不产」和正常采集在计数器上完全一样。
+        """
+        source = self._source(specs=[(0, None, "dxgi")], camera=_StubCamera([None]))
+        for _ in range(3):
+            self.assertIsNone(source.read())
+        status = source.status()
+        self.assertEqual(status["frames"], 0, "没拿到帧就不能计入 frames")
+        self.assertEqual(status["grabs_attempted"], 3)
+        self.assertEqual(status["empty_grabs"], 3)
+
+    def test_sustained_empty_grabs_eventually_surface_an_error(self) -> None:
+        source = self._source(specs=[(0, None, "dxgi")], camera=_StubCamera([None]))
+        for _ in range(DxcamFrameSource._EMPTY_GRAB_LIMIT):
+            source.read()
+        status = source.status()
+        self.assertIsNotNone(
+            status["last_error"],
+            "持续不产帧必须报错，沉默才是这里真正的 bug",
+        )
+        self.assertFalse(status["available"])
+
+    def test_a_real_frame_clears_the_empty_grab_streak(self) -> None:
+        camera = _StubCamera([None, None, "frame"])
+        source = self._source(specs=[(0, None, "dxgi")], camera=camera)
+        source.read()
+        source.read()
+        self.assertEqual(source.status()["empty_grabs"], 2)
+        self.assertEqual(source.read(), "frame")
+        status = source.status()
+        self.assertEqual(status["empty_grabs"], 0)
+        self.assertEqual(status["frames"], 1)
+        self.assertTrue(status["available"])
+
+
+class WindowRegionClampTests(unittest.TestCase):
+    """越界窗口矩形必须被夹到虚拟桌面内，且夹取量要报出来。
+
+    DXcam 对越界区域整块拒绝（``Invalid Region``），采集直接归零。夹取把它救回来，
+    但采集区域一变，FOV→bearing_deg 的映射基准就跟着变——所以不能默默夹。
+    """
+
+    def test_clamped_region_reports_how_much_was_lost(self) -> None:
+        clamped = _clamp_to_virtual_desktop(
+            (881, 108, 2042, 874), virtual=(0, 0, 1920, 1080)
+        )
+        self.assertEqual(
+            (clamped["left"], clamped["top"], clamped["right"], clamped["bottom"]),
+            (881, 108, 1920, 874),
+        )
+        self.assertTrue(clamped["clamped"])
+        self.assertEqual(clamped["clamped_px"]["right"], 122)
+
+    def test_in_bounds_region_is_not_marked_clamped(self) -> None:
+        clamped = _clamp_to_virtual_desktop(
+            (755, 119, 1916, 885), virtual=(0, 0, 1920, 1080)
+        )
+        self.assertNotIn("clamped", clamped)
+        self.assertNotIn("clamped_px", clamped)
+
+    def test_clamp_metadata_survives_normalization_without_leaking(self) -> None:
+        # 额外的键不能破坏 _normalize_region，也不能漏进采集后端的 region 元组。
+        region = _normalize_region({
+            "left": 881, "top": 108, "right": 1920, "bottom": 874,
+            "clamped": True, "clamped_px": {"right": 122},
+        })
+        self.assertEqual(region["width"], 1039)
+        self.assertEqual(
+            sorted(region.keys()),
+            ["bottom", "height", "left", "right", "top", "width"],
+        )
+
+
+def _clamp_to_virtual_desktop(rect, *, virtual):
+    """复刻 ``find_window_region`` 的夹取算法，便于脱离 Win32 断言。
+
+    真实函数要调 FindWindowW/GetSystemMetrics，在 CI 或无窗口时不可用；这里只
+    验证算术，Win32 那一段由真机验证覆盖。
+    """
+    vl, vt, vr, vb = virtual
+    left = max(vl, min(int(rect[0]), vr - 1))
+    top = max(vt, min(int(rect[1]), vb - 1))
+    right = max(left + 1, min(int(rect[2]), vr))
+    bottom = max(top + 1, min(int(rect[3]), vb))
+    result = {"left": left, "top": top, "right": right, "bottom": bottom}
+    clipped = {
+        "left": left - int(rect[0]),
+        "top": top - int(rect[1]),
+        "right": int(rect[2]) - right,
+        "bottom": int(rect[3]) - bottom,
+    }
+    if any(clipped.values()):
+        result["clamped"] = True
+        result["clamped_px"] = clipped
+    return result
+
+
 class WindowTrackedFrameSourceTests(unittest.TestCase):
     def _build(self, rects, *, interval_s=5.0):
         """``rects`` 是每次解析依次返回的窗口矩形。"""

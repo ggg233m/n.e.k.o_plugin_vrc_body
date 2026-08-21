@@ -38,6 +38,29 @@
   时后端仍可启动并报告 `available=false`。不要从兄弟插件项目导入截图服务，避免
   把 SDK 依赖带回独立后端。
 
+## 采集环境（真机实测，2026-08-21）
+
+后端必须跑在仓库根目录的 `.venv`（Python 3.11.11）。该环境里
+**`onnxruntime` 有、`mss` 和 `cv2` 没有**，因此：
+
+- `DesktopMirrorFrameSource` 名义上是「DXcam 失败回退 MSS」，但在这个环境里
+  **实际只有 DXcam 一条腿**——MSS 那一路恒为 `ModuleNotFoundError`。
+  排查采集问题时不要假设有回退兜底。
+- 系统 python（scoop 3.11.9）能力正好相反：有 `mss`/`cv2`、没有 `onnxruntime`。
+  用它跑探针脚本会得到和后端**不一样**的结论，务必用
+  `.venv/Scripts/python.exe` 复现。
+
+**不要"顺手补装 mss 恢复双后端"。** 实测过：窗口被拖出屏幕边缘时 MSS 确实能出帧，
+但越界的那部分是**纯黑填充**（`mean=0.00 / std=0.00 / unique=1`），等于把假像素喂给
+检测器，还会顺带稀释 `apparent_height`。这种"回退成功"比直接失败更危险，正是
+「不可违反的约束」第 1 条要防的东西。真正的修法是把窗口矩形夹到虚拟桌面内
+（`find_window_region` 已实现，并通过 `window_clamped` / `window_clamped_px` 报告
+夹掉了多少）。
+
+⚠️ `process.py` 的 `--offline`/`--dry-run` 会强制 `vision.enabled=False`
+（见 `process.py` 中 offline 分支）。用它启动后 `frames_captured` 恒为 0——那是
+视觉被关掉，不是采集坏了。验证采集时**不能带 `--offline`**。
+
 要将此后端适配到其他项目，请复制本目录，替换 `adapters.py` 中的调度器、VMC、
 OSC 和遥测映射，并保持进程协议与世界状态模块不变。进程入口会动态发现所在的
 项目包，不会导入 N.E.K.O SDK。
