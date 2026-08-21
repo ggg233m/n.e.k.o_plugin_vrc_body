@@ -1459,6 +1459,7 @@ class VisionRuntime:
         detector: FrameDetector | None = None,
         semantic: SemanticBackend | None = None,
         semantic_cooldown_s: float = 0.75,
+        detect_interval_s: float = 0.0,
         clock: Any = time.monotonic,
         observation_callback: Callable[[VisionObservation, Mapping[str, Any]], None] | None = None,
         frame_cache_interval_s: float = 1.0,
@@ -1473,6 +1474,12 @@ class VisionRuntime:
         self._observation_callback = observation_callback
         self._lock = threading.Lock()
         self._last_semantic_at: float | None = None
+        # 检测最小间隔。线程上限管的是「一次推理占几个核」，这个管的是「一秒里
+        # 推几次」——两者相乘才是实际 CPU 占用，少任何一个都收不住。0 表示每帧
+        # 都检测（保持既有行为，也是所有现存测试的假设）。
+        self._detect_interval_s = max(0.0, float(detect_interval_s))
+        self._last_detect_at: float | None = None
+        self._detect_skipped = 0
         self._last_error: str | None = None
         # 单槽最新帧缓存。给 agent 看的图不走世界状态，也不进 120 Hz 调度线程：
         # 它只在采集 worker 自己的消费线程里按间隔编码一次，之后所有拉取都命中
@@ -1728,6 +1735,9 @@ class VisionRuntime:
             frame_cache_at = self._frame_cache_at
             frame_cache_error = self._frame_cache_error
             frame_cache_interval_s = self._frame_cache_interval_s
+            detect_interval_s = self._detect_interval_s
+            detect_skipped = self._detect_skipped
+            last_detect_at = self._last_detect_at
         def backend_status(backend: Any, *, label: str) -> Mapping[str, Any]:
             if backend is None:
                 return {"available": False, "reason": "not_configured"}
@@ -1759,6 +1769,16 @@ class VisionRuntime:
                 ),
                 "interval_s": frame_cache_interval_s,
                 "last_error": frame_cache_error,
+            },
+            # 节流是可观测的：跳过多少帧必须能读到，否则「限流生效」与「采集挂了」
+            # 在外面看起来一样。interval_s 为 0 表示每帧都检测。
+            "detect_throttle": {
+                "interval_s": detect_interval_s,
+                "skipped_frames": detect_skipped,
+                "age_ms": (
+                    None if last_detect_at is None
+                    else round(max(0.0, (self._clock() - last_detect_at) * 1000.0), 1)
+                ),
             },
             "last_error": last_error,
         }
@@ -1900,7 +1920,21 @@ class VisionRuntime:
                 except Exception:
                     detector_available = True
             if detector_available and detector is not None and self.capture_state()["active"]:
-                self.ingest(detector.observe(frame, now=observation_now), _reactivate=False)
+                with self._lock:
+                    detect_due = (
+                        self._detect_interval_s <= 0.0
+                        or self._last_detect_at is None
+                        or processing_now - self._last_detect_at >= self._detect_interval_s
+                    )
+                    if detect_due:
+                        self._last_detect_at = processing_now
+                    else:
+                        self._detect_skipped += 1
+                # 跳过时**不**写世界状态。补一个空观测会把「这一帧没看」伪造成
+                # 「这一帧什么都没有」，实体全部消失；不写则由 store 自己让
+                # age_ms 长上去，「多久之前看到的」仍然是真话。
+                if detect_due:
+                    self.ingest(detector.observe(frame, now=observation_now), _reactivate=False)
             if semantic is not None and self.capture_state()["active"]:
                 with self._lock:
                     semantic_due = (
@@ -1948,9 +1982,11 @@ class VisionRuntime:
 # 在此导入可以避免循环依赖：``local_perception`` 使用的所有协议/数据类定义
 # 已经完成初始化。
 from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # noqa: E402,F401
+from .local_perception import cap_openmp_threads as cap_openmp_threads  # noqa: E402,F401
 
 
 __all__ = [
+    "cap_openmp_threads",
     "CapturedFrame",
     "draw_detection_overlay",
     "encode_frame_jpeg",

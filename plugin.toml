@@ -164,6 +164,34 @@ dxcam_output_idx = -1
 dxcam_backend = "auto"
 interval_ms = 100
 queue_size = 1
+# 检测器的 CPU 上限，三个旋钮拧的是三个不同的池子，缺一个就收不住。
+#
+# 排查结论（20 核机器，1161x766 采集区，实测）：吃满 CPU 的**主因不是 YOLO**。
+# numpy 的 BLAS（scipy-openblas，OpenMP 线程模型）按逻辑核数开线程并且**自旋
+# 等待**，采集与前后处理全走它。把检测器换成空实现、一次推理都不做，仅采集路径
+# 就空转掉 7.23 核：
+#
+#   默认                        7.23 核   6.8 帧/秒
+#   OMP_NUM_THREADS=2          0.87 核   6.8 帧/秒
+#   OMP_WAIT_POLICY=PASSIVE    0.11 核   6.9 帧/秒   <- 三行吞吐一样
+#
+# 吞吐完全不变，所以那 7 核是纯空转，不是计算。这两个环境变量由
+# backend/local_perception.py 的 cap_openmp_threads() 在 BackendService.__init__
+# 里设（必须早于 numpy 被导入），detector_threads 同时作为 OMP_NUM_THREADS 的值。
+#
+# detector_threads 还限 ONNX Runtime 自己的线程池（SessionOptions），
+# detector_interval_ms 限「一秒里推几次」。ORT 在这个模型上并行效率很差——单次
+# 推理的总 CPU 开销 10 线程要 1.44 CPU·秒，2 线程只要 0.52，6→10 线程甚至是负
+# 收益，所以砍线程数几乎不牺牲延迟。0 表示沿用 ONNX Runtime 默认（=物理核数），
+# 同时也关掉上面的 OpenMP 收口——只留给需要裸速度的基准测量。
+#
+# 全部装上之后的整条流水线实测：7.04 核 → 1.22 核，单次延迟反而从 469ms 降到
+# 328ms（少了 18 个线程抢核）。
+detector_threads = 2
+# 推理最小间隔。只限检测，不限给 agent 看的帧缓存（那个由
+# frame_cache_interval_s 独立控制）。跳过的帧不写世界状态：补空观测会把
+# 「这一帧没看」伪造成「这一帧什么都没有」。0 表示不限速。
+detector_interval_ms = 500
 lifecycle_watermark_limit = 4096
 # 按窗口标题限定采集区域。非空时通过 FindWindow 取窗口坐标后只采集该矩形
 # 区域，而不是整块显示器。窗口未找到时回落到全屏采集。

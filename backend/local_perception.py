@@ -14,9 +14,12 @@ HOG 人形检测器。HOG 路径会标记为 ``degraded``，不会声称识别�
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
 import json
 import math
+import os
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
@@ -24,6 +27,103 @@ from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:
     from .vision import VisionObservation
 from .world_state import stable_track_entity_id
+
+
+# 可能被载入的 OpenMP 运行时。numpy 的 scipy-openblas 用 OpenMP 线程模型，
+# 具体是哪个 DLL 取决于 wheel 怎么构建，所以按序探测而不是假定一个。
+_OPENMP_RUNTIME_DLLS: tuple[str, ...] = ("vcomp140", "libiomp5md", "libomp", "vcomp")
+
+# 第一次成功的收口结果。OpenMP 是进程级的，所以「有没有限住」也是进程级的事实：
+# 之后 BackendService 之外的调用方（检测器自己、基准脚本）再调一次必然报
+# too_late=True，用它覆盖记录会让 status() 反过来污蔑一次成功的收口。
+_OPENMP_STATE: dict[str, Any] = {}
+
+
+def cap_openmp_threads(threads: int) -> dict[str, Any]:
+    """收住**进程级** OpenMP 线程池，返回实际做到了什么。
+
+    这里限的不是 YOLO 自己的线程池——那个由 ``SessionOptions`` 管（见
+    ``OpenVinoLocalDetector._onnx_session_options``）。numpy 的 BLAS
+    （scipy-openblas，OpenMP 线程模型）是**另一个**池子：采集、缩放、前后处理
+    全走它，它默认按逻辑核数开线程**并且自旋等待**。
+
+    实测（20 核，1161x766 采集区，检测器换成空实现，所以下面这些开销里没有一次
+    推理）：
+
+    | 设置 | 占用 | 吞吐 |
+    |---|---|---|
+    | 默认 | 7.23 核 | 6.8 帧/秒 |
+    | ``OMP_NUM_THREADS=2`` | 0.87 核 | 6.8 帧/秒 |
+    | ``OMP_WAIT_POLICY=PASSIVE`` | **0.11 核** | 6.9 帧/秒 |
+
+    三行吞吐一模一样——那 7 个核**全部**是空转自旋，不是计算。所以主力是
+    ``OMP_WAIT_POLICY``，线程数上限只是顺带；这也是为什么限了之后单次推理延迟反而
+    从 469ms 降到 312ms：少了 18 个线程抢核。
+
+    两个都只能靠环境变量：OpenMP 运行时初始化时读一次，之后改环境变量没人看。
+    所以必须在 numpy 被导入**之前**调用。本仓里 numpy 全是函数内惰性导入
+    （``import numpy as np`` 都在函数体内），所以从 ``BackendService.__init__``
+    开头调用仍然赶得上。
+
+    赶不上的场景是插件跑在宿主进程里、宿主已经先导入了 numpy。那时退到 ctypes 调
+    ``omp_set_num_threads``：能改线程数（→0.86 核），改不了等待策略。用
+    ``setdefault`` 是为了让显式设了这两个变量的运维配置说了算。
+    """
+    result: dict[str, Any] = {
+        "requested": int(threads),
+        "env_applied": False,
+        "wait_policy": None,
+        "runtime_dll": None,
+        "too_late": False,
+        "error": None,
+    }
+    if threads <= 0:
+        return result
+    if _OPENMP_STATE.get("env_applied"):
+        # 已经在 numpy 之前收住过了。再走一遍只会得到 too_late=True，把已经成立
+        # 的事实记成失败，所以直接复述第一次的结果。
+        return dict(_OPENMP_STATE)
+    # numpy 在不在 sys.modules 里，是「OpenMP 是否已经初始化」的近似判据。宁可
+    # 近似也要记下来：环境变量设晚了是静默失效的，外面必须看得出差别。
+    result["too_late"] = "numpy" in sys.modules
+    try:
+        os.environ.setdefault("OMP_NUM_THREADS", str(threads))
+        # ACTIVE（很多运行时的默认）让空闲线程自旋抢核；PASSIVE 让它们睡。
+        # 实测吞吐不变而占用降到 1.5%，所以这不是「省 CPU 换性能」的权衡。
+        os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        result["env_applied"] = not result["too_late"]
+        result["wait_policy"] = os.environ.get("OMP_WAIT_POLICY")
+    except Exception as exc:  # pragma: no cover - environ 赋值几乎不会失败
+        result["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    if result["too_late"]:
+        for name in _OPENMP_RUNTIME_DLLS:
+            try:
+                dll = ctypes.CDLL(name)
+                dll.omp_set_num_threads(ctypes.c_int(int(threads)))
+                result["runtime_dll"] = name
+                break
+            except Exception:
+                # 探测式加载：这个名字不存在就试下一个。全都失败只意味着没有
+                # OpenMP 运行时可限，不该让感知因此失败。
+                continue
+    _OPENMP_STATE.update(result)
+    return result
+
+
+def openmp_thread_count() -> int | None:
+    """返回 OpenMP 当前的最大线程数，取不到就返回 ``None``。
+
+    这是给 ``status()`` 用的**实测值**而不是配置值：配置只说明意图，这个说明
+    结果。上限设晚了、或者运维显式覆盖了环境变量，只有这里看得出来。
+    """
+    for name in _OPENMP_RUNTIME_DLLS:
+        try:
+            dll = ctypes.CDLL(name)
+            dll.omp_get_max_threads.restype = ctypes.c_int
+            return int(dll.omp_get_max_threads())
+        except Exception:
+            continue
+    return None
 
 
 # 帧内 NMS 的候选上限。裸 YOLO 输出可能有上千个框过阈值，而贪心抑制是
@@ -234,6 +334,7 @@ class OpenVinoLocalDetector:
         min_box_height_ratio: float | None = None,
         track_iou_threshold: float = 0.25,
         track_ttl_s: float = 1.5,
+        intra_op_threads: int = 2,
         fallback_backend: str = "none",
         infer: Callable[[Any], Mapping[str, Any] | Any] | None = None,
         openvino_core: Any | None = None,
@@ -284,6 +385,16 @@ class OpenVinoLocalDetector:
         self._min_box_width_ratio = width_ratio
         self._min_box_height_ratio = height_ratio
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
+        # 推理线程上限。0 表示不设置，沿用运行时自己的默认（CPU EP 会开到物理
+        # 核数）——留这个出口给需要裸速度的基准测量，部署配置不该用它。
+        self._intra_op_threads = min(32, max(0, int(intra_op_threads)))
+        # 上限有没有真的设上去，要和「配了多少」分开记：运行时可能不认这个旋钮，
+        # 此时我们宁可满线程跑也不让检测器整体失败，那就必须能从外面看出差别。
+        self._thread_cap_applied = False
+        self._thread_cap_error: str | None = None
+        # OpenMP（numpy BLAS）那一侧的收口结果。和上面两个分开：ORT 的池和
+        # numpy 的池是两个东西，实测大头在后者，混成一个字段就没法定位了。
+        self._openmp: dict[str, Any] = {}
         self._infer = infer
         # 模型推理和跟踪器都不是默认线程安全的；旁路调用也必须按帧串行化，
         # 避免实体 ID 与帧计数被并发破坏。
@@ -336,7 +447,22 @@ class OpenVinoLocalDetector:
 
                 core = Core()
             model = core.read_model(model=str(path))
-            compiled = core.compile_model(model, self._device)
+            # 这条回退路径当前机器上不可达（没装 OpenVINO wheel），但它是刻意
+            # 保留的；不在这里也设上限，等于把同一个吃满 CPU 的 bug 留在门后。
+            if self._intra_op_threads > 0:
+                try:
+                    compiled = core.compile_model(
+                        model, self._device, {"INFERENCE_NUM_THREADS": self._intra_op_threads}
+                    )
+                    self._thread_cap_applied = True
+                except TypeError as exc:
+                    # 注入的 core 可能只接受两个参数（测试替身、自带运行时的调用
+                    # 方）。多一个位置参数不该把它们的检测器整体打掉，所以退回
+                    # 不带配置的调用；上限没设成会在 status() 里报出来。
+                    self._thread_cap_error = f"{type(exc).__name__}: {exc}"[:200]
+                    compiled = core.compile_model(model, self._device)
+            else:
+                compiled = core.compile_model(model, self._device)
             inputs = list(getattr(model, "inputs", ()) or ())
             if not inputs:
                 raise RuntimeError("OpenVINO model has no inputs")
@@ -366,6 +492,43 @@ class OpenVinoLocalDetector:
             if path.suffix.lower() == ".onnx":
                 self._initialize_opencv_dnn(path)
 
+    def _onnx_session_options(self, ort: Any) -> Any | None:
+        """构造带线程上限的 ``SessionOptions``，取不到就返回 ``None``。
+
+        上限是**优化**，不是正确性前提。所以这里刻意不让它变成加载失败的理由：
+        某个运行时没有 ``SessionOptions`` 时，宁可开着满线程跑，也不能让一个
+        省 CPU 的设置把整条感知通路静默关掉——那是拿故障换降级。
+        真正应用成功与否记在 ``_thread_cap_applied`` 里，由 ``status()`` 报出，
+        不然「限了」和「没限成」在外面看起来一模一样。
+        """
+        if self._intra_op_threads <= 0:
+            return None
+        try:
+            options = ort.SessionOptions()
+            # 不设的话 CPU EP 会按物理核数开线程（本机 10 个），实测把整机吃掉
+            # 近一半。并行效率很差，所以砍掉的宽度几乎不换来延迟：10 线程
+            # 144ms/次要 1.44 CPU·秒，2 线程 259ms/次只要 0.52。
+            options.intra_op_num_threads = self._intra_op_threads
+            # 单模型单输入，算子间没有可并行的分支；留着 inter-op 池只会在
+            # intra-op 之外再开一组线程，把刚设的上限绕过去。
+            options.inter_op_num_threads = 1
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        except Exception as exc:
+            self._thread_cap_error = f"{type(exc).__name__}: {exc}"[:200]
+            return None
+        self._thread_cap_applied = True
+        return options
+
+    def _cap_openmp_before_import(self) -> None:
+        """在导入推理运行时之前收一次进程级 OpenMP 池。
+
+        真正管用的调用点是 ``BackendService.__init__``（那时 numpy 还没被导入）。
+        这里再调一次是为了让**单独**构造检测器的调用方（基准脚本、旁路进程、
+        测试）也拿到同一个上限，而不必知道要先手动设环境变量。
+        ``cap_openmp_threads`` 用 ``setdefault``，所以重复调用不会互相打脸。
+        """
+        self._openmp = cap_openmp_threads(self._intra_op_threads)
+
     def _initialize_onnxruntime(self, path: Path) -> None:
         """用 ONNX Runtime 加载 ONNX 模型。
 
@@ -374,9 +537,16 @@ class OpenVinoLocalDetector:
         请求它们只会得到警告和静默回退。
         """
         try:
+            self._cap_openmp_before_import()
             import onnxruntime as ort  # type: ignore[import-not-found]
 
-            session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            options = self._onnx_session_options(ort)
+            if options is None:
+                session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            else:
+                session = ort.InferenceSession(
+                    str(path), sess_options=options, providers=["CPUExecutionProvider"]
+                )
             inputs = session.get_inputs()
             if not inputs:
                 raise RuntimeError("ONNX model has no inputs")
@@ -411,6 +581,15 @@ class OpenVinoLocalDetector:
         try:
             import cv2  # type: ignore[import-not-found]
 
+            if self._intra_op_threads > 0:
+                # cv2 的线程数是进程级全局状态，所以只在 cv2 真的成为推理引擎时
+                # 才动它——放在这里而不是构造函数里，就是为了把副作用限定在这一种
+                # 情况，不去影响仅用 cv2 做 resize 的那条预处理路径。
+                try:
+                    cv2.setNumThreads(self._intra_op_threads)
+                    self._thread_cap_applied = True
+                except Exception as exc:
+                    self._thread_cap_error = f"{type(exc).__name__}: {exc}"[:200]
             network = cv2.dnn.readNet(str(path))
             if network is None:
                 raise RuntimeError("OpenCV DNN returned no network")
@@ -654,6 +833,22 @@ class OpenVinoLocalDetector:
                 "nms_iou_threshold": self._nms_iou_threshold,
                 "min_box_width_ratio": self._min_box_width_ratio,
                 "min_box_height_ratio": self._min_box_height_ratio,
+                # 0 表示没设上限。上限必须能从 /perception 直接读到，否则「配了
+                # 但没生效」和「配对了」在外面看起来完全一样。
+                "intra_op_threads": self._intra_op_threads,
+                # 配置值只说明意图，这两个才说明结果：运行时不认这个旋钮时我们
+                # 选择满线程降级而不是失败，那么「限住了」就必须与「没限住」可
+                # 区分，否则排查吃满 CPU 时只能看见一个撒谎的 2。
+                "thread_cap_applied": self._thread_cap_applied,
+                "thread_cap_error": self._thread_cap_error,
+                # numpy/BLAS 那个池子单独报。``threads`` 是 ctypes 现读的实测值，
+                # 不是配置回显——设晚了或被运维覆盖，只有这里看得出来。实测这一项
+                # 才是吃满 CPU 的主因（7.23 核 → 0.11 核），排查时先看它。
+                "openmp": {
+                    "threads": openmp_thread_count(),
+                    "wait_policy": os.environ.get("OMP_WAIT_POLICY"),
+                    **self._openmp,
+                },
                 "frames": self._frames,
                 "last_inference_ms": self._last_inference_ms,
                 "uncertainties": list(dict.fromkeys(self._uncertainties)),

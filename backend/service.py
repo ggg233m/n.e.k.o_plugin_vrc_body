@@ -25,6 +25,7 @@ from .cognition import CognitionRuntime
 from .autonomy import AutonomyRuntime
 from .navigator import LocalNavigator
 from .vision import (
+    cap_openmp_threads,
     DesktopMirrorFrameSource,
     DxcamFrameSource,
     find_window_region,
@@ -164,6 +165,12 @@ class BackendService:
         self.config_dir = Path(config_dir)
         self.logger = logger
         self.dry_run = bool(dry_run)
+        # 必须在这里，而且必须在建采集源／检测器之前：OpenMP 只在初始化时读一次
+        # 环境变量，而本仓的 numpy 全是函数内惰性导入，所以此刻还没人导入过它。
+        # 往后挪一行到 _build_configured_vision_source 之后就晚了——dxcam 会先把
+        # numpy 拉进来，环境变量随之失效，只剩 ctypes 那条降级路。
+        # 收的是 numpy/BLAS 的池，不是 YOLO 的：实测采集路径空转自旋就吃 7.23 核。
+        self._openmp = cap_openmp_threads(self.config.vision.detector_threads)
         # FrameSource 持有操作系统句柄，调用 ``close()`` 后刻意不再复用。
         # 为已配置的来源保留工厂，使视觉停止/启动接口可以销毁并重新创建句柄。
         # 注入的来源只保证一个生命周期；测试或旁路进程可显式提供工厂来重复创建。
@@ -195,6 +202,7 @@ class BackendService:
                 min_box_width_ratio=self.config.vision.min_box_width_ratio,
                 min_box_height_ratio=self.config.vision.min_box_height_ratio,
                 fallback_backend=self.config.vision.fallback_backend,
+                intra_op_threads=self.config.vision.detector_threads,
             )
         vision_semantic: Any | None = None
         if self.config.vision.enabled and self.config.vision.semantic_backend == "openai_compatible":
@@ -220,6 +228,7 @@ class BackendService:
             detector=vision_detector,
             semantic=vision_semantic,
             observation_callback=self._on_vision_observation,
+            detect_interval_s=self.config.vision.detector_interval_ms / 1000.0,
             frame_cache_interval_s=self.config.vision.frame_cache_interval_s,
             frame_cache_max_width=self.config.vision.frame_max_width,
             frame_cache_quality=self.config.vision.frame_jpeg_quality,

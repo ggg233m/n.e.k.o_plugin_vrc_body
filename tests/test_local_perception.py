@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 import tempfile
 import types
@@ -12,10 +13,12 @@ except ImportError:  # pragma: no cover - optional perception dependency
     np = None  # type: ignore[assignment]
 
 from tests import _bootstrap  # noqa: F401
+from neko_anyadance_body.backend import local_perception as _lp
 from neko_anyadance_body.backend.local_perception import (
     OpenVinoLocalDetector,
     _LabelLoadError,
     _load_labels,
+    cap_openmp_threads,
 )
 from neko_anyadance_body.config import PluginConfig
 
@@ -656,6 +659,167 @@ class LocalPerceptionTests(unittest.TestCase):
             else:
                 sys.modules["onnxruntime"] = previous
 
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_onnxruntime_session_is_capped_on_both_thread_pools(self) -> None:
+        """限 intra-op 还不够：留着 inter-op 池会在上限之外再开一组线程。
+
+        实测默认配置（10 线程 + 背靠背推理）在 20 核机器上稳定吃掉 9.13 核，
+        VRChat 自己开始掉帧。所以这里断言的不只是"设了个数"，而是两个池都被
+        收窄、且执行模式是顺序的——只设 intra_op_num_threads 会让上限漏掉。
+        """
+        class _Input:
+            name = "images"
+            shape = ["batch", 3, "height", "width"]
+
+        class _Options:
+            def __init__(self) -> None:
+                self.intra_op_num_threads = 0
+                self.inter_op_num_threads = 0
+                self.execution_mode = None
+
+        captured = {}
+
+        class _Session:
+            def __init__(self, path, sess_options=None, providers=None):
+                captured["options"] = sess_options
+
+            def get_inputs(self):
+                return [_Input()]
+
+            def run(self, _outputs, _feed):
+                return [np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]], dtype=np.float32)]
+
+        fake_ort = types.SimpleNamespace(
+            InferenceSession=_Session,
+            SessionOptions=_Options,
+            ExecutionMode=types.SimpleNamespace(ORT_SEQUENTIAL="sequential"),
+        )
+        previous = sys.modules.get("onnxruntime")
+        sys.modules["onnxruntime"] = fake_ort  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                model = Path(directory) / "model.onnx"
+                model.write_bytes(b"fake")
+                detector = OpenVinoLocalDetector(model_path=str(model), intra_op_threads=3)
+                status = detector.status()
+                self.assertTrue(status["available"])
+                self.assertEqual(status["intra_op_threads"], 3)
+                self.assertTrue(status["thread_cap_applied"])
+                self.assertIsNone(status["thread_cap_error"])
+                options = captured["options"]
+                self.assertEqual(options.intra_op_num_threads, 3)
+                self.assertEqual(options.inter_op_num_threads, 1)
+                self.assertEqual(options.execution_mode, "sequential")
+        finally:
+            if previous is None:
+                sys.modules.pop("onnxruntime", None)
+            else:
+                sys.modules["onnxruntime"] = previous
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_missing_thread_knob_degrades_the_cap_not_the_detector(self) -> None:
+        """省 CPU 的设置不能变成关掉感知的理由。
+
+        上限是优化，不是正确性前提。运行时不认这个旋钮时正确的行为是满线程
+        跑（降级），而不是让 ``available`` 变 false（故障）——后者是拿故障换
+        降级。但降级必须留痕：``thread_cap_applied`` 得能把"限住了"和"没限
+        住"区分开，否则排查吃满 CPU 时只看得见一个撒谎的配置值。
+        """
+        class _Input:
+            name = "images"
+            shape = [1, 3, 8, 8]
+
+        class _Session:
+            def __init__(self, path, providers=None):
+                self.providers = providers
+
+            def get_inputs(self):
+                return [_Input()]
+
+            def run(self, _outputs, _feed):
+                return [np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]], dtype=np.float32)]
+
+        # 没有 SessionOptions 的运行时：构造上限的第一步就会失败。
+        fake_ort = types.SimpleNamespace(InferenceSession=_Session)
+        previous = sys.modules.get("onnxruntime")
+        sys.modules["onnxruntime"] = fake_ort  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                model = Path(directory) / "model.onnx"
+                model.write_bytes(b"fake")
+                detector = OpenVinoLocalDetector(model_path=str(model), intra_op_threads=2)
+                status = detector.status()
+                self.assertTrue(status["available"])
+                self.assertEqual(status["runtime"], "onnxruntime")
+                self.assertFalse(status["thread_cap_applied"])
+                self.assertIsNotNone(status["thread_cap_error"])
+                observation = detector.observe(np.zeros((8, 8, 3), dtype=np.uint8), now=9.0)
+                self.assertEqual(len(observation.entities), 1)
+        finally:
+            if previous is None:
+                sys.modules.pop("onnxruntime", None)
+            else:
+                sys.modules["onnxruntime"] = previous
+
+    @unittest.skipIf(np is None, "numpy is optional")
+    def test_openvino_thread_cap_survives_a_two_argument_compile_model(self) -> None:
+        """OpenVINO 的上限走 compile_model 的第三个参数，但不能强求它存在。
+
+        自带运行时/测试替身的 ``compile_model`` 可能只接受两个位置参数；多传
+        一个不该把它们的检测器整体打掉。收到上限的实现要真的收到，没收到的
+        要照常可用。
+        """
+        class _Input:
+            any_name = "images"
+            partial_shape = (1, 3, 8, 8)
+
+        class _Model:
+            inputs = [_Input()]
+
+        class _Compiled:
+            def __call__(self, _inputs):
+                return np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]])
+
+        class _ModernCore:
+            def __init__(self) -> None:
+                self.config = None
+
+            def read_model(self, **_kwargs):
+                return _Model()
+
+            def compile_model(self, _model, _device, config=None):
+                self.config = config
+                return _Compiled()
+
+        class _LegacyCore:
+            def read_model(self, **_kwargs):
+                return _Model()
+
+            def compile_model(self, _model, _device):
+                return _Compiled()
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.xml"
+            model.write_text("<fake/>", encoding="utf-8")
+
+            modern = _ModernCore()
+            detector = OpenVinoLocalDetector(
+                model_path=str(model), openvino_core=modern, intra_op_threads=4
+            )
+            self.assertTrue(detector.status()["available"])
+            self.assertEqual(modern.config, {"INFERENCE_NUM_THREADS": 4})
+            self.assertTrue(detector.status()["thread_cap_applied"])
+
+            legacy = OpenVinoLocalDetector(
+                model_path=str(model), openvino_core=_LegacyCore(), intra_op_threads=4
+            )
+            status = legacy.status()
+            self.assertTrue(status["available"])
+            self.assertFalse(status["thread_cap_applied"])
+            self.assertIsNotNone(status["thread_cap_error"])
+            observation = legacy.observe(np.zeros((8, 8, 3), dtype=np.uint8), now=10.0)
+            self.assertEqual(len(observation.entities), 1)
+
     def test_config_exposes_explicit_model_and_degraded_fallback_options(self) -> None:
         config = PluginConfig.from_mapping({
             "vision": {
@@ -676,6 +840,99 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertEqual(config.vision.fallback_backend, "opencv_hog")
         self.assertEqual(config.vision.input_width, 320)
         self.assertEqual(config.vision.max_detections, 12)
+
+
+class OpenMpCapTests(unittest.TestCase):
+    """进程级 OpenMP 收口。
+
+    实测这才是吃满 CPU 的主因：numpy/BLAS 的 OpenMP 池按逻辑核数开线程并自旋，
+    仅采集路径（检测器换成空实现、零次推理）就空转掉 7.23 核，收口后 0.11 核，
+    吞吐一模一样。所以这里测的是「有没有真的去收」和「收的结果有没有被谎报」，
+    不测具体核数——那要真机。
+    """
+
+    def setUp(self) -> None:
+        # 环境变量与首次成功记录都是进程级状态，必须存档还原，否则测试之间会
+        # 互相污染（先跑的那个把 setdefault 占掉，后跑的就永远看不到自己的值）。
+        self._saved_env = {
+            key: os.environ.get(key) for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY")
+        }
+        self._saved_state = dict(_lp._OPENMP_STATE)
+        # numpy 在不在 sys.modules 里决定走「赶上了」还是「太晚了」分支，而它取决
+        # 于测试顺序（别的用例会导入 numpy）。这里显式摘掉，让默认情形确定为
+        # 「赶上了」；需要另一条分支的用例自己塞回去。
+        self._saved_numpy = sys.modules.pop("numpy", None)
+        for key in self._saved_env:
+            os.environ.pop(key, None)
+        _lp._OPENMP_STATE.clear()
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if self._saved_numpy is None:
+            sys.modules.pop("numpy", None)
+        else:
+            sys.modules["numpy"] = self._saved_numpy
+        _lp._OPENMP_STATE.clear()
+        _lp._OPENMP_STATE.update(self._saved_state)
+
+    def test_cap_sets_both_thread_count_and_wait_policy(self) -> None:
+        # 只设线程数只能到 0.87 核；WAIT_POLICY 才是把 7.23 核压到 0.11 核的那一
+        # 个。少设一个就等于把大头留在门后，所以两个都必须写。
+        result = cap_openmp_threads(2)
+
+        self.assertEqual(os.environ.get("OMP_NUM_THREADS"), "2")
+        self.assertEqual(os.environ.get("OMP_WAIT_POLICY"), "PASSIVE")
+        self.assertEqual(result["requested"], 2)
+
+    def test_explicit_operator_environment_wins(self) -> None:
+        # 这是进程级全局状态，运维显式设了就该说了算——我们只补默认值。
+        os.environ["OMP_NUM_THREADS"] = "8"
+        os.environ["OMP_WAIT_POLICY"] = "ACTIVE"
+
+        cap_openmp_threads(2)
+
+        self.assertEqual(os.environ.get("OMP_NUM_THREADS"), "8")
+        self.assertEqual(os.environ.get("OMP_WAIT_POLICY"), "ACTIVE")
+
+    def test_zero_threads_leaves_the_environment_untouched(self) -> None:
+        # 0 表示「不设上限」，留给需要裸速度的基准测量。它不该偷偷改环境。
+        result = cap_openmp_threads(0)
+
+        self.assertNotIn("OMP_NUM_THREADS", os.environ)
+        self.assertNotIn("OMP_WAIT_POLICY", os.environ)
+        self.assertFalse(result["env_applied"])
+
+    def test_a_later_call_cannot_downgrade_a_successful_cap(self) -> None:
+        # 检测器会在 BackendService 之后再调一次。那时 numpy 早就导入了，单看那
+        # 次必然 too_late=True——如果让它覆盖记录，status() 就会在一次成功的收口
+        # 上报「没限住」，把排查引到完全错误的方向。
+        first = cap_openmp_threads(2)
+        self.assertTrue(first["env_applied"])
+        self.assertFalse(first["too_late"])
+
+        sys.modules["numpy"] = types.ModuleType("numpy")
+        second = cap_openmp_threads(2)
+
+        self.assertTrue(second["env_applied"])
+        self.assertFalse(second["too_late"])
+
+    def test_missing_openmp_runtime_is_not_an_error(self) -> None:
+        # 没有 OpenMP 运行时可限，只意味着少一项优化，不该让感知失败——和线程
+        # 上限一样，降级优于故障。
+        original = _lp._OPENMP_RUNTIME_DLLS
+        _lp._OPENMP_RUNTIME_DLLS = ("definitely_not_a_real_openmp_dll",)
+        sys.modules["numpy"] = types.ModuleType("numpy")
+        try:
+            result = cap_openmp_threads(2)
+        finally:
+            _lp._OPENMP_RUNTIME_DLLS = original
+
+        self.assertIsNone(result["runtime_dll"])
+        self.assertIsNone(result["error"])
 
 
 class LabelLoadingTests(unittest.TestCase):

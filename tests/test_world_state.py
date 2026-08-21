@@ -710,6 +710,56 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertTrue(snapshot["vision"]["detector"]["available"])
         self.assertTrue(snapshot["vision"]["semantic"]["available"])
 
+    def test_detect_interval_throttles_inference_without_erasing_the_world(self) -> None:
+        """检测占空比是 CPU 上限的第二个轴，但跳帧不能变成"看到了空场景"。
+
+        限线程只管"一次推理占几个核"，限间隔才管"一秒推几次"，两者相乘才是
+        实际占用。而跳过的帧必须**不写**世界状态：补一个空观测会把「这一帧
+        没看」伪造成「这一帧什么都没有」，实体会在两次推理之间整体闪烁消失。
+        不写则由 store 自己让 age_ms 长上去，「多久之前看到的」仍然是真话。
+        """
+        now = [0.0]
+        detector = _Detector()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=detector,
+            detect_interval_s=0.5,
+            clock=lambda: now[0],
+        )
+
+        runtime.process_frame(object())
+        self.assertEqual(detector.calls, 1)
+        # 间隔内的帧被跳过：推理次数不涨，但已有实体不能消失。
+        for moment in (0.1, 0.25, 0.49):
+            now[0] = moment
+            snapshot = runtime.process_frame(object())
+            self.assertEqual(detector.calls, 1, moment)
+            self.assertEqual(len(snapshot["entities"]), 1, moment)
+
+        now[0] = 0.5
+        runtime.process_frame(object())
+        self.assertEqual(detector.calls, 2)
+
+        throttle = runtime.snapshot()["vision"]["detect_throttle"]
+        self.assertEqual(throttle["interval_s"], 0.5)
+        self.assertEqual(throttle["skipped_frames"], 3)
+
+    def test_zero_detect_interval_leaves_every_frame_inferred(self) -> None:
+        """0 表示不限速——这是基准测量和默认行为依赖的出口，不能被钳成有限值。"""
+        now = [0.0]
+        detector = _Detector()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=detector,
+            detect_interval_s=0.0,
+            clock=lambda: now[0],
+        )
+        for index in range(4):
+            now[0] = index * 0.001
+            runtime.process_frame(object())
+        self.assertEqual(detector.calls, 4)
+        self.assertEqual(runtime.snapshot()["vision"]["detect_throttle"]["skipped_frames"], 0)
+
     def test_backend_error_is_reported_without_raising_to_control_loop(self) -> None:
         class BrokenDetector(_Detector):
             def observe(self, frame, *, now):

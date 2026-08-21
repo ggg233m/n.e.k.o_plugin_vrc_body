@@ -7,3 +7,4 @@ build/
 store.db
 tmp/
 .venv/
+.trae/

@@ -220,6 +220,17 @@ class VisionConfig:
     dxcam_backend: str = "auto"
     interval_ms: int = 100
     queue_size: int = 1
+    # 检测器的 CPU 上限。``detector_threads`` 同时拧两个池子：ONNX Runtime 自己的
+    # ``SessionOptions``，以及 numpy/BLAS 的进程级 OpenMP 池（见
+    # ``backend.local_perception.cap_openmp_threads``）。实测后者才是大头——仅采集
+    # 路径（检测器换成空实现、零次推理）就空转自旋掉 7.23 核，收口后 0.11 核，而
+    # 吞吐一模一样。``detector_interval_ms`` 管的是另一个轴：一秒里推几次。
+    # 整条流水线实测 7.04 核 → 1.22 核，单次延迟 469ms → 328ms（少了抢核的线程）。
+    # ``detector_threads`` 取 0 表示两个池子都不设上限，只留给基准测量。
+    # ``detector_interval_ms`` 取 0 表示不限速；它只限推理，不限给 agent 看的
+    # 帧缓存（后者由 frame_cache_interval_s 独立控制）。
+    detector_threads: int = 2
+    detector_interval_ms: int = 500
     lifecycle_watermark_limit: int = 4096
     # 按标题定位采集窗口，非空时将窗口屏幕坐标作为采集区域传给帧源。
     # 仅限 Windows；其他平台静默忽略。窗口未找到时回落到全屏采集。
@@ -551,6 +562,20 @@ class PluginConfig:
                 minimum=1,
                 maximum=4,
                 name="vision.queue_size",
+            ),
+            detector_threads=_bounded_int(
+                vision.get("detector_threads"),
+                2,
+                minimum=0,
+                maximum=32,
+                name="vision.detector_threads",
+            ),
+            detector_interval_ms=_bounded_int(
+                vision.get("detector_interval_ms"),
+                500,
+                minimum=0,
+                maximum=10000,
+                name="vision.detector_interval_ms",
             ),
             lifecycle_watermark_limit=_bounded_int(
                 vision.get("lifecycle_watermark_limit"),
