@@ -71,7 +71,16 @@ listen_port = 9001
 allowed_sender = "127.0.0.1"
 input_pulse_ms = 100
 parameter_cache_size = 256
-awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding"]
+# 前四个是本插件自己驱动的动作状态参数；后六个是 VRChat 内置 Avatar 参数，
+# 用于确认角色是否真的在移动（`accepted=true` 只代表本机发送成功）。
+#
+# ⚠️ 内置参数名未经实机验证，且只有在 avatar 的参数列表里存在时 VRChat 才会
+# 驱动并回传。收不到时 body_awareness.vrchat_osc.motion 报 available=false，
+# 不会把「没数据」当成「速度为零」。
+awareness_parameters = [
+  "NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding",
+  "VelocityX", "VelocityY", "VelocityZ", "AngularY", "Upright", "Grounded",
+]
 
 [input]
 primary = "anyadance"
@@ -118,11 +127,34 @@ input_width = 640
 input_height = 640
 horizontal_fov_deg = 90.0
 max_detections = 64
-# 检测框最短边占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性，
-# 它们会被跟踪器当成真人并污染导航距离闭环。0 表示关闭该过滤。
+# 检测框宽/高占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性，
+# 它们会被跟踪器当成真人并污染导航距离闭环。
+#
+# 宽高分开设阈值：站立的人在画面里高而窄，共用一个 2% 时总是宽度先卡——
+# 1920 宽下要求最小宽 38 px，按人体长宽比反推，能进入世界的最小
+# apparent_height 已经有 7%~11%，而导航器的目标是 0.55。也就是说房间对面
+# 的人会和噪点一起被裁掉。宽阈值放松到 0.8%，让高度成为主判据；两条边仍然
+# 都要过关，墙缝和 UI 边框照样被挡住。
+#
+# min_box_ratio 是两轴的共同回退值（旧配置仍然有效）。0 表示关闭对应轴。
 min_box_ratio = 0.02
+min_box_width_ratio = 0.008
+min_box_height_ratio = 0.02
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
+# 给 agent 看的单槽帧缓存。这条路径与 world_state 完全无关：帧只喂理解，不
+# 产生实体也不产生事件，更不能用来满足 body_reach_and_grab 的 preconditions。
+# 编码只在采集线程里按 frame_cache_interval_s 做一次，之后所有拉取命中缓存。
+frame_cache_interval_s = 1.0
+# 降采样宽度。给 LLM 的图不需要原始分辨率——降采样同时压低 token 成本和
+# 「盯着模糊像素脑补」的风险。0 表示不缩放。
+frame_max_width = 960
+frame_jpeg_quality = 70
+# agent 主动调用 vrc_vision_frame 的每分钟上限（滑动窗口）。一张 960 px 的
+# JPEG 进上下文是十万字符量级的 base64，循环里每回合拉一张能把会话挤爆。
+# 0 表示禁止拉图，不是不限量。主动唤醒配的图不占这个预算，它自己有 12 s 的
+# 最小间隔。
+frame_max_per_minute = 10
 # -1 自动探测；物理显示器优先，0 表示 MSS 虚拟桌面。
 monitor_index = -1
 # DXcam 的设备/输出索引；-1 自动探测全部可见适配器与输出。

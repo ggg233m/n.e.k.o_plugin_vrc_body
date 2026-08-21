@@ -192,6 +192,8 @@ class BackendService:
                 horizontal_fov_deg=self.config.vision.horizontal_fov_deg,
                 max_detections=self.config.vision.max_detections,
                 min_box_ratio=self.config.vision.min_box_ratio,
+                min_box_width_ratio=self.config.vision.min_box_width_ratio,
+                min_box_height_ratio=self.config.vision.min_box_height_ratio,
                 fallback_backend=self.config.vision.fallback_backend,
             )
         vision_semantic: Any | None = None
@@ -218,6 +220,9 @@ class BackendService:
             detector=vision_detector,
             semantic=vision_semantic,
             observation_callback=self._on_vision_observation,
+            frame_cache_interval_s=self.config.vision.frame_cache_interval_s,
+            frame_cache_max_width=self.config.vision.frame_max_width,
+            frame_cache_quality=self.config.vision.frame_jpeg_quality,
         )
         self.vision_worker: VisionWorker | None = None
         if self.config.vision.enabled and vision_source is not None:
@@ -254,6 +259,7 @@ class BackendService:
             goal_provider=lambda: self.autonomy.snapshot(),
             send_axes=self._navigator_send_axes,
             release_inputs=self._navigator_release_inputs,
+            motion_provider=self._navigator_motion_feedback,
         )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
@@ -1031,6 +1037,27 @@ class BackendService:
             "worker": self._vision_worker_status(),
         }
 
+    def vision_frame(self, *, max_age_ms: Any = 3000) -> dict[str, Any]:
+        """返回最近一帧的 base64 JPEG，仅供 agent 理解画面使用。
+
+        这条路径与 ``world_state`` 完全分离，也不经过 ``navigator``：帧不产生
+        实体、不产生事件，更不能拿去满足 ``body_reach_and_grab`` 的
+        ``preconditions``。由画面得出的一切结论都是低置信视觉猜测。
+        """
+        try:
+            limit_ms = int(max_age_ms)
+        except (TypeError, ValueError, OverflowError):
+            limit_ms = 3000
+        # 下限 250 ms 而不是 0：``latest_frame`` 把 0 当作「不限龄」，于是把
+        # 「我要最新的」写成 0 会拿到最旧的一张——正好反了。
+        limit_ms = min(30000, max(250, limit_ms))
+        result = dict(self.vision.latest_frame(max_age_ms=limit_ms))
+        data = result.pop("data", None)
+        if isinstance(data, bytes):
+            import base64
+            result["data_base64"] = base64.b64encode(data).decode("ascii")
+        return result
+
     def _navigator_send_axes(self, side: str, x: float, y: float, duration_ms: int) -> bool:
         """只发送主 AnyaDance 命令，绝不回退到 OSC。"""
         scheduler = self.scheduler
@@ -1046,6 +1073,17 @@ class BackendService:
         scheduler = self.scheduler
         if scheduler is not None:
             scheduler.submit("input_release", {"side": side})
+
+    def _navigator_motion_feedback(self) -> dict[str, Any]:
+        """VRChat 内置 Velocity 参数，供导航器判断是否顶着墙推摇杆。
+
+        OSC 桥没起来时返回 available=false：导航器会退回到没有卡墙判据的旧行为，
+        而不是把「读不到」当成「速度为零」然后立刻停车。
+        """
+        osc = self.osc
+        if osc is None:
+            return {"available": False, "reason": "osc_unavailable"}
+        return osc.motion_feedback()
 
     def send_avatar_parameter(self, name: str, value: Any) -> tuple[bool, str | None]:
         if self.osc is None:

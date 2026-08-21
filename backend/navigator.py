@@ -41,6 +41,14 @@ class NavigatorConfig:
     # 变化」的直觉；而按固定身高反算的米制距离对矮/高 avatar 会差出数倍。
     target_apparent_height: float = 0.55
     max_goal_age_s: float = 60.0
+    # 顶着墙推摇杆的判据。检测器只看画面，永远不会告诉你「前面有堵墙」；
+    # VRChat 内置 Velocity 参数是唯一能说明「命令发了但人没动」的回传。
+    #
+    # ⚠️ 两个默认值都是估算，需要实机校准：Velocity 的单位未经验证，而
+    # max_forward_axis=0.28 对应的实际速度也没实测过。收不到内置参数时整个
+    # 判据自动失效（不阻断移动），这是刻意的——没数据不等于没动。
+    stall_speed_mps: float = 0.15
+    stall_ticks: int = 8
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.tick_hz) or not 2.0 <= self.tick_hz <= 30.0:
@@ -63,6 +71,10 @@ class NavigatorConfig:
             raise ValueError("navigator.target_apparent_height must be between 0.05 and 0.95")
         if not 5.0 <= float(self.max_goal_age_s) <= 600.0:
             raise ValueError("navigator.max_goal_age_s must be between 5 and 600")
+        if not 0.01 <= float(self.stall_speed_mps) <= 1.0:
+            raise ValueError("navigator.stall_speed_mps must be between 0.01 and 1")
+        if not 2 <= int(self.stall_ticks) <= 100:
+            raise ValueError("navigator.stall_ticks must be between 2 and 100")
 
 
 @dataclass(frozen=True)
@@ -203,6 +215,7 @@ class LocalNavigator:
         goal_provider: SnapshotProvider,
         send_axes: AxisSender,
         release_inputs: ReleaseSender,
+        motion_provider: SnapshotProvider | None = None,
         config: NavigatorConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -211,6 +224,9 @@ class LocalNavigator:
         self._goal_provider = goal_provider
         self._send_axes = send_axes
         self._release_inputs = release_inputs
+        # 可选：VRChat 内置 Velocity 参数。没有它时导航器行为与之前完全一致，
+        # 只是无法察觉卡墙——这是降级，不是故障。
+        self._motion_provider = motion_provider
         self._clock = clock
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -221,6 +237,12 @@ class LocalNavigator:
         self._tick_count = 0
         self._command_count = 0
         self._stop_count = 0
+        self._stall_ticks = 0
+        self._stall_count = 0
+        self._stalled = False
+        self._stall_goal_key: tuple[str, str] | None = None
+        self._stall_goal_age: float | None = None
+        self._last_motion: dict[str, Any] | None = None
 
     def start(self) -> bool:
         with self._lock:
@@ -250,7 +272,7 @@ class LocalNavigator:
         try:
             goal_state = self._goal_provider()
             world = self._world_provider()
-            decision = self._decide(goal_state, world, now)
+            decision = self._stall_guard(self._decide(goal_state, world, now), goal_state)
             self._apply(decision)
             with self._lock:
                 self._last_error = None
@@ -263,6 +285,87 @@ class LocalNavigator:
                 self._last_error = str(exc)[:240]
                 self._last_decision = decision
             return decision
+
+    def _stall_guard(
+        self,
+        decision: NavigationDecision,
+        goal_state: Mapping[str, Any] | None,
+    ) -> NavigationDecision:
+        """把「命令发了但人没动」变成一次显式停车。
+
+        检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是
+        唯一能区分「正在前进」和「顶着墙推摇杆」的回传。没有这个回传时本守卫
+        整体失效并放行——没数据不等于没动，不能凭空停车。
+
+        判定会闩锁：停下之后速度当然还是 0，靠速度自己是解不开的。闩锁只由
+        「换了目标」解除，让 LLM 去决定绕行还是放弃，导航器不自作主张侧移。
+        """
+        goal = _mapping((goal_state or {}).get("goal")) or {}
+        goal_key = (str(goal.get("kind") or ""), str(goal.get("text") or ""))
+        goal_age = _finite(goal.get("age_seconds"))
+        with self._lock:
+            previous_key = self._stall_goal_key
+            previous_age = self._stall_goal_age
+            # 目标换了，或同一句目标被重新提交（年龄倒退），都算新的一次尝试。
+            renewed = goal_key != previous_key or (
+                goal_age is not None and previous_age is not None and goal_age < previous_age
+            )
+            if renewed:
+                self._stall_ticks = 0
+                self._stalled = False
+            self._stall_goal_key = goal_key
+            self._stall_goal_age = goal_age
+            stalled = self._stalled
+
+        if decision.state != "advance":
+            # 转身和停车都不算尝试前进；不清零计数，以免「转一下再撞」反复重置。
+            return decision
+        if stalled:
+            return NavigationDecision(
+                "stop",
+                "movement_stalled",
+                decision.target_id,
+                decision.bearing_deg,
+                decision.distance_m,
+                revision=decision.revision,
+                observed_age_ms=decision.observed_age_ms,
+            )
+
+        motion = self._sample_motion()
+        if motion is None or not motion.get("available"):
+            return decision
+        speed = _finite(motion.get("horizontal_speed_mps"))
+        if speed is None:
+            return decision
+        with self._lock:
+            if speed >= self.config.stall_speed_mps:
+                self._stall_ticks = 0
+                return decision
+            self._stall_ticks += 1
+            if self._stall_ticks < self.config.stall_ticks:
+                return decision
+            self._stalled = True
+            self._stall_count += 1
+        return NavigationDecision(
+            "stop",
+            "movement_stalled",
+            decision.target_id,
+            decision.bearing_deg,
+            decision.distance_m,
+            revision=decision.revision,
+            observed_age_ms=decision.observed_age_ms,
+        )
+
+    def _sample_motion(self) -> Mapping[str, Any] | None:
+        provider = self._motion_provider
+        if provider is None:
+            return None
+        motion = provider()
+        if not isinstance(motion, Mapping):
+            return None
+        with self._lock:
+            self._last_motion = dict(motion)
+        return motion
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -277,6 +380,17 @@ class LocalNavigator:
                 "active_side": self._active_side,
                 "last_decision": decision,
                 "last_error": self._last_error,
+                "stall": {
+                    # detectable=false 表示收不到 VRChat 内置 Velocity 参数，
+                    # 「卡墙」这件事在本次会话里根本无法被观测到——不是「没卡」。
+                    "detectable": bool(self._last_motion and self._last_motion.get("available")),
+                    "stalled": self._stalled,
+                    "consecutive_ticks": self._stall_ticks,
+                    "threshold_ticks": self.config.stall_ticks,
+                    "speed_threshold_mps": self.config.stall_speed_mps,
+                    "stall_count": self._stall_count,
+                    "last_motion": None if self._last_motion is None else dict(self._last_motion),
+                },
             }
 
     def _run(self) -> None:

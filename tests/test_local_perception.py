@@ -396,6 +396,66 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertEqual(len(observation.entities), 1)
         self.assertAlmostEqual(observation.entities[0]["confidence"], 0.8, places=5)
 
+    def test_distant_person_survives_the_width_axis(self) -> None:
+        """远处的人是「窄」而不是「小」，不能和噪点用同一个阈值裁掉。
+
+        1920 宽的采集区里，共用 2% 阈值要求最小宽 38 px；一个 2.6:1 的站立
+        avatar 到那个宽度时高度已经占了画面 5% 以上，而更远一点的人（宽 24 px、
+        高 62 px）会被整条丢掉——导航器的距离闭环整个挂在 ``apparent_height``
+        上，看不见就等于房间对面没人。
+        """
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    # 远处的人：宽 1.25%（< 2%），高 3.2%。
+                    {"label": "person", "confidence": 0.7, "bbox": [0.40, 0.44, 0.4125, 0.472]},
+                    # 27×27 px 级别的方形噪点：两条边都不到 1.5%。
+                    {"label": "person", "confidence": 0.95, "bbox": [0.70, 0.70, 0.714, 0.714]},
+                ],
+            },
+            min_box_width_ratio=0.008,
+            min_box_height_ratio=0.02,
+        )
+        observation = detector.observe(object(), now=4.0)
+        self.assertEqual(len(observation.entities), 1)
+        # 留下的必须是远处的人，不是高分噪点。
+        self.assertAlmostEqual(observation.entities[0]["confidence"], 0.7, places=5)
+
+    def test_wall_seam_shaped_boxes_are_still_rejected(self) -> None:
+        """放松宽阈值不能把墙缝和 UI 边框放进来。
+
+        这是原本「两条边都要过关」规则守住的东西：细长误检面积不小，但没有
+        一条边像人。高度轴仍然是硬门槛。
+        """
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    # 横向的 UI 边框：很宽，但高度只有 0.6%。
+                    {"label": "person", "confidence": 0.9, "bbox": [0.10, 0.50, 0.90, 0.506]},
+                ],
+            },
+            min_box_width_ratio=0.008,
+            min_box_height_ratio=0.02,
+        )
+        observation = detector.observe(object(), now=4.0)
+        self.assertEqual(observation.entities, ())
+
+    def test_legacy_shared_min_box_ratio_still_applies_to_both_axes(self) -> None:
+        # 只传共用值的旧调用方不能因为默认值变成非对称而被静默改掉判定。
+        detector = OpenVinoLocalDetector(
+            infer=lambda _frame: {
+                "detections": [
+                    # 宽 1.25% < 共用的 2%，旧行为下应当被丢弃。
+                    {"label": "person", "confidence": 0.7, "bbox": [0.40, 0.40, 0.4125, 0.60]},
+                ],
+            },
+            min_box_ratio=0.02,
+        )
+        self.assertEqual(detector.observe(object(), now=4.0).entities, ())
+        status = detector.status()
+        self.assertAlmostEqual(status["min_box_width_ratio"], 0.02, places=6)
+        self.assertAlmostEqual(status["min_box_height_ratio"], 0.02, places=6)
+
     def test_record_form_is_supported_for_explicit_fallback_adapters(self) -> None:
         detector = OpenVinoLocalDetector(
             infer=lambda _frame: {

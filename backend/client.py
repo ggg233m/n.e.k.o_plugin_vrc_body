@@ -473,6 +473,7 @@ class RemoteOsc:
                 "connection": "unknown",
                 "summary": str(exc),
                 "parameters": {},
+                "motion": {"available": False, "reason": "backend_unavailable"},
                 "pose_feedback_available": False,
                 "pickup_confirmation_available": False,
             }
@@ -749,6 +750,25 @@ class RemoteVision:
                 "social": {"status": "unknown", "players_persisted": False, "chat_persisted": False},
                 "uncertainty": ["backend_unavailable"],
                 "changes": {"entities": [], "events": [], "removed_entity_ids": [], "removed_entity_count": 0},
+                "error": str(exc),
+            }
+
+    def frame(self, *, max_age_ms: int = 3000) -> dict[str, Any]:
+        """取最近一帧的 base64 JPEG，只用于让 agent 看画面。
+
+        后端不可用、采集已停止或缓存过期时返回 ``available=false`` 并说明原因，
+        不返回旧画面——过期的画面比没有画面更危险，agent 会拿它当现在。
+        """
+        try:
+            return self.client.request(
+                "GET",
+                f"/vision/frame?max_age_ms={int(max_age_ms)}",
+            )
+        except BackendUnavailable as exc:
+            return {
+                "available": False,
+                "capture_active": False,
+                "reason": "backend_unavailable",
                 "error": str(exc),
             }
 

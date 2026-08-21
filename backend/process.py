@@ -106,6 +106,15 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        if self.path.startswith("/vision/frame"):
+            from urllib.parse import parse_qs, urlsplit
+            frame_query = parse_qs(urlsplit(self.path).query)
+            try:
+                max_age_ms = int(frame_query.get("max_age_ms", [3000])[0])
+            except (TypeError, ValueError, OverflowError):
+                max_age_ms = 3000
+            self._json(200, self.server.service.vision_frame(max_age_ms=max_age_ms))
+            return
         self._json(404, {"error": "unknown endpoint"})
 
     def do_POST(self) -> None:

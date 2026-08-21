@@ -28,6 +28,20 @@ def _finite_float(value: Any, default: float, *, minimum: float, maximum: float,
     return parsed
 
 
+def _axis_box_ratio(value: Any, *, legacy: float | None, default: float, name: str) -> float:
+    """解析单轴最小框比例。
+
+    优先级：显式的每轴键 > 已设置的共用 ``min_box_ratio`` > 内置默认值。
+    只写了 ``min_box_ratio`` 的旧配置因此保持原来的两轴同值行为，不会因为
+    默认值变成非对称而被静默改掉判定。
+    """
+    if value is not None:
+        return _finite_float(value, default, minimum=0.0, maximum=0.5, name=name)
+    if legacy is not None:
+        return legacy
+    return default
+
+
 def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int, name: str) -> int:
     if value is None:
         return min(maximum, max(minimum, default))
@@ -113,6 +127,16 @@ class VrchatOscConfig:
         "NEKO_ActionActive",
         "NEKO_ActionPhase",
         "NEKO_Holding",
+        # VRChat 内置 Avatar 参数。它们一直在被缓存，只是过去被这张白名单挡在
+        # awareness 之外——于是「我是不是卡墙了」在整个仓库里没有任何数据源。
+        # 名称未经实机验证；收不到时 motion_feedback 返回 available=false，
+        # 不会退化成「速度为零」。
+        "VelocityX",
+        "VelocityY",
+        "VelocityZ",
+        "AngularY",
+        "Upright",
+        "Grounded",
     )
 
 
@@ -172,11 +196,22 @@ class VisionConfig:
     input_height: int = 640
     horizontal_fov_deg: float = 90.0
     max_detections: int = 64
-    # 检测框最短边占画面的最小比例，用于滤掉几十像素级别的高分假阳性。
-    # 0 表示关闭该过滤。
+    # 检测框宽/高占画面的最小比例，用于滤掉几十像素级别的高分假阳性。
+    # ``min_box_ratio`` 是两轴的共同默认值；站立的人是高而窄的，单一阈值下
+    # 总是宽度先卡，所以宽阈值默认更松，让高度成为主判据。0 表示关闭对应轴。
     min_box_ratio: float = 0.02
+    min_box_width_ratio: float | None = 0.008
+    min_box_height_ratio: float | None = 0.02
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
+    # 给 agent 看的单槽帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
+    # 不产生实体也不产生事件。编码按间隔做一次，之后所有拉取都命中缓存。
+    frame_cache_interval_s: float = 1.0
+    frame_max_width: int = 960
+    frame_jpeg_quality: int = 70
+    # agent 主动拉图的每分钟上限。滑动窗口，0 表示禁止拉图（不是不限量）。
+    # 主动唤醒配的图不走这个预算，它自己有 12 s 的最小间隔。
+    frame_max_per_minute: int = 10
     # -1 表示自动探测。优先使用物理监视器而不是 MSS 虚拟桌面，DXcam 会探测
     # 所有可见适配器/输出。
     monitor_index: int = -1
@@ -381,6 +416,13 @@ class PluginConfig:
         dxcam_backend = str(vision.get("dxcam_backend", "auto")).strip().lower() or "auto"
         if dxcam_backend not in {"auto", "dxgi", "winrt"}:
             raise ValueError("vision.dxcam_backend must be auto, dxgi, or winrt")
+        shared_box_ratio = _finite_float(
+            vision.get("min_box_ratio"),
+            0.02,
+            minimum=0.0,
+            maximum=0.5,
+            name="vision.min_box_ratio",
+        )
         vision_config = VisionConfig(
             enabled=_boolean(vision.get("enabled"), False, name="vision.enabled"),
             source=vision_source,
@@ -425,12 +467,18 @@ class PluginConfig:
                 maximum=512,
                 name="vision.max_detections",
             ),
-            min_box_ratio=_finite_float(
-                vision.get("min_box_ratio"),
-                0.02,
-                minimum=0.0,
-                maximum=0.5,
-                name="vision.min_box_ratio",
+            min_box_ratio=shared_box_ratio,
+            min_box_width_ratio=_axis_box_ratio(
+                vision.get("min_box_width_ratio"),
+                legacy=shared_box_ratio if "min_box_ratio" in vision else None,
+                default=0.008,
+                name="vision.min_box_width_ratio",
+            ),
+            min_box_height_ratio=_axis_box_ratio(
+                vision.get("min_box_height_ratio"),
+                legacy=shared_box_ratio if "min_box_ratio" in vision else None,
+                default=0.02,
+                name="vision.min_box_height_ratio",
             ),
             semantic_backend=semantic_backend,
             semantic_max_per_minute=_bounded_int(
@@ -439,6 +487,34 @@ class PluginConfig:
                 minimum=1,
                 maximum=30,
                 name="vision.semantic_max_per_minute",
+            ),
+            frame_cache_interval_s=_finite_float(
+                vision.get("frame_cache_interval_s"),
+                1.0,
+                minimum=0.0,
+                maximum=30.0,
+                name="vision.frame_cache_interval_s",
+            ),
+            frame_max_width=_bounded_int(
+                vision.get("frame_max_width"),
+                960,
+                minimum=0,
+                maximum=3840,
+                name="vision.frame_max_width",
+            ),
+            frame_jpeg_quality=_bounded_int(
+                vision.get("frame_jpeg_quality"),
+                70,
+                minimum=30,
+                maximum=95,
+                name="vision.frame_jpeg_quality",
+            ),
+            frame_max_per_minute=_bounded_int(
+                vision.get("frame_max_per_minute"),
+                10,
+                minimum=0,
+                maximum=60,
+                name="vision.frame_max_per_minute",
             ),
             monitor_index=_bounded_int(
                 vision.get("monitor_index"),

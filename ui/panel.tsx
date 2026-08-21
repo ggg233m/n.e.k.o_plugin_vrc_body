@@ -52,6 +52,8 @@ type DebugState = {
   vrchat_osc?: Record<string, any>
   driver_log?: Record<string, any>
   host_vmc?: Record<string, any>
+  world?: Record<string, any>
+  autonomy?: Record<string, any>
   clips?: {
     clips?: ClipSummary[]
     invalid_clips?: Array<{ name?: string; error?: string }>
@@ -143,6 +145,11 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const idleRelay = body.idle_relay || awareness.idle_relay || {}
   const hostVmc = state.host_vmc || {}
   const autonomy = state.autonomy || {}
+  const navigation = autonomy.navigation || {}
+  // 卡墙判据的两个数据源：OSC 快照里的实时读数，以及导航器 tick 里的最后一次
+  // 采样。后者在解除授权后就冻住了，所以优先用前者。
+  const stall = navigation.stall || {}
+  const oscMotion = osc.motion || stall.last_motion || { available: false, reason: "osc_unavailable" }
   const metrics = body.metrics || {}
   const udp = body.udp || {}
   const currentAction = body.current_action || null
@@ -348,6 +355,28 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               { key: "ttl", label: "剩余授权", value: autonomy.remaining_seconds == null ? "—" : `${fixed(autonomy.remaining_seconds, 0)} 秒` },
               { key: "revision", label: "世界 revision", value: autonomy.world_revision ?? 0 },
               { key: "goal", label: "当前目标", value: autonomy.goal?.text || "无" },
+              { key: "navReason", label: "导航决策", value: navigation.last_decision?.reason || "—" },
+              {
+                key: "speed",
+                label: "实测水平速度",
+                // available=false 是「读不到」，不是「速度为零」——这两者混淆
+                // 正是「卡墙不自知」的根源，所以这里必须显式写出来。
+                value: oscMotion.available
+                  ? `${fixed(oscMotion.horizontal_speed_mps, 2)} m/s`
+                  : `不可测（${oscMotion.reason || "unknown"}）`,
+              },
+              {
+                key: "stall",
+                label: "卡住判定",
+                // detectable 只在导航器 tick 时刷新，未授权时恒为 false；这里用
+                // OSC 快照的实时读数判断「能不能观测」，避免把「还没跑」显示成
+                // 「观测不到」。
+                value: !oscMotion.available
+                  ? "无法观测（VRChat 未回传内置移动参数）"
+                  : stall.stalled
+                    ? `已卡住 ×${stall.stall_count ?? 0}（换目标才解除）`
+                    : `正常 ${stall.consecutive_ticks ?? 0}/${stall.threshold_ticks ?? 0}`,
+              },
             ]} />
             <ButtonGroup>
               <Button tone="success" disabled={busy || autonomy.armed} onClick={() => run("vrc_autonomy_arm")}>手动授权 30 分钟</Button>
@@ -613,7 +642,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
           <JsonView data={{ behavior, idle_relay: idleRelay, motion: awareness.motion, pose: awareness.pose, transition: awareness.transition }} />
         </Card>
         <Card title="OSC 参数回传">
-          <JsonView data={{ avatar_id: osc.avatar_id, connection: osc.connection, parameters: osc.parameters || {} }} />
+          <JsonView data={{ avatar_id: osc.avatar_id, connection: osc.connection, motion: oscMotion, parameters: osc.parameters || {} }} />
         </Card>
       </Grid>
 

@@ -230,6 +230,8 @@ class OpenVinoLocalDetector:
         max_detections: int = 64,
         nms_iou_threshold: float = 0.45,
         min_box_ratio: float = 0.02,
+        min_box_width_ratio: float | None = None,
+        min_box_height_ratio: float | None = None,
         track_iou_threshold: float = 0.25,
         track_ttl_s: float = 1.5,
         fallback_backend: str = "none",
@@ -259,11 +261,28 @@ class OpenVinoLocalDetector:
         # 0 会把所有同类框合成一个，1 等于完全不抑制；两端都不是有用的部署
         # 取值，因此钳到留有余量的区间内。
         self._nms_iou_threshold = min(0.95, max(0.1, float(nms_iou_threshold)))
-        # 框最短边占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性
+        # 框的宽/高占画面的最小比例。实测真实帧里出现过 27×27 px 的高分假阳性
         # （1920 宽下约 1.4%），它们会被跟踪器当成真人并污染导航的距离闭环。
-        # 私人房里真人 avatar 至少占画面几个百分点，2% 足以滤掉噪点又不会误伤
-        # 远处的人。0 表示完全关闭该过滤。
-        self._min_box_ratio = min(0.5, max(0.0, _finite(min_box_ratio, 0.02)))
+        #
+        # 宽高分开：站立的人在画面里是高而窄的，单一阈值下总是宽度先卡。0.02
+        # 的共用阈值在 1920 宽下要求最小宽 38 px，按 2:1~3:1 的人体长宽比反推，
+        # 能进入世界的最小 apparent_height 已经有 7%~11%——而导航器的目标是
+        # 0.55，等于把「房间对面的人」和噪点一起裁掉了。默认宽阈值更松，让
+        # 高度成为主判据；两条边仍然都要过关，墙缝和 UI 边框照样被挡住。
+        #
+        # ``min_box_ratio`` 保留为两轴的共同默认值（旧配置与旧调用方仍然有效），
+        # 显式传入的每轴阈值优先。0 表示关闭对应轴的过滤。
+        shared_ratio = min(0.5, max(0.0, _finite(min_box_ratio, 0.02)))
+        if min_box_width_ratio is None:
+            width_ratio = shared_ratio
+        else:
+            width_ratio = min(0.5, max(0.0, _finite(min_box_width_ratio, shared_ratio)))
+        if min_box_height_ratio is None:
+            height_ratio = shared_ratio
+        else:
+            height_ratio = min(0.5, max(0.0, _finite(min_box_height_ratio, shared_ratio)))
+        self._min_box_width_ratio = width_ratio
+        self._min_box_height_ratio = height_ratio
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
         self._infer = infer
         # 模型推理和跟踪器都不是默认线程安全的；旁路调用也必须按帧串行化，
@@ -633,7 +652,8 @@ class OpenVinoLocalDetector:
                 "input_size": [self._input_width, self._input_height],
                 "max_detections": self._max_detections,
                 "nms_iou_threshold": self._nms_iou_threshold,
-                "min_box_ratio": self._min_box_ratio,
+                "min_box_width_ratio": self._min_box_width_ratio,
+                "min_box_height_ratio": self._min_box_height_ratio,
                 "frames": self._frames,
                 "last_inference_ms": self._last_inference_ms,
                 "uncertainties": list(dict.fromkeys(self._uncertainties)),
@@ -823,14 +843,20 @@ class OpenVinoLocalDetector:
         return [item for item, _key in kept]
 
     def _is_too_small(self, left: float, top: float, right: float, bottom: float) -> bool:
-        """归一化框的任一边小于 ``min_box_ratio`` 时判定为噪点。
+        """归一化框的宽或高低于各自阈值时判定为噪点。
 
-        用最短边而不是面积：细长的误检（例如墙缝、UI 边框）面积可能不小，
+        用两条边而不是面积：细长的误检（例如墙缝、UI 边框）面积可能不小，
         但没有任何一条边像人。两条边都要过关。
+
+        宽高分开设阈值，因为站立的人本来就是高而窄：单一阈值下总是宽度先卡，
+        于是「远处的人」和「噪点」被同一个数字裁掉，而画面里的人高度还远没到
+        导航器要的比例。默认宽阈值比高阈值宽松，正是为了让远处的人留下来。
         """
-        if self._min_box_ratio <= 0.0:
-            return False
-        return (right - left) < self._min_box_ratio or (bottom - top) < self._min_box_ratio
+        if self._min_box_width_ratio > 0.0 and (right - left) < self._min_box_width_ratio:
+            return True
+        if self._min_box_height_ratio > 0.0 and (bottom - top) < self._min_box_height_ratio:
+            return True
+        return False
 
     def _decode_rows(self, outputs: Any) -> list[_Detection]:
         detections: list[_Detection] = []

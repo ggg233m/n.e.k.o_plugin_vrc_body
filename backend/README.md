@@ -106,6 +106,26 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
 
+### 卡墙判据（movement_stalled）
+
+检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是唯一能区分
+「正在前进」和「顶着墙推摇杆」的回传。`VrchatOscBridge.motion_feedback()` 把这些内置
+参数汇总成 `body_awareness.vrchat_osc.motion`（`GET /snapshot` 的 `vrchat_osc.motion`
+也带同一份读数），导航器每 tick 采样一次：连续 `stall_ticks` 次发出前进指令但实测
+水平速度低于 `stall_speed_mps` 时停车，`navigation.last_decision.reason` 变成
+`movement_stalled`。水平速度用 `hypot(VelocityX, VelocityZ)`，不含 `VelocityY`——否则
+「贴着墙往下滑」会被读成「正在前进」。
+
+判定会闩锁：停下之后速度当然还是 0，靠速度自己解不开。闩锁只在换目标或重新提交
+目标时解除，导航器不会自作主张侧移绕行——绕行还是放弃由 LLM 决定。
+`navigation.stall.detectable=false` 表示这台机器收不到内置参数，「卡墙」这件事根本
+无法被观测到，**不是「没卡」**；此时整个判据失效并放行，不会把「读不到」当成
+「速度为零」而废掉导航。
+
+> ⚠️ `stall_speed_mps = 0.15` 和 `stall_ticks = 8` 都是估算，需要**真机会话校准**：
+> VRChat Velocity 的单位未经验证，`max_forward_axis = 0.28` 对应的实际速度也没实测过。
+> 内置参数名同样未经真机验证。单元测试全绿不能说明这两个默认值是对的。
+
 ```powershell
 python backend/debug_cli.py --port 48912 --token dev shell
 ```
@@ -217,10 +237,18 @@ input_width = 640
 input_height = 640
 horizontal_fov_deg = 90.0
 max_detections = 64
-# 检测框最短边占画面的最小比例，用于滤掉几十像素级的高分假阳性。0 关闭。
+# 检测框宽/高占画面的最小比例，用于滤掉几十像素级的高分假阳性。0 关闭对应轴。
+# min_box_ratio 是两轴的共同回退值；只写它时两轴同值（旧配置行为不变）。
 min_box_ratio = 0.02
+min_box_width_ratio = 0.008
+min_box_height_ratio = 0.02
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
+# 给 agent 看的单槽帧缓存；与 world_state 无关，不产生实体也不产生事件。
+frame_cache_interval_s = 1.0
+frame_max_width = 960 # 降采样宽度；0 表示不缩放
+frame_jpeg_quality = 70
+frame_max_per_minute = 10 # agent 主动拉图的滑动窗口上限；0 表示禁止拉图
 # -1 自动探测；MSS 的 0 是虚拟桌面，物理显示器从 1 开始。
 monitor_index = -1
 # -1 自动探测 DXGI 设备/输出；也可以填固定索引排查多 GPU 环境。
@@ -248,11 +276,40 @@ endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行
 只能显式设置 `fallback_backend = "opencv_hog"`；该路径仅检测行人并标记
 `degraded=true`，不识别玩家身份，也不产生通用物体或距离结论。
 
-检测结果在进入跟踪器之前会先过一道最小尺寸过滤（`min_box_ratio`，默认 2%）。
-实测真实帧里出现过 27×27 px 的 0.9 分框：跟踪器会给它分配实体 ID，导航器再用
-`apparent_height` 反推距离，于是把噪点当成一个站在很远处的人——比漏检更糟，因为
-它会主动驱动动作。排查漏检时可以把该值设为 0 关闭过滤。当前生效值会出现在
-`/perception` 的检测器状态里。
+检测结果在进入跟踪器之前会先过一道最小尺寸过滤。实测真实帧里出现过 27×27 px 的
+0.9 分框：跟踪器会给它分配实体 ID，导航器再用 `apparent_height` 反推距离，于是把
+噪点当成一个站在很远处的人——比漏检更糟，因为它会主动驱动动作。
+
+宽高分开设阈值（`min_box_width_ratio` 默认 0.8%、`min_box_height_ratio` 默认 2%），
+因为站立的人在画面里是高而窄的：共用一个 2% 时总是宽度先卡，1920 宽下要求最小宽
+38 px，按人体长宽比反推，能进入世界的最小 `apparent_height` 已经有 7%~11%，而导航
+器的目标是 0.55——房间对面的人会和噪点一起被裁掉。放松宽阈值让高度成为主判据；
+两条边仍然都要过关，所以墙缝和 UI 边框这类细长误检照样被挡住。
+
+`min_box_ratio` 是两轴的共同回退值，只设置它时两轴同值，旧配置行为不变。排查漏检
+时可以把相应的值设为 0 关闭该轴的过滤。当前生效值会出现在 `/perception` 的检测器
+状态里（`min_box_width_ratio` / `min_box_height_ratio`）。
+
+### 给 agent 看的帧（`GET /vision/frame`）
+
+检测器只回答「有几个人、在哪个方位」。要确认对方是谁、菜单开着没、界面上写了什么，
+需要让 agent 亲眼看画面。这条路径和 `world_state` 完全分离：帧不产生实体、不产生
+事件，也**不能**用来满足 `body_reach_and_grab` 的 `preconditions`——那条路仍然只认
+检测器给出的 `entity_id` 与置信度。从像素得出的结论一律是低置信视觉猜测。
+
+`VisionRuntime` 持有一个单槽最新帧缓存，由采集 worker 自己的消费线程在
+`process_frame` 里填充，位置在 `_release_frame` 之前（句柄一旦释放就编码不了了），
+并按 `frame_cache_interval_s` 限流。存最新一帧而不是队列，是因为过期的画面比没有
+画面更危险：agent 会把它当成现在。
+
+`GET /vision/frame?max_age_ms=N` 返回 `data_base64` 与 `age_ms`；采集已停止、还没有
+帧、或缓存超过 `max_age_ms` 时返回 `available=false` 并给出 `reason`
+（`capture_stopped` / `no_frame_cached` / `frame_stale`），不会退而求其次给旧画面。
+编码失败只记进 `frame_cache.last_error` 并让这次拉取报不可用，绝不打断采集——看不到
+图是降级，掉帧才是故障。
+
+运行时层面 `max_age_ms <= 0` 表示不限龄，这是留给内部调用方的逃生口；`BackendService`
+和 LLM 工具都把下限抬到 250 ms，否则「要最新的画面」写成 0 反而会拿到最旧的一张。
 
 Windows 上若 DXGI 返回 `0x80070005`，可安装 `dxcam[winrt]` 启用合成器捕获回退：
 

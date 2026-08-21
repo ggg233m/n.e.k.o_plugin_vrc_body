@@ -125,5 +125,125 @@ class NavigatorTests(unittest.TestCase):
             NavigatorConfig(max_forward_axis=0.9)
 
 
+class NavigatorStallTests(unittest.TestCase):
+    """「卡墙不自知」：检测器只看画面，永远不会报告前面有堵墙。"""
+
+    def setUp(self) -> None:
+        self.world = {
+            "available": True,
+            "uncertainties": [],
+            "status": {"revision": 3, "last_observation_age_ms": 80},
+            "entities": [{
+                "id": "vision:person:1",
+                "label": "person",
+                "confidence": 0.92,
+                "visible": True,
+                "attributes": {"bearing_deg": 0.0, "apparent_height": 0.2},
+            }],
+        }
+        self.goal = {
+            "state": "armed",
+            "goal": {"kind": "approach", "text": "walk to the person", "age_seconds": 1.0},
+        }
+        self.motion: dict[str, object] = {"available": True, "horizontal_speed_mps": 0.9}
+        self.sent: list[tuple[str, float, float, int]] = []
+        self.released: list[str] = []
+
+    def _navigator(self, *, motion_provider=..., **overrides) -> LocalNavigator:
+        return LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            release_inputs=lambda side: self.released.append(side),
+            motion_provider=(lambda: self.motion) if motion_provider is ... else motion_provider,
+            config=NavigatorConfig(stall_ticks=3, **overrides),
+        )
+
+    def test_moving_forward_never_trips_the_stall_guard(self) -> None:
+        navigator = self._navigator()
+        for _ in range(10):
+            self.assertEqual(navigator.tick().state, "advance")
+        self.assertFalse(navigator.snapshot()["stall"]["stalled"])
+
+    def test_zero_velocity_while_advancing_stops_and_latches(self) -> None:
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        decision = navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "movement_stalled")
+        self.assertEqual(self.released, ["all"])
+
+        # 闩锁：停下之后速度当然还是 0，靠速度本身永远解不开。必须由换目标解除，
+        # 否则导航器会在「停车 → 速度为零 → 继续判定卡住」里空转。
+        self.assertEqual(navigator.tick().reason, "movement_stalled")
+        snapshot = navigator.snapshot()
+        self.assertTrue(snapshot["stall"]["stalled"])
+        self.assertEqual(snapshot["stall"]["stall_count"], 1)
+
+    def test_new_goal_clears_the_latch(self) -> None:
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.0
+        for _ in range(3):
+            navigator.tick()
+        self.assertTrue(navigator.snapshot()["stall"]["stalled"])
+
+        self.goal["goal"] = {"kind": "follow", "text": "follow the person", "age_seconds": 0.5}
+        self.motion["horizontal_speed_mps"] = 0.9
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertFalse(navigator.snapshot()["stall"]["stalled"])
+
+    def test_resubmitting_the_same_goal_also_clears_the_latch(self) -> None:
+        # 同一句目标重新提交时文本不变，只有 age_seconds 会倒退。若不认这个信号，
+        # 用户「再试一次」会被永远拒绝。
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.0
+        for _ in range(3):
+            navigator.tick()
+        self.assertTrue(navigator.snapshot()["stall"]["stalled"])
+
+        self.goal["goal"] = {"kind": "approach", "text": "walk to the person", "age_seconds": 0.1}
+        self.motion["horizontal_speed_mps"] = 0.9
+        self.assertEqual(navigator.tick().state, "advance")
+
+    def test_missing_velocity_feedback_never_blocks_movement(self) -> None:
+        # 收不到内置参数时「有没有卡住」不可知。把不可知当成卡住，等于在没配
+        # 这些参数的 avatar 上直接废掉导航。
+        navigator = self._navigator(motion_provider=None)
+        for _ in range(10):
+            self.assertEqual(navigator.tick().state, "advance")
+        stall = navigator.snapshot()["stall"]
+        self.assertFalse(stall["detectable"])
+        self.assertFalse(stall["stalled"])
+
+    def test_unavailable_motion_report_never_blocks_movement(self) -> None:
+        self.motion = {"available": False, "reason": "velocity_parameters_absent"}
+        navigator = self._navigator()
+        for _ in range(10):
+            self.assertEqual(navigator.tick().state, "advance")
+        self.assertFalse(navigator.snapshot()["stall"]["detectable"])
+
+    def test_turning_in_place_does_not_reset_the_stall_counter(self) -> None:
+        # 顶着墙时导航器会在 advance/turn 之间抖动。若 turn 清零计数，卡墙就
+        # 永远攒不够连续 tick，判据形同虚设。
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
+        self.assertEqual(navigator.tick().state, "turn")
+
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 0.0
+        self.assertEqual(navigator.tick().reason, "movement_stalled")
+
+    def test_config_rejects_unbounded_stall_thresholds(self) -> None:
+        with self.assertRaises(ValueError):
+            NavigatorConfig(stall_speed_mps=5.0)
+        with self.assertRaises(ValueError):
+            NavigatorConfig(stall_ticks=1)
+
+
 if __name__ == "__main__":
     unittest.main()

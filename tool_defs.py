@@ -385,6 +385,30 @@ VRC_VISION_STOP = {
     },
 }
 
+VRC_VISION_FRAME = {
+    "name": "vrc_vision_frame",
+    "description": (
+        "取最近一帧 VRChat 画面来亲眼看看。适合确认检测器没有识别出的东西："
+        "对方是谁、菜单开着没、界面上写了什么。看到的一切都是画面猜测，只能用来理解，"
+        "不能写进 world_state，也不能拿来满足 body_reach_and_grab 的 preconditions——"
+        "那条路必须用 world_observe 给出的 entity_id 与置信度。画面过期或采集已停止时"
+        "返回 available=false，此时按看不见处理，不要沿用上一次看到的内容。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "max_age_ms": {
+                "type": "integer",
+                "minimum": 250,
+                "maximum": 30000,
+                "default": 3000,
+                "description": "可接受的画面陈旧上限；超过则返回 available=false 而不是给旧画面。",
+            }
+        },
+        "required": [],
+    },
+}
+
 BODY_LOCOMOTION = {
     "name": "body_locomotion",
     "description": "优先通过 AnyaDance 虚拟 Index 左摇杆实现移动，没有可用驱动时回退到 VRChat OSC；直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",

@@ -77,6 +77,10 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 `body_awareness.vrchat_osc` 只报告 VRChat 实际发回的 Avatar ID 和配置参数，不提供实时骨骼角度，也不能确认 Pickup 是否附着。默认关注 `NEKO_Action`、`NEKO_ActionActive`、`NEKO_ActionPhase` 和 `NEKO_Holding`；这些参数需要先在 Avatar 的 Expression Parameters/Animator 中创建并驱动。
 
+白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_awareness.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
+
+> ⚠️ **参数名未经真机验证。** 内置参数只有在 Avatar 的参数列表里存在时 VRChat 才会驱动并回传；名字对不上或 Avatar 没配就一个都收不到。此时 `motion.available=false` 并给出 `reason`（`no_feedback_received` / `feedback_stale` / `velocity_parameters_absent`），**不会退化成“速度为零”**。新鲜度按链路年龄判定而不是取值年龄：VRChat 参数是变化驱动的，站着不动时速度恒为 0 就不再有新消息，取值年龄单独报告为 `value_age_ms`。
+
 ## 独立后端进程
 
 身体运行时采用一个粗粒度的本机后端进程，而不是把每个动作拆成独立服务。Hosted 插件只保留 LLM 工具参数校验、UI 和 IPC 适配；后端进程统一持有 `BodyScheduler`、AnyaDance UDP 输出、VMC idle 中转、VRChat OSC、驱动遥测、动作加载和世界状态。两者通过带随机令牌的 loopback HTTP 通信，后端不可用时插件进入安全的 `backend_unavailable` 状态。
@@ -110,8 +114,25 @@ python -m pip install --user "dxcam[winrt]"
 不回退全屏——把整个桌面喂给检测器比暂时抓一块过期区域危险得多。设为 0 可恢复
 "只在启动时解析一次"的旧行为。
 
-本地检测器还会丢弃最短边不足画面 `min_box_ratio`（默认 2%）的框。实测真实帧里出现
-过 27×27 px 的高分假阳性，它们会被跟踪器当成真人并污染导航器的距离闭环。
+本地检测器还会丢弃过小的框，宽高分别设阈值（`min_box_width_ratio` 默认 0.8%、
+`min_box_height_ratio` 默认 2%，`min_box_ratio` 为两轴共同回退值）。实测真实帧里出现
+过 27×27 px 的高分假阳性，它们会被跟踪器当成真人并污染导航器的距离闭环。宽阈值
+更松是因为站立的人本来就高而窄，共用一个阈值时总是宽度先卡，会把房间对面的人一并
+裁掉；两条边仍然都要过关，墙缝和 UI 边框这类细长误检照样被挡住。
+
+检测器只回答"有几个人、在哪个方位"。要确认对方是谁、菜单开着没、界面上写了什么，
+`vrc_vision_frame` 会把最近一帧降采样后的 JPEG 注入当前回合；被判定为社交相关的主动
+唤醒推送也会附带一张。图不能走工具返回值——那只是一个 JSON 值，模型看不到里面的
+base64——所以两条路都通过 `push_message` 的 image part 交给宿主注入。
+
+画面只用于理解，**不进入 `world_state`**：从像素得出的一切都是低置信视觉猜测，不能
+当作实体、事件或位置的来源，也不能用来满足 `body_reach_and_grab` 的 `preconditions`；
+那条路仍然只认 `world_observe` 给出的 `entity_id` 与置信度。采集停止、还没有帧或画面
+超龄时明确返回 `available=false`，不会退而求其次给一张旧图。
+
+拉图有每分钟上限（`frame_max_per_minute` 默认 10，滑动窗口）。一张 960 px 的 JPEG 进
+上下文是十万字符量级的 base64，agent 在循环里每回合拉一张足以把会话挤爆。唤醒配的图
+不占这个预算，它自己受 12 s 的最小唤醒间隔约束。
 
 视觉捕获也可以独立于身体控制链路启停：调用后端 `POST /vision/stop` 会释放当前
 DXcam/WinRT/MSS 句柄并解除自主导航，`POST /vision/start` 会创建全新的
@@ -168,7 +189,12 @@ listen_port = 9001
 allowed_sender = "127.0.0.1"
 input_pulse_ms = 100
 parameter_cache_size = 256
-awareness_parameters = ["NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding"]
+# 前四个是本插件自己驱动的动作状态参数；后六个是 VRChat 内置 Avatar 参数，
+# 用于确认角色是否真的在移动（内置参数名未经真机验证，收不到时报 available=false）。
+awareness_parameters = [
+  "NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding",
+  "VelocityX", "VelocityY", "VelocityZ", "AngularY", "Upright", "Grounded",
+]
 ```
 
 参数工具示例：

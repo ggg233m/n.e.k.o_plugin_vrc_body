@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import socket
 import struct
 import time
@@ -208,6 +209,109 @@ class OscProtocolTests(unittest.TestCase):
         accepted, reason = bridge.send_chatbox("hello", immediate=False)
         self.assertTrue(accepted, reason)
         self.assertEqual(sent, [("/chatbox/input", ("hello", False, False))])
+
+
+class OscMotionFeedbackTests(unittest.TestCase):
+    """VRChat 内置 Velocity 参数是唯一能说明「我真的动了没有」的回传。"""
+
+    def setUp(self) -> None:
+        self.now = [100.0]
+        self.wall = [1_700_000_000.0]
+        self.bridge = VrchatOscBridge(
+            VrchatOscConfig(),
+            clock=lambda: self.now[0],
+            wall_clock=lambda: self.wall[0],
+        )
+
+    def _feed(self, name: str, value: object) -> None:
+        self.bridge._handle_message(f"/avatar/parameters/{name}", (value,))
+        self.bridge._last_receive_at_monotonic = self.now[0]
+
+    def test_missing_builtins_report_unavailable_not_zero_speed(self) -> None:
+        # 最重要的一条：avatar 没配这些参数时不能读成「速度为零」，否则导航器
+        # 会把「读不到」当成「卡住了」，一armed 就立刻停车。
+        self._feed("NEKO_Action", 1)
+        motion = self.bridge.motion_feedback()
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "velocity_parameters_absent")
+        self.assertIsNone(motion["speed_mps"])
+        self.assertIn("VelocityX", motion["expected"])
+
+    def test_no_feedback_at_all_is_distinguished_from_absent_parameters(self) -> None:
+        motion = self.bridge.motion_feedback()
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "no_feedback_received")
+
+    def test_horizontal_speed_ignores_vertical_component(self) -> None:
+        # 跳跃/下落时 VelocityY 很大而水平速度为零；用三维速度判断卡墙会把
+        # 「贴着墙往下滑」误判成「正在前进」。
+        self._feed("VelocityX", 3.0)
+        self._feed("VelocityY", -9.0)
+        self._feed("VelocityZ", 4.0)
+        motion = self.bridge.motion_feedback()
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertAlmostEqual(motion["horizontal_speed_mps"], 5.0, places=3)
+        self.assertAlmostEqual(motion["vertical_speed_mps"], -9.0, places=3)
+        self.assertAlmostEqual(motion["speed_mps"], math.hypot(5.0, 9.0), places=3)
+
+    def test_standing_still_stays_available_because_freshness_follows_the_link(self) -> None:
+        # VRChat 的参数是变化驱动的：站着不动时速度恒为 0，就不会再有新消息。
+        # 若按取值年龄判新鲜度，站住不动几秒后速度反而变成「不可知」——正好把
+        # 唯一能确认「我没在动」的时刻丢掉。
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        self.now[0] += 5.0
+        self.wall[0] += 5.0
+        self.bridge._last_receive_at_monotonic = self.now[0]  # 心跳仍在，只是速度没变
+        motion = self.bridge.motion_feedback()
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertEqual(motion["horizontal_speed_mps"], 0.0)
+        self.assertGreaterEqual(motion["value_age_ms"], 5000.0)
+        self.assertLess(motion["link_age_ms"], 1.0)
+
+    def test_dead_link_reports_stale_rather_than_last_known_speed(self) -> None:
+        self._feed("VelocityX", 1.0)
+        self._feed("VelocityZ", 0.0)
+        self.now[0] += 30.0
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "feedback_stale")
+        self.assertIsNone(motion["speed_mps"])
+
+    def test_grounded_and_upright_are_read_without_faking_missing_ones(self) -> None:
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        self._feed("Grounded", True)
+        motion = self.bridge.motion_feedback()
+        self.assertIs(motion["grounded"], True)
+        self.assertIsNone(motion["upright"])
+        self.assertIsNone(motion["angular_speed"])
+
+    def test_awareness_surfaces_motion_and_keeps_action_summary_readable(self) -> None:
+        self._feed("NEKO_Action", 2)
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        awareness = self.bridge.awareness()
+        self.assertTrue(awareness["motion"]["available"])
+        # 内置参数仍在 parameters 里（面板要看原始回传），但摘要只列动作状态，
+        # 否则六个速度分量会把真正要读的东西淹掉。
+        self.assertIn("VelocityX", awareness["parameters"])
+        self.assertIn("NEKO_Action=2", awareness["summary"])
+        self.assertNotIn("VelocityX=", awareness["summary"])
+
+    def test_awareness_says_so_when_builtins_never_arrive(self) -> None:
+        self._feed("NEKO_Action", 2)
+        awareness = self.bridge.awareness()
+        self.assertFalse(awareness["motion"]["available"])
+        self.assertIn("无法确认自己是否真的在移动", awareness["summary"])
+
+    def test_snapshot_carries_motion_for_the_unarmed_debug_panel(self) -> None:
+        # 面板在未授权时读不到导航器的采样（那是 tick 里刷新的），只能靠快照。
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 1.5)
+        motion = self.bridge.snapshot()["motion"]
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertAlmostEqual(motion["horizontal_speed_mps"], 1.5, places=3)
 
 
 class OscBridgeIntegrationTests(unittest.TestCase):

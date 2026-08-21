@@ -44,6 +44,21 @@ _BUTTON_ADDRESSES = {
 _INPUT_HOLD_MIN_MS = 20
 _INPUT_HOLD_MAX_MS = 1000
 
+# VRChat 内置 Avatar 参数。名称取自 VRChat 官方 Avatar Parameters 文档，但**本仓库
+# 无法验证实机上的实际回传**：built-in 参数只有在 avatar 的参数列表里存在时才会被
+# VRChat 驱动并经 OSC 发回 9001。因此所有读取路径都必须能接受「一个都收不到」，
+# 返回 available=false 而不是猜一个速度出来。
+_VELOCITY_AXIS_PARAMETERS = ("VelocityX", "VelocityY", "VelocityZ")
+BUILTIN_MOTION_PARAMETERS = _VELOCITY_AXIS_PARAMETERS + ("Upright", "Grounded", "AngularY")
+
+
+def _numeric(value: Any) -> float | None:
+    """把 OSC 标量读成有限浮点；bool 不算数值（Grounded 单独处理）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
 
 class OscProtocolError(ValueError):
     """Raised when an OSC packet is malformed or unsupported."""
@@ -770,6 +785,9 @@ class VrchatOscBridge:
 
     def snapshot(self, *, include_parameters: bool = True) -> dict[str, Any]:
         now = self._clock()
+        # 诊断面板要能在未 arm 时也看到「VRChat 有没有在回传移动」——导航器的
+        # last_motion 只在 tick 里刷新，授权解除后就冻住了。
+        motion = self.motion_feedback()
         with self._lock:
             age_ms = None
             if self._last_receive_at_monotonic is not None:
@@ -804,10 +822,110 @@ class VrchatOscBridge:
                 "last_receive_age_ms": age_ms,
                 "last_error": self._last_error,
                 "delivery_confirmation": "unavailable",
+                "motion": motion,
             }
             if include_parameters:
                 result["parameters"] = dict(self._parameters)
             return result
+
+    def motion_feedback(self, *, max_age_ms: int = 2000) -> dict[str, Any]:
+        """从 VRChat 内置 Avatar 参数读取实际移动反馈。
+
+        这是全仓库唯一一条「VRChat 说我动了没有」的通路：AnyaDance 与 OSC 都只能
+        确认本机发送成功，`accepted=true` 从来不代表角色真的移动了。有了它，导航
+        器才能区分「正在前进」和「顶着墙推摇杆」。
+
+        两个必须记住的前提：
+
+        1. **参数名未经实机验证。** 内置参数只有在 avatar 的参数列表里存在时才会
+           被驱动并回传；名字对不上或 avatar 没配，就一个都收不到。此时返回
+           ``available=false`` 并给出 ``expected``，绝不猜一个速度出来。
+        2. **新鲜度看链路，不看取值。** VRChat 的参数是变化驱动的：站着不动时
+           速度恒为 0，于是根本不会有新消息，取值记录会一直变老。所以可用性由
+           「最近是否收到过任何 OSC 回传」决定，而速度取最后已知值——这正是站住
+           不动时唯一正确的读法。取值年龄单独报告为 ``value_age_ms``。
+        """
+        try:
+            limit_ms = max(0, int(max_age_ms))
+        except (TypeError, ValueError, OverflowError):
+            limit_ms = 2000
+        now_mono = self._clock()
+        now_wall = self._wall_clock()
+        with self._lock:
+            link_age_ms = (
+                None
+                if self._last_receive_at_monotonic is None
+                else max(0.0, (now_mono - self._last_receive_at_monotonic) * 1000.0)
+            )
+            records = {
+                name: dict(self._parameters[name])
+                for name in BUILTIN_MOTION_PARAMETERS
+                if name in self._parameters
+            }
+        result: dict[str, Any] = {
+            "available": False,
+            "reason": None,
+            "expected": list(BUILTIN_MOTION_PARAMETERS),
+            "present": sorted(records),
+            "link_age_ms": None if link_age_ms is None else round(link_age_ms, 1),
+            "value_age_ms": None,
+            "speed_mps": None,
+            "horizontal_speed_mps": None,
+            "vertical_speed_mps": None,
+            "angular_speed": None,
+            "grounded": None,
+            "upright": None,
+        }
+        if not self.config.enabled:
+            result["reason"] = "osc_disabled"
+            return result
+        if link_age_ms is None:
+            result["reason"] = "no_feedback_received"
+            return result
+        if limit_ms and link_age_ms > limit_ms:
+            result["reason"] = "feedback_stale"
+            return result
+
+        axes: dict[str, float] = {}
+        newest_received: float | None = None
+        for name in _VELOCITY_AXIS_PARAMETERS:
+            record = records.get(name)
+            if record is None:
+                continue
+            value = _numeric(record.get("value"))
+            if value is None:
+                continue
+            axes[name] = value
+            received = _numeric(record.get("received_at_unix"))
+            if received is not None and (newest_received is None or received > newest_received):
+                newest_received = received
+        if not axes:
+            # 参数名可能不对，也可能 avatar 根本没配。两者都不是「速度为零」。
+            result["reason"] = "velocity_parameters_absent"
+            return result
+
+        vx = axes.get("VelocityX", 0.0)
+        vy = axes.get("VelocityY", 0.0)
+        vz = axes.get("VelocityZ", 0.0)
+        horizontal = math.hypot(vx, vz)
+        result["available"] = True
+        result["value_age_ms"] = (
+            None if newest_received is None else round(max(0.0, (now_wall - newest_received) * 1000.0), 1)
+        )
+        result["horizontal_speed_mps"] = round(horizontal, 4)
+        result["vertical_speed_mps"] = round(vy, 4)
+        result["speed_mps"] = round(math.sqrt(horizontal * horizontal + vy * vy), 4)
+
+        angular = _numeric((records.get("AngularY") or {}).get("value"))
+        if angular is not None:
+            result["angular_speed"] = round(angular, 4)
+        upright = _numeric((records.get("Upright") or {}).get("value"))
+        if upright is not None:
+            result["upright"] = round(upright, 4)
+        grounded = (records.get("Grounded") or {}).get("value")
+        if isinstance(grounded, bool):
+            result["grounded"] = grounded
+        return result
 
     def awareness(self) -> dict[str, Any]:
         with self._lock:
@@ -818,20 +936,33 @@ class VrchatOscBridge:
             }
             detected = self._last_receive_at_monotonic is not None
             avatar_id = self._avatar_id
+        motion = self.motion_feedback()
+        # 内置移动参数已经由 ``motion`` 汇总；再在摘要里逐个列出来只会把真正需要
+        # 人读的动作状态参数淹掉。
+        summary_parameters = {
+            name: record
+            for name, record in parameters.items()
+            if name not in BUILTIN_MOTION_PARAMETERS
+        }
         if not self.config.enabled:
             summary = "VRChat OSC 已禁用。"
         elif not detected:
             summary = "尚未收到 VRChat OSC 回传；发送状态不能证明 VRChat 已接收。"
-        elif parameters:
-            values = "、".join(f"{name}={record['value']}" for name, record in parameters.items())
+        elif summary_parameters:
+            values = "、".join(f"{name}={record['value']}" for name, record in summary_parameters.items())
             summary = f"已收到 VRChat OSC；动作参数：{values}。"
         else:
             summary = "已收到 VRChat OSC，但尚无配置的动作状态参数。"
+        if motion["available"]:
+            summary += f"实测水平速度 {motion['horizontal_speed_mps']} m/s。"
+        elif detected and self.config.enabled:
+            summary += "VRChat 未回传内置移动参数，无法确认自己是否真的在移动。"
         return {
             "enabled": self.config.enabled,
             "connection": "detected" if detected else "unknown",
             "avatar_id": avatar_id,
             "parameters": parameters,
+            "motion": motion,
             "summary": summary,
             "pose_feedback_available": False,
             "pickup_confirmation_available": False,
@@ -839,6 +970,7 @@ class VrchatOscBridge:
 
 
 __all__ = [
+    "BUILTIN_MOTION_PARAMETERS",
     "MAX_OSC_PACKET_BYTES",
     "OscProtocolError",
     "VrchatOscBridge",

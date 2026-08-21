@@ -122,6 +122,60 @@ def _module_available(module_name: str) -> bool:
         return False
 
 
+def encode_frame_jpeg(
+    frame: Any,
+    *,
+    max_width: int = 0,
+    quality: int = 70,
+) -> tuple[bytes, int, int]:
+    """把一帧编码成 JPEG 字节，并返回 ``(数据, 宽, 高)``。
+
+    ``max_width`` 大于 0 时按比例降采样到该宽度以内。给 LLM 的图不需要原始
+    分辨率——降采样同时压低了 token 成本和「盯着模糊像素脑补」的风险。
+
+    已经是 ``bytes`` 的帧按原样返回（假定调用方已编码），此时尺寸未知，返回
+    ``(data, 0, 0)``：宁可说不知道，也不猜一个尺寸。
+    """
+    if isinstance(frame, bytes):
+        return frame, 0, 0
+    from io import BytesIO
+
+    quality = min(95, max(30, int(quality)))
+    image = None
+    save = getattr(frame, "save", None)
+    if callable(save) and hasattr(frame, "size"):
+        image = frame
+    else:
+        try:
+            from PIL import Image  # type: ignore[import-not-found]
+            import numpy as np  # type: ignore[import-not-found]
+            image = Image.fromarray(np.asarray(frame).astype(np.uint8))
+        except Exception as exc:
+            raise ValueError(f"frame cannot be encoded: {exc}") from exc
+    try:
+        width, height = int(image.size[0]), int(image.size[1])
+        if max_width > 0 and width > max_width and width > 0:
+            scale = float(max_width) / float(width)
+            target = (max_width, max(1, int(round(height * scale))))
+            # 到这里 image 可能是任何实现了 save/size 的对象，不一定来自 Pillow，
+            # 所以采样常量要能在 Pillow 缺席时退化——2 就是 PIL 的 BILINEAR。
+            resample: Any = 2
+            try:
+                from PIL import Image as _Image  # type: ignore[import-not-found]
+                resample = _Image.BILINEAR
+            except Exception:
+                pass
+            image = image.resize(target, resample)
+            width, height = int(image.size[0]), int(image.size[1])
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        return buf.getvalue(), width, height
+    except Exception as exc:
+        raise ValueError(f"frame cannot be encoded: {exc}") from exc
+
+
 def find_window_region(title: str) -> dict[str, int] | None:
     """通过标题查找 Windows 顶层窗口并返回其屏幕坐标。
 
@@ -1177,6 +1231,9 @@ class VisionRuntime:
         semantic_cooldown_s: float = 0.75,
         clock: Any = time.monotonic,
         observation_callback: Callable[[VisionObservation, Mapping[str, Any]], None] | None = None,
+        frame_cache_interval_s: float = 1.0,
+        frame_cache_max_width: int = 960,
+        frame_cache_quality: int = 70,
     ) -> None:
         self.store = store or WorldStateStore(clock=clock)
         self.detector = detector
@@ -1187,6 +1244,15 @@ class VisionRuntime:
         self._lock = threading.Lock()
         self._last_semantic_at: float | None = None
         self._last_error: str | None = None
+        # 单槽最新帧缓存。给 agent 看的图不走世界状态，也不进 120 Hz 调度线程：
+        # 它只在采集 worker 自己的消费线程里按间隔编码一次，之后所有拉取都命中
+        # 缓存。存最新一帧而不是队列，是因为过期的画面比没有画面更危险。
+        self._frame_cache_interval_s = max(0.0, float(frame_cache_interval_s))
+        self._frame_cache_max_width = max(0, int(frame_cache_max_width))
+        self._frame_cache_quality = min(95, max(30, int(frame_cache_quality)))
+        self._frame_cache: dict[str, Any] | None = None
+        self._frame_cache_at: float | None = None
+        self._frame_cache_error: str | None = None
         # 采集生命周期与检测器可用性分离。将门控放在运行时中，可让所有消费者
         # （HTTP、世界桥、自主控制和导航器）统一认定已停止的来源为未知，即使
         # 有界世界存储中仍保留最近一帧。
@@ -1205,6 +1271,11 @@ class VisionRuntime:
             self._capture_reason = (
                 "active" if active else (str(reason or "capture_stopped").strip()[:160] or "capture_stopped")
             )
+            if not active:
+                # 停止采集时丢掉缓存帧。留着它会让停止后的拉取返回停止前的画面，
+                # 而 agent 无法区分「刚才」和「现在」。
+                self._frame_cache = None
+                self._frame_cache_at = None
         self.store.set_backend_status("vision_runtime", self.status())
 
     def capture_state(self) -> dict[str, Any]:
@@ -1213,6 +1284,93 @@ class VisionRuntime:
                 "active": self._capture_active,
                 "reason": self._capture_reason,
             }
+
+    def _cache_frame(self, frame: Any, captured_at: float) -> None:
+        """按间隔把最新帧编码进单槽缓存。
+
+        必须在帧被 ``_release_frame`` 释放之前调用。编码失败只记录原因，绝不
+        让采集或检测因此中断——看不到图是降级，掉帧是故障。
+        """
+        if self._frame_cache_interval_s < 0:
+            return
+        with self._lock:
+            last = self._frame_cache_at
+            interval = self._frame_cache_interval_s
+        if last is not None and (captured_at - last) < interval:
+            return
+        try:
+            data, width, height = encode_frame_jpeg(
+                frame,
+                max_width=self._frame_cache_max_width,
+                quality=self._frame_cache_quality,
+            )
+        except Exception as exc:
+            with self._lock:
+                self._frame_cache_error = f"{type(exc).__name__}: {exc}"[:256]
+            return
+        with self._lock:
+            self._frame_cache = {
+                "data": data,
+                "mime": "image/jpeg",
+                "width": width,
+                "height": height,
+                "bytes": len(data),
+            }
+            self._frame_cache_at = captured_at
+            self._frame_cache_error = None
+
+    def latest_frame(self, *, max_age_ms: int = 3000) -> dict[str, Any]:
+        """返回最近一次缓存的画面，超龄或采集停止时明确拒绝。
+
+        这条路径刻意与 ``world_state`` 完全分离：帧只喂给 agent 理解，不产生
+        实体、不产生事件，也不能拿去满足 ``body_reach_and_grab`` 的
+        ``preconditions``。从画面得出的任何结论都是低置信视觉猜测。
+
+        ``max_age_ms <= 0`` 表示不限龄，这是留给运行时内部调用方的逃生口。
+        LLM 那一侧不允许走到这里——工具与 ``BackendService`` 都把下限抬到了
+        250 ms，否则「要最新的画面」写成 0 反而会拿到最旧的一张。
+        """
+        now = self._clock()
+        capture = self.capture_state()
+        with self._lock:
+            cached = self._frame_cache
+            cached_at = self._frame_cache_at
+            error = self._frame_cache_error
+        if not capture["active"]:
+            return {
+                "available": False,
+                "reason": capture["reason"] or "capture_stopped",
+                "capture_active": False,
+            }
+        if cached is None or cached_at is None:
+            return {
+                "available": False,
+                "reason": error or "no_frame_cached",
+                "capture_active": True,
+            }
+        age_ms = max(0.0, (now - cached_at) * 1000.0)
+        try:
+            limit_ms = max(0.0, float(max_age_ms))
+        except (TypeError, ValueError, OverflowError):
+            limit_ms = 3000.0
+        if limit_ms and age_ms > limit_ms:
+            # 过期的画面比没有画面更危险：agent 会拿它当现在。
+            return {
+                "available": False,
+                "reason": "frame_stale",
+                "age_ms": round(age_ms, 1),
+                "capture_active": True,
+            }
+        return {
+            "available": True,
+            "capture_active": True,
+            "age_ms": round(age_ms, 1),
+            "mime": cached["mime"],
+            "width": cached["width"],
+            "height": cached["height"],
+            "bytes": cached["bytes"],
+            "data": cached["data"],
+        }
 
     def _mask_stopped_snapshot(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         """返回未知视图，同时不修改持久化世界存储。"""
@@ -1273,6 +1431,10 @@ class VisionRuntime:
             last_error = self._last_error
             capture_active = self._capture_active
             capture_reason = self._capture_reason
+            frame_cached = self._frame_cache is not None
+            frame_cache_at = self._frame_cache_at
+            frame_cache_error = self._frame_cache_error
+            frame_cache_interval_s = self._frame_cache_interval_s
         def backend_status(backend: Any, *, label: str) -> Mapping[str, Any]:
             if backend is None:
                 return {"available": False, "reason": "not_configured"}
@@ -1294,6 +1456,17 @@ class VisionRuntime:
             "detector": backend_status(detector, label="detector"),
             "semantic": backend_status(semantic, label="semantic"),
             "optional_dependencies": optional_dependency_status(),
+            # 画面缓存独立于世界状态；这里只报告它是否可用，不把画面内容
+            # 混进感知结论。
+            "frame_cache": {
+                "cached": frame_cached,
+                "age_ms": (
+                    None if frame_cache_at is None
+                    else round(max(0.0, (self._clock() - frame_cache_at) * 1000.0), 1)
+                ),
+                "interval_s": frame_cache_interval_s,
+                "last_error": frame_cache_error,
+            },
             "last_error": last_error,
         }
 
@@ -1414,6 +1587,9 @@ class VisionRuntime:
             observation_now = min(processing_now, float(observed_at)) if observed_at is not None else processing_now
         except (TypeError, ValueError, OverflowError):
             observation_now = processing_now
+        # 在检测之前缓存：帧在 worker 的 finally 里就会被释放，之后再想编码
+        # 只能拿到已关闭的句柄。缓存自身按间隔限流，不是每帧都编。
+        self._cache_frame(frame, processing_now)
         # attach_vision/set_backends 可能与采集线程并行；在锁内取得稳定引用，
         # 后续推理不持有运行时锁，避免阻塞生命周期控制。
         with self._lock:
@@ -1483,6 +1659,7 @@ from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # 
 
 __all__ = [
     "CapturedFrame",
+    "encode_frame_jpeg",
     "find_window_region",
     "FrameDetector",
     "FrameSource",
