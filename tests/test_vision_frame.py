@@ -8,9 +8,15 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
-from neko_anyadance_body.backend.vision import VisionRuntime, encode_frame_jpeg
+from neko_anyadance_body.backend.vision import (
+    VisionRuntime,
+    draw_detection_overlay,
+    encode_frame_jpeg,
+    overlay_boxes_geometry,
+)
 from neko_anyadance_body.backend.world_state import WorldStateStore
 
 
@@ -232,6 +238,301 @@ class FrameCacheTests(unittest.TestCase):
         self.assertEqual(snapshot["events"], [])
         # 但帧确实缓存下来了，否则上面三条断言只是在测「什么都没发生」。
         self.assertTrue(runtime.latest_frame()["available"])
+
+
+class OverlayGeometryTests(unittest.TestCase):
+    """归一化 bbox → 像素矩形。纯算术，刻意不碰 Pillow。"""
+
+    @staticmethod
+    def _box(bbox, **extra):
+        item = {"id": "e1", "label": "person", "confidence": 0.5, "bbox": bbox}
+        item.update(extra)
+        return item
+
+    def test_normalized_bbox_maps_to_pixels(self) -> None:
+        [box] = overlay_boxes_geometry([self._box([0.25, 0.5, 0.75, 1.0])], width=960, height=640)
+        self.assertEqual(box["rect"], (240, 320, 720, 640))
+        self.assertEqual(box["label"], "person")
+        self.assertEqual(box["confidence"], 0.5)
+
+    def test_edge_touching_boxes_survive_and_fill_the_canvas(self) -> None:
+        """贴边不是越界；0..1 整幅框必须画得出来，否则最近的目标反而没框。"""
+        [box] = overlay_boxes_geometry([self._box([0.0, 0.0, 1.0, 1.0])], width=100, height=80)
+        self.assertEqual(box["rect"], (0, 0, 100, 80))
+
+    def test_out_of_range_bbox_is_clamped_not_dropped(self) -> None:
+        [box] = overlay_boxes_geometry([self._box([-0.4, -1.0, 1.9, 2.5])], width=100, height=80)
+        self.assertEqual(box["rect"], (0, 0, 100, 80))
+
+    def test_boxes_entirely_outside_the_canvas_are_dropped(self) -> None:
+        """钳完塌成一条边的框不画：一条线会被读成「这里检测到了东西」。"""
+        self.assertEqual(overlay_boxes_geometry([self._box([1.2, 1.2, 1.8, 1.9])], width=100, height=80), [])
+        self.assertEqual(overlay_boxes_geometry([self._box([-0.9, -0.8, -0.2, -0.1])], width=100, height=80), [])
+
+    def test_degenerate_and_inverted_boxes_are_dropped(self) -> None:
+        for bbox in ([0.5, 0.5, 0.5, 0.5], [0.5, 0.2, 0.5, 0.9], [0.8, 0.2, 0.3, 0.9]):
+            self.assertEqual(overlay_boxes_geometry([self._box(bbox)], width=100, height=80), [], bbox)
+
+    def test_sub_pixel_boxes_are_dropped_rather_than_rounded_up(self) -> None:
+        self.assertEqual(overlay_boxes_geometry([self._box([0.5, 0.5, 0.5001, 0.5001])], width=100, height=80), [])
+
+    def test_non_finite_and_malformed_entries_are_skipped(self) -> None:
+        nan = float("nan")
+        boxes = [
+            self._box([nan, 0.1, 0.9, 0.9]),
+            self._box([0.1, 0.1, float("inf"), 0.9]),
+            self._box("not-a-bbox"),
+            self._box([0.1, 0.2]),
+            self._box(["a", "b", "c", "d"]),
+            "not-a-mapping",
+            self._box([0.1, 0.1, 0.9, 0.9]),
+        ]
+        self.assertEqual(len(overlay_boxes_geometry(boxes, width=100, height=80)), 1)
+
+    def test_empty_and_absent_inputs_are_not_errors(self) -> None:
+        for boxes in ([], None, ()):
+            self.assertEqual(overlay_boxes_geometry(boxes, width=100, height=80), [])
+
+    def test_zero_or_bogus_canvas_yields_nothing(self) -> None:
+        box = [self._box([0.1, 0.1, 0.9, 0.9])]
+        for width, height in ((0, 80), (100, 0), (-5, 80), ("wide", 80)):
+            self.assertEqual(overlay_boxes_geometry(box, width=width, height=height), [], (width, height))
+
+    def test_clipped_and_bearing_are_carried_through_for_labelling(self) -> None:
+        """贴边的表观高度已饱和，不能再当距离用——这个事实必须一路带到图上。"""
+        [box] = overlay_boxes_geometry(
+            [self._box([0.1, 0.0, 0.9, 0.999],
+                       attributes={"apparent_height_clipped": True, "bearing_deg": -28.8})],
+            width=100, height=80,
+        )
+        self.assertTrue(box["clipped"])
+        self.assertEqual(box["bearing_deg"], -28.8)
+
+    def test_missing_attributes_do_not_claim_clipping(self) -> None:
+        for attributes in (None, {}, "nope"):
+            [box] = overlay_boxes_geometry(
+                [self._box([0.1, 0.1, 0.9, 0.9], attributes=attributes)], width=100, height=80
+            )
+            self.assertFalse(box["clipped"], attributes)
+            self.assertIsNone(box["bearing_deg"], attributes)
+
+    def test_unusable_confidence_becomes_zero_rather_than_raising(self) -> None:
+        [box] = overlay_boxes_geometry(
+            [self._box([0.1, 0.1, 0.9, 0.9], confidence="high")], width=100, height=80
+        )
+        self.assertEqual(box["confidence"], 0.0)
+
+
+class OverlayFrameTests(unittest.TestCase):
+    """``latest_frame(overlay=True)`` 的行为：报错位、不污染缓存、缺依赖时降级。"""
+
+    def _runtime(self, clock: _Clock, **kwargs) -> VisionRuntime:
+        return VisionRuntime(
+            WorldStateStore(clock=clock),
+            clock=clock,
+            frame_cache_max_width=0,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _entity(entity_id: str, bbox, **attributes):
+        return {
+            "id": entity_id,
+            "label": "person",
+            "confidence": 0.8,
+            "bbox": list(bbox),
+            "attributes": dict(attributes),
+        }
+
+    def test_overlay_is_opt_in_and_absent_by_default(self) -> None:
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        self.assertNotIn("overlay", runtime.latest_frame())
+
+    def test_empty_world_returns_the_frame_unchanged_not_an_error(self) -> None:
+        """没有实体不是故障：给原图、说 0 个框，别让看图这条路整体失败。"""
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        plain = runtime.latest_frame()["data"]
+        result = runtime.latest_frame(overlay=True)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["overlay"]["entities_available"], 0)
+        self.assertEqual(result["overlay"].get("boxes_drawn", 0), 0)
+        if result["overlay"]["drawn"]:
+            # 真有 Pillow 时会重编码一遍，字节可以不同，但尺寸必须还是那一张。
+            self.assertEqual(result["bytes"], len(result["data"]))
+        else:
+            self.assertEqual(result["data"], plain)
+
+    def test_overlay_never_mutates_the_frame_cache(self) -> None:
+        """缓存里必须留原始像素：唤醒推送用的是同一份，烧了框就再也还原不回来。"""
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        before = runtime.latest_frame()["data"]
+        runtime.latest_frame(overlay=True)
+        self.assertEqual(runtime.latest_frame()["data"], before)
+
+    def test_skew_is_computed_from_frame_age_and_world_age(self) -> None:
+        """一秒前的像素配现在的框，等于伪造位置。错位量必须报出来。"""
+        clock = _Clock()
+        runtime = self._runtime(clock, frame_cache_interval_s=1.0)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        clock.advance(0.9)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        clock.advance(0.1)
+        overlay = runtime.latest_frame(overlay=True)["overlay"]
+        self.assertAlmostEqual(overlay["frame_age_ms"], 1000.0, places=0)
+        self.assertAlmostEqual(overlay["world_age_ms"], 100.0, places=0)
+        self.assertAlmostEqual(overlay["skew_ms"], 900.0, places=0)
+
+    def test_large_skew_is_flagged_so_it_cannot_be_read_as_simultaneous(self) -> None:
+        clock = _Clock()
+        runtime = self._runtime(clock, frame_cache_interval_s=1.0)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        clock.advance(2.0)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        overlay = runtime.latest_frame(max_age_ms=5000, overlay=True)["overlay"]
+        self.assertTrue(overlay["skew_warning"])
+
+    def test_fresh_frame_and_fresh_world_are_not_flagged(self) -> None:
+        clock = _Clock()
+        runtime = self._runtime(clock, frame_cache_interval_s=1.0)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        overlay = runtime.latest_frame(overlay=True)["overlay"]
+        self.assertNotIn("skew_warning", overlay)
+
+    def test_unavailable_frames_are_never_overlaid(self) -> None:
+        """没有画面时叠框无从谈起，也不能因此多出一个 overlay 字段。"""
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        result = runtime.latest_frame(overlay=True)
+        self.assertFalse(result["available"])
+        self.assertNotIn("overlay", result)
+
+    def test_missing_pillow_degrades_to_the_original_frame(self) -> None:
+        """看不到框是降级，掉帧才是故障：给原图 + 说明原因，而不是报 unavailable。"""
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        plain = runtime.latest_frame()["data"]
+        with mock.patch(
+            "neko_anyadance_body.backend.vision.draw_detection_overlay",
+            side_effect=ValueError("overlay requires Pillow: no module named PIL"),
+        ):
+            result = runtime.latest_frame(overlay=True)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["data"], plain)
+        self.assertFalse(result["overlay"]["drawn"])
+        self.assertIn("Pillow", result["overlay"]["reason"])
+        self.assertEqual(result["overlay"]["entities_available"], 1)
+
+    def test_undecodable_cached_frame_still_returns_the_frame(self) -> None:
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        result = runtime.latest_frame(overlay=True)
+        # _FakeImage 存的是伪 JPEG，真 Pillow 解不开；两种环境下都不能变成 unavailable。
+        self.assertTrue(result["available"])
+        self.assertIn("drawn", result["overlay"])
+
+    def test_skipped_boxes_are_counted_so_silence_is_not_mistaken_for_zero(self) -> None:
+        """世界里有 3 个实体、图上只画了 1 个，这个差必须报出来。
+
+        这里必须缓存**真** JPEG：``_FakeImage`` 造的伪 JPEG 连 Pillow 都解不开，
+        于是绘制走降级分支，``boxes_drawn`` 根本不会被算出来——断言就成了空转。
+        """
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+        except Exception:  # pragma: no cover - 取决于机器上有没有可选依赖
+            self.skipTest("Pillow is not installed")
+        buf = BytesIO()
+        Image.new("RGB", (120, 90), (12, 12, 12)).save(buf, format="JPEG", quality=80)
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(buf.getvalue(), clock.now)
+        runtime.store.ingest(
+            [
+                self._entity("track:1", [0.2, 0.2, 0.6, 0.9]),
+                self._entity("track:2", [1.4, 1.4, 1.8, 1.9]),
+                self._entity("track:3", [0.5, 0.5, 0.5, 0.5]),
+            ],
+            observed_at=clock.now,
+        )
+        overlay = runtime.latest_frame(overlay=True)["overlay"]
+        self.assertTrue(overlay["drawn"], overlay.get("reason"))
+        self.assertEqual(overlay["entities_available"], 3)
+        self.assertEqual(overlay["boxes_drawn"], 1)
+        self.assertEqual(overlay["boxes_skipped"], 2)
+
+
+class DrawDetectionOverlayTests(unittest.TestCase):
+    """绘制那一层需要真 Pillow，所以整类按依赖 skip。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            from PIL import Image, ImageDraw  # noqa: F401
+        except Exception:  # pragma: no cover - 取决于机器上有没有可选依赖
+            raise unittest.SkipTest("Pillow is not installed")
+
+    @staticmethod
+    def _jpeg(width: int = 120, height: int = 90) -> bytes:
+        from io import BytesIO
+
+        from PIL import Image
+
+        buf = BytesIO()
+        Image.new("RGB", (width, height), (12, 12, 12)).save(buf, format="JPEG", quality=80)
+        return buf.getvalue()
+
+    def test_drawing_reports_how_many_boxes_landed_on_the_image(self) -> None:
+        data, drawn = draw_detection_overlay(
+            self._jpeg(),
+            [
+                {"id": "a", "label": "person", "confidence": 0.83, "bbox": [0.1, 0.1, 0.5, 0.9]},
+                {"id": "b", "label": "person", "confidence": 0.4, "bbox": [1.4, 1.4, 1.9, 1.9]},
+            ],
+        )
+        self.assertEqual(drawn, 1)
+        self.assertTrue(data.startswith(b"\xff\xd8"))
+
+    def test_drawing_changes_pixels_and_leaves_the_input_bytes_alone(self) -> None:
+        original = self._jpeg()
+        data, drawn = draw_detection_overlay(
+            original, [{"id": "a", "label": "person", "confidence": 0.9, "bbox": [0.1, 0.1, 0.9, 0.9]}]
+        )
+        self.assertEqual(drawn, 1)
+        self.assertNotEqual(data, original)
+        self.assertEqual(original, self._jpeg())
+
+    def test_geometry_is_preserved_through_the_round_trip(self) -> None:
+        from io import BytesIO
+
+        from PIL import Image
+
+        data, _ = draw_detection_overlay(self._jpeg(120, 90), [])
+        with Image.open(BytesIO(data)) as image:
+            self.assertEqual(image.size, (120, 90))
+
+    def test_warning_is_burned_into_the_image_not_just_reported(self) -> None:
+        """JSON 字段会被忽略，画面顶部的红条不会。"""
+        plain, _ = draw_detection_overlay(self._jpeg(), [])
+        warned, _ = draw_detection_overlay(self._jpeg(), [], warning="SKEW 900ms")
+        self.assertNotEqual(plain, warned)
+
+    def test_undecodable_input_raises_so_the_caller_can_degrade(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be decoded"):
+            draw_detection_overlay(b"not-a-jpeg", [])
 
 
 class VisionFrameServiceTests(unittest.TestCase):

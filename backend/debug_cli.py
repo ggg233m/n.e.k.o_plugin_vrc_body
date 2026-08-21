@@ -110,6 +110,33 @@ def _run_shell(host: str, port: int, token: str) -> int:
     return 0
 
 
+def _write_frame(result: dict, out: Path) -> dict:
+    """把 base64 帧落盘，并把 base64 从返回值里摘掉。
+
+    摘掉不是为了省内存，是为了终端可读：十万字符的 base64 打到 stdout 会把
+    ``overlay`` / ``age_ms`` 这些真正要看的字段冲走。
+    """
+    payload = {key: value for key, value in result.items() if key != "data_base64"}
+    encoded = result.get("data_base64")
+    if not isinstance(encoded, str) or not encoded:
+        payload["saved_to"] = None
+        payload.setdefault("reason", "no frame data in response")
+        return payload
+    import base64
+
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        payload["saved_to"] = None
+        payload["reason"] = f"undecodable frame: {exc}"
+        return payload
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    payload["saved_to"] = str(out)
+    payload["saved_bytes"] = len(data)
+    return payload
+
+
 def request(host: str, port: int, token: str, method: str, path: str, payload: dict | None = None) -> dict:
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(
@@ -213,6 +240,29 @@ def main() -> int:
     )
     chatbox.set_defaults(immediate=True)
     sub.add_parser("cancel-inputs", help="cancel pending inputs and release buttons")
+    vision_frame = sub.add_parser(
+        "vision-frame",
+        help="save the latest captured frame to a file so it can actually be looked at",
+    )
+    vision_frame.add_argument(
+        "--out",
+        default="tmp/vision_frame.jpg",
+        help="where to write the JPEG (tmp/ is gitignored)",
+    )
+    vision_frame.add_argument(
+        "--overlay",
+        action="store_true",
+        help="draw detector boxes on the frame to compare detections against the pixels",
+    )
+    vision_frame.add_argument("--max-age-ms", type=int, default=3000)
+    vision_frame.add_argument(
+        "--quiet",
+        action="store_true",
+        help="print only the output path instead of the full metadata",
+    )
+    vision_stop = sub.add_parser("vision-stop", help="stop capture and release capture handles")
+    vision_stop.add_argument("--reason", default="manual_stop")
+    sub.add_parser("vision-start", help="recreate the frame source and start the capture worker")
     args = parser.parse_args()
     if args.command == "shell":
         return _run_shell(args.host, args.port, args.token)
@@ -340,6 +390,21 @@ def main() -> int:
             )
         elif args.command == "cancel-inputs":
             result = request(args.host, args.port, args.token, "POST", "/osc/cancel", {})
+        elif args.command == "vision-start":
+            result = request(args.host, args.port, args.token, "POST", "/vision/start", {})
+        elif args.command == "vision-stop":
+            result = request(
+                args.host, args.port, args.token, "POST", "/vision/stop", {"reason": args.reason}
+            )
+        elif args.command == "vision-frame":
+            query = f"/vision/frame?max_age_ms={args.max_age_ms}"
+            if args.overlay:
+                query += "&overlay=1"
+            result = request(args.host, args.port, args.token, "GET", query)
+            result = _write_frame(result, Path(args.out))
+            if args.quiet:
+                print(result.get("saved_to") or result.get("reason") or "no frame")
+                return 0 if result.get("saved_to") else 1
         else:
             result = request(
                 args.host,

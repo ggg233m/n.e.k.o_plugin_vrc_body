@@ -1037,12 +1037,15 @@ class BackendService:
             "worker": self._vision_worker_status(),
         }
 
-    def vision_frame(self, *, max_age_ms: Any = 3000) -> dict[str, Any]:
+    def vision_frame(self, *, max_age_ms: Any = 3000, overlay: Any = False) -> dict[str, Any]:
         """返回最近一帧的 base64 JPEG，仅供 agent 理解画面使用。
 
         这条路径与 ``world_state`` 完全分离，也不经过 ``navigator``：帧不产生
         实体、不产生事件，更不能拿去满足 ``body_reach_and_grab`` 的
         ``preconditions``。由画面得出的一切结论都是低置信视觉猜测。
+
+        ``overlay=True`` 叠加检测框用于对照「检测器看到的」与「画面里实际有的」。
+        框来自世界快照，但叠框图本身仍然只是像素——它不因为画了框就变成观测。
         """
         try:
             limit_ms = int(max_age_ms)
@@ -1051,7 +1054,7 @@ class BackendService:
         # 下限 250 ms 而不是 0：``latest_frame`` 把 0 当作「不限龄」，于是把
         # 「我要最新的」写成 0 会拿到最旧的一张——正好反了。
         limit_ms = min(30000, max(250, limit_ms))
-        result = dict(self.vision.latest_frame(max_age_ms=limit_ms))
+        result = dict(self.vision.latest_frame(max_age_ms=limit_ms, overlay=bool(overlay)))
         data = result.pop("data", None)
         if isinstance(data, bytes):
             import base64

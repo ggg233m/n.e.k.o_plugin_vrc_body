@@ -1357,13 +1357,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         return Ok(result)
 
     @llm_tool(**VRC_VISION_FRAME)
-    async def vrc_vision_frame(self, *, max_age_ms: Any = 3000, **_: Any):
+    async def vrc_vision_frame(self, *, max_age_ms: Any = 3000, overlay: Any = False, **_: Any):
         """把最近一帧画面注入当前回合，工具结果只回报元数据。
 
         图不能走工具返回值——``Ok`` 只是一个 JSON 值，模型看不到里面的 base64。
         所以这里用 ``ai_behavior="read"`` 推一个纯图片 part：宿主对 read 的图是
         立刻 ``stream_image`` 进当前会话的，正好赶上这次工具调用之后的生成。
         不带文字，免得再排一条装饰下一轮的 passive 提示。
+
+        ``overlay`` 只影响画的内容，不额外记账——同一次拉图，同一份预算。
         """
         if self._vision is None:
             return Ok({
@@ -1394,7 +1396,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         # 这个值等于把「要最新的」变成「要最旧的」。
         limit_ms = min(30000, max(250, limit_ms))
         try:
-            frame = await asyncio.to_thread(self._vision.frame, max_age_ms=limit_ms)
+            frame = await asyncio.to_thread(
+                self._vision.frame, max_age_ms=limit_ms, overlay=bool(overlay)
+            )
         except Exception as exc:
             return Ok({
                 "available": False,

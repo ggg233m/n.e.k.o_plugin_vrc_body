@@ -403,7 +403,18 @@ VRC_VISION_FRAME = {
                 "maximum": 30000,
                 "default": 3000,
                 "description": "可接受的画面陈旧上限；超过则返回 available=false 而不是给旧画面。",
-            }
+            },
+            "overlay": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "叠加检测框，用于对照「检测器看到的」与「画面里实际有的」——"
+                    "例如确认某个高分实体圈的是真人还是墙上的立绘。框来自世界快照，"
+                    "而画面按间隔缓存，两者可能不同时刻；返回的 overlay.skew_ms 就是这个"
+                    "错位量，够大时画面顶部会有红色警告条。叠了框也不改变性质：画面结论"
+                    "仍然只是低置信视觉猜测，不能写进 world_state。"
+                ),
+            },
         },
         "required": [],
     },

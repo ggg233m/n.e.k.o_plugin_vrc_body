@@ -11,6 +11,7 @@ from collections import deque
 import base64
 import importlib.util
 import json
+import math
 import os
 import re
 from queue import Empty, Full, Queue
@@ -174,6 +175,133 @@ def encode_frame_jpeg(
         return buf.getvalue(), width, height
     except Exception as exc:
         raise ValueError(f"frame cannot be encoded: {exc}") from exc
+
+
+def overlay_boxes_geometry(
+    boxes: Any,
+    *,
+    width: int,
+    height: int,
+) -> list[dict[str, Any]]:
+    """把归一化 bbox 换算成像素矩形，并丢掉画不出来的框。
+
+    单独成函数是为了能在没有 Pillow 的机器上测：归一化→像素的换算是这里唯一
+    可能出 off-by-one 的地方，而绘制那层必须要 PIL。``tests/test_vision_frame.py``
+    明确不依赖可选视觉依赖，所以算术必须能被单独 import。
+
+    ``bbox`` 是采集区域的 0..1 归一化坐标（``local_perception`` 按轴各自归一化，
+    无 letterbox），缓存 JPEG 是同一区域的等比降采样，所以直接乘宽高即可，不需要
+    letterbox 校正。退化框（宽或高不足 1 px）与非有限值被跳过而不是钳成一条线：
+    画一条线出来会让人以为检测到了什么。
+    """
+    try:
+        canvas_w = int(width)
+        canvas_h = int(height)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if canvas_w <= 0 or canvas_h <= 0:
+        return []
+    result: list[dict[str, Any]] = []
+    for item in boxes or ():
+        if not isinstance(item, Mapping):
+            continue
+        bbox = item.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            values = [float(bbox[index]) for index in range(4)]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(value) for value in values):
+            continue
+        left = int(round(min(max(values[0], 0.0), 1.0) * canvas_w))
+        top = int(round(min(max(values[1], 0.0), 1.0) * canvas_h))
+        right = int(round(min(max(values[2], 0.0), 1.0) * canvas_w))
+        bottom = int(round(min(max(values[3], 0.0), 1.0) * canvas_h))
+        # 先钳进画布再判退化，顺序不能反：整个落在画布外的框钳完会塌到角上，
+        # 若此时把 left/top 抬到 canvas-1，它就复活成一个 1×1 的角点——而一个
+        # 孤立像素会被读成「这里检测到了东西」。要求宽高各至少 1 px，也就顺带
+        # 保证了留下来的框 left <= canvas_w-1、top <= canvas_h-1，可以直接画。
+        left = min(max(left, 0), canvas_w)
+        top = min(max(top, 0), canvas_h)
+        right = min(max(right, 0), canvas_w)
+        bottom = min(max(bottom, 0), canvas_h)
+        if right - left < 1 or bottom - top < 1:
+            continue
+        attributes = item.get("attributes")
+        attributes = attributes if isinstance(attributes, Mapping) else {}
+        try:
+            confidence = float(item.get("confidence") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            confidence = 0.0
+        result.append({
+            "id": str(item.get("id") or ""),
+            "label": str(item.get("label") or "?"),
+            "confidence": confidence,
+            "rect": (left, top, right, bottom),
+            "clipped": bool(attributes.get("apparent_height_clipped")),
+            "bearing_deg": attributes.get("bearing_deg"),
+        })
+    return result
+
+
+def draw_detection_overlay(
+    data: bytes,
+    boxes: Any,
+    *,
+    quality: int = 70,
+    warning: str | None = None,
+) -> tuple[bytes, int]:
+    """在 JPEG 副本上画检测框，返回 ``(数据, 画出的框数)``。
+
+    调用方传入的是已编码的 JPEG 字节；这里解码、绘制、重新编码，**绝不写回
+    帧缓存**——缓存里必须保留原始像素，否则唤醒推送会拿到烧了框的图，而那张图
+    再也无法还原。
+
+    需要 Pillow。缺席时抛 ``ValueError``，由调用方降级成"给原图 + 说明原因"：
+    看不到框是降级，掉帧才是故障。
+    """
+    from io import BytesIO
+
+    try:
+        from PIL import Image, ImageDraw  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise ValueError(f"overlay requires Pillow: {exc}") from exc
+    try:
+        image = Image.open(BytesIO(data))
+        image.load()
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"frame cannot be decoded: {exc}") from exc
+    geometry = overlay_boxes_geometry(boxes, width=image.size[0], height=image.size[1])
+    draw = ImageDraw.Draw(image)
+    for box in geometry:
+        left, top, right, bottom = box["rect"]
+        # 贴边的框换个颜色并标 CLIPPED：表观高度已饱和，不能再当距离的单调
+        # 函数用，看图的人必须能一眼分辨。
+        color = (255, 96, 0) if box["clipped"] else (0, 224, 96)
+        draw.rectangle((left, top, right, bottom), outline=color, width=3)
+        caption = f"{box['label']} {box['confidence']:.2f}"
+        if box["clipped"]:
+            caption += " CLIPPED"
+        bearing = box.get("bearing_deg")
+        if isinstance(bearing, (int, float)) and math.isfinite(float(bearing)):
+            caption += f" {float(bearing):+.0f}°"
+        # 标签画在框内侧顶部：画在外面时贴着画面上边的框会把文字挤出画布。
+        text_y = top + 2 if top + 16 < image.size[1] else max(0, top - 14)
+        draw.rectangle((left, text_y, left + 8 * len(caption) + 4, text_y + 12), fill=(0, 0, 0))
+        draw.text((left + 2, text_y), caption, fill=color)
+    if warning:
+        # 警告烧在图上而不是只放进 JSON：JSON 字段容易被忽略，画面上的红条不会。
+        draw.rectangle((0, 0, image.size[0], 16), fill=(160, 0, 0))
+        draw.text((4, 3), warning[:120], fill=(255, 255, 255))
+    try:
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=min(95, max(30, int(quality))))
+        return buf.getvalue(), len(geometry)
+    except Exception as exc:
+        raise ValueError(f"overlay cannot be encoded: {exc}") from exc
 
 
 def find_window_region(title: str) -> dict[str, int] | None:
@@ -1421,7 +1549,7 @@ class VisionRuntime:
             self._frame_cache_at = captured_at
             self._frame_cache_error = None
 
-    def latest_frame(self, *, max_age_ms: int = 3000) -> dict[str, Any]:
+    def latest_frame(self, *, max_age_ms: int = 3000, overlay: bool = False) -> dict[str, Any]:
         """返回最近一次缓存的画面，超龄或采集停止时明确拒绝。
 
         这条路径刻意与 ``world_state`` 完全分离：帧只喂给 agent 理解，不产生
@@ -1431,6 +1559,9 @@ class VisionRuntime:
         ``max_age_ms <= 0`` 表示不限龄，这是留给运行时内部调用方的逃生口。
         LLM 那一侧不允许走到这里——工具与 ``BackendService`` 都把下限抬到了
         250 ms，否则「要最新的画面」写成 0 反而会拿到最旧的一张。
+
+        ``overlay=True`` 时叠加检测框，用于对照「检测器看到的」与「画面里实际
+        有的」。叠框只画在副本上，缓存中的原始像素不受影响。
         """
         now = self._clock()
         capture = self.capture_state()
@@ -1463,7 +1594,7 @@ class VisionRuntime:
                 "age_ms": round(age_ms, 1),
                 "capture_active": True,
             }
-        return {
+        result = {
             "available": True,
             "capture_active": True,
             "age_ms": round(age_ms, 1),
@@ -1473,6 +1604,66 @@ class VisionRuntime:
             "bytes": cached["bytes"],
             "data": cached["data"],
         }
+        if overlay:
+            result = self._apply_overlay(result, frame_age_ms=age_ms, now=now)
+        return result
+
+    def _apply_overlay(
+        self,
+        frame: dict[str, Any],
+        *,
+        frame_age_ms: float,
+        now: float,
+    ) -> dict[str, Any]:
+        """把当前世界实体画到帧副本上，并报告两者的时间差。
+
+        帧缓存按 ``frame_cache_interval_s`` 限流，世界快照却是最新的——两者能差
+        接近一个间隔。把一秒前的像素配上现在的框，等于告诉看图的人「这个人现在
+        在这个位置」，而那是伪造。所以 ``skew_ms`` 必须报出来，超过半个采集间隔
+        时还要烧到图上：JSON 字段会被忽略，画面上的红条不会。
+        """
+        snapshot = self._mask_stopped_snapshot(self.store.snapshot(now=now))
+        entities = snapshot.get("entities") or []
+        world_age_ms = snapshot.get("status", {}).get("last_observation_age_ms")
+        try:
+            world_age = float(world_age_ms) if world_age_ms is not None else None
+        except (TypeError, ValueError, OverflowError):
+            world_age = None
+        # 帧龄与世界龄都是「距今多久」，所以两者之差就是像素与框之间的错位。
+        skew_ms = abs(frame_age_ms - world_age) if world_age is not None else None
+        overlay_status: dict[str, Any] = {
+            "requested": True,
+            "frame_age_ms": round(frame_age_ms, 1),
+            "world_age_ms": round(world_age, 1) if world_age is not None else None,
+            "skew_ms": round(skew_ms, 1) if skew_ms is not None else None,
+            "entities_available": len(entities),
+        }
+        warning = None
+        if skew_ms is not None and skew_ms > max(250.0, self._frame_cache_interval_s * 500.0):
+            warning = (
+                f"SKEW {skew_ms:.0f}ms: boxes are from a different moment than these pixels"
+            )
+            overlay_status["skew_warning"] = True
+        try:
+            data, drawn = draw_detection_overlay(
+                frame["data"],
+                entities,
+                quality=self._frame_cache_quality,
+                warning=warning,
+            )
+        except Exception as exc:
+            # 画不出框就给原图。看不到框是降级，掉帧才是故障。
+            overlay_status["drawn"] = False
+            overlay_status["reason"] = f"{type(exc).__name__}: {exc}"[:200]
+            frame["overlay"] = overlay_status
+            return frame
+        overlay_status["drawn"] = True
+        overlay_status["boxes_drawn"] = drawn
+        overlay_status["boxes_skipped"] = max(0, len(entities) - drawn)
+        frame["data"] = data
+        frame["bytes"] = len(data)
+        frame["overlay"] = overlay_status
+        return frame
 
     def _mask_stopped_snapshot(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         """返回未知视图，同时不修改持久化世界存储。"""
@@ -1761,6 +1952,7 @@ from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # 
 
 __all__ = [
     "CapturedFrame",
+    "draw_detection_overlay",
     "encode_frame_jpeg",
     "find_window_region",
     "FrameDetector",
@@ -1770,6 +1962,7 @@ __all__ = [
     "MssFrameSource",
     "OpenVinoLocalDetector",
     "OpenAICompatibleSemanticBackend",
+    "overlay_boxes_geometry",
     "SemanticBackend",
     "VisionObservation",
     "VisionRuntime",

@@ -113,7 +113,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 max_age_ms = int(frame_query.get("max_age_ms", [3000])[0])
             except (TypeError, ValueError, OverflowError):
                 max_age_ms = 3000
-            self._json(200, self.server.service.vision_frame(max_age_ms=max_age_ms))
+            overlay = str(frame_query.get("overlay", ["0"])[0]).lower() in {"1", "true", "yes"}
+            self._json(
+                200,
+                self.server.service.vision_frame(max_age_ms=max_age_ms, overlay=overlay),
+            )
             return
         self._json(404, {"error": "unknown endpoint"})
 

@@ -753,17 +753,20 @@ class RemoteVision:
                 "error": str(exc),
             }
 
-    def frame(self, *, max_age_ms: int = 3000) -> dict[str, Any]:
+    def frame(self, *, max_age_ms: int = 3000, overlay: bool = False) -> dict[str, Any]:
         """取最近一帧的 base64 JPEG，只用于让 agent 看画面。
 
         后端不可用、采集已停止或缓存过期时返回 ``available=false`` 并说明原因，
         不返回旧画面——过期的画面比没有画面更危险，agent 会拿它当现在。
+
+        ``overlay=True`` 叠加检测框，用于对照检测器与画面本身；叠框不改变这条
+        路径的性质，画面结论仍然只是低置信视觉猜测。
         """
         try:
-            return self.client.request(
-                "GET",
-                f"/vision/frame?max_age_ms={int(max_age_ms)}",
-            )
+            query = f"/vision/frame?max_age_ms={int(max_age_ms)}"
+            if overlay:
+                query += "&overlay=1"
+            return self.client.request("GET", query)
         except BackendUnavailable as exc:
             return {
                 "available": False,
