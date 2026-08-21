@@ -374,6 +374,111 @@ def find_window_region(title: str) -> dict[str, int] | None:
         return None
 
 
+#: 可见比例低于此值就算「画面已经不是目标窗口了」。留一点余量：任务栏、输入法
+#: 候选框、Steam 通知都会盖掉窗口边角，那不该报警。
+_WINDOW_OBSCURED_BELOW = 0.6
+
+
+def window_visibility(title: str, *, grid: int = 12) -> dict[str, Any]:
+    """报告目标窗口此刻是否真的露在外面。
+
+    DXGI 桌面复制抓的是**合成后的桌面**、按输出而不是按窗口。VRChat 一被最小化
+    或被别的窗口盖住，采集依旧成功，只是像素换成了压在上面那个窗口的内容——
+    ``find_window_region`` 照样返回矩形、``window_found`` 照样是 true，检测器却在
+    别人的画面里找人。这个失败必须能被看见，否则 world_state 会凭空长出玩家。
+
+    可见度用**采样**而不是矩形求差：多个遮挡窗口互相重叠时面积会重复累加，两个
+    各盖 60% 的窗口能算出 120% 被盖，实际还露着 40%。这里在窗口矩形上取
+    ``grid × grid`` 个点，逐点问 ``WindowFromPoint`` 最上层是谁，重叠因此天然只
+    算一次。``WindowFromPoint`` 本身会跳过隐藏、禁用和 ``WS_EX_TRANSPARENT``
+    窗口，正好是我们想要的语义：点不到的覆盖物不算覆盖。
+
+    非 Windows、窗口不存在或 Win32 调用失败时返回 ``{"found": False}``，不抛异常。
+    可见度只是诊断信息，不该让采集本身挂掉。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # 用独立的 WinDLL 实例而不是共享的 ``ctypes.windll``：下面要设 argtypes/
+        # restype，而 windll 是进程级缓存，改它会波及别处的调用。
+        user32 = ctypes.WinDLL("user32")  # type: ignore[attr-defined]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return {"found": False}
+        if user32.IsIconic(hwnd):
+            # 最小化后 GetWindowRect 仍会返回一个屏外的旧矩形，在那上面采样毫无
+            # 意义，直接判 0。
+            return {"found": True, "minimized": True, "visible_ratio": 0.0}
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return {"found": True, "minimized": False}
+        width = int(rect.right) - int(rect.left)
+        height = int(rect.bottom) - int(rect.top)
+        if width <= 0 or height <= 0:
+            return {"found": True, "minimized": False, "visible_ratio": 0.0}
+
+        root = user32.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT=2
+        steps = max(1, int(grid))
+        point = wintypes.POINT()
+        hits = 0
+        total = 0
+        blockers: dict[int, int] = {}
+        for row in range(steps):
+            point.y = int(rect.top) + int((row + 0.5) * height / steps)
+            for col in range(steps):
+                point.x = int(rect.left) + int((col + 0.5) * width / steps)
+                total += 1
+                topmost = user32.WindowFromPoint(point)
+                if not topmost:
+                    continue
+                owner = user32.GetAncestor(topmost, 2) or topmost
+                if owner == root:
+                    hits += 1
+                else:
+                    blockers[owner] = blockers.get(owner, 0) + 1
+
+        result: dict[str, Any] = {
+            "found": True,
+            "minimized": False,
+            "visible_ratio": round(hits / total, 3),
+        }
+        if blockers:
+            worst, _count = max(blockers.items(), key=lambda item: item[1])
+            # 只解析盖得最多的那一个的标题：「被谁盖住了」是运维唯一想知道的，
+            # 逐个取标题只是白花 Win32 调用。
+            name = _hwnd_title(user32, worst)
+            if name:
+                result["occluded_by"] = name
+        return result
+    except Exception:
+        return {"found": False}
+
+
+def _hwnd_title(user32: Any, hwnd: Any) -> str:
+    try:
+        import ctypes
+
+        length = int(user32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value[:128]
+    except Exception:
+        return ""
+
+
 def _normalize_region(region: Mapping[str, Any] | None) -> dict[str, int] | None:
     """把采集区域补全成同时含 ``left/top/right/bottom/width/height`` 的形式。
 
@@ -917,6 +1022,12 @@ class WindowTrackedFrameSource:
 
     窗口暂时找不到时（最小化、切到别的桌面、VRChat 还没起来）保留上一次的矩形，
     而不是立刻退回全屏：把整个桌面喂给检测器比暂时抓一块过期区域更糟。
+
+    找到矩形不等于抓到了游戏画面：DXGI 抓的是合成后的桌面，窗口被盖住时采集照样
+    成功、内容却是压在上面那个窗口的。因此每个 TTL 还会顺手问一次
+    ``window_visibility``，把结果原样抬进 ``status()``。这一层仍然只报告、照常出帧；
+    要不要因此跳过推理由 ``VisionRuntime._observe_obscured`` 决定——采集源不该替
+    消费者判断画面有没有用。
     """
 
     name = "window_tracked"
@@ -929,6 +1040,7 @@ class WindowTrackedFrameSource:
         interval_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         resolver: Callable[[str], dict[str, int] | None] = find_window_region,
+        visibility: Callable[[str], Mapping[str, Any]] | None = window_visibility,
     ) -> None:
         self._lock = threading.Lock()
         self._title = str(title)[:256]
@@ -936,12 +1048,14 @@ class WindowTrackedFrameSource:
         self._interval_s = max(0.0, float(interval_s))
         self._clock = clock
         self._resolver = resolver
+        self._visibility = visibility
         self._closed = False
         self._rebuilds = 0
         self._last_error: str | None = None
         region = self._resolve()
         self._region: dict[str, int] | None = region
         self._window_found = region is not None
+        self._visible: dict[str, Any] = self._probe_visibility()
         self._checked_at = clock()
         self._source: FrameSource | None = factory(region)
 
@@ -953,6 +1067,19 @@ class WindowTrackedFrameSource:
                 self._last_error = f"{type(exc).__name__}: {exc}"[:256]
             return None
 
+    def _probe_visibility(self) -> dict[str, Any]:
+        """探测失败一律当「不知道」，不写进 ``_last_error``。
+
+        可见度是诊断信息，把它的异常混进采集错误里，会让一个纯诊断故障看起来
+        像采集挂了。
+        """
+        if self._visibility is None:
+            return {}
+        try:
+            return dict(self._visibility(self._title))
+        except Exception:
+            return {}
+
     def _refresh(self) -> None:
         if self._interval_s <= 0.0:
             return
@@ -962,8 +1089,12 @@ class WindowTrackedFrameSource:
                 return
             self._checked_at = now
         region = self._resolve()
+        # 可见度必须留在区域比较之外：它每次 Alt-Tab 都会变，塞进 region 会让
+        # 相等判断失手，于是每切一次窗口就重建一次 DXGI 会话。
+        visible = self._probe_visibility()
         with self._lock:
             self._window_found = region is not None
+            self._visible = visible
             if region is None or region == self._region or self._closed:
                 return
             old = self._source
@@ -1009,6 +1140,7 @@ class WindowTrackedFrameSource:
             source = self._source
             region = dict(self._region) if self._region else None
             found = self._window_found
+            visible = dict(self._visible)
             rebuilds = self._rebuilds
             last_error = self._last_error
         if source is None:
@@ -1029,6 +1161,18 @@ class WindowTrackedFrameSource:
         result["window_clamped_px"] = dict(region.get("clamped_px") or {}) if region else {}
         result["window_rebuilds"] = rebuilds
         result["window_track_interval_ms"] = round(self._interval_s * 1000.0, 1)
+        # 可见度探测失败时 ratio 留 None（「不知道」），而不是 0。分不清这两者的话，
+        # 一个坏掉的探测会被读成「窗口被完全盖住」，那是喊狼来了。
+        minimized = bool(visible.get("minimized"))
+        ratio = visible.get("visible_ratio")
+        result["window_minimized"] = minimized
+        result["window_visible_ratio"] = ratio
+        result["window_obscured"] = bool(
+            minimized or (ratio is not None and float(ratio) < _WINDOW_OBSCURED_BELOW)
+        )
+        occluder = visible.get("occluded_by")
+        if occluder:
+            result["window_occluded_by"] = occluder
         if last_error and not result.get("last_error"):
             result["last_error"] = last_error
         return result
@@ -1400,6 +1544,17 @@ class VisionWorker:
                 self._record_error(exc)
             self._stop.wait(self.interval_s)
 
+    def _obscured(self) -> bool:
+        """采集源是否报告目标窗口被盖住。探测不出来就当没被盖住。
+
+        这里刻意宁放不误封：把探测故障读成"被遮挡"会让检测在窗口其实可见时
+        整段停掉，那是用一个诊断故障换掉全部感知。
+        """
+        try:
+            return bool(dict(self.source.status()).get("window_obscured", False))
+        except Exception:
+            return False
+
     def _process_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -1407,7 +1562,11 @@ class VisionWorker:
             except Empty:
                 continue
             try:
-                self.runtime.process_frame(packet.frame, observed_at=packet.captured_at)
+                self.runtime.process_frame(
+                    packet.frame,
+                    observed_at=packet.captured_at,
+                    source_obscured=self._obscured(),
+                )
                 with self._lock:
                     self._processed += 1
                     self._last_processed_at = self._clock()
@@ -1480,6 +1639,7 @@ class VisionRuntime:
         self._detect_interval_s = max(0.0, float(detect_interval_s))
         self._last_detect_at: float | None = None
         self._detect_skipped = 0
+        self._obscured_frames = 0
         self._last_error: str | None = None
         # 单槽最新帧缓存。给 agent 看的图不走世界状态，也不进 120 Hz 调度线程：
         # 它只在采集 worker 自己的消费线程里按间隔编码一次，之后所有拉取都命中
@@ -1737,6 +1897,7 @@ class VisionRuntime:
             frame_cache_interval_s = self._frame_cache_interval_s
             detect_interval_s = self._detect_interval_s
             detect_skipped = self._detect_skipped
+            obscured_frames = self._obscured_frames
             last_detect_at = self._last_detect_at
         def backend_status(backend: Any, *, label: str) -> Mapping[str, Any]:
             if backend is None:
@@ -1780,6 +1941,10 @@ class VisionRuntime:
                     else round(max(0.0, (self._clock() - last_detect_at) * 1000.0), 1)
                 ),
             },
+            # 被遮挡而整帧丢弃的次数。它跟 skipped_frames 是两回事：限流是「这一帧
+            # 不看」，遮挡是「这一帧看不见」。混在一起读，就分不清检测器在省 CPU
+            # 还是窗口一直被别的应用压着。
+            "obscured_frames": obscured_frames,
             "last_error": last_error,
         }
 
@@ -1879,17 +2044,60 @@ class VisionRuntime:
         self.store.set_backend_status("vision_runtime", self.status())
         return result
 
+    def _observe_obscured(self, processing_now: float, observation_now: float) -> dict[str, Any]:
+        """窗口被盖住时只声明看不见，不对这一帧做任何推理。
+
+        DXGI 抓的是合成后的桌面，VRChat 被别的窗口压住时采集依旧"成功"，拿到的
+        却是上层窗口的像素。对它推理会把浏览器或聊天窗里的人形当成世界里的玩家
+        写进世界状态——那比没有观测危险得多，因为下游分不出真假。
+
+        因此这里既不写实体也不删实体：已有实体按各自 TTL 自然老化，
+        ``visual_capture_occluded`` 则明确告诉消费者「观测缺失是有原因的」。它不在
+        ``INFORMATIONAL_UNCERTAINTIES`` 白名单里，所以会照常阻断移动——看不见就
+        不该走。写入沿用检测节流的节拍，避免每帧都推高世界修订号。
+        """
+        with self._lock:
+            self._obscured_frames += 1
+            due = (
+                self._detect_interval_s <= 0.0
+                or self._last_detect_at is None
+                or processing_now - self._last_detect_at >= self._detect_interval_s
+            )
+            if due:
+                self._last_detect_at = processing_now
+            else:
+                self._detect_skipped += 1
+        if due:
+            self.ingest(
+                VisionObservation(
+                    entities=(),
+                    events=(),
+                    source="vision",
+                    observed_at=observation_now,
+                    uncertainties=("visual_capture_occluded",),
+                ),
+                _reactivate=False,
+            )
+        self.store.set_backend_status("vision_runtime", self.status())
+        result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
+        result["vision"] = self.status()
+        return result
+
     def process_frame(
         self,
         frame: Any,
         *,
         force_semantic: bool = False,
         observed_at: float | None = None,
+        source_obscured: bool = False,
     ) -> dict[str, Any]:
         """处理一帧画面而不阻塞身体调度器。
 
         采集循环由调用方负责。语义推理受到频率限制，只在明确请求或冷却时间
         到期时运行。
+
+        ``source_obscured`` 为真表示采集拿到的不是目标窗口的画面（被别的窗口
+        压住、或已最小化）。这种帧一律不推理：见 ``_observe_obscured``。
         """
         processing_now = self._clock()
         if not self.capture_state()["active"]:
@@ -1903,6 +2111,8 @@ class VisionRuntime:
         # 在检测之前缓存：帧在 worker 的 finally 里就会被释放，之后再想编码
         # 只能拿到已关闭的句柄。缓存自身按间隔限流，不是每帧都编。
         self._cache_frame(frame, processing_now)
+        if source_obscured:
+            return self._observe_obscured(processing_now, observation_now)
         # attach_vision/set_backends 可能与采集线程并行；在锁内取得稳定引用，
         # 后续推理不持有运行时锁，避免阻塞生命周期控制。
         with self._lock:
@@ -2004,5 +2214,6 @@ __all__ = [
     "VisionRuntime",
     "VisionWorker",
     "WindowTrackedFrameSource",
+    "window_visibility",
     "optional_dependency_status",
 ]

@@ -760,6 +760,140 @@ class VisionRuntimeTests(unittest.TestCase):
         self.assertEqual(detector.calls, 4)
         self.assertEqual(runtime.snapshot()["vision"]["detect_throttle"]["skipped_frames"], 0)
 
+    def test_an_obscured_frame_is_not_inferred_at_all(self) -> None:
+        """窗口被盖住时抓到的是上层窗口的像素，对它推理等于凭空造实体。
+
+        DXGI 抓的是合成后的桌面，被遮挡时采集"成功"但内容是别的应用。检测器
+        在浏览器或聊天窗里找到的人形会被写成世界里的玩家，而下游分不出真假。
+        所以整帧不推理——检测器和 VLM 一个都不叫。
+        """
+        detector = _Detector()
+        semantic = _Semantic()
+        runtime = VisionRuntime(detector=detector, semantic=semantic)
+
+        snapshot = runtime.process_frame(object(), source_obscured=True)
+
+        self.assertEqual(detector.calls, 0)
+        self.assertEqual(semantic.calls, 0)
+        self.assertEqual(snapshot["entities"], [])
+        self.assertIn("visual_capture_occluded", snapshot["uncertainties"])
+        self.assertEqual(snapshot["vision"]["obscured_frames"], 1)
+
+    def test_occlusion_uncertainty_stops_movement(self) -> None:
+        """看不见就不该走：这条不确定性必须留在阻断集合里。
+
+        ``INFORMATIONAL_UNCERTAINTIES`` 白名单里的编码不阻断移动。遮挡说的是
+        "当前观测不可信"，不是"这项能力天生没有"，一旦被误加进白名单，机器人
+        就会照着一屏浏览器画面继续导航。
+        """
+        self.assertEqual(
+            blocking_uncertainties(["visual_capture_occluded"]),
+            ["visual_capture_occluded"],
+        )
+
+    def test_obscured_frames_let_known_entities_age_out_instead_of_erasing_them(self) -> None:
+        """遮挡不是离场证据，已有实体只能按各自 TTL 自然老化。
+
+        强清会把"我暂时看不见"伪造成"它们走了"，Alt-Tab 一下世界就空掉；而 TTL
+        路径保留了 age_ms，"多久之前看到的"仍然是真话。
+        """
+        now = [0.0]
+        detector = _Detector()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=detector,
+            clock=lambda: now[0],
+        )
+        runtime.process_frame(object())
+        self.assertEqual(len(runtime.snapshot()["entities"]), 1)
+
+        for moment in (0.2, 0.4, 0.6):
+            now[0] = moment
+            snapshot = runtime.process_frame(object(), source_obscured=True)
+            self.assertEqual(len(snapshot["entities"]), 1, moment)
+            self.assertNotIn("changes", snapshot, moment)
+
+        self.assertEqual(detector.calls, 1)
+        self.assertGreater(snapshot["entities"][0]["age_ms"], 0.0)
+
+    def test_obscured_writes_follow_the_detect_interval(self) -> None:
+        """遮挡期间的声明也要限流，否则每帧都在推高世界修订号。
+
+        遮挡可能持续几分钟。若每帧都写一次，消费者的增量流会被一条重复的
+        不确定性刷满，真正的变化反而被挤出窗口。
+        """
+        now = [0.0]
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=_Detector(),
+            detect_interval_s=0.5,
+            clock=lambda: now[0],
+        )
+        first = runtime.process_frame(object(), source_obscured=True)["status"]["revision"]
+        for moment in (0.1, 0.25, 0.49):
+            now[0] = moment
+            self.assertEqual(
+                runtime.process_frame(object(), source_obscured=True)["status"]["revision"],
+                first,
+                moment,
+            )
+
+        now[0] = 0.5
+        self.assertGreater(
+            runtime.process_frame(object(), source_obscured=True)["status"]["revision"],
+            first,
+        )
+        vision = runtime.snapshot()["vision"]
+        self.assertEqual(vision["obscured_frames"], 5)
+        self.assertEqual(vision["detect_throttle"]["skipped_frames"], 3)
+
+    def test_worker_reads_occlusion_from_the_source_before_inferring(self) -> None:
+        """遮挡状态由采集源报告，worker 只负责把它传下去。
+
+        运行时拿不到窗口句柄，只有采集源知道自己抓的是不是目标窗口。
+        """
+        class ObscuredSource(_FrameSource):
+            def status(self):
+                return {"available": True, "window_found": True, "window_obscured": True}
+
+        detector = _Detector()
+        runtime = VisionRuntime(detector=detector)
+        worker = VisionWorker(runtime=runtime, source=ObscuredSource(), interval_s=0.01)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and runtime.status()["obscured_frames"] < 1:
+                time.sleep(0.01)
+        finally:
+            worker.stop()
+
+        self.assertGreaterEqual(runtime.status()["obscured_frames"], 1)
+        self.assertEqual(detector.calls, 0)
+        self.assertIn("visual_capture_occluded", runtime.snapshot()["uncertainties"])
+
+    def test_worker_treats_an_unreadable_source_status_as_visible(self) -> None:
+        """探测故障不能停掉全部感知：宁放不误封。
+
+        把 status() 抛异常读成"被遮挡"，等于用一个诊断故障换掉整条视觉通路。
+        """
+        class BrokenStatusSource(_FrameSource):
+            def status(self):
+                raise RuntimeError("status unavailable")
+
+        detector = _Detector()
+        runtime = VisionRuntime(detector=detector)
+        worker = VisionWorker(runtime=runtime, source=BrokenStatusSource(), interval_s=0.01)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and detector.calls < 1:
+                time.sleep(0.01)
+        finally:
+            worker.stop()
+
+        self.assertGreaterEqual(detector.calls, 1)
+        self.assertEqual(runtime.status()["obscured_frames"], 0)
+
     def test_backend_error_is_reported_without_raising_to_control_loop(self) -> None:
         class BrokenDetector(_Detector):
             def observe(self, frame, *, now):

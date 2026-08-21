@@ -319,8 +319,12 @@ def _clamp_to_virtual_desktop(rect, *, virtual):
 
 
 class WindowTrackedFrameSourceTests(unittest.TestCase):
-    def _build(self, rects, *, interval_s=5.0):
-        """``rects`` 是每次解析依次返回的窗口矩形。"""
+    def _build(self, rects, *, interval_s=5.0, visibility=None):
+        """``rects`` 是每次解析依次返回的窗口矩形。
+
+        ``visibility`` 默认关掉：不然测试会真去 ``FindWindowW("VRChat")``，
+        结果取决于跑测试的机器上有没有开着 VRChat。
+        """
         clock = _Clock()
         pending = list(rects)
         built: list[_FakeSource] = []
@@ -339,6 +343,7 @@ class WindowTrackedFrameSourceTests(unittest.TestCase):
             interval_s=interval_s,
             clock=clock,
             resolver=resolver,
+            visibility=visibility,
         )
         return tracked, clock, built
 
@@ -407,6 +412,128 @@ class WindowTrackedFrameSourceTests(unittest.TestCase):
         tracked.close()
         self.assertTrue(built[0].closed)
         self.assertIsNone(tracked.read(), "关闭后不能再返回帧，否则生命周期门会被重新打开")
+
+
+class WindowOcclusionReportingTests(unittest.TestCase):
+    """窗口被盖住时采集依旧「成功」，所以必须靠 status 把它报出来。"""
+
+    def _build(self, probes, *, rect=None):
+        rect = rect or {"left": 0, "top": 0, "right": 1280, "bottom": 720}
+        clock = _Clock()
+        pending = list(probes)
+        last = {"value": {}}
+
+        def visibility(_title):
+            if pending:
+                last["value"] = pending.pop(0)
+            return last["value"]
+
+        tracked = WindowTrackedFrameSource(
+            title="VRChat",
+            factory=_FakeSource,
+            interval_s=5.0,
+            clock=clock,
+            resolver=lambda _title: dict(rect),
+            visibility=visibility,
+        )
+        return tracked, clock
+
+    def test_a_fully_visible_window_is_not_flagged(self) -> None:
+        tracked, _clock = self._build([{"found": True, "minimized": False, "visible_ratio": 1.0}])
+        status = tracked.status()
+        self.assertFalse(status["window_obscured"])
+        self.assertEqual(status["window_visible_ratio"], 1.0)
+        self.assertNotIn("window_occluded_by", status)
+
+    def test_a_minimized_window_is_flagged_even_though_capture_succeeds(self) -> None:
+        """最小化是最刺眼的例子：矩形还在，采集还成功，画面已经完全不是游戏了。"""
+        tracked, _clock = self._build([{"found": True, "minimized": True, "visible_ratio": 0.0}])
+        status = tracked.status()
+        self.assertTrue(status["window_minimized"])
+        self.assertTrue(status["window_obscured"])
+        self.assertTrue(status["window_found"], "窗口仍然存在，只是看不见——两件事不能混")
+
+    def test_a_covered_window_names_the_window_on_top(self) -> None:
+        tracked, _clock = self._build(
+            [{"found": True, "minimized": False, "visible_ratio": 0.05, "occluded_by": "Discord"}]
+        )
+        status = tracked.status()
+        self.assertTrue(status["window_obscured"])
+        self.assertEqual(status["window_occluded_by"], "Discord")
+
+    def test_a_notification_sized_overlap_is_not_flagged(self) -> None:
+        # 任务栏、输入法候选框、Steam 弹窗都会盖掉一角，那不该报警。
+        tracked, _clock = self._build(
+            [{"found": True, "minimized": False, "visible_ratio": 0.93, "occluded_by": "Steam"}]
+        )
+        status = tracked.status()
+        self.assertFalse(status["window_obscured"])
+        self.assertEqual(status["window_occluded_by"], "Steam", "盖住谁照样要报，只是不算失效")
+
+    def test_a_failed_probe_reports_unknown_rather_than_fully_covered(self) -> None:
+        """探测坏掉不等于窗口被盖住。混为一谈就是喊狼来了。"""
+        tracked, _clock = self._build([{}])
+        status = tracked.status()
+        self.assertIsNone(status["window_visible_ratio"])
+        self.assertFalse(status["window_obscured"])
+
+    def test_a_raising_probe_does_not_break_capture_or_forge_an_error(self) -> None:
+        def visibility(_title):
+            raise OSError("user32 unavailable")
+
+        tracked = WindowTrackedFrameSource(
+            title="VRChat",
+            factory=_FakeSource,
+            interval_s=5.0,
+            clock=_Clock(),
+            resolver=lambda _title: {"left": 0, "top": 0, "right": 8, "bottom": 8},
+            visibility=visibility,
+        )
+        status = tracked.status()
+        self.assertIsNotNone(tracked.read())
+        self.assertIsNone(status["window_visible_ratio"])
+        self.assertNotIn(
+            "last_error", status, "可见度只是诊断信息，它的异常不该伪装成采集故障"
+        )
+
+    def test_visibility_changes_do_not_rebuild_the_capture_session(self) -> None:
+        """Alt-Tab 一次就重建一次 DXGI 会话的话，切窗口会变成掉帧风暴。"""
+        built: list[_FakeSource] = []
+        clock = _Clock()
+        probes = [
+            {"found": True, "minimized": False, "visible_ratio": 1.0},
+            {"found": True, "minimized": False, "visible_ratio": 0.0, "occluded_by": "Chrome"},
+        ]
+
+        def factory(region):
+            source = _FakeSource(region)
+            built.append(source)
+            return source
+
+        def visibility(_title):
+            return probes.pop(0) if probes else {}
+
+        tracked = WindowTrackedFrameSource(
+            title="VRChat",
+            factory=factory,
+            interval_s=5.0,
+            clock=clock,
+            resolver=lambda _title: {"left": 0, "top": 0, "right": 1280, "bottom": 720},
+            visibility=visibility,
+        )
+        clock.now += 10.0
+        tracked.read()
+        self.assertEqual(len(built), 1)
+        self.assertEqual(tracked.status()["window_rebuilds"], 0)
+        self.assertTrue(tracked.status()["window_obscured"])
+
+
+class WindowVisibilityProbeTests(unittest.TestCase):
+    def test_probe_never_raises_and_always_reports_found(self) -> None:
+        """非 Windows、没窗口、Win32 报错，一律返回 found=False 而不是抛异常。"""
+        result = vision.window_visibility("a window that does not exist — 3f9c1a")
+        self.assertIn("found", result)
+        self.assertFalse(result["found"])
 
 
 if __name__ == "__main__":
