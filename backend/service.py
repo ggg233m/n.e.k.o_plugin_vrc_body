@@ -51,6 +51,10 @@ _OSC_DURATION_MIN_MS = 100
 _OSC_DURATION_MAX_MS = 10000
 _OSC_HOLD_MIN_MS = 20
 _OSC_HOLD_MAX_MS = 1000
+# 满舵转向速度。把 (horizontal, duration_ms) 这套摇杆语义换算成角度：
+# horizontal=1.0 保持 500ms 就是 90°。调度器还会按 safety.max_angular_speed_dps
+# 再限一次速，这个常数只决定「一条指令要转多少」。
+TURN_SPEED_DPS = 180.0
 
 
 def _osc_axis_value(value: Any, name: str) -> float:
@@ -267,6 +271,7 @@ class BackendService:
             world_provider=lambda: self.vision.snapshot(),
             goal_provider=lambda: self.autonomy.snapshot(),
             send_axes=self._navigator_send_axes,
+            send_turn=self._navigator_send_turn,
             release_inputs=self._navigator_release_inputs,
             motion_provider=self._navigator_motion_feedback,
         )
@@ -1081,6 +1086,19 @@ class BackendService:
         )
         return bool(result.get("accepted"))
 
+    def _navigator_send_turn(self, delta_deg: float) -> bool:
+        """转向直接进调度器，不经 set_turn。
+
+        set_turn 是摇杆语义（horizontal + duration_ms），duration 有 100ms 下限，
+        换算过去等于最小 18°——而导航器的死区只有 8°，小幅修正会被整条拒掉。
+        这里要的就是「转这么多度」，中间那层换算只会丢精度。
+        """
+        scheduler = self.scheduler
+        if scheduler is None:
+            return False
+        result = scheduler.submit("turn", {"delta_deg": float(delta_deg)})
+        return bool(result.get("accepted"))
+
     def _navigator_release_inputs(self, side: str = "all") -> None:
         scheduler = self.scheduler
         if scheduler is not None:
@@ -1137,26 +1155,20 @@ class BackendService:
         return self.osc.pulse_input(normalized_action, normalized_side, normalized_hold)
 
     def set_locomotion(self, vertical: Any, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
+        """走位固定走 VRChat OSC，不经过 ``input.primary`` 路由。
+
+        移动是游戏输入，不是骨骼姿态。VMC 那条路把摇杆值写成 avatar 的手臂
+        pose，看起来像在推摇杆，VRChat 却收不到 ``/input/Move*``——人不动，
+        而调用方拿到的是 ``accepted: true``。VMC 只负责待机动作。
+        """
         try:
             normalized_vertical = _osc_axis_value(vertical, "vertical")
             normalized_horizontal = _osc_axis_value(horizontal, "horizontal")
             normalized_duration = _osc_duration_ms(duration_ms, 1000)
         except ValueError as exc:
             return False, str(exc)
-        if self.config.input.primary == "anyadance" and self.scheduler is not None:
-            result = self.scheduler.submit(
-                "input_axes",
-                {
-                    "side": "left",
-                    "x": normalized_horizontal,
-                    "y": normalized_vertical,
-                    "duration_ms": min(normalized_duration, self.config.input.max_hold_ms),
-                },
-            )
-            if result.get("accepted") or not self.config.input.osc_fallback:
-                return bool(result.get("accepted")), result.get("reason")
         if self.osc is None:
-            return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
+            return False, "VRChat OSC bridge is unavailable"
         duration_s = normalized_duration / 1000.0
         set_axes = getattr(self.osc, "set_axes", None)
         if callable(set_axes):
@@ -1187,45 +1199,52 @@ class BackendService:
         return False, horizontal_result[1] or "VRChat OSC locomotion send failed"
 
     def set_turn(self, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
+        """转向走 AnyaDance，直接转虚拟 HMD，不经 VRChat 的输入层。
+
+        VR 模式下 ``/input/LookHorizontal`` 是死路：VRChat 只在桌面模式把它当连续
+        转向，实测发再干净的边沿镜头也不动，但 OSC 照样回 ``accepted: true``。
+        完全虚拟模式下虚拟 HMD 就是相机，转它才是唯一可靠的转向手段，而且实测移动
+        方向跟着头走——转向 + 前进因此能组成完整的二维导航。
+
+        这里**不**回落到 OSC。已知在本机配置下那条路径不产生任何效果，回落只会把
+        「没转」重新包装成成功，正是之前查了很久的那个坑。
+        """
         try:
             normalized_horizontal = _osc_axis_value(horizontal, "horizontal")
             normalized_duration = _osc_duration_ms(duration_ms, 500)
         except ValueError as exc:
             return False, str(exc)
-        if self.config.input.primary == "anyadance" and self.scheduler is not None:
-            result = self.scheduler.submit(
-                "input_axes",
-                {
-                    "side": "right",
-                    "x": normalized_horizontal,
-                    "y": 0.0,
-                    "duration_ms": min(normalized_duration, self.config.input.max_hold_ms),
-                },
-            )
-            if result.get("accepted") or not self.config.input.osc_fallback:
-                return bool(result.get("accepted")), result.get("reason")
-        if self.osc is None:
-            return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
-        return self.osc.set_axis(
-            "look_horizontal",
-            normalized_horizontal,
-            normalized_duration / 1000.0,
-        )
+        if self.scheduler is None:
+            return False, "AnyaDance scheduler is not initialized"
+        delta_deg = normalized_horizontal * TURN_SPEED_DPS * (normalized_duration / 1000.0)
+        result = self.scheduler.submit("turn", {"delta_deg": delta_deg})
+        return bool(result.get("accepted")), result.get("reason")
 
     def stop_movement(self) -> tuple[bool, str | None]:
-        direct_ok = False
+        """释放移动轴。OSC 存在时，它的结果决定成败。
+
+        走位与转向现在只经由 OSC，因此只有 ``stop_all_axes`` 能真正让人停下。
+        VMC 覆盖层照常清掉（它持有待机动作的轴），但它成功不能掩盖 OSC 失败：
+        那会把"还在走"报成已停住，而调用方不会重试。
+        """
         direct_reason: str | None = None
         if self.config.input.primary == "anyadance" and self.scheduler is not None:
             result = self.scheduler.submit("input_release", {"side": "all"})
-            direct_ok = bool(result.get("accepted"))
             direct_reason = result.get("reason")
-        osc_ok = True
-        osc_reason: str | None = None
+            direct_ok = bool(result.get("accepted"))
+        else:
+            direct_ok = False
+        if self.scheduler is not None:
+            # 转向不在 OSC 轴里，stop_all_axes 碰不到它。不停就会继续转到目标角度。
+            self.scheduler.submit("turn", {"halt": True})
         if self.osc is not None:
             osc_ok, osc_reason = self.osc.stop_all_axes()
-        if direct_ok or osc_ok:
+            if osc_ok:
+                return True, None
+            return False, osc_reason or "VRChat OSC movement release failed"
+        if direct_ok:
             return True, None
-        return False, direct_reason or osc_reason or "movement release failed"
+        return False, direct_reason or "movement release failed"
 
     def set_controller_axes(self, side: Any, x: Any, y: Any, duration_ms: Any) -> tuple[bool, str | None]:
         normalized_side = str(side or "").strip().lower()

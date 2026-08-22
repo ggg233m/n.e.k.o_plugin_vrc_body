@@ -111,7 +111,9 @@ class AutonomyRuntime:
             if revision < self._world_revision:
                 return
             self._world_revision = revision
-            if self._state != "armed":
+            # degraded 也要往下走：它是「授权还在，但暂时看不见」，必须能恢复。
+            # stopping/disarmed 是终态，不复活。
+            if self._state not in {"armed", "degraded"}:
                 return
             events = world.get("events") if isinstance(world.get("events"), (list, tuple)) else ()
             if any(
@@ -130,6 +132,12 @@ class AutonomyRuntime:
                 self._reason = "world_observation_unknown"
                 self._release_inputs()
                 return
+            if self._state == "degraded":
+                # 看回来了就恢复。world.available 只表示「此刻有没有没过期的实体」，
+                # 而人的 TTL 才 1.5 秒——检测漏一帧半就会掉一次。没有这条恢复边的话，
+                # 一次瞬时丢失就把整个会话锁死在 degraded，导航器从此只报
+                # autonomy_not_armed，实机上 2.5 秒就复现了。
+                self._state = "armed"
             # This first runtime only authorizes goals. Navigation policy is
             # supplied by the perception/planner layer and must explicitly
             # submit bounded controller commands; no blind movement is emitted.

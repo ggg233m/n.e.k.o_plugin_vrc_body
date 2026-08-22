@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -445,6 +446,79 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(reset["accepted"])
         wait_until(lambda: self.scheduler.snapshot()["state"] == "idle")
         self.assertEqual(self.scheduler.snapshot()["safety_state"], "normal")
+
+    def test_turn_works_while_body_output_is_disabled(self) -> None:
+        """转向不能依赖 body enable。
+
+        N.E.K.O 宿主不在线时开 body 输出会把角色拽成 T Pose，所以导航必须能在
+        输出关闭的状态下转向。此时只推 HMD，其余设备靠驱动保留上一帧。
+        """
+        self.assertEqual(self.scheduler.snapshot()["state"], "disabled")
+        result = self.scheduler.submit("turn", {"delta_deg": 90.0})
+        self.assertTrue(result["accepted"], result.get("reason"))
+        # 命令是异步出队的，直接等 "not turning" 会在它开始之前就返回。
+        wait_until(lambda: self.scheduler.snapshot()["heading"]["turn_commands"] >= 1)
+        wait_until(lambda: not self.scheduler.snapshot()["heading"]["turning"])
+        heading = self.scheduler.snapshot()["heading"]
+        self.assertAlmostEqual(heading["yaw_deg"], 90.0, places=1)
+        self.assertGreater(self.transport.count(), 0)
+        devices = self.transport.latest_payload()["devices"]
+        self.assertEqual(list(devices), ["hmd"])
+
+    def test_turn_rotates_whole_play_space_not_just_the_head(self) -> None:
+        """只转头会让身体拧着；整个 play space 绕原点转才是原地转身。"""
+        self.enable()
+        wait_until(lambda: self.transport.count() >= 3)
+        before = self.transport.latest_payload()["devices"]
+        self.assertIn("hip", before)
+        hip_before = tuple(before["hip"]["pose"]["position"])
+
+        self.assertTrue(self.scheduler.submit("turn", {"yaw_deg": 180.0})["accepted"])
+        wait_until(lambda: self.scheduler.snapshot()["heading"]["turn_commands"] >= 1)
+        wait_until(lambda: not self.scheduler.snapshot()["heading"]["turning"])
+        hip_after = tuple(self.transport.latest_payload()["devices"]["hip"]["pose"]["position"])
+
+        # 绕 Y 轴转 180 度：X/Z 取反，高度不变。位置没变化就说明只转了朝向。
+        self.assertAlmostEqual(hip_after[0], -hip_before[0], places=3)
+        self.assertAlmostEqual(hip_after[1], hip_before[1], places=3)
+        self.assertAlmostEqual(hip_after[2], -hip_before[2], places=3)
+
+    def test_reported_yaw_stays_inside_one_revolution(self) -> None:
+        """朝向必须落在 [0, 360)。
+
+        每条转向命令都是 target += radians(delta)，累积误差真实存在：30 次 -24 度
+        算出 -720.0000000000002。先四舍五入再取模会把它报成 360.0，读的人会当成
+        「转了一整圈」而不是零——而这个字段正是验证转向是否生效的依据。
+        """
+        accumulated = 0.0
+        for _ in range(30):
+            accumulated += math.radians(-24.0)
+        # 确认边界真的构造出来了：老写法（先取模再四舍五入）会报出区间外的 360.0。
+        # 少了这步，等式两边都变对之后测试会静默失去意义。
+        self.assertEqual(round(math.degrees(accumulated) % 360.0, 2), 360.0)
+
+        self.scheduler._yaw_rad = accumulated
+        self.scheduler._yaw_target_rad = accumulated
+        # 直接调格式化函数：snapshot() 返回的是运行线程按间隔发布的缓存副本，
+        # 读它会拿到赋值之前的旧值，测试会在新旧代码下都通过。
+        heading = self.scheduler._heading_snapshot()
+        self.assertGreaterEqual(heading["yaw_deg"], 0.0)
+        self.assertLess(heading["yaw_deg"], 360.0)
+        self.assertLess(heading["target_yaw_deg"], 360.0)
+
+    def test_halt_stops_turning_in_place_without_snapping_back(self) -> None:
+        """转向没有「回中」，只有停。回中会把镜头猛甩回起点。"""
+        self.assertTrue(self.scheduler.submit("turn", {"delta_deg": 300.0})["accepted"])
+        wait_until(lambda: self.scheduler.snapshot()["heading"]["yaw_deg"] > 20.0)
+        self.assertTrue(self.scheduler.submit("turn", {"halt": True})["accepted"])
+        wait_until(lambda: not self.scheduler.snapshot()["heading"]["turning"])
+        stopped_at = self.scheduler.snapshot()["heading"]["yaw_deg"]
+        self.assertGreater(stopped_at, 0.0)
+        self.assertLess(stopped_at, 300.0)
+        time.sleep(0.1)
+        self.assertAlmostEqual(
+            self.scheduler.snapshot()["heading"]["yaw_deg"], stopped_at, places=1
+        )
 
     def test_disable_sends_six_neutral_frames_then_stops(self) -> None:
         self.enable()

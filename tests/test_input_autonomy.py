@@ -84,6 +84,67 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertFalse(runtime.snapshot()["armed"])
         self.assertIn("release", released)
 
+    def test_degraded_recovers_when_the_target_comes_back_into_view(self) -> None:
+        """看不见了要降级，看回来了必须恢复——degraded 不能是死状态。
+
+        world.available 只表示「此刻有没有没过期的实体」，而人的 TTL 是 1.5 秒，
+        检测漏一帧半就会掉一次。少了恢复边的话，一次瞬时丢失就把会话永久锁死，
+        导航器从此只报 autonomy_not_armed。实机跑真实检测时 2.5 秒就复现了。
+        """
+        now = [0.0]
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            clock=lambda: now[0],
+            session_ttl_s=600.0,
+        )
+        self.assertTrue(runtime.arm()["armed"])
+        self.assertTrue(runtime.submit_goal("walk to the person", "approach")["accepted"])
+
+        def world(available: bool, revision: int) -> dict:
+            return {"available": available, "entities": [], "events": [],
+                    "status": {"revision": revision}}
+
+        runtime.update_world(world(True, 1))
+        self.assertEqual(runtime.snapshot()["state"], "armed")
+
+        runtime.update_world(world(False, 2))
+        degraded = runtime.snapshot()
+        self.assertEqual(degraded["state"], "degraded")
+        self.assertEqual(degraded["reason"], "world_observation_unknown")
+
+        runtime.update_world(world(True, 3))
+        recovered = runtime.snapshot()
+        self.assertEqual(recovered["state"], "armed")
+        # 导航器要的是 state == "armed"，光有 armed=True 不够：degraded 也算 armed。
+        self.assertTrue(recovered["armed"])
+        self.assertIsNotNone(recovered["goal"])
+
+    def test_degraded_does_not_resurrect_a_disarmed_session(self) -> None:
+        """恢复边不能把已经 disarm 的会话弄活。
+
+        这里真正拦住它的是 disarm 清掉了 goal（goal is None 会提前返回），不是状态
+        守卫——把守卫改成 `if False` 这个测试照样过。写清楚是为了别人改 goal 检查时
+        知道这条断言依赖的是什么。
+        """
+        now = [0.0]
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            clock=lambda: now[0],
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        runtime.submit_goal("walk to the person", "approach")
+        runtime.disarm("manual_disarm")
+        self.assertIsNone(runtime.snapshot()["goal"])
+
+        runtime.update_world({"available": True, "entities": [], "events": [],
+                              "status": {"revision": 9}})
+        after = runtime.snapshot()
+        self.assertEqual(after["state"], "disarmed")
+        self.assertFalse(after["armed"])
+
     def test_world_delta_revision_and_player_memory_boundary(self) -> None:
         store = WorldStateStore(clock=lambda: 1.0)
         first = store.delta(wait_ms=0)

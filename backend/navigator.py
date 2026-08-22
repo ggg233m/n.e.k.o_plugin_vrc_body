@@ -15,6 +15,7 @@ from .world_state import blocking_uncertainties
 
 
 AxisSender = Callable[[str, float, float, int], bool]
+TurnSender = Callable[[float], bool]
 ReleaseSender = Callable[[str], None]
 SnapshotProvider = Callable[[], Mapping[str, Any]]
 
@@ -32,6 +33,11 @@ class NavigatorConfig:
     pulse_ms: int = 220
     max_forward_axis: float = 0.28
     max_turn_axis: float = 0.35
+    # 转向现在直接给角度（转虚拟 HMD），不再压成摇杆量。gain < 1 是刻意的：
+    # bearing 来自上一帧观测，按整个偏差一次转到位会越过中心然后来回摆；
+    # 留一点余量让 10 Hz 的闭环收敛。
+    turn_gain: float = 0.8
+    max_turn_deg: float = 45.0
     max_observation_age_ms: int = 1000
     min_confidence: float = 0.55
     bearing_deadband_deg: float = 8.0
@@ -59,6 +65,10 @@ class NavigatorConfig:
             raise ValueError("navigator.max_forward_axis must be between 0.05 and 0.6")
         if not 0.05 <= float(self.max_turn_axis) <= 0.8:
             raise ValueError("navigator.max_turn_axis must be between 0.05 and 0.8")
+        if not 0.1 <= float(self.turn_gain) <= 1.0:
+            raise ValueError("navigator.turn_gain must be between 0.1 and 1")
+        if not 5.0 <= float(self.max_turn_deg) <= 180.0:
+            raise ValueError("navigator.max_turn_deg must be between 5 and 180")
         if not 100 <= int(self.max_observation_age_ms) <= 5000:
             raise ValueError("navigator.max_observation_age_ms must be between 100 and 5000")
         if not 0.1 <= float(self.min_confidence) <= 1.0:
@@ -90,6 +100,7 @@ class NavigationDecision:
     pulse_ms: int = 0
     revision: int = 0
     observed_age_ms: float | None = None
+    turn_deg: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +115,7 @@ class NavigationDecision:
             "pulse_ms": self.pulse_ms,
             "revision": self.revision,
             "observed_age_ms": None if self.observed_age_ms is None else round(self.observed_age_ms, 1),
+            "turn_deg": round(self.turn_deg, 2),
         }
 
 
@@ -214,6 +226,7 @@ class LocalNavigator:
         world_provider: SnapshotProvider,
         goal_provider: SnapshotProvider,
         send_axes: AxisSender,
+        send_turn: TurnSender,
         release_inputs: ReleaseSender,
         motion_provider: SnapshotProvider | None = None,
         config: NavigatorConfig | None = None,
@@ -223,6 +236,7 @@ class LocalNavigator:
         self._world_provider = world_provider
         self._goal_provider = goal_provider
         self._send_axes = send_axes
+        self._send_turn = send_turn
         self._release_inputs = release_inputs
         # 可选：VRChat 内置 Velocity 参数。没有它时导航器行为与之前完全一致，
         # 只是无法察觉卡墙——这是降级，不是故障。
@@ -441,10 +455,17 @@ class LocalNavigator:
         if bearing is None:
             return NavigationDecision("stop", "target_bearing_unknown", target_id=target_id, revision=revision, observed_age_ms=observed_age)
         if abs(bearing) > self.config.bearing_deadband_deg:
-            turn = _clamp(
-                bearing / 45.0 * self.config.max_turn_axis,
-                -self.config.max_turn_axis,
-                self.config.max_turn_axis,
+            # 转向直接给角度，不再经摇杆。bearing 本身就是「要转多少度才能把目标
+            # 转到画面中央」，压成摇杆量再靠脉冲时长积分只会丢精度；而且 VR 模式
+            # 下右摇杆根本不产生转向。
+            #
+            # 符号：bearing>0 表示目标在画面右侧（local_perception.py 的
+            # (center_x - 0.5) * fov），而 +yaw 是左转（实测 tmp/turn_sign.py：
+            # 转 +20° 画面内容右移 154 px），所以要取反才能转向目标。
+            turn_deg = _clamp(
+                -bearing * self.config.turn_gain,
+                -self.config.max_turn_deg,
+                self.config.max_turn_deg,
             )
             return NavigationDecision(
                 "turn",
@@ -452,12 +473,13 @@ class LocalNavigator:
                 target_id,
                 bearing,
                 distance,
-                "right",
-                turn,
+                None,
                 0.0,
-                self.config.pulse_ms,
+                0.0,
+                0,
                 revision,
                 observed_age,
+                turn_deg=turn_deg,
             )
         # 优先使用表观高度：这是二维检测器唯一实测得到的接近度指标。必须排在
         # ``distance is None`` 之前，否则不带深度适配器的检测器永远走不到这里。
@@ -550,12 +572,14 @@ class LocalNavigator:
         return candidates[0][2]
 
     def _apply(self, decision: NavigationDecision) -> None:
-        if decision.state == "turn" and decision.side:
-            if self._active_side == "left":
-                self._release_inputs("left")
-            if self._send_axes("right", decision.x, decision.y, decision.pulse_ms):
+        if decision.state == "turn":
+            # 转向不占摇杆，所以不进 _active_side：它是 play space 的朝向，不是
+            # 需要按住再松开的输入。但前进摇杆必须先松——边走边转会让 bearing
+            # 在观测间隔里持续漂移，转向永远收敛不了。
+            if self._active_side is not None:
+                self._safe_release()
+            if self._send_turn(decision.turn_deg):
                 with self._lock:
-                    self._active_side = "right"
                     self._command_count += 1
             return
         if decision.state == "advance" and decision.side:

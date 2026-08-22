@@ -6,10 +6,22 @@ import json
 from typing import Any, Dict
 
 from .config import SafetyConfig
-from .model import CONTROLLER_IDS, DEVICE_IDS, FrameState, all_finite, quat_norm_sq
+from .model import CONTROLLER_IDS, DEVICE_IDS, DeviceState, FrameState, all_finite, quat_norm_sq
 
 PROTOCOL_VERSION = 1
 MAX_PACKET_BYTES = 8192
+
+
+def _validate_device_pose(name: str, device: DeviceState, safety: SafetyConfig) -> None:
+    if not all_finite(device.position) or not all_finite(device.rotation):
+        raise ValueError(f"{name} pose contains NaN or Infinity")
+    if any(abs(value) > safety.max_position_abs_m for value in device.position):
+        raise ValueError(f"{name} position exceeds plugin safety bounds")
+    if device.position[1] > safety.max_y_m:
+        raise ValueError(f"{name} Y position exceeds plugin safety bounds")
+    norm_sq = quat_norm_sq(device.rotation)
+    if not 0.5 <= norm_sq <= 1.5:
+        raise ValueError(f"{name} quaternion length is invalid")
 
 
 def validate_frame(frame: FrameState, safety: SafetyConfig) -> None:
@@ -20,15 +32,7 @@ def validate_frame(frame: FrameState, safety: SafetyConfig) -> None:
 
     for name in DEVICE_IDS:
         device = frame.devices[name]
-        if not all_finite(device.position) or not all_finite(device.rotation):
-            raise ValueError(f"{name} pose contains NaN or Infinity")
-        if any(abs(value) > safety.max_position_abs_m for value in device.position):
-            raise ValueError(f"{name} position exceeds plugin safety bounds")
-        if device.position[1] > safety.max_y_m:
-            raise ValueError(f"{name} Y position exceeds plugin safety bounds")
-        norm_sq = quat_norm_sq(device.rotation)
-        if not 0.5 <= norm_sq <= 1.5:
-            raise ValueError(f"{name} quaternion length is invalid")
+        _validate_device_pose(name, device, safety)
 
     for name in CONTROLLER_IDS:
         controller = frame.controllers[name]
@@ -98,3 +102,28 @@ def encode_frame(frame: FrameState, safety: SafetyConfig) -> bytes:
     if len(encoded) >= MAX_PACKET_BYTES:
         raise ValueError(f"serialized UDP packet is {len(encoded)} bytes; limit is < {MAX_PACKET_BYTES}")
     return encoded
+
+
+def encode_head_frame(device: DeviceState, safety: SafetyConfig) -> bytes:
+    """把只含 HMD 的部分帧编码成 UDP 包。
+
+    协议允许发送方少报设备，驱动会为省略的设备保留上一次的位姿。转向靠这条路径：
+    完全虚拟模式下虚拟 HMD 就是相机本身，所以即使身体输出关着，头也必须能转——
+    否则「转向」会被迫依赖 body_enable，而在 N.E.K.O 主机没起来时那会把角色摆成
+    T Pose。
+    """
+    _validate_device_pose("hmd", device, safety)
+    payload = {
+        "version": PROTOCOL_VERSION,
+        "devices": {
+            "hmd": {
+                "valid": bool(device.valid),
+                "connected": bool(device.connected),
+                "pose": {
+                    "position": list(device.position),
+                    "rotation_xyzw": list(device.rotation),
+                },
+            }
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")

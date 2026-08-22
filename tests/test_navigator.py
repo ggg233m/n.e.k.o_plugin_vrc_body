@@ -25,11 +25,13 @@ class NavigatorTests(unittest.TestCase):
             "goal": {"kind": "approach", "text": "approach the door", "age_seconds": 1.0},
         }
         self.sent: list[tuple[str, float, float, int]] = []
+        self.turns: list[float] = []
         self.released: list[str] = []
         self.navigator = LocalNavigator(
             world_provider=lambda: self.world,
             goal_provider=lambda: self.goal,
             send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
             release_inputs=lambda side: self.released.append(side),
         )
 
@@ -42,12 +44,32 @@ class NavigatorTests(unittest.TestCase):
         self.assertGreater(self.sent[0][2], 0.0)
 
     def test_off_center_target_turns_without_forward_motion(self) -> None:
+        """目标偏右就必须往右转，而且不能同时前进。
+
+        符号搞反会让导航器背对目标越转越远，且看起来一切正常（命令都 accepted）。
+        bearing>0 是「目标在画面右侧」，+delta_deg 是左转，所以 turn_deg 必须是负的。
+        """
         self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
         decision = self.navigator.tick()
         self.assertEqual(decision.state, "turn")
-        self.assertEqual(self.sent[0][0], "right")
-        self.assertGreater(self.sent[0][1], 0.0)
-        self.assertEqual(self.sent[0][2], 0.0)
+        self.assertLess(decision.turn_deg, 0.0)
+        self.assertEqual(self.turns, [decision.turn_deg])
+        # 转向不碰摇杆：一路都不该有 axis 命令。
+        self.assertEqual(self.sent, [])
+
+    def test_turn_magnitude_is_bounded_and_undershoots(self) -> None:
+        """转向幅度要收敛，不能一次转过头。
+
+        bearing 来自上一帧观测，按整个偏差转会越过中心然后来回摆；同时再大的
+        bearing 也不能换来无界的转身。
+        """
+        self.world["entities"][0]["attributes"]["bearing_deg"] = -40.0
+        decision = self.navigator.tick()
+        self.assertGreater(decision.turn_deg, 0.0)
+        self.assertLess(decision.turn_deg, 40.0)
+
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 179.0
+        self.assertLessEqual(abs(self.navigator.tick().turn_deg), 45.0)
 
     def test_unknown_or_stale_world_releases_active_axis(self) -> None:
         self.navigator.tick()
@@ -74,6 +96,7 @@ class NavigatorTests(unittest.TestCase):
                     world_provider=lambda: {**self.world, "uncertainties": [code]},
                     goal_provider=lambda: self.goal,
                     send_axes=lambda side, x, y, pulse: True,
+                    send_turn=lambda delta: True,
                     release_inputs=lambda side: None,
                 )
                 decision = navigator.tick()
@@ -147,6 +170,7 @@ class NavigatorStallTests(unittest.TestCase):
         }
         self.motion: dict[str, object] = {"available": True, "horizontal_speed_mps": 0.9}
         self.sent: list[tuple[str, float, float, int]] = []
+        self.turns: list[float] = []
         self.released: list[str] = []
 
     def _navigator(self, *, motion_provider=..., **overrides) -> LocalNavigator:
@@ -154,6 +178,7 @@ class NavigatorStallTests(unittest.TestCase):
             world_provider=lambda: self.world,
             goal_provider=lambda: self.goal,
             send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
             release_inputs=lambda side: self.released.append(side),
             motion_provider=(lambda: self.motion) if motion_provider is ... else motion_provider,
             config=NavigatorConfig(stall_ticks=3, **overrides),

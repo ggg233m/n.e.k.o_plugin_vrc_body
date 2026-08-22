@@ -121,6 +121,95 @@ class BackendClientTests(unittest.TestCase):
         service.osc = Osc()  # type: ignore[assignment]
         self.assertEqual(service.stop_movement(), (False, "zero packet failed"))
 
+    def test_movement_reaches_vrchat_osc_even_when_vmc_is_primary(self) -> None:
+        """走位与转向必须落到 OSC，不能被 VMC 路由吃掉。
+
+        VMC 覆盖层把摇杆值写成 avatar 手臂 pose：看着像在推摇杆，VRChat 收不到
+        ``/input/*``，人原地不动，而调用方拿到 ``accepted: true``。这是 turn
+        长期"接受但不转"的根因——修好之前，下面的 set_axis 断言一条都到不了。
+        """
+        class RecordingOsc:
+            def __init__(self) -> None:
+                self.axes: list[tuple[str, float, float]] = []
+
+            def set_axis(self, name, value, duration_s):
+                self.axes.append((name, value, duration_s))
+                return True, None
+
+            def stop_all_axes(self):
+                return True, None
+
+        class RecordingScheduler:
+            def __init__(self) -> None:
+                self.submits: list[str] = []
+                self.params: list[dict] = []
+
+            def submit(self, kind, _params=None):
+                self.submits.append(kind)
+                self.params.append(dict(_params or {}))
+                return {"accepted": True, "reason": None}
+
+        service = BackendService({"input": {"primary": "anyadance"}}, Path.cwd())
+        osc = RecordingOsc()
+        scheduler = RecordingScheduler()
+        service.osc = osc  # type: ignore[assignment]
+        service.scheduler = scheduler  # type: ignore[assignment]
+
+        self.assertEqual(service.set_turn(0.5, 500), (True, None))
+        self.assertEqual(service.set_locomotion(1.0, 0.0, 1000), (True, None))
+
+        sent = {name for name, _value, _duration in osc.axes}
+        self.assertIn("move_vertical", sent)
+        # 转向不能走 OSC：VR 模式下 look 轴是死地址，发了照样回 accepted。
+        self.assertNotIn("look_horizontal", sent)
+        # 它走调度器，直接转虚拟 HMD。
+        self.assertIn("turn", scheduler.submits)
+        # 摇杆轴一次都不该进调度器：那条路服务待机动作，不是游戏输入。
+        self.assertNotIn("input_axes", scheduler.submits)
+
+    def test_stop_movement_does_not_hide_an_osc_failure_behind_the_vmc_release(self) -> None:
+        """OSC 停不下来就必须报失败，哪怕 VMC 覆盖层清干净了。
+
+        移动轴现在只经由 OSC，只有它能真正让人停下。把 VMC 的成功当成整体成功，
+        等于把"还在走"报成"已停住"，而调用方不会重试。
+        """
+        class FailingStopOsc:
+            def stop_all_axes(self):
+                return False, "zero packet failed"
+
+        class AcceptingScheduler:
+            def submit(self, _kind, _params=None):
+                return {"accepted": True, "reason": None}
+
+        service = BackendService({"input": {"primary": "anyadance"}}, Path.cwd())
+        service.osc = FailingStopOsc()  # type: ignore[assignment]
+        service.scheduler = AcceptingScheduler()  # type: ignore[assignment]
+
+        self.assertEqual(service.stop_movement(), (False, "zero packet failed"))
+
+    def test_movement_without_its_transport_fails_instead_of_reporting_success(self) -> None:
+        """走位和转向各有各的通道，缺谁就该谁失败，不能互相顶替。
+
+        走位只能靠 OSC；转向只能靠 AnyaDance，因为 VR 模式下 look 轴根本不生效，
+        回落到 OSC 只会把"没转"重新包装成成功。
+        """
+        class AcceptingScheduler:
+            def submit(self, _kind, _params=None):
+                return {"accepted": True, "reason": None}
+
+        service = BackendService({"input": {"primary": "anyadance"}}, Path.cwd())
+        service.osc = None  # type: ignore[assignment]
+        service.scheduler = AcceptingScheduler()  # type: ignore[assignment]
+
+        # 转向不碰 OSC，所以 OSC 缺席也照样能转。
+        self.assertEqual(service.set_turn(0.5, 500), (True, None))
+        self.assertFalse(service.set_locomotion(1.0, 0.0, 1000)[0])
+
+        service.scheduler = None  # type: ignore[assignment]
+        turn_ok, turn_reason = service.set_turn(0.5, 500)
+        self.assertFalse(turn_ok)
+        self.assertIn("scheduler", turn_reason or "")
+
     def test_osc_batch_is_bounded_and_records_dispatch_latency(self) -> None:
         service = BackendService({}, Path.cwd())
 
@@ -146,6 +235,12 @@ class BackendClientTests(unittest.TestCase):
 
         osc = Osc()
         service.osc = osc  # type: ignore[assignment]
+
+        class AcceptingScheduler:
+            def submit(self, _kind, _params=None):
+                return {"accepted": True, "reason": None}
+
+        service.scheduler = AcceptingScheduler()  # type: ignore[assignment]
         result = service.send_osc_batch([
             {"kind": "locomotion", "vertical": 0.4, "horizontal": 0.0, "duration_ms": 500},
             {"kind": "turn", "horizontal": -0.2, "duration_ms": 300},
@@ -153,9 +248,9 @@ class BackendClientTests(unittest.TestCase):
         ])
         self.assertTrue(result["accepted"])
         self.assertEqual(len(result["results"]), 3)
+        # 转向不再产生 OSC 调用，它走调度器。
         self.assertEqual(osc.calls[0][0], "axes")
-        self.assertEqual(osc.calls[1][0], "axis")
-        self.assertEqual(osc.calls[2][0], "parameter")
+        self.assertEqual(osc.calls[1][0], "parameter")
 
         self.assertFalse(service.send_osc_batch([{"kind": "noop"}] * 9)["accepted"])
         service.record_control_dispatch("/osc/batch", 0.0)

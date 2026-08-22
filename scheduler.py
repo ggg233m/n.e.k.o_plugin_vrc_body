@@ -31,9 +31,10 @@ from .motion import (
     gesture_frame,
     interpolate_frame,
     move_hand_target,
+    quat_multiply,
     reach_target,
 )
-from .protocol import encode_frame, validate_frame
+from .protocol import encode_frame, encode_head_frame, validate_frame
 from .expression_motion import (
     EXPRESSION_GESTURES,
     ExpressionOverlay,
@@ -204,6 +205,14 @@ class BodyScheduler:
         self._idle_relay_applied = False
         self._idle_relay_error: Optional[str] = None
         self._input_overlay = ControllerInputOverlay()
+        # 转向是 play space 的 yaw，不是某个身体姿势。它必须跨动作、待机中继和表情
+        # 一直保持，所以作为变换叠在合成好的输出帧上，而不是写进 self._frame——
+        # 后者每帧都会被动作采样覆盖掉。
+        self._yaw_rad = 0.0
+        self._yaw_target_rad = 0.0
+        self._yaw_last_tick: Optional[float] = None
+        self._yaw_hold_frames = 0
+        self._yaw_commands = 0
         self._behavior = BehaviorStateMachine(
             history_size=self.config.behavior.transition_history_size
         )
@@ -213,6 +222,13 @@ class BodyScheduler:
             "state": "disabled",
             "safety_state": "normal",
             "output_enabled": False,
+            "heading": {
+                "yaw_deg": 0.0,
+                "target_yaw_deg": 0.0,
+                "turning": False,
+                "turn_commands": 0,
+                "max_turn_speed_dps": self.config.safety.max_angular_speed_dps,
+            },
             "udp": {
                 "target": f"{self.config.host}:{self.config.port}",
                 "connected": "unknown",
@@ -326,7 +342,7 @@ class BodyScheduler:
 
         if kind == "stop":
             priority = 0
-        elif kind in self.INPUT_COMMANDS:
+        elif kind in self.INPUT_COMMANDS or kind == "turn":
             priority = 2
         elif kind in {"disable", "reset", "enable", "cancel"}:
             priority = 1
@@ -391,6 +407,10 @@ class BodyScheduler:
             predicted = "idle"
         elif kind == "cancel":
             predicted = "holding"
+        elif kind == "turn":
+            # 转向只改 play space 的朝向，不驱动身体，所以不改变调度器状态；
+            # 身体输出关着的时候它照样有效（虚拟 HMD 就是相机）。
+            predicted = state
         else:
             predicted = "moving"
         return {
@@ -485,6 +505,8 @@ class BodyScheduler:
                     self._sample_idle_relay()
                     self._sample_expression_motion(now)
                     self._apply_controller_input_overlay(now)
+                    self._advance_yaw(now)
+                    self._apply_play_space_yaw()
                     if self._enabled:
                         self._send_current_frame(now)
                         if self._disable_frames_remaining > 0:
@@ -494,6 +516,10 @@ class BodyScheduler:
                                 self._state = "disabled"
                                 self._active = None
                                 self._clear_current_action(now, "completed")
+                    elif self._yaw_is_settling():
+                        # 身体输出关着也要能转向：只推 HMD，别的设备保持驱动里的
+                        # 上一帧，所以不会把角色拽成 T Pose。
+                        self._send_head_frame(now)
                     self._publish_snapshot_if_due(now)
                 except Exception as exc:  # scheduler must fail safe instead of dying
                     self._enter_fault(exc)
@@ -539,6 +565,9 @@ class BodyScheduler:
             kind = command.kind
             if kind == "input_axes":
                 self._apply_input_axes_command(command.params, now)
+                return
+            if kind == "turn":
+                self._apply_turn_command(command.params)
                 return
             if kind == "input_button":
                 self._apply_input_button_command(command.params, now)
@@ -774,6 +803,84 @@ class BodyScheduler:
             elif button == "b":
                 controller.b_click = pressed
 
+    # --- play space yaw ------------------------------------------------------
+    #
+    # VR 模式下 VRChat 不认 /input/LookHorizontal，虚拟右摇杆也只有一个方向偶尔
+    # 生效，所以转向不走 VRChat 的输入层，而是直接转虚拟 HMD。实测（见
+    # .scratch/turn_move.py）移动方向跟着头走：yaw 一改，/input/Vertical 就沿新
+    # 朝向推进，转向 + 前进因此构成完整的二维导航。
+
+    def _apply_turn_command(self, params: Dict[str, Any]) -> None:
+        if params.get("halt"):
+            self._halt_yaw()
+            return
+        if "yaw_deg" in params:
+            target = math.radians(float(params["yaw_deg"]))
+        else:
+            target = self._yaw_target_rad + math.radians(float(params.get("delta_deg", 0.0)))
+        if not math.isfinite(target):
+            raise CommandRejected("turn target must be finite")
+        self._yaw_target_rad = target
+        self._yaw_commands += 1
+        # 转到位之后再多发一小段。身体输出关着时我们只在转向期间发包，丢掉收尾帧
+        # 就会停在差几度的地方；驱动保留最后一帧，多推 250ms 足够让它落地。
+        self._yaw_hold_frames = max(self._yaw_hold_frames, max(2, int(self.config.rate_hz) // 4))
+
+    def _yaw_is_settling(self) -> bool:
+        return abs(self._yaw_target_rad - self._yaw_rad) > 1e-6 or self._yaw_hold_frames > 0
+
+    def _halt_yaw(self) -> None:
+        """停在当前朝向。转向没有「回中」的概念，只有停。"""
+        self._yaw_target_rad = self._yaw_rad
+        self._yaw_hold_frames = 0
+
+    def _heading_snapshot(self) -> Dict[str, Any]:
+        """当前朝向。相对会话起点，不是世界坐标——驱动不回传世界位姿。
+
+        先取整再取模：反过来会让 -720.0000001 这种累积误差变成 359.9999…，
+        四舍五入后报出区间外的 360.0，读的人会当成「转了一整圈」而不是零。
+        """
+        return {
+            "yaw_deg": round(math.degrees(self._yaw_rad), 2) % 360.0,
+            "target_yaw_deg": round(math.degrees(self._yaw_target_rad), 2) % 360.0,
+            "turning": self._yaw_is_settling(),
+            "turn_commands": self._yaw_commands,
+            "max_turn_speed_dps": self.config.safety.max_angular_speed_dps,
+        }
+
+    def _advance_yaw(self, now: float) -> None:
+        previous = self._yaw_last_tick
+        self._yaw_last_tick = now
+        remaining = self._yaw_target_rad - self._yaw_rad
+        if abs(remaining) <= 1e-6:
+            self._yaw_rad = self._yaw_target_rad
+            if self._yaw_hold_frames > 0:
+                self._yaw_hold_frames -= 1
+            return
+        dt = 1.0 / self.config.rate_hz if previous is None else max(0.0, now - previous)
+        step = math.radians(self.config.safety.max_angular_speed_dps) * dt
+        if step <= 0.0 or step >= abs(remaining):
+            self._yaw_rad = self._yaw_target_rad
+        else:
+            self._yaw_rad += math.copysign(step, remaining)
+
+    def _apply_play_space_yaw(self) -> None:
+        """把 yaw 作为变换叠在输出帧上，整个 play space 一起转。
+
+        只转头会让身体拧着；连位置一起绕原点转才是原地转身。HMD 在 Y 轴上，
+        所以它只换朝向、不位移。
+        """
+        yaw = self._yaw_rad
+        if abs(yaw) < 1e-9:
+            return
+        rotation = (0.0, math.sin(yaw / 2.0), 0.0, math.cos(yaw / 2.0))
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        for device in self._output_frame.devices.values():
+            x, y, z = device.position
+            device.position = (x * cos_y + z * sin_y, y, -x * sin_y + z * cos_y)
+            device.rotation = quat_multiply(rotation, device.rotation)
+
     def controller_input_snapshot(self) -> dict[str, Any]:
         """Return a cheap, JSON-safe view of the scheduler-owned input state."""
         return {
@@ -800,6 +907,7 @@ class BodyScheduler:
         self._input_overlay.clear()
         self._active = None
         self._drop_expression_overlays(now, "stopped")
+        self._halt_yaw()
         neutralize_inputs(self._frame)
         self._state = "stopped_latched" if self._enabled else "disabled"
         self._safety_state = "stopped" if self._enabled else "normal"
@@ -1351,6 +1459,21 @@ class BodyScheduler:
         self._last_send_at = now
         self._sent_packets += 1
 
+    def _send_head_frame(self, now: float) -> None:
+        """只推 HMD 的部分帧，用于身体输出关闭时的转向。"""
+        if self._transport is None:
+            raise RuntimeError("UDP transport is not initialized")
+        try:
+            payload = encode_head_frame(self._output_frame.devices["hmd"], self.config.safety)
+            self._transport.send(payload, (self.config.host, self.config.port))
+        except Exception:
+            self._send_failures += 1
+            raise
+        if self._last_send_at is not None:
+            self._send_intervals.append(max(0.0, now - self._last_send_at))
+        self._last_send_at = now
+        self._sent_packets += 1
+
     def _enter_fault(self, exc: Exception) -> None:
         now = self._clock()
         self._error_count += 1
@@ -1360,6 +1483,9 @@ class BodyScheduler:
         self._frame = neutral_frame()
         self._output_frame = self._frame.clone()
         self._input_overlay.clear()
+        # 就地停转，而不是回到 yaw 0：故障时把镜头甩回原点比停下更吓人，而且
+        # 继续朝目标推进会让每一帧都重新触发这个异常。
+        self._halt_yaw()
         neutralize_inputs(self._frame)
         self._state = "fault_latched" if self._enabled else "disabled"
         self._safety_state = "fault" if self._enabled else "normal"
@@ -1637,6 +1763,7 @@ class BodyScheduler:
             "state": self._state,
             "safety_state": self._safety_state,
             "output_enabled": self._enabled,
+            "heading": self._heading_snapshot(),
             "udp": {
                 "target": f"{self.config.host}:{self.config.port}",
                 "connected": "unknown",
