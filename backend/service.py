@@ -45,6 +45,10 @@ from .world_state import WorldStateStore
 _VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
 _WORLD_GATE_BYPASS_ACTIONS = frozenset({"stop", "disable", "reset", "cancel"})
+# 手掌朝向由 motion.palm_rotation 解析，非法值在调度线程上抛 ValueError。
+# 那时 submit() 早已返回 accepted=true，所以要在入队前挡下来。
+_PALM_ORIENTATIONS = frozenset({"neutral", "forward", "down", "inward"})
+_PALM_ACTIONS = frozenset({"arm_pose", "move_hand"})
 _OSC_AXIS_MIN = -1.0
 _OSC_AXIS_MAX = 1.0
 _OSC_DURATION_MIN_MS = 100
@@ -859,6 +863,21 @@ class BackendService:
                 "safety_state": "fault",
             })
         normalized = dict(params or {})
+        if kind in _PALM_ACTIONS and "palm" in normalized:
+            palm = normalized["palm"]
+            if palm not in _PALM_ORIENTATIONS:
+                state = scheduler.snapshot()
+                return finish({
+                    "accepted": False,
+                    "action_id": None,
+                    "state": state["state"],
+                    "normalized_params": normalized,
+                    "reason": (
+                        f"palm must be one of "
+                        f"{', '.join(sorted(_PALM_ORIENTATIONS))}; got {palm!r}"
+                    ),
+                    "safety_state": state["safety_state"],
+                })
         embedded_preconditions = normalized.pop("_world_preconditions", None)
         precondition_alias_conflict = (
             preconditions is not None and embedded_preconditions is not None
