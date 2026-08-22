@@ -8,3 +8,5 @@ store.db
 tmp/
 .venv/
 .trae/
+world_memory.json
+memory/

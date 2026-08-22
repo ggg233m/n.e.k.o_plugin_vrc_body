@@ -38,8 +38,8 @@ class NavigatorConfig:
     # 留一点余量让 10 Hz 的闭环收敛。
     turn_gain: float = 0.8
     max_turn_deg: float = 45.0
-    max_observation_age_ms: int = 1000
-    min_confidence: float = 0.55
+    max_observation_age_ms: int = 2500
+    min_confidence: float = 0.40
     bearing_deadband_deg: float = 8.0
     target_distance_m: float = 1.25
     # 表观高度（归一化检测框高度）是二维检测器唯一能实测的接近度指标。它随
@@ -50,11 +50,29 @@ class NavigatorConfig:
     # 顶着墙推摇杆的判据。检测器只看画面，永远不会告诉你「前面有堵墙」；
     # VRChat 内置 Velocity 参数是唯一能说明「命令发了但人没动」的回传。
     #
-    # ⚠️ 两个默认值都是估算，需要实机校准：Velocity 的单位未经验证，而
-    # max_forward_axis=0.28 对应的实际速度也没实测过。收不到内置参数时整个
-    # 判据自动失效（不阻断移动），这是刻意的——没数据不等于没动。
+    # 已实机校准：max_forward_axis=0.28 实测 0.8 m/s，正常行走远高于阈值。
+    # 收不到内置参数时整个判据自动失效（不阻断移动），这是刻意的——没数据不
+    # 等于没动。注意 0.15 这个阈值只在命令过得了死区时才有意义，见
+    # min_forward_axis。
     stall_speed_mps: float = 0.15
     stall_ticks: int = 8
+    # VRChat 的起步死区。摇杆量低于它时 VRChat 完全不驱动 avatar，而导航器接近
+    # 目标时会把前进轴按比例缩小，于是最后一段距离命令照发、人不动，失速守卫
+    # 读到真实的 0 并误判撞墙。
+    #
+    # 实测（10 Hz 按住 220ms 脉冲，每档后接同方向 y=0.28 控制组证明前方是通的）：
+    #   y=0.076 -> 0.0      y=0.10 -> 0.0     y=0.13 -> 0.1333
+    #   y=0.15  -> 0.2222   y=0.20 -> 0.4444  y=0.28 -> 0.8
+    # 0.13 能动但仍低于 stall_speed_mps，所以取 0.15：既过死区，也保证真的在走
+    # 时速度高于失速阈值，两个判据不互相矛盾。
+    min_forward_axis: float = 0.15
+    # 失速过的目标要记多久「够不着」。闩锁只停住当前这次尝试，解不开「换个目标
+    # 再选中同一个实体」的死循环：镜面倒影是画面里置信度最高的 person，重提目标
+    # 后 _select_target 照样挑它，于是又是 8 tick 顶墙。
+    #
+    # 不做永久：挡在中间的可能是会走开的人，自己转过身之后墙也不在正前方了。
+    # 45 s 足够 LLM 换个方向做别的事，又不至于把一次偶然的堵塞记成永久地形。
+    unreachable_ttl_s: float = 45.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.tick_hz) or not 2.0 <= self.tick_hz <= 30.0:
@@ -85,6 +103,12 @@ class NavigatorConfig:
             raise ValueError("navigator.stall_speed_mps must be between 0.01 and 1")
         if not 2 <= int(self.stall_ticks) <= 100:
             raise ValueError("navigator.stall_ticks must be between 2 and 100")
+        if not 0.05 <= float(self.min_forward_axis) <= 0.6:
+            raise ValueError("navigator.min_forward_axis must be between 0.05 and 0.6")
+        if float(self.min_forward_axis) > float(self.max_forward_axis):
+            raise ValueError("navigator.min_forward_axis must not exceed max_forward_axis")
+        if not 0.0 <= float(self.unreachable_ttl_s) <= 600.0:
+            raise ValueError("navigator.unreachable_ttl_s must be between 0 and 600")
 
 
 @dataclass(frozen=True)
@@ -206,7 +230,11 @@ def _spatial_hint(entity: Mapping[str, Any]) -> tuple[float | None, float | None
             if top is not None and bottom is not None and bottom >= top and bottom <= 1.25:
                 apparent = bottom - top
                 if not clipped:
-                    clipped = top <= 0.001 or bottom >= 0.999
+                    # 0.97/0.03: NPC 坐在地上时摄像机在站立视高，bbox 底边实测
+                    # 稳定在 0.991，永远够不到 0.999 的阈值。放宽到 0.97 让接近
+                    # 到足够近时的夹帧触发 clipped，从而走 _CLIPPED_REACH_FACTOR
+                    # 分支提前判定 reached，而不是让 apparent 一路缩到 0 也不停。
+                    clipped = top <= 0.03 or bottom >= 0.97
     if apparent is not None and not 0.0 < apparent <= 1.0:
         apparent = None
 
@@ -256,7 +284,19 @@ class LocalNavigator:
         self._stalled = False
         self._stall_goal_key: tuple[str, str] | None = None
         self._stall_goal_age: float | None = None
+        # target_id -> 记录到期的时刻。刻意不随换目标清空：「顶着它推了 8 tick
+        # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
+        self._unreachable: dict[str, float] = {}
         self._last_motion: dict[str, Any] | None = None
+        # 最近一次前进轴指令有没有真的发出去。None = 还没发过。
+        # 由 _apply 写、_stall_guard 读，所以读到的是「上一 tick 那条」——这正是
+        # 失速判据要的：这一 tick 的速度反映的就是上一条指令的结果。
+        self._axis_send_ok: bool | None = None
+        # 已经为哪一次观测发过转向。故意不随目标切换重置：它描述的是「这一帧
+        # 世界我已经转过了」，是观测的属性而不是目标的属性。换目标时观测没变，
+        # 照样不该再转一次。
+        self._last_turn_revision: int | None = None
+        self._turn_suppressed_count = 0
 
     def start(self) -> bool:
         with self._lock:
@@ -286,6 +326,7 @@ class LocalNavigator:
         try:
             goal_state = self._goal_provider()
             world = self._world_provider()
+            self._pre_tick_goal_check(goal_state)
             decision = self._stall_guard(self._decide(goal_state, world, now), goal_state)
             self._apply(decision)
             with self._lock:
@@ -300,6 +341,35 @@ class LocalNavigator:
                 self._last_decision = decision
             return decision
 
+    def _pre_tick_goal_check(self, goal_state: Mapping[str, Any] | None) -> None:
+        """在 _decide 之前处理目标切换，保证 _decide 拿到的 skip_ids 已经反映了
+        当前目标的新鲜度。
+
+        分离到这里的原因：_decide 的求值顺序早于 _stall_guard（Python 先对内层
+        表达式求值再传给外层），所以如果目标清单的更新只在 _stall_guard 里做，
+        _decide 这一 tick 永远拿到的是上一 tick 的过期 skip_ids。把更新提前到
+        _decide 之前就可以消除这个一拍延迟。
+        """
+        goal = _mapping((goal_state or {}).get("goal")) or {}
+        goal_key = (str(goal.get("kind") or ""), str(goal.get("text") or ""))
+        goal_age = _finite(goal.get("age_seconds"))
+        with self._lock:
+            previous_key = self._stall_goal_key
+            previous_age = self._stall_goal_age
+            renewed = goal_key != previous_key or (
+                goal_age is not None and previous_age is not None and goal_age < previous_age
+            )
+            if renewed:
+                self._stall_ticks = 0
+                self._stalled = False
+                # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
+                # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
+                # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
+                if goal_key != previous_key:
+                    self._unreachable.clear()
+            self._stall_goal_key = goal_key
+            self._stall_goal_age = goal_age
+
     def _stall_guard(
         self,
         decision: NavigationDecision,
@@ -311,28 +381,28 @@ class LocalNavigator:
         唯一能区分「正在前进」和「顶着墙推摇杆」的回传。没有这个回传时本守卫
         整体失效并放行——没数据不等于没动，不能凭空停车。
 
-        判定会闩锁：停下之后速度当然还是 0，靠速度自己是解不开的。闩锁只由
-        「换了目标」解除，让 LLM 去决定绕行还是放弃，导航器不自作主张侧移。
+        判定会闩锁：停下之后速度当然还是 0，靠速度自己是解不开的。闩锁由
+        _pre_tick_goal_check 在 _decide 之前处理；本方法只读取结果。
         """
-        goal = _mapping((goal_state or {}).get("goal")) or {}
-        goal_key = (str(goal.get("kind") or ""), str(goal.get("text") or ""))
-        goal_age = _finite(goal.get("age_seconds"))
         with self._lock:
-            previous_key = self._stall_goal_key
-            previous_age = self._stall_goal_age
-            # 目标换了，或同一句目标被重新提交（年龄倒退），都算新的一次尝试。
-            renewed = goal_key != previous_key or (
-                goal_age is not None and previous_age is not None and goal_age < previous_age
-            )
-            if renewed:
-                self._stall_ticks = 0
-                self._stalled = False
-            self._stall_goal_key = goal_key
-            self._stall_goal_age = goal_age
             stalled = self._stalled
 
         if decision.state != "advance":
             # 转身和停车都不算尝试前进；不清零计数，以免「转一下再撞」反复重置。
+            # 但有一个例外：如果已经闩锁了，此时 _decide 看到 skip_ids 没有候选
+            # 就会返回 target_unreachable，_stall_guard 如果只过 advance 就永远
+            # 输出 target_unreachable 而不是 movement_stalled，让上游 LLM 以为是
+            # 「视野里没有人」而不是「顶着墙卡住了」。
+            if stalled and decision.reason == "target_unreachable":
+                return NavigationDecision(
+                    "stop",
+                    "movement_stalled",
+                    decision.target_id,
+                    decision.bearing_deg,
+                    decision.distance_m,
+                    revision=decision.revision,
+                    observed_age_ms=decision.observed_age_ms,
+                )
             return decision
         if stalled:
             return NavigationDecision(
@@ -344,6 +414,17 @@ class LocalNavigator:
                 revision=decision.revision,
                 observed_age_ms=decision.observed_age_ms,
             )
+
+        with self._lock:
+            axis_send_ok = self._axis_send_ok
+        if axis_send_ok is False:
+            # 上一条前进指令被下游拒收（scheduler 拒收，多半是 body output 还没
+            # enable）。速度当然是 0，但那是「没发命令」而不是「顶着墙」。
+            # 重置计数而不是累加，确保 body enable 后立刻从头开始计。
+            # axis_send_ok is None（从没发过）时正常走速度判据——这是首次。
+            with self._lock:
+                self._stall_ticks = 0
+            return decision
 
         motion = self._sample_motion()
         if motion is None or not motion.get("available"):
@@ -360,6 +441,7 @@ class LocalNavigator:
                 return decision
             self._stalled = True
             self._stall_count += 1
+            self._mark_unreachable_locked(decision.target_id)
         return NavigationDecision(
             "stop",
             "movement_stalled",
@@ -369,6 +451,29 @@ class LocalNavigator:
             revision=decision.revision,
             observed_age_ms=decision.observed_age_ms,
         )
+
+    def _mark_unreachable_locked(self, target_id: str | None) -> None:
+        """记下「朝这个实体推过摇杆，人没动」。调用方必须已持有 _lock。
+
+        ttl <= 0 表示关掉这个机制，此时不记账，行为退回纯闩锁。
+        """
+        if not target_id or self.config.unreachable_ttl_s <= 0.0:
+            return
+        self._unreachable[target_id] = self._clock() + self.config.unreachable_ttl_s
+        if len(self._unreachable) > 64:
+            # track id 会随检测跳变而不断新增，不清理就是一个只涨不跌的字典。
+            now = self._clock()
+            self._unreachable = {
+                key: expiry for key, expiry in self._unreachable.items() if expiry > now
+            }
+
+    def _unreachable_ids(self) -> set[str]:
+        now = self._clock()
+        with self._lock:
+            expired = [key for key, expiry in self._unreachable.items() if expiry <= now]
+            for key in expired:
+                del self._unreachable[key]
+            return set(self._unreachable)
 
     def _sample_motion(self) -> Mapping[str, Any] | None:
         provider = self._motion_provider
@@ -383,6 +488,7 @@ class LocalNavigator:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            now = self._clock()
             decision = self._last_decision.to_dict()
             return {
                 "enabled": True,
@@ -394,16 +500,33 @@ class LocalNavigator:
                 "active_side": self._active_side,
                 "last_decision": decision,
                 "last_error": self._last_error,
+                "turn": {
+                    # 转向是相对位移，同一次观测重发会累加。suppressed 高于
+                    # sent 是正常的（tick 频率本就高于出帧频率）；两者相等则说明
+                    # 去重没生效，转向正在按 tick/观测 的倍数超调。
+                    "last_revision": self._last_turn_revision,
+                    "suppressed_count": self._turn_suppressed_count,
+                },
                 "stall": {
                     # detectable=false 表示收不到 VRChat 内置 Velocity 参数，
                     # 「卡墙」这件事在本次会话里根本无法被观测到——不是「没卡」。
                     "detectable": bool(self._last_motion and self._last_motion.get("available")),
+                    # 上一条前进指令是否被下游接受。false 表示命令被 scheduler
+                    # 拒了（多半是 body output 还没 enable），此时失速判据整体
+                    # 失效——速度为零是因为没发命令，不是因为撞墙。
+                    "axis_send_ok": self._axis_send_ok,
                     "stalled": self._stalled,
                     "consecutive_ticks": self._stall_ticks,
                     "threshold_ticks": self.config.stall_ticks,
                     "speed_threshold_mps": self.config.stall_speed_mps,
                     "stall_count": self._stall_count,
                     "last_motion": None if self._last_motion is None else dict(self._last_motion),
+                    # 已实测「推了摇杆但没动」的目标。换目标能解开闩锁，但解不开
+                    # 这一份——不然又会选中同一个镜面倒影。
+                    "unreachable_targets": sorted(
+                        key for key, expiry in self._unreachable.items() if expiry > now
+                    ),
+                    "unreachable_ttl_s": self.config.unreachable_ttl_s,
                 },
             }
 
@@ -444,8 +567,15 @@ class LocalNavigator:
         if observed_age is None or observed_age > self.config.max_observation_age_ms:
             return NavigationDecision("stop", "observation_stale", revision=revision, observed_age_ms=observed_age)
 
-        entity = self._select_target(goal, world.get("entities"))
+        skip = self._unreachable_ids()
+        entity = self._select_target(goal, world.get("entities"), skip)
         if entity is None:
+            # 区分「没看到匹配的东西」和「看到了但刚证明够不着」。两者对 LLM 的
+            # 下一步完全不同：前者该换个方向看，后者该换个目标或先转身。
+            if skip and self._select_target(goal, world.get("entities"), frozenset()) is not None:
+                return NavigationDecision(
+                    "stop", "target_unreachable", revision=revision, observed_age_ms=observed_age
+                )
             return NavigationDecision("stop", "target_not_visible", revision=revision, observed_age_ms=observed_age)
         target_id = str(entity.get("id") or "")[:96] or None
         confidence = _finite(entity.get("confidence")) or 0.0
@@ -500,7 +630,7 @@ class LocalNavigator:
                 )
             forward = _clamp(
                 (target_apparent - apparent) / target_apparent * self.config.max_forward_axis,
-                0.05,
+                self.config.min_forward_axis,
                 self.config.max_forward_axis,
             )
             return NavigationDecision(
@@ -522,7 +652,7 @@ class LocalNavigator:
             return NavigationDecision("reached", "target_in_interaction_range", target_id, bearing, distance, revision=revision, observed_age_ms=observed_age)
         forward = _clamp(
             (distance - self.config.target_distance_m) / max(distance, 0.25) * self.config.max_forward_axis,
-            0.05,
+            self.config.min_forward_axis,
             self.config.max_forward_axis,
         )
         return NavigationDecision(
@@ -539,7 +669,12 @@ class LocalNavigator:
             observed_age,
         )
 
-    def _select_target(self, goal: Mapping[str, Any], raw_entities: Any) -> Mapping[str, Any] | None:
+    def _select_target(
+        self,
+        goal: Mapping[str, Any],
+        raw_entities: Any,
+        skip_ids: frozenset[str] | set[str] = frozenset(),
+    ) -> Mapping[str, Any] | None:
         if not isinstance(raw_entities, (list, tuple)):
             return None
         text = str(goal.get("text") or "").strip().lower()
@@ -552,6 +687,9 @@ class LocalNavigator:
             label = str(raw.get("label") or "").strip().lower()
             entity_id = str(raw.get("id") or "").strip().lower()
             if raw.get("visible") is False:
+                continue
+            # 与 _decide 里 target_id 的取法保持一致，否则记账和跳过对不上。
+            if skip_ids and str(raw.get("id") or "")[:96] in skip_ids:
                 continue
             confidence = _finite(raw.get("confidence")) or 0.0
             score = 0
@@ -571,6 +709,29 @@ class LocalNavigator:
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return candidates[0][2]
 
+    def _turn_already_sent(self, revision: int) -> bool:
+        """同一次观测只转一次。
+
+        转向和前进的命令语义不一样：前进轴是**按住的状态**，重发只是覆盖，
+        幂等；转向是**相对位移**，重发会累加。而导航器的 tick 频率远高于检测
+        器的出帧频率（实测 9.14 Hz 对 1.75 Hz，每观测 5.2 tick），于是同一个
+        bearing 会被当成 5 条独立的转向命令发出去。
+
+        实测 bearing -11.47 度算出 +9.18 度，连发 5 次就是 +45.9 度，对着 11.47
+        度的偏差转过去 4 倍，冲过中心后符号翻转，再朝反方向超调——闭环第一次
+        实跑就是这样从 -11 发散到 -18，最后摄像机停在海面上。
+
+        去重之后转向按观测频率发（1.75 Hz），单次仍是 -bearing * turn_gain。
+        实测发 10 度实际转 5.13 度，等效增益约 0.5，欠阻尼收敛，不会震荡。
+
+        revision <= 0 表示这个世界源根本不发版本号，观测之间无从区分。此时不
+        去重——「一条都不转」比「多转几度」坏得多，会直接废掉转向。
+        """
+        if revision <= 0:
+            return False
+        with self._lock:
+            return self._last_turn_revision == revision
+
     def _apply(self, decision: NavigationDecision) -> None:
         if decision.state == "turn":
             # 转向不占摇杆，所以不进 _active_side：它是 play space 的朝向，不是
@@ -578,14 +739,24 @@ class LocalNavigator:
             # 在观测间隔里持续漂移，转向永远收敛不了。
             if self._active_side is not None:
                 self._safe_release()
+            if self._turn_already_sent(decision.revision):
+                with self._lock:
+                    self._turn_suppressed_count += 1
+                return
             if self._send_turn(decision.turn_deg):
                 with self._lock:
                     self._command_count += 1
+                    self._last_turn_revision = decision.revision
             return
         if decision.state == "advance" and decision.side:
             if self._active_side == "right":
                 self._release_inputs("right")
-            if self._send_axes("left", decision.x, decision.y, decision.pulse_ms):
+            sent = self._send_axes("left", decision.x, decision.y, decision.pulse_ms)
+            with self._lock:
+                # 记下「这条前进指令到底发出去了吗」。失速守卫必须能区分
+                # 「发了但人没动」（真卡墙）和「压根没发」（body 未 enable）。
+                self._axis_send_ok = bool(sent)
+            if sent:
                 with self._lock:
                     self._active_side = "left"
                     self._command_count += 1

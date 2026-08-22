@@ -122,7 +122,9 @@ labels_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_labels.jso
 device = "AUTO"
 # none（默认），或显式启用降级的 OpenCV HOG 仅人形回退。
 fallback_backend = "none"
-confidence_threshold = 0.35
+# 0.35 → 0.25：实测三帧真机对比，中距离的模型只打到 0.296，0.35 会整帧丢掉；
+# 降到 0.25 后该帧稳定检出，且同批帧未出现假阳性。近距离全身像打 0.85+，不受影响。
+confidence_threshold = 0.25
 input_width = 640
 input_height = 640
 horizontal_fov_deg = 90.0

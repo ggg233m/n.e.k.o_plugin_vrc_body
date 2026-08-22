@@ -1194,7 +1194,9 @@ class OpenVinoLocalDetector:
             apparent_height = bottom - top
             # bbox 已被钳制到 [0,1]，因此贴边说明目标超出画面、真实高度不可测。
             # 此时表观高度会饱和，不能再当作距离的单调函数使用。
-            clipped = top <= 0.001 or bottom >= 0.999
+            # 0.97/0.03: NPC 坐在地上时摄像机在站立视高，bbox 底边实测稳定
+            # 在 0.991，永远够不到 0.999。放宽到 0.97 与 navigator.py 一致。
+            clipped = top <= 0.03 or bottom >= 0.97
             entities.append({
                 "id": stable_track_entity_id(self._source_name, track_id),
                 "track_id": track_id,
