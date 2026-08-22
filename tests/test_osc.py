@@ -270,6 +270,8 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.assertLess(motion["link_age_ms"], 1.0)
 
     def test_dead_link_reports_stale_rather_than_last_known_speed(self) -> None:
+        # 最后一次回传说自己在动，之后彻底没声音：真在移动就会持续有速度更新，
+        # 所以沉默与取值矛盾，只能判链路在运动中断了。
         self._feed("VelocityX", 1.0)
         self._feed("VelocityZ", 0.0)
         self.now[0] += 30.0
@@ -277,6 +279,50 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.assertFalse(motion["available"])
         self.assertEqual(motion["reason"], "feedback_stale")
         self.assertIsNone(motion["speed_mps"])
+
+    def test_silence_after_a_resting_reading_stays_available_indefinitely(self) -> None:
+        """站着不动时链路必然安静，不能因此判不可用。
+
+        VRChat 的参数是变化驱动的：站住之后速度恒为 0，一个包都不会再来，链路
+        年龄和取值年龄一起无上限地涨。此前用 2 秒链路年龄上限判 stale，等于把
+        「站着没动」这个唯一能确认静止的读数，在静止满 2 秒后必然丢掉——而导航器
+        的卡墙判据正是靠它区分「顶着墙」和「在走」。
+
+        判据换成看最后那个取值与沉默是否矛盾：静止 + 沉默不矛盾，保持可用。
+        """
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        self.now[0] += 600.0
+        self.wall[0] += 600.0
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertEqual(motion["horizontal_speed_mps"], 0.0)
+        # 可用，但面板要能看出这是靠静止取值兜住的沉默，不是活跃回传。
+        self.assertEqual(motion["reason"], "link_quiet_at_rest")
+        self.assertGreaterEqual(motion["link_age_ms"], 600_000.0)
+
+    def test_pushing_into_a_wall_counts_as_moving_so_silence_is_still_stale(self) -> None:
+        """卡墙实测速度 0.08 m/s，必须仍算「在动」。
+
+        顶着墙时速度低但恒定，VRChat 同样可能不再发包。若把这个读数算成「静止
+        且可信」，沉默就会被无限兜住——而这正是卡墙判据要抓的场景，等于反过来
+        把它废掉。静止阈值必须留在实测卡墙速度之下。
+        """
+        self._feed("VelocityX", 0.08)
+        self._feed("VelocityZ", 0.0)
+        self.now[0] += 30.0
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "feedback_stale")
+
+    def test_quiet_link_at_rest_is_not_flagged_while_feedback_is_fresh(self) -> None:
+        # link_quiet_at_rest 只描述「沉默但可信」。回传还新鲜时不该带这个标记，
+        # 否则面板无法区分活跃回传和靠静止兜住的沉默。
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertIsNone(motion["reason"])
 
     def test_grounded_and_upright_are_read_without_faking_missing_ones(self) -> None:
         self._feed("VelocityX", 0.0)

@@ -51,6 +51,13 @@ _INPUT_HOLD_MAX_MS = 1000
 _VELOCITY_AXIS_PARAMETERS = ("VelocityX", "VelocityY", "VelocityZ")
 BUILTIN_MOTION_PARAMETERS = _VELOCITY_AXIS_PARAMETERS + ("Upright", "Grounded", "AngularY")
 
+# 「最后一次回传说自己是静止的」的判定阈值。低于它时链路沉默与取值不矛盾
+# （没变化自然没有包），可用性保持；高于它时沉默与取值矛盾，说明链路是在运动中
+# 断掉的。上界由实测卡墙速度 0.08 m/s 定死：顶着墙推摇杆必须仍算「在动」，否则
+# 撞墙时若速度恒定不发包，就会被读成「静止且可信」。真正的静止恒为 0，所以只需
+# 一个能盖住浮点噪声、又明显低于 0.08 的值。
+_RESTING_SPEED_MPS = 0.05
+
 
 def _numeric(value: Any) -> float | None:
     """把 OSC 标量读成有限浮点；bool 不算数值（Grounded 单独处理）。"""
@@ -840,10 +847,19 @@ class VrchatOscBridge:
         1. **参数名未经实机验证。** 内置参数只有在 avatar 的参数列表里存在时才会
            被驱动并回传；名字对不上或 avatar 没配，就一个都收不到。此时返回
            ``available=false`` 并给出 ``expected``，绝不猜一个速度出来。
-        2. **新鲜度看链路，不看取值。** VRChat 的参数是变化驱动的：站着不动时
-           速度恒为 0，于是根本不会有新消息，取值记录会一直变老。所以可用性由
-           「最近是否收到过任何 OSC 回传」决定，而速度取最后已知值——这正是站住
-           不动时唯一正确的读法。取值年龄单独报告为 ``value_age_ms``。
+        2. **静止时的沉默要靠取值自证，链路年龄单独判不出来。** VRChat 的参数是
+           变化驱动的：站着不动时速度恒为 0，于是**一个包都不会来**，链路年龄和
+           取值年龄一起变老。所以「安静」和「断了」无法只靠入站流量区分，得看
+           最后那个取值跟沉默是否自相矛盾：
+
+           - 最后报的是 ~0 速度 → 沉默正是「没变化」的证据，可用性保持，速度
+             继续读 0。这是站住不动时唯一正确的读法，也是唯一能确认「我没在动」
+             的时刻，不能丢。
+           - 最后报的是在动 → 沉默与之矛盾：真在移动就会持续有速度更新。持续
+             沉默说明链路是在运动中断掉的，此时把最后已知速度当现值就是撒谎，
+             按 ``feedback_stale`` 判不可用。
+
+           取值年龄始终单独报告为 ``value_age_ms``，不参与可用性判定。
         """
         try:
             limit_ms = max(0, int(max_age_ms))
@@ -882,9 +898,6 @@ class VrchatOscBridge:
         if link_age_ms is None:
             result["reason"] = "no_feedback_received"
             return result
-        if limit_ms and link_age_ms > limit_ms:
-            result["reason"] = "feedback_stale"
-            return result
 
         axes: dict[str, float] = {}
         newest_received: float | None = None
@@ -908,13 +921,26 @@ class VrchatOscBridge:
         vy = axes.get("VelocityY", 0.0)
         vz = axes.get("VelocityZ", 0.0)
         horizontal = math.hypot(vx, vz)
+        speed = math.sqrt(horizontal * horizontal + vy * vy)
+
+        # 链路安静下来时，唯一能判断「安静」还是「断了」的证据就是最后那个取值：
+        # 静止时没有变化所以本就该没有包，在动时却必须持续有速度更新。用平移速度
+        # 判定，不看 AngularY——原地匀速转身时 AngularY 恒定同样不发包，而那时
+        # 平移速度确实是 0，把它算成「在动」会白丢一次有效读数。
+        if limit_ms and link_age_ms > limit_ms and speed > _RESTING_SPEED_MPS:
+            result["reason"] = "feedback_stale"
+            return result
+
         result["available"] = True
         result["value_age_ms"] = (
             None if newest_received is None else round(max(0.0, (now_wall - newest_received) * 1000.0), 1)
         )
         result["horizontal_speed_mps"] = round(horizontal, 4)
         result["vertical_speed_mps"] = round(vy, 4)
-        result["speed_mps"] = round(math.sqrt(horizontal * horizontal + vy * vy), 4)
+        result["speed_mps"] = round(speed, 4)
+        if limit_ms and link_age_ms > limit_ms:
+            # 可用，但要让面板看出这是「靠静止取值兜住的沉默」而不是活跃回传。
+            result["reason"] = "link_quiet_at_rest"
 
         angular = _numeric((records.get("AngularY") or {}).get("value"))
         if angular is not None:
