@@ -323,6 +323,9 @@ class NavigatorStallTests(unittest.TestCase):
         self.released: list[str] = []
 
     def _navigator(self, *, motion_provider=..., **overrides) -> LocalNavigator:
+        # 默认关掉自动绕行，让这一组用例专注于「失速判据本身」。绕行会在撞墙
+        # 与闩锁之间插入若干 recover tick，那是 NavigatorAutoRecoverTests 的题目。
+        overrides.setdefault("auto_recover_limit", 0)
         return LocalNavigator(
             world_provider=lambda: self.world,
             goal_provider=lambda: self.goal,
@@ -466,7 +469,7 @@ class NavigatorStallTests(unittest.TestCase):
             send_turn=lambda delta: True,
             release_inputs=lambda side: None,
             motion_provider=lambda: self.motion,
-            config=NavigatorConfig(stall_ticks=3),
+            config=NavigatorConfig(stall_ticks=3, auto_recover_limit=0),
         )
         self.motion["horizontal_speed_mps"] = 0.0
         for _ in range(5):
@@ -553,7 +556,7 @@ class NavigatorStallTests(unittest.TestCase):
             send_turn=lambda delta: True,
             release_inputs=lambda side: None,
             motion_provider=lambda: self.motion,
-            config=NavigatorConfig(stall_ticks=3, unreachable_ttl_s=45.0),
+            config=NavigatorConfig(stall_ticks=3, unreachable_ttl_s=45.0, auto_recover_limit=0),
             clock=lambda: clock["now"],
         )
         # 第一轮：失速，实体进入 _unreachable。
@@ -597,6 +600,223 @@ class NavigatorStallTests(unittest.TestCase):
         self.goal["goal"] = {"kind": "approach", "text": "walk to the person", "age_seconds": 0.1}
         self.motion["horizontal_speed_mps"] = 0.9
         self.assertEqual(navigator.tick().state, "advance")
+
+
+class NavigatorAutoRecoverTests(unittest.TestCase):
+    """撞墙后自己绕行，而不是停下来等 LLM 重提目标。
+
+    两件事在这里成立或不成立：
+      1. 斜撞墙能被发现。速度模长还在阈值之上，纯速度判据看不见。
+      2. 绕行预算有限。死胡同里怎么转都出不去，最终必须交还 LLM。
+    """
+
+    def setUp(self) -> None:
+        self.world = {
+            "available": True,
+            "uncertainties": [],
+            "status": {"revision": 3, "last_observation_age_ms": 80},
+            "entities": [{
+                "id": "vision:person:1",
+                "label": "person",
+                "confidence": 0.92,
+                "visible": True,
+                "attributes": {"bearing_deg": 0.0, "apparent_height": 0.2},
+            }],
+        }
+        self.goal = {
+            "state": "armed",
+            "goal": {"kind": "approach", "text": "walk to the person", "age_seconds": 1.0},
+        }
+        # 畅通：全速前进，前进分量占满。
+        self.motion: dict[str, object] = {
+            "available": True,
+            "horizontal_speed_mps": 0.9,
+            "forward_ratio": 1.0,
+            "slip_ratio": 0.0,
+        }
+        self.sent: list[tuple[str, float, float, int]] = []
+        self.turns: list[float] = []
+        self.released: list[str] = []
+
+    def _navigator(self, **overrides) -> LocalNavigator:
+        overrides.setdefault("stall_ticks", 3)
+        overrides.setdefault("slip_ticks", 3)
+        overrides.setdefault("auto_recover_limit", 2)
+        return LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
+            release_inputs=lambda side: self.released.append(side),
+            motion_provider=lambda: self.motion,
+            config=NavigatorConfig(**overrides),
+        )
+
+    def _slide(self, slip: float) -> None:
+        """贴着墙滑：速度模长很高，但前进分量已经塌了。"""
+        self.motion["horizontal_speed_mps"] = 0.85
+        self.motion["forward_ratio"] = 0.2
+        self.motion["slip_ratio"] = slip
+
+    def test_wall_slide_is_detected_even_though_speed_stays_above_threshold(self) -> None:
+        navigator = self._navigator()
+        self._slide(0.98)
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        decision = navigator.tick()
+        # 关键：速度全程高于 stall_speed_mps，旧判据永远不会触发。
+        self.assertGreater(self.motion["horizontal_speed_mps"], 0.15)
+        self.assertEqual(decision.state, "recover")
+        self.assertTrue(decision.reason.startswith("auto_recover_slide"))
+        self.assertGreater(navigator.snapshot()["stall"]["slip_count"], 0)
+
+    def test_slide_recovery_turns_toward_the_slide_direction(self) -> None:
+        # 滑行方向就是几何上可通行的方向；朝反方向转就是往墙里拐。
+        navigator = self._navigator()
+        self._slide(0.98)
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertGreater(decision.turn_deg, 0.0)
+
+        navigator = self._navigator()
+        self._slide(-0.98)
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertLess(decision.turn_deg, 0.0)
+
+    def test_slide_recovery_does_not_waste_a_backup_step(self) -> None:
+        # 斜撞墙时人还在动，直接转就行，不需要先退。
+        navigator = self._navigator()
+        self._slide(0.98)
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertEqual(decision.y, 0.0)
+
+    def test_head_on_wall_backs_up_before_turning(self) -> None:
+        # 正面墙贴着墙角转身会蹭不出去，所以先退一步。
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.motion["forward_ratio"] = None
+        self.motion["slip_ratio"] = None
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertEqual(decision.state, "recover")
+        self.assertTrue(decision.reason.startswith("auto_recover_blocked"))
+        self.assertLess(decision.y, 0.0)
+        self.assertNotEqual(decision.turn_deg, 0.0)
+
+    def test_recovery_budget_runs_out_and_hands_control_back_to_the_llm(self) -> None:
+        # 死胡同：怎么绕都出不去。有限预算保证最终会把决策权交还上层，
+        # 而不是永远自己转圈。
+        navigator = self._navigator(auto_recover_limit=2)
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.motion["forward_ratio"] = None
+        self.motion["slip_ratio"] = None
+
+        states = [navigator.tick().state for _ in range(12)]
+        self.assertEqual(states.count("recover"), 2)
+        self.assertEqual(states[-1], "stop")
+
+        snapshot = navigator.snapshot()
+        self.assertTrue(snapshot["stall"]["stalled"])
+        self.assertEqual(snapshot["stall"]["recover_attempts"], 2)
+        self.assertEqual(snapshot["stall"]["recover_limit"], 2)
+        self.assertEqual(snapshot["stall"]["stall_count"], 1)
+
+    def test_new_goal_restores_the_recovery_budget(self) -> None:
+        navigator = self._navigator(auto_recover_limit=1)
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.motion["forward_ratio"] = None
+        self.motion["slip_ratio"] = None
+        for _ in range(8):
+            navigator.tick()
+        self.assertEqual(navigator.snapshot()["stall"]["recover_attempts"], 1)
+
+        self.goal["goal"] = {"kind": "approach", "text": "try the other side", "age_seconds": 1.0}
+        navigator.tick()
+        self.assertEqual(navigator.snapshot()["stall"]["recover_attempts"], 0)
+
+    def test_clear_path_never_triggers_recovery(self) -> None:
+        navigator = self._navigator()
+        for _ in range(12):
+            self.assertEqual(navigator.tick().state, "advance")
+        snapshot = navigator.snapshot()
+        self.assertEqual(snapshot["stall"]["recover_count"], 0)
+        self.assertEqual(snapshot["stall"]["slip_count"], 0)
+        self.assertEqual(self.turns, [])
+
+    def test_missing_ratios_fall_back_to_the_pure_speed_judgement(self) -> None:
+        # 旧 avatar / 旧后端没有这两个字段。没有比值时行为必须与之前完全一致，
+        # 而不是因为读不到就当成撞墙。
+        navigator = self._navigator()
+        self.motion.pop("forward_ratio")
+        self.motion.pop("slip_ratio")
+        for _ in range(12):
+            self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.snapshot()["stall"]["slip_count"], 0)
+
+    def test_recovery_can_be_disabled_to_restore_pure_latching(self) -> None:
+        navigator = self._navigator(auto_recover_limit=0)
+        self.motion["horizontal_speed_mps"] = 0.0
+        self.motion["forward_ratio"] = None
+        self.motion["slip_ratio"] = None
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "movement_stalled")
+        self.assertTrue(navigator.snapshot()["stall"]["stalled"])
+
+
+    def test_real_measured_wall_slide_readings_trip_the_guard(self) -> None:
+        """用实机实测的原始读数当回归基线。
+
+        2026-08-23 海滩地图斜角推墙实测：撞墙后 |h|=0.170、fwd=0.507、
+        slip=-0.862，连续 23 个 tick。关键是 0.170 **高于** stall_speed_mps
+        =0.15——纯速度判据永远不会触发，这正是滑行判据存在的理由。
+
+        0.507 距离阈值 0.55 只有 0.043。把 slip_forward_ratio 往下调到 0.5
+        就会漏掉这次真实撞墙，所以这个用例是防止"顺手改得更保守"的闸门。
+        """
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.170
+        self.motion["forward_ratio"] = 0.507
+        self.motion["slip_ratio"] = -0.862
+
+        # 速度确实高于失速阈值：旧判据看不见这种撞墙。
+        self.assertGreater(0.170, NavigatorConfig().stall_speed_mps)
+
+        # slip_ticks=3：前两 tick 累加计数仍放行，第三 tick 才判定。
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        decision = navigator.tick()
+        self.assertEqual(decision.state, "recover")
+        self.assertTrue(decision.reason.startswith("auto_recover_slide"))
+        # slip 是负的，绕行必须朝负方向转——朝正方向就是往墙里拐。
+        self.assertLess(decision.turn_deg, 0.0)
+
+    def test_real_measured_clear_walk_never_trips_the_guard(self) -> None:
+        # 同一次实测的负样本：斜着走但畅通，fwd=0.887 远高于阈值。
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 3.255
+        self.motion["forward_ratio"] = 0.887
+        self.motion["slip_ratio"] = 0.461
+        for _ in range(12):
+            self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.snapshot()["stall"]["slip_count"], 0)
+
+    def test_real_measured_head_on_wall_uses_the_speed_judgement(self) -> None:
+        # 另一次实测：正面撞墙时速度直接塌到 0.062，低于失速阈值，
+        # 走的是原有失速判据。此时 slip 仍有值（贴着墙微微侧滑），
+        # 所以绕行应当利用这个方向而不是盲转。
+        navigator = self._navigator()
+        self.motion["horizontal_speed_mps"] = 0.062
+        self.motion["forward_ratio"] = 0.020
+        self.motion["slip_ratio"] = -0.9998
+        for _ in range(3):
+            decision = navigator.tick()
+        self.assertEqual(decision.state, "recover")
+        self.assertTrue(decision.reason.startswith("auto_recover_slide"))
+        self.assertLess(decision.turn_deg, 0.0)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,36 @@ class NavigatorConfig:
     # 不做永久：挡在中间的可能是会走开的人，自己转过身之后墙也不在正前方了。
     # 45 s 足够 LLM 换个方向做别的事，又不至于把一次偶然的堵塞记成永久地形。
     unreachable_ttl_s: float = 45.0
+    # 斜撞墙判据。VRChat 的角色控制器把移动投影到墙面上，所以贴着墙斜着走时
+    # 速度模长可能还在 stall_speed_mps 之上，而前进分量已经塌了——纯速度判据
+    # 看不见这种撞墙，会一直沿着墙滑到天涯海角。
+    #
+    # forward_ratio = velocity_z / horizontal_speed（avatar 本地系，已实机验证）。
+    # 低于该阈值即认为前进被挡住。
+    #
+    # 实机实测（2026-08-23，海滩地图斜角推墙）：
+    #   斜着走畅通:  |h|=3.255  fwd=0.887  slip=+0.461
+    #   斜撞墙滑行:  |h|=0.170  fwd=0.507  slip=-0.862   <- 连续 23 个 tick
+    #
+    # 注意撞墙时速度 0.170 **高于** stall_speed_mps=0.15，所以纯速度判据永远
+    # 不会触发——这正是本判据存在的理由。同时 0.507 贴着 0.55 很近：阈值再低
+    # 一点（比如 0.5）这次就漏了，不要为了"更保守"往下调。
+    slip_forward_ratio: float = 0.55
+    # 滑行要连续多少 tick 才算数。比 stall_ticks 短：滑行时人确实在动，误判的
+    # 代价只是多转一次身，而卡在墙上白滑几秒的代价更大。
+    slip_ticks: int = 5
+    # 撞墙后自动绕行的预算。闩锁只停车、等 LLM 重提目标，往返一轮要好几秒；
+    # 绕行本身不需要语义判断——滑行方向就是可通行方向，几何上已经给出答案。
+    #
+    # 有限次数是刻意的：真正的死胡同里怎么绕都出不去，转够 auto_recover_limit
+    # 次仍然撞墙就必须把决策权交还 LLM，让它换个目标或者放弃。0 表示关闭自动
+    # 绕行，退回原来的纯闩锁行为。
+    auto_recover_limit: int = 3
+    # 单次绕行的转身角度。正面墙没有滑行方向可用，只能盲转；取一个足够大、能
+    # 明显换个朝向，又不至于原地打转的角度。
+    auto_recover_turn_deg: float = 55.0
+    # 正面墙先后退再转，避免贴着墙转身时蹭着墙角出不去。
+    auto_recover_back_axis: float = 0.22
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.tick_hz) or not 2.0 <= self.tick_hz <= 30.0:
@@ -109,6 +139,16 @@ class NavigatorConfig:
             raise ValueError("navigator.min_forward_axis must not exceed max_forward_axis")
         if not 0.0 <= float(self.unreachable_ttl_s) <= 600.0:
             raise ValueError("navigator.unreachable_ttl_s must be between 0 and 600")
+        if not 0.0 <= float(self.slip_forward_ratio) <= 1.0:
+            raise ValueError("navigator.slip_forward_ratio must be between 0 and 1")
+        if not 2 <= int(self.slip_ticks) <= 100:
+            raise ValueError("navigator.slip_ticks must be between 2 and 100")
+        if not 0 <= int(self.auto_recover_limit) <= 20:
+            raise ValueError("navigator.auto_recover_limit must be between 0 and 20")
+        if not 5.0 <= float(self.auto_recover_turn_deg) <= 180.0:
+            raise ValueError("navigator.auto_recover_turn_deg must be between 5 and 180")
+        if not 0.0 <= float(self.auto_recover_back_axis) <= 0.6:
+            raise ValueError("navigator.auto_recover_back_axis must be between 0 and 0.6")
 
 
 @dataclass(frozen=True)
@@ -292,6 +332,17 @@ class LocalNavigator:
         # 由 _apply 写、_stall_guard 读，所以读到的是「上一 tick 那条」——这正是
         # 失速判据要的：这一 tick 的速度反映的就是上一条指令的结果。
         self._axis_send_ok: bool | None = None
+        # 斜撞墙：连续多少 tick 前进分量被压住。与 _stall_ticks 分开计，因为
+        # 这时人确实在动，纯速度判据永远不会累加。
+        self._slip_ticks = 0
+        self._slip_count = 0
+        # 自动绕行预算。撞墙后先自己转身重试，转够 auto_recover_limit 次仍然
+        # 撞墙才闩锁交还 LLM。换目标时随闩锁一起清零。
+        self._recover_attempts = 0
+        self._recover_count = 0
+        # 最近一次绕行往哪边转（+1 右 / -1 左）。滑行时跟着滑行方向走，正面墙
+        # 没有方向可用就沿用上次的，避免左右横跳原地打转。
+        self._recover_sign = 1.0
         # 已经为哪一次观测发过转向。故意不随目标切换重置：它描述的是「这一帧
         # 世界我已经转过了」，是观测的属性而不是目标的属性。换目标时观测没变，
         # 照样不该再转一次。
@@ -362,6 +413,10 @@ class LocalNavigator:
             if renewed:
                 self._stall_ticks = 0
                 self._stalled = False
+                self._slip_ticks = 0
+                # 绕行预算随闩锁一起归零：LLM 换了目标就是新的一次尝试，不该
+                # 背着上一个目标用掉的次数。
+                self._recover_attempts = 0
                 # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
                 # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
@@ -432,16 +487,71 @@ class LocalNavigator:
         speed = _finite(motion.get("horizontal_speed_mps"))
         if speed is None:
             return decision
+
+        # 斜撞墙：人在动，但动的方向不是前方。角色控制器把移动投影到墙面上，
+        # 所以速度模长过得了 stall_speed_mps，纯速度判据永远不会触发，会一直
+        # 贴着墙滑下去。forward_ratio 是 None 表示水平速度低于静止阈值，那属于
+        # 下面的失速判据管的范围，这里不插手。
+        forward_ratio = _finite(motion.get("forward_ratio"))
+        slip_ratio = _finite(motion.get("slip_ratio"))
+        sliding = False
+        if forward_ratio is not None and speed >= self.config.stall_speed_mps:
+            with self._lock:
+                if forward_ratio < self.config.slip_forward_ratio:
+                    self._slip_ticks += 1
+                    sliding = self._slip_ticks >= self.config.slip_ticks
+                else:
+                    self._slip_ticks = 0
+
         with self._lock:
-            if speed >= self.config.stall_speed_mps:
+            if speed >= self.config.stall_speed_mps and not sliding:
                 self._stall_ticks = 0
                 return decision
-            self._stall_ticks += 1
-            if self._stall_ticks < self.config.stall_ticks:
-                return decision
-            self._stalled = True
-            self._stall_count += 1
-            self._mark_unreachable_locked(decision.target_id)
+            if not sliding:
+                self._stall_ticks += 1
+                if self._stall_ticks < self.config.stall_ticks:
+                    return decision
+
+            # 到这里已经确认撞墙了，区别只在正面还是斜着。先花掉绕行预算，
+            # 预算用尽才闩锁交还 LLM。
+            if sliding:
+                self._slip_count += 1
+            budget_left = self._recover_attempts < self.config.auto_recover_limit
+            if budget_left:
+                self._recover_attempts += 1
+                self._recover_count += 1
+                self._stall_ticks = 0
+                self._slip_ticks = 0
+                attempt = self._recover_attempts
+                if slip_ratio is not None and abs(slip_ratio) > 1e-3:
+                    # 正贴着墙滑，滑行方向就是几何上可通行的方向：跟着它转。
+                    self._recover_sign = 1.0 if slip_ratio > 0.0 else -1.0
+                    reason = "auto_recover_slide"
+                    back_axis = 0.0
+                else:
+                    # 正面墙：没有滑行方向可用，沿用上次的转向并先退一步，
+                    # 免得贴着墙角转身蹭不出去。
+                    reason = "auto_recover_blocked"
+                    back_axis = -abs(self.config.auto_recover_back_axis)
+                sign = self._recover_sign
+            else:
+                self._stalled = True
+                self._stall_count += 1
+                self._mark_unreachable_locked(decision.target_id)
+
+        if budget_left:
+            return NavigationDecision(
+                "recover",
+                f"{reason}:{attempt}/{self.config.auto_recover_limit}",
+                decision.target_id,
+                decision.bearing_deg,
+                decision.distance_m,
+                y=back_axis,
+                pulse_ms=self.config.pulse_ms,
+                revision=decision.revision,
+                observed_age_ms=decision.observed_age_ms,
+                turn_deg=sign * self.config.auto_recover_turn_deg,
+            )
         return NavigationDecision(
             "stop",
             "movement_stalled",
@@ -520,6 +630,18 @@ class LocalNavigator:
                     "threshold_ticks": self.config.stall_ticks,
                     "speed_threshold_mps": self.config.stall_speed_mps,
                     "stall_count": self._stall_count,
+                    # 斜撞墙：人在动但前进分量被墙压住。纯速度判据看不见这种撞墙，
+                    # 因为速度模长还在阈值之上。
+                    "slip_ticks": self._slip_ticks,
+                    "slip_threshold_ticks": self.config.slip_ticks,
+                    "slip_forward_ratio": self.config.slip_forward_ratio,
+                    "slip_count": self._slip_count,
+                    # 自动绕行：撞墙后先自己转身重试，预算用尽才闩锁交还 LLM。
+                    # attempts 达到 limit 且 stalled=true 表示「怎么绕都出不去」，
+                    # 这时才真的需要 LLM 换目标。
+                    "recover_attempts": self._recover_attempts,
+                    "recover_limit": self.config.auto_recover_limit,
+                    "recover_count": self._recover_count,
                     "last_motion": None if self._last_motion is None else dict(self._last_motion),
                     # 已实测「推了摇杆但没动」的目标。换目标能解开闩锁，但解不开
                     # 这一份——不然又会选中同一个镜面倒影。
@@ -759,6 +881,20 @@ class LocalNavigator:
             if sent:
                 with self._lock:
                     self._active_side = "left"
+                    self._command_count += 1
+            return
+        if decision.state == "recover":
+            # 绕行是「先退开、再转身」。后退轴可选：斜撞墙时人还在动，直接转
+            # 就行；正面墙才需要先退一步，免得贴着墙角转身蹭不出去。
+            #
+            # 转向不做 revision 去重。去重是为了避免同一次观测被重复转，而绕行
+            # 本就与观测无关——它由速度回传触发，每次都是新的一步。
+            if decision.y:
+                self._send_axes("left", 0.0, decision.y, decision.pulse_ms)
+            else:
+                self._safe_release()
+            if self._send_turn(decision.turn_deg):
+                with self._lock:
                     self._command_count += 1
             return
         self._safe_release()
