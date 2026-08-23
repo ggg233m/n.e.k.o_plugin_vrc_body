@@ -254,6 +254,51 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.assertAlmostEqual(motion["vertical_speed_mps"], -9.0, places=3)
         self.assertAlmostEqual(motion["speed_mps"], math.hypot(5.0, 9.0), places=3)
 
+    def test_clear_path_reports_forward_ratio_near_one(self) -> None:
+        # 实测：畅通前进时 VelocityZ 主导，X 只有 ~1e-7 的数值噪声。
+        self._feed("VelocityX", -1.1920928955078125e-07)
+        self._feed("VelocityZ", 2.6666667461395264)
+        motion = self.bridge.motion_feedback()
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertAlmostEqual(motion["forward_ratio"], 1.0, places=3)
+        self.assertAlmostEqual(motion["slip_ratio"], 0.0, places=3)
+
+    def test_wall_slide_collapses_forward_ratio_while_speed_stays_high(self) -> None:
+        # 斜撞墙时角色控制器把移动投影到墙面上：速度模长还很大，但前进分量塌了。
+        # 只看 horizontal_speed_mps 看不出这个差别——这正是要导出比值的原因。
+        self._feed("VelocityX", 2.5)
+        self._feed("VelocityZ", 0.4)
+        motion = self.bridge.motion_feedback()
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertGreater(motion["horizontal_speed_mps"], 2.0)  # 速度并不低
+        self.assertLess(abs(motion["forward_ratio"]), 0.25)      # 但没在前进
+        self.assertGreater(motion["slip_ratio"], 0.9)            # 正沿墙面滑行
+
+    def test_slip_ratio_sign_distinguishes_which_way_the_wall_deflects(self) -> None:
+        # 滑行方向就是可通行方向，符号不能丢，否则绕行会朝墙里拐。
+        self._feed("VelocityX", -2.5)
+        self._feed("VelocityZ", 0.4)
+        motion = self.bridge.motion_feedback()
+        self.assertLess(motion["slip_ratio"], -0.9)
+
+    def test_ratios_are_none_at_rest_rather_than_zero(self) -> None:
+        # 0.0 会被读成「正对着墙」，与「站着不动」是完全不同的结论。
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 0.0)
+        motion = self.bridge.motion_feedback()
+        self.assertTrue(motion["available"], motion["reason"])
+        self.assertEqual(motion["horizontal_speed_mps"], 0.0)
+        self.assertIsNone(motion["forward_ratio"])
+        self.assertIsNone(motion["slip_ratio"])
+
+    def test_wall_slide_ratio_ignores_vertical_slide(self) -> None:
+        # 贴着墙下滑时 Y 很大；把它算进分母会把「前进被挡住」稀释成还在走。
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityY", -9.0)
+        self._feed("VelocityZ", 2.0)
+        motion = self.bridge.motion_feedback()
+        self.assertAlmostEqual(motion["forward_ratio"], 1.0, places=3)
+
     def test_standing_still_stays_available_because_freshness_follows_the_link(self) -> None:
         # VRChat 的参数是变化驱动的：站着不动时速度恒为 0，就不会再有新消息。
         # 若按取值年龄判新鲜度，站住不动几秒后速度反而变成「不可知」——正好把

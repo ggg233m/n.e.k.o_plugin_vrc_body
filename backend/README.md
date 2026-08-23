@@ -145,9 +145,14 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 无法被观测到，**不是「没卡」**；此时整个判据失效并放行，不会把「读不到」当成
 「速度为零」而废掉导航。
 
-> ⚠️ `stall_speed_mps = 0.15` 和 `stall_ticks = 8` 都是估算，需要**真机会话校准**：
-> VRChat Velocity 的单位未经验证，`max_forward_axis = 0.28` 对应的实际速度也没实测过。
-> 内置参数名同样未经真机验证。单元测试全绿不能说明这两个默认值是对的。
+> ⚠️ `stall_speed_mps = 0.15` 和 `stall_ticks = 8` 仍是估算值，需要**真机会话校准**。
+> 已实测确认（2026-08-23）：内置参数名有效，`VelocityX/Z` 是 avatar 本地系，该 avatar
+> 跑满速度为 `2.6667 m/s`。但 `max_forward_axis = 0.28` 对应的实际速度还没单独标定过，
+> 单元测试全绿不能说明这两个默认值是对的。
+>
+> 另外 `motion` 现在还导出 `velocity_x` / `velocity_z` 与 `forward_ratio` / `slip_ratio`。
+> 比起只看 `horizontal_speed_mps` 是否塌到 0，这两个比值能区分「正面墙」和「斜撞墙正在
+> 滑行」——后者速度模长未必小，但前进分量已经塌了，而滑行方向就是可通行方向。
 
 ```powershell
 python backend/debug_cli.py --port 48912 --token dev shell

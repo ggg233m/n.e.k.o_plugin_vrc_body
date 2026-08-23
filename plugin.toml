@@ -74,8 +74,9 @@ parameter_cache_size = 256
 # 前四个是本插件自己驱动的动作状态参数；后六个是 VRChat 内置 Avatar 参数，
 # 用于确认角色是否真的在移动（`accepted=true` 只代表本机发送成功）。
 #
-# ⚠️ 内置参数名未经实机验证，且只有在 avatar 的参数列表里存在时 VRChat 才会
-# 驱动并回传。收不到时 body_awareness.vrchat_osc.motion 报 available=false，
+# ✅ 内置参数名已实机验证（2026-08-23），VelocityX/Z 为 avatar 本地系。但只有在
+# avatar 的参数列表里存在时 VRChat 才会驱动并回传。收不到时
+# body_awareness.vrchat_osc.motion 报 available=false，
 # 不会把「没数据」当成「速度为零」。
 awareness_parameters = [
   "NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding",

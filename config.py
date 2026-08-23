@@ -129,8 +129,8 @@ class VrchatOscConfig:
         "NEKO_Holding",
         # VRChat 内置 Avatar 参数。它们一直在被缓存，只是过去被这张白名单挡在
         # awareness 之外——于是「我是不是卡墙了」在整个仓库里没有任何数据源。
-        # 名称未经实机验证；收不到时 motion_feedback 返回 available=false，
-        # 不会退化成「速度为零」。
+        # 名称已实机验证（2026-08-23）；换一个没配这些参数的 avatar 时
+        # motion_feedback 返回 available=false，不会退化成「速度为零」。
         "VelocityX",
         "VelocityY",
         "VelocityZ",

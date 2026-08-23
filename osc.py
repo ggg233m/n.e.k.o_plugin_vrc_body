@@ -844,9 +844,11 @@ class VrchatOscBridge:
 
         两个必须记住的前提：
 
-        1. **参数名未经实机验证。** 内置参数只有在 avatar 的参数列表里存在时才会
-           被驱动并回传；名字对不上或 avatar 没配，就一个都收不到。此时返回
-           ``available=false`` 并给出 ``expected``，绝不猜一个速度出来。
+        1. **参数名已实机验证（2026-08-23），但仍要防缺配。** 实测 ``VelocityX/Y/Z``、
+           ``AngularY``、``Grounded`` 会回传，且 ``VelocityX/Z`` 是 avatar 本地系。
+           不过内置参数只有在 avatar 的参数列表里存在时才会被驱动并回传；换一个没配
+           的 avatar 就一个都收不到。此时返回 ``available=false`` 并给出 ``expected``，
+           绝不猜一个速度出来。
         2. **静止时的沉默要靠取值自证，链路年龄单独判不出来。** VRChat 的参数是
            变化驱动的：站着不动时速度恒为 0，于是**一个包都不会来**，链路年龄和
            取值年龄一起变老。所以「安静」和「断了」无法只靠入站流量区分，得看
@@ -888,6 +890,14 @@ class VrchatOscBridge:
             "speed_mps": None,
             "horizontal_speed_mps": None,
             "vertical_speed_mps": None,
+            # 原始轴值与派生比值。hypot 会丢掉方向，而「撞墙」和「畅通」的区别
+            # 恰恰只在方向里：VRChat 的角色控制器把移动投影到墙面上，所以斜撞
+            # 墙时前进分量塌陷、侧滑分量抬起，速度模长却未必小。实测确认这两轴
+            # 是 avatar 本地系（转 90° 后仍是 Z 主导），因此无需先按 HMD yaw 旋转。
+            "velocity_x": None,
+            "velocity_z": None,
+            "forward_ratio": None,
+            "slip_ratio": None,
             "angular_speed": None,
             "grounded": None,
             "upright": None,
@@ -938,6 +948,14 @@ class VrchatOscBridge:
         result["horizontal_speed_mps"] = round(horizontal, 4)
         result["vertical_speed_mps"] = round(vy, 4)
         result["speed_mps"] = round(speed, 4)
+        result["velocity_x"] = round(vx, 4)
+        result["velocity_z"] = round(vz, 4)
+        # 比值按水平模长归一，不含 Y：贴着墙下滑时 Y 很大，算进分母会把
+        # 「前进被挡住」稀释成看起来还在走。静止时分母无意义，留 None 而不是
+        # 0.0——0.0 会被读成「正对着墙」，那是完全不同的结论。
+        if horizontal > _RESTING_SPEED_MPS:
+            result["forward_ratio"] = round(vz / horizontal, 4)
+            result["slip_ratio"] = round(vx / horizontal, 4)
         if limit_ms and link_age_ms > limit_ms:
             # 可用，但要让面板看出这是「靠静止取值兜住的沉默」而不是活跃回传。
             result["reason"] = "link_quiet_at_rest"

@@ -79,7 +79,15 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_awareness.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
 
-> ⚠️ **参数名未经真机验证。** 内置参数只有在 Avatar 的参数列表里存在时 VRChat 才会驱动并回传；名字对不上或 Avatar 没配就一个都收不到。此时 `motion.available=false` 并给出 `reason`（`no_feedback_received` / `feedback_stale` / `velocity_parameters_absent`），**不会退化成“速度为零”**。新鲜度按链路年龄判定而不是取值年龄：VRChat 参数是变化驱动的，站着不动时速度恒为 0 就不再有新消息，取值年龄单独报告为 `value_age_ms`。
+> ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。内置参数仍然只有在 Avatar 的参数列表里存在时才会驱动并回传；名字对不上或 Avatar 没配就一个都收不到。此时 `motion.available=false` 并给出 `reason`（`no_feedback_received` / `feedback_stale` / `velocity_parameters_absent`），**不会退化成“速度为零”**。新鲜度按链路年龄判定而不是取值年龄：VRChat 参数是变化驱动的，站着不动时速度恒为 0 就不再有新消息，取值年龄单独报告为 `value_age_ms`。
+
+`motion` 除标量速度外还导出 `velocity_x` / `velocity_z` 原始轴值，以及按水平模长归一的
+`forward_ratio` / `slip_ratio`。这两个比值用于区分「畅通」与「撞墙」：VRChat 的角色控制器
+会把移动向量投影到墙面上，所以斜撞墙时前进分量塌陷、侧滑分量抬起，而速度模长未必变小——
+`hypot` 之后的标量看不出这个差别。`forward_ratio ≈ 1` 是畅通；明显小于 1 且 `slip_ratio`
+变大表示正贴着墙滑行，滑行方向即可通行方向；`horizontal_speed_mps` 塌到接近 0 则是正面墙
+或墙角。水平速度低于静止阈值时两个比值为 `None` 而不是 `0.0`——`0.0` 会被读成「正对着墙」，
+与「站着不动」是完全不同的结论。
 
 ## 独立后端进程
 
@@ -190,7 +198,7 @@ allowed_sender = "127.0.0.1"
 input_pulse_ms = 100
 parameter_cache_size = 256
 # 前四个是本插件自己驱动的动作状态参数；后六个是 VRChat 内置 Avatar 参数，
-# 用于确认角色是否真的在移动（内置参数名未经真机验证，收不到时报 available=false）。
+# 用于确认角色是否真的在移动（已实机验证会回传，收不到时报 available=false）。
 awareness_parameters = [
   "NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding",
   "VelocityX", "VelocityY", "VelocityZ", "AngularY", "Upright", "Grounded",
