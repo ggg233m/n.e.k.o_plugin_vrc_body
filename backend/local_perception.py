@@ -305,6 +305,11 @@ def _load_labels(path: str | Path | None) -> tuple[str, ...]:
         raise _LabelLoadError(f"labels file {candidate}: {exc}") from exc
 
 
+# 不接受 INFERENCE_NUM_THREADS 的设备。这个属性限的是 CPU 线程池，这些插件
+# 里没有对应物，喂过去实测直接抛 RuntimeError 而不是被忽略。
+_OPENVINO_ACCELERATORS = frozenset({"GPU", "NPU"})
+
+
 class OpenVinoLocalDetector:
     """采用保守输出归一化策略的 OpenVINO 检测器。
 
@@ -411,6 +416,13 @@ class OpenVinoLocalDetector:
         self._available = infer is not None
         self._degraded = False
         self._last_error: str | None = None
+        # 设备协商的结果要能从 /perception 读到。「配了 AUTO」和「最后跑在
+        # GPU 上」是两件事，混成一个字段就没法判断加速有没有真的生效——而
+        # 两者的延迟差 22 倍，静默落回 CPU 会表现为整个循环变慢却无人知晓。
+        self._resolved_device: str | None = None
+        self._device_fallbacks: tuple[str, ...] = ()
+        self._openvino_error: str | None = None
+        self._core_devices: tuple[str, ...] = ()
         self._uncertainties: list[str] = []
         self._frames = 0
         self._last_inference_ms: float | None = None
@@ -431,41 +443,102 @@ class OpenVinoLocalDetector:
         if not path.exists() or not path.is_file():
             self._last_error = f"OpenVINO model does not exist: {path}"
             return
-        # ONNX 优先交给 ONNX Runtime。它是三条路径里唯一能正确处理动态
-        # batch/宽高的：OpenCV 的 ONNX 导入器会在动态形状的 Concat 上形状
-        # 推断失败（实测 yolo11n 动态导出直接抛 ConcatLayer），而 OpenVINO
-        # wheel 在冻结宿主里根本不存在。显式注入 core 时跳过这里，避免旁路
-        # 掉调用方指定的运行时。
-        if supplied_core is None and path.suffix.lower() == ".onnx":
-            self._initialize_onnxruntime(path)
-            if self._available:
-                return
-        try:
-            core = supplied_core
-            if core is None:
+        # 曾经这里对 .onnx 无条件先走 ONNX Runtime 并直接 return，理由是
+        # 「OpenVINO wheel 在冻结宿主里根本不存在」。装上 wheel 后那个前提就
+        # 失效了，而短路的代价很大：本机 ORT 只有 CPU 提供者（装的是基础包，
+        # providers 仅 Azure/CPU），而 CPU 是 Xeon E5-2666 v3——2014 年的
+        # Haswell，无 AVX-512。实测 person_detect_v1.3_s @640：
+        #
+        #   ORT CPU / 2 线程        258 ms   <- 这条短路选中的路径
+        #   OpenVINO CPU / 2 线程   329 ms
+        #   OpenVINO GPU (Arc A770)  11.7 ms  <- 快 22 倍，整卡驻留只 +79 MB
+        #
+        # 所以顺序反过来：先让 OpenVINO 试，逐个设备回落，全都连不上才落回
+        # ORT。注入 core 时同样走这里，只是跳过自己 import。
+        core = supplied_core
+        if core is None:
+            try:
                 from openvino import Core  # type: ignore[import-not-found]
 
                 core = Core()
-            model = core.read_model(model=str(path))
-            # 这条回退路径当前机器上不可达（没装 OpenVINO wheel），但它是刻意
-            # 保留的；不在这里也设上限，等于把同一个吃满 CPU 的 bug 留在门后。
-            if self._intra_op_threads > 0:
-                try:
-                    compiled = core.compile_model(
-                        model, self._device, {"INFERENCE_NUM_THREADS": self._intra_op_threads}
-                    )
-                    self._thread_cap_applied = True
-                except TypeError as exc:
-                    # 注入的 core 可能只接受两个参数（测试替身、自带运行时的调用
-                    # 方）。多一个位置参数不该把它们的检测器整体打掉，所以退回
-                    # 不带配置的调用；上限没设成会在 status() 里报出来。
-                    self._thread_cap_error = f"{type(exc).__name__}: {exc}"[:200]
-                    compiled = core.compile_model(model, self._device)
+            except Exception as exc:
+                # wheel 没装是预期情况（别人的机器、冻结宿主），不是故障。
+                self._openvino_error = f"{type(exc).__name__}: {exc}"[:200]
+                core = None
+        if core is not None:
+            try:
+                self._core_devices = tuple(str(d) for d in core.available_devices)
+            except Exception:
+                # 注入的测试替身通常没有这个属性。留空表示「不知道有哪些设备」，
+                # 候选列表会退化成照单全试——比假装设备不存在要好。
+                self._core_devices = ()
+            try:
+                model = core.read_model(model=str(path))
+            except Exception as exc:
+                self._openvino_error = f"read_model: {type(exc).__name__}: {exc}"[:200]
             else:
-                compiled = core.compile_model(model, self._device)
+                if self._compile_openvino(core, model):
+                    return
+        # OpenVINO 整条路都不通。ONNX 还有两个后备解释器，IR XML 没有——
+        # 用 cv2 去读 XML 只会得到虚假的成功状态。
+        if path.suffix.lower() == ".onnx":
+            self._initialize_onnxruntime(path)
+            if self._available:
+                return
+            self._initialize_opencv_dnn(path)
+        if not self._available and not self._last_error:
+            self._last_error = (
+                f"no runtime could load {path.name}"
+                + (f"; openvino: {self._openvino_error}" if self._openvino_error else "")
+            )
+
+    def _openvino_device_candidates(self) -> list[str]:
+        """按优先级排出要试的设备，CPU 兜底。
+
+        配置里的 ``AUTO`` 不能直接用：实测 ``EXECUTION_DEVICES=['(CPU)']``，
+        AUTO 会先把首帧放在 CPU 上、GPU 在后台慢慢编译。对一个感知循环来说
+        那等于长时间拿不到 GPU 的 11.7 ms。所以 AUTO 在这里被展开成「显式挨
+        个试」，而不是交给 AUTO 插件去调度。
+
+        只在**确实知道**有哪些设备时才展开。注入的 core（测试替身、自带运行时
+        的调用方）通常没有 ``available_devices``，那种情况下照配置原样传过去：
+        凭空试 NPU/GPU 等于对一个不了解的运行时瞎猜设备名，而它可能来者不拒，
+        于是我们会"成功"编译到一个根本不存在的加速器上。
+        """
+        configured = self._device.strip() or "AUTO"
+        available = [d for d in self._core_devices if d]
+        if not available:
+            return [configured]
+
+        roots = {d.split(".", 1)[0].upper() for d in available}
+        if configured.upper() != "AUTO":
+            # 显式配了具体设备时尊重它，但仍然在后面挂上 CPU：用户要求的是
+            # 「用这块加速器」，不是「没有加速器就整个瞎掉」。
+            order = [configured]
+        else:
+            # NPU 排在 GPU 前：有 NPU 的机器上它功耗低得多，而这个模型小到
+            # 两者都远快于 CPU，此时省电比省几毫秒更值。
+            order = [d for d in ("NPU", "GPU") if d in roots]
+
+        candidates = list(order)
+        candidates.append("CPU")
+        # 保序去重，避免 device="CPU" 时试两遍。
+        seen: set[str] = set()
+        return [d for d in candidates if not (d.upper() in seen or seen.add(d.upper()))]
+
+    def _compile_openvino(self, core: Any, model: Any) -> bool:
+        """逐个设备编译，成功即返回 True。全失败返回 False 交给 ORT。"""
+        errors: list[str] = []
+        for device in self._openvino_device_candidates():
+            try:
+                compiled = self._compile_on_device(core, model, device)
+            except Exception as exc:
+                errors.append(f"{device}: {type(exc).__name__}: {exc}"[:180])
+                continue
             inputs = list(getattr(model, "inputs", ()) or ())
             if not inputs:
-                raise RuntimeError("OpenVINO model has no inputs")
+                errors.append(f"{device}: model has no inputs")
+                continue
             input_port = inputs[0]
             try:
                 self._input_name = input_port.any_name
@@ -483,14 +556,42 @@ class OpenVinoLocalDetector:
             self._available = True
             self._runtime = "openvino"
             self._source_name = "openvino"
+            self._resolved_device = device
+            self._device_fallbacks = tuple(errors)
             self._last_error = None
-        except Exception as exc:
-            self._last_error = f"{type(exc).__name__}: {exc}"[:500]
-            # 即使未安装可选的 OpenVINO wheel，OpenCV 也通常带有可用的 ONNX
-            # 导入器。此回退仅限 ONNX 文件；尝试用 cv2 解释 IR XML 会造成
-            # 虚假的成功状态。
-            if path.suffix.lower() == ".onnx":
-                self._initialize_opencv_dnn(path)
+            return True
+        self._openvino_error = "; ".join(errors)[:400] if errors else "no device compiled"
+        self._device_fallbacks = tuple(errors)
+        return False
+
+    def _compile_on_device(self, core: Any, model: Any, device: str) -> Any:
+        """在单个设备上编译。线程上限不喂给纯加速器设备。
+
+        GPU 插件不认 ``INFERENCE_NUM_THREADS``，实测会抛 ``RuntimeError``
+        （``Check 'it != m_options_map.end()' failed``），不是 ``TypeError``。
+        原来只捕 TypeError，所以把这个属性喂给 GPU 会让整条 OpenVINO 分支
+        崩掉、静默退回 258 ms 的 CPU 路径。更根本的是这个旋钮对 GPU 无意义：
+        它限的是 CPU 线程池，GPU 上没有对应物。
+
+        排除按加速器名单而不是「只给 CPU」：``AUTO`` 实测接受这个属性（它的
+        候选里含 CPU），而注入的测试替身也用默认的 AUTO——按 CPU 白名单写会
+        把它们的线程上限一起吞掉。
+        """
+        root = device.split(".", 1)[0].upper()
+        if self._intra_op_threads > 0 and root not in _OPENVINO_ACCELERATORS:
+            try:
+                compiled = core.compile_model(
+                    model, device, {"INFERENCE_NUM_THREADS": self._intra_op_threads}
+                )
+            except TypeError as exc:
+                # 注入的 core 可能只接受两个参数（测试替身、自带运行时的调用
+                # 方）。多一个位置参数不该把它们的检测器整体打掉，所以退回
+                # 不带配置的调用；上限没设成会在 status() 里报出来。
+                self._thread_cap_error = f"{type(exc).__name__}: {exc}"[:200]
+                return core.compile_model(model, device)
+            self._thread_cap_applied = True
+            return compiled
+        return core.compile_model(model, device)
 
     def _onnx_session_options(self, ort: Any) -> Any | None:
         """构造带线程上限的 ``SessionOptions``，取不到就返回 ``None``。
@@ -823,6 +924,13 @@ class OpenVinoLocalDetector:
                 },
                 "runtime": self._runtime,
                 "device": self._device,
+                # 配置意图 vs 协商结果。AUTO 被展开成挨个试，所以「配的」和
+                # 「跑的」经常不同；GPU 掉到 CPU 是 22 倍的延迟差，必须能从
+                # 外面直接看出来，而不是靠观察循环变慢去猜。
+                "resolved_device": self._resolved_device,
+                "device_fallbacks": list(self._device_fallbacks),
+                "openvino_error": self._openvino_error,
+                "openvino_devices": list(self._core_devices),
                 "model_path_configured": bool(self._model_path),
                 "model_path": self._model_path[-160:] if self._model_path else None,
                 "labels_path_configured": bool(self._labels_path),

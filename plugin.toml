@@ -120,6 +120,19 @@ local_backend = "openvino"
 # 会报告 unavailable，而不是进行猜测。
 model_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_model.onnx"
 labels_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_labels.json"
+# AUTO 表示按 NPU -> GPU -> CPU 挨个试，取第一个能编译的；实际落在哪个设备
+# 由 /perception 的 resolved_device 报出，失败原因在 device_fallbacks 里。
+#
+# 注意 AUTO 不会原样传给 OpenVINO 的 AUTO 插件。实测 AUTO 插件把首帧放在 CPU
+# 上（EXECUTION_DEVICES=['(CPU)']）、GPU 在后台慢慢编译，对感知循环来说等于
+# 长时间拿不到加速。所以这里自己展开成显式逐个尝试。
+#
+# 实测（Intel Arc A770 + Xeon E5-2666 v3，person_detect_v1.3_s @640）：
+#   ORT CPU / 2 线程       258 ms   端到端
+#   OpenVINO CPU / 2 线程  354 ms   端到端
+#   OpenVINO GPU            44 ms   端到端（裸推理 11.7 ms，整卡驻留 +79 MB）
+# GPU 默认跑 FP16，但分数偏差只有 0.004（CPU 0.7846 vs GPU 0.7847），过 0.25
+# 阈值的框两边都是 9 个，所以下面的 confidence_threshold 不需要跟着改。
 device = "AUTO"
 # none（默认），或显式启用降级的 OpenCV HOG 仅人形回退。
 fallback_backend = "none"
