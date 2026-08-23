@@ -259,6 +259,8 @@ local_backend = "openvino"
 model_path = "models/yolox.xml" # 可选 XML/ONNX 路径，相对于配置目录
 labels_path = "models/labels.txt" # 可选；留空时使用 COCO 名称
 device = "AUTO" # AUTO / GPU / CPU，取决于已安装的 OpenVINO 插件
+onnxruntime_cuda = "auto" # auto / prefer / disabled；只对 ONNX 模型生效
+onnxruntime_cuda_device_id = 0 # NVIDIA CUDA device_id
 fallback_backend = "none" # 显式设为 "opencv_hog" 可启用降级的仅人形模式
 confidence_threshold = 0.35
 input_width = 640
@@ -294,9 +296,13 @@ window_track_interval_ms = 5000
 
 配置只描述 worker，不下载模型。启用视觉后，即使模型暂缺也可以用
 `capture_only=true` 运行采集诊断；这时世界仍是 unknown，不会产生实体。配置了
-`model_path` 后，后端会在独立视觉 worker
-中优先加载 OpenVINO IR/ONNX；当 OpenVINO 不可用且文件是 ONNX 时，会尝试 OpenCV
-DNN 导入。常见 YOLO/SSD 输出会被归一化为带稳定 track ID 的实体；
+`model_path` 后，后端会在独立视觉 worker 中加载模型。ONNX 的自动优先级为
+OpenVINO NPU/GPU → ONNX Runtime CUDA（可选）→ OpenVINO CPU → ONNX Runtime
+CPU → OpenCV DNN。`onnxruntime_cuda = "auto"` 只负责探测，不构成硬依赖；设为
+`prefer` 可让 CUDA 抢在 OpenVINO NPU/GPU 前（适合 Intel 核显 + NVIDIA 独显）；环境里
+没有 `onnxruntime-gpu`、CUDA/cuDNN 动态库不匹配或 Session 创建失败时，原因会出现在
+`/perception` 的 `onnxruntime.cuda_error`，然后继续 CPU 回落。设置为 `disabled` 可
+完全跳过探测。常见 YOLO/SSD 输出会被归一化为带稳定 track ID 的实体；
 `attributes.bearing_deg` 和屏幕几何关系可以供本地导航使用，但没有深度模型时距离
 仍然是 unknown。OpenVINO 模型包、VLM endpoint 和 API key 由部署环境提供（VLM
 endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行时或模型时

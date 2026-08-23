@@ -22,11 +22,43 @@ from neko_anyadance_body.backend.client import (
     RemoteScheduler,
     RemoteVision,
 )
-from neko_anyadance_body.backend.service import BackendService
+from neko_anyadance_body.backend.service import BackendService, _effective_detector_interval_ms
 from neko_anyadance_body.backend.vision import VisionObservation
 
 
 class BackendClientTests(unittest.TestCase):
+    def test_detector_interval_uses_override_only_for_resolved_accelerators(self) -> None:
+        config = SimpleNamespace(
+            detector_interval_ms=500,
+            detector_accelerator_interval_ms=100,
+        )
+
+        def detector(runtime: str, resolved_device: str):
+            return SimpleNamespace(status=lambda: {
+                "runtime": runtime,
+                "resolved_device": resolved_device,
+            })
+
+        self.assertEqual(
+            _effective_detector_interval_ms(config, detector("openvino", "GPU.1")), 100
+        )
+        self.assertEqual(
+            _effective_detector_interval_ms(config, detector("openvino", "NPU")), 100
+        )
+        self.assertEqual(
+            _effective_detector_interval_ms(
+                config, detector("onnxruntime_cuda", "CUDA.2")
+            ),
+            100,
+        )
+        self.assertEqual(
+            _effective_detector_interval_ms(config, detector("openvino", "CPU")), 500
+        )
+        self.assertEqual(
+            _effective_detector_interval_ms(config, detector("onnxruntime", "CPU")), 500
+        )
+        self.assertEqual(_effective_detector_interval_ms(config, None), 500)
+
     def test_remote_vision_keeps_lifecycle_publish_as_a_structured_transport_call(self) -> None:
         client = BackendClient({}, Path.cwd())
         invalid = client.vision.ingest(42)  # type: ignore[arg-type]

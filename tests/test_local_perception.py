@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 try:
     import numpy as np
@@ -660,6 +661,142 @@ class LocalPerceptionTests(unittest.TestCase):
                 sys.modules["onnxruntime"] = previous
 
     @unittest.skipIf(np is None, "numpy is optional")
+    def test_optional_cuda_provider_is_detected_before_cpu_and_falls_back_safely(self) -> None:
+        """CUDA 可用才抢在 CPU 前；缺 provider/动态库或显式关闭都回落 CPU。"""
+        class _Input:
+            any_name = "images"
+            partial_shape = (1, 3, 8, 8)
+            name = "images"
+            shape = [1, 3, 8, 8]
+
+        class _Model:
+            inputs = [_Input()]
+
+        class _Compiled:
+            def __call__(self, _inputs):
+                return np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]])
+
+        class _Core:
+            def __init__(self, available_devices: list[str]) -> None:
+                self.available_devices = list(available_devices)
+                self.compile_calls: list[str] = []
+
+            def read_model(self, **_kwargs):
+                return _Model()
+
+            def compile_model(self, _model, device, config=None):
+                self.compile_calls.append(device)
+                return _Compiled()
+
+        def construct(
+            available_providers: list[str],
+            *,
+            cuda_error: str | None = None,
+            cuda_mode: str = "auto",
+            cuda_device_id: int = 0,
+            openvino_devices: list[str] | None = None,
+        ):
+            captured: dict[str, object] = {"provider_queries": 0}
+
+            def get_available_providers():
+                captured["provider_queries"] = int(captured["provider_queries"]) + 1
+                return list(available_providers)
+
+            class _Session:
+                def __init__(self, _path, providers=None):
+                    captured["providers"] = providers
+                    names = [
+                        item[0] if isinstance(item, tuple) else item
+                        for item in (providers or [])
+                    ]
+                    if names and names[0] == "CUDAExecutionProvider" and cuda_error:
+                        raise OSError(cuda_error)
+                    self._providers = names
+
+                def get_providers(self):
+                    return list(self._providers)
+
+                def get_inputs(self):
+                    return [_Input()]
+
+                def run(self, _outputs, _feed):
+                    return [np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]])]
+
+            fake_ort = types.SimpleNamespace(
+                get_available_providers=get_available_providers,
+                InferenceSession=_Session,
+            )
+            core = _Core(openvino_devices or ["CPU"])
+            with patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+                detector = OpenVinoLocalDetector(
+                    model_path=str(model),
+                    openvino_core=core,
+                    onnxruntime_cuda=cuda_mode,
+                    onnxruntime_cuda_device_id=cuda_device_id,
+                    intra_op_threads=0,
+                )
+            return detector, core, captured
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.onnx"
+            model.write_bytes(b"fake")
+
+            cuda, cuda_core, cuda_capture = construct(
+                ["CUDAExecutionProvider", "CPUExecutionProvider"], cuda_device_id=2
+            )
+            cuda_status = cuda.status()
+            self.assertEqual(cuda_status["runtime"], "onnxruntime_cuda")
+            self.assertEqual(cuda_status["resolved_device"], "CUDA.2")
+            self.assertEqual(cuda_core.compile_calls, [])
+            self.assertEqual(
+                cuda_capture["providers"][0],
+                ("CUDAExecutionProvider", {"device_id": 2}),
+            )
+            self.assertIsNone(cuda_status["onnxruntime"]["cuda_error"])
+
+            auto_intel, auto_intel_core, auto_intel_capture = construct(
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                openvino_devices=["GPU", "CPU"],
+            )
+            self.assertEqual(auto_intel.status()["resolved_device"], "GPU")
+            self.assertEqual(auto_intel_core.compile_calls, ["GPU"])
+            self.assertEqual(auto_intel_capture["provider_queries"], 0)
+
+            preferred, preferred_core, _ = construct(
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                cuda_mode="prefer",
+                openvino_devices=["GPU", "CPU"],
+            )
+            self.assertEqual(preferred.status()["runtime"], "onnxruntime_cuda")
+            self.assertEqual(preferred_core.compile_calls, [])
+
+            missing, missing_core, _ = construct(["CPUExecutionProvider"])
+            missing_status = missing.status()
+            self.assertEqual(missing_status["runtime"], "openvino")
+            self.assertEqual(missing_status["resolved_device"], "CPU")
+            self.assertEqual(missing_core.compile_calls, ["CPU"])
+            self.assertIn("unavailable", missing_status["onnxruntime"]["cuda_error"])
+
+            broken, broken_core, _ = construct(
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                cuda_error="cudnn64_9.dll is missing",
+            )
+            broken_status = broken.status()
+            self.assertEqual(broken_status["runtime"], "openvino")
+            self.assertEqual(broken_core.compile_calls, ["CPU"])
+            self.assertIn("cudnn64_9.dll", broken_status["onnxruntime"]["cuda_error"])
+
+            disabled, disabled_core, disabled_capture = construct(
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                cuda_mode="disabled",
+            )
+            disabled_status = disabled.status()
+            self.assertEqual(disabled_status["runtime"], "openvino")
+            self.assertEqual(disabled_core.compile_calls, ["CPU"])
+            self.assertEqual(disabled_capture["provider_queries"], 0)
+            self.assertFalse(disabled_status["onnxruntime"]["cuda_probed"])
+
+    @unittest.skipIf(np is None, "numpy is optional")
     def test_onnxruntime_session_is_capped_on_both_thread_pools(self) -> None:
         """限 intra-op 还不够：留着 inter-op 池会在上限之外再开一组线程。
 
@@ -820,6 +957,47 @@ class LocalPerceptionTests(unittest.TestCase):
             observation = legacy.observe(np.zeros((8, 8, 3), dtype=np.uint8), now=10.0)
             self.assertEqual(len(observation.entities), 1)
 
+    def test_auto_device_falls_through_each_qualified_gpu(self) -> None:
+        """GPU.0 失败后必须尝试 GPU.1，而不是把两者折叠成 GPU。"""
+        class _Input:
+            any_name = "images"
+            partial_shape = (1, 3, 8, 8)
+
+        class _Model:
+            inputs = [_Input()]
+
+        class _Compiled:
+            def __call__(self, _inputs):
+                return np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]])
+
+        class _Core:
+            available_devices = ["CPU", "GPU.0", "GPU.1"]
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def read_model(self, **_kwargs):
+                return _Model()
+
+            def compile_model(self, _model, device, config=None):
+                self.calls.append(device)
+                if device == "GPU.0":
+                    raise RuntimeError("GPU.0 cannot compile this model")
+                return _Compiled()
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.xml"
+            model.write_text("<fake/>", encoding="utf-8")
+            core = _Core()
+            detector = OpenVinoLocalDetector(
+                model_path=str(model), openvino_core=core, intra_op_threads=0
+            )
+            status = detector.status()
+            self.assertEqual(status["runtime"], "openvino")
+            self.assertEqual(status["resolved_device"], "GPU.1")
+            self.assertEqual(core.calls, ["GPU.0", "GPU.1"])
+            self.assertIn("GPU.0: RuntimeError", status["device_fallbacks"][0])
+
     def test_config_exposes_explicit_model_and_degraded_fallback_options(self) -> None:
         config = PluginConfig.from_mapping({
             "vision": {
@@ -878,6 +1056,40 @@ class OpenMpCapTests(unittest.TestCase):
             sys.modules["numpy"] = self._saved_numpy
         _lp._OPENMP_STATE.clear()
         _lp._OPENMP_STATE.update(self._saved_state)
+
+    def test_openmp_is_capped_even_when_openvino_wins_over_onnxruntime(self) -> None:
+        """OpenMP 收口不能挂在 ONNX Runtime 那条路上。"""
+        class _Input:
+            any_name = "images"
+            partial_shape = (1, 3, 8, 8)
+
+        class _Model:
+            inputs = [_Input()]
+
+        class _Compiled:
+            def __call__(self, _inputs):
+                return np.asarray([[0.5, 0.5, 0.5, 0.5, 0.9, 0.9]])
+
+        class _Core:
+            available_devices = ["CPU"]
+
+            def read_model(self, **_kwargs):
+                return _Model()
+
+            def compile_model(self, _model, _device, config=None):
+                return _Compiled()
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.onnx"
+            model.write_text("<fake/>", encoding="utf-8")
+            detector = OpenVinoLocalDetector(
+                model_path=str(model), openvino_core=_Core(), intra_op_threads=3
+            )
+            status = detector.status()
+            self.assertEqual(status["runtime"], "openvino")
+            self.assertTrue(status["available"])
+            self.assertEqual(os.environ.get("OMP_NUM_THREADS"), "3")
+            self.assertEqual(os.environ.get("OMP_WAIT_POLICY"), "PASSIVE")
 
     def test_cap_sets_both_thread_count_and_wait_policy(self) -> None:
         # 只设线程数只能到 0.87 核；WAIT_POLICY 才是把 7.23 核压到 0.11 核的那一

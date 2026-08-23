@@ -61,6 +61,29 @@ _OSC_HOLD_MAX_MS = 1000
 TURN_SPEED_DPS = 180.0
 
 
+def _effective_detector_interval_ms(config: Any, detector: Any | None) -> int:
+    """按实际推理设备选择检测间隔，未知状态一律走 CPU 安全值。"""
+    fallback = max(0, int(config.detector_interval_ms))
+    if detector is None:
+        return fallback
+    try:
+        status = detector.status()
+    except Exception:
+        return fallback
+    if not isinstance(status, Mapping):
+        return fallback
+    runtime = str(status.get("runtime") or "").strip().lower()
+    resolved = str(status.get("resolved_device") or "").split(".", 1)[0].upper()
+    accelerated = (
+        runtime == "openvino" and resolved in {"GPU", "NPU"}
+    ) or (
+        runtime == "onnxruntime_cuda" and resolved == "CUDA"
+    )
+    if accelerated:
+        return max(0, int(config.detector_accelerator_interval_ms))
+    return fallback
+
+
 def _osc_axis_value(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be a finite number")
@@ -201,6 +224,8 @@ class BackendService:
                 model_path=configured_model,
                 labels_path=configured_labels,
                 device=self.config.vision.device,
+                onnxruntime_cuda=self.config.vision.onnxruntime_cuda,
+                onnxruntime_cuda_device_id=self.config.vision.onnxruntime_cuda_device_id,
                 confidence_threshold=self.config.vision.confidence_threshold,
                 input_width=self.config.vision.input_width,
                 input_height=self.config.vision.input_height,
@@ -231,12 +256,15 @@ class BackendService:
             persist_world=self.config.world_memory.persist_world and "world_memory" in config_data,
             persist_players=self.config.world_memory.persist_players and "world_memory" in config_data,
         )
+        effective_detector_interval_ms = _effective_detector_interval_ms(
+            self.config.vision, vision_detector
+        )
         self.vision = VisionRuntime(
             self.world_state,
             detector=vision_detector,
             semantic=vision_semantic,
             observation_callback=self._on_vision_observation,
-            detect_interval_s=self.config.vision.detector_interval_ms / 1000.0,
+            detect_interval_s=effective_detector_interval_ms / 1000.0,
             frame_cache_interval_s=self.config.vision.frame_cache_interval_s,
             frame_cache_max_width=self.config.vision.frame_max_width,
             frame_cache_quality=self.config.vision.frame_jpeg_quality,

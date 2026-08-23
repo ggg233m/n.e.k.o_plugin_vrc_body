@@ -328,6 +328,8 @@ class OpenVinoLocalDetector:
         model_path: str | None = None,
         labels_path: str | None = None,
         device: str = "AUTO",
+        onnxruntime_cuda: str = "auto",
+        onnxruntime_cuda_device_id: int = 0,
         confidence_threshold: float = 0.35,
         input_width: int = 640,
         input_height: int = 640,
@@ -359,6 +361,11 @@ class OpenVinoLocalDetector:
         else:
             self._label_load_error = ""
         self._device = str(device or "AUTO").strip() or "AUTO"
+        cuda_mode = str(onnxruntime_cuda or "auto").strip().lower() or "auto"
+        if cuda_mode not in {"auto", "prefer", "disabled"}:
+            raise ValueError("onnxruntime_cuda must be auto, prefer, or disabled")
+        self._onnx_cuda_mode = cuda_mode
+        self._onnx_cuda_device_id = min(31, max(0, int(onnxruntime_cuda_device_id)))
         self._confidence_threshold = min(1.0, max(0.0, float(confidence_threshold)))
         self._input_width = min(4096, max(32, int(input_width)))
         self._input_height = min(4096, max(32, int(input_height)))
@@ -423,6 +430,13 @@ class OpenVinoLocalDetector:
         self._device_fallbacks: tuple[str, ...] = ()
         self._openvino_error: str | None = None
         self._core_devices: tuple[str, ...] = ()
+        # ORT GPU wheel 与 CUDA/cuDNN 都是可选依赖。仅在真的轮到 CUDA 候选时
+        # 才导入和探测；结果必须能从状态面区分「没探测」「wheel 不带 provider」
+        # 和「provider 在但动态库/Session 初始化失败」。
+        self._onnx_cuda_probed = False
+        self._onnx_available_providers: tuple[str, ...] = ()
+        self._onnx_session_providers: tuple[str, ...] = ()
+        self._onnx_cuda_error: str | None = None
         self._uncertainties: list[str] = []
         self._frames = 0
         self._last_inference_ms: float | None = None
@@ -453,9 +467,19 @@ class OpenVinoLocalDetector:
         #   OpenVINO CPU / 2 线程   329 ms
         #   OpenVINO GPU (Arc A770)  11.7 ms  <- 快 22 倍，整卡驻留只 +79 MB
         #
-        # 所以顺序反过来：先让 OpenVINO 试，逐个设备回落，全都连不上才落回
-        # ORT。注入 core 时同样走这里，只是跳过自己 import。
+        # 所以顺序反过来。ONNX 的完整优先级是：OpenVINO NPU/GPU → 可选的
+        # ORT CUDA → OpenVINO CPU → ORT CPU → OpenCV。这样 NVIDIA-only 机器
+        # 不会因为 OpenVINO CPU 先成功而永远绕过 CUDA，同时也保留 Intel
+        # 加速器的既有优先级。注入 core 时同样走这里，只是跳过自己 import。
+        #
+        # OpenMP 收口必须在这里、在**任何**运行时被导入之前做。原来它挂在
+        # _initialize_onnxruntime 里，而 ORT 曾经是 .onnx 的第一站，所以顺带
+        # 就收住了。现在 OpenVINO 抢在前面并直接 return，那个调用点再也到不了：
+        # 实测检测器 CPU 占用从 1.2 核涨回 3~6 核，全是 numpy BLAS 的自旋等待
+        # （见 plugin.toml 里 detector_threads 那段——空转 7 核而吞吐不变）。
+        self._cap_openmp_before_import()
         core = supplied_core
+        model: Any | None = None
         if core is None:
             try:
                 from openvino import Core  # type: ignore[import-not-found]
@@ -476,13 +500,42 @@ class OpenVinoLocalDetector:
                 model = core.read_model(model=str(path))
             except Exception as exc:
                 self._openvino_error = f"read_model: {type(exc).__name__}: {exc}"[:200]
-            else:
-                if self._compile_openvino(core, model):
-                    return
-        # OpenVINO 整条路都不通。ONNX 还有两个后备解释器，IR XML 没有——
+                model = None
+
+        is_onnx = path.suffix.lower() == ".onnx"
+        openvino_candidates = self._openvino_device_candidates() if model is not None else []
+        accelerator_candidates = [
+            item for item in openvino_candidates
+            if item.split(".", 1)[0].upper() in _OPENVINO_ACCELERATORS
+        ]
+        remaining_candidates = [
+            item for item in openvino_candidates if item not in accelerator_candidates
+        ]
+
+        if is_onnx and self._onnx_cuda_mode == "prefer":
+            self._initialize_onnxruntime(path, use_cuda=True)
+            if self._available:
+                return
+
+        if model is not None and accelerator_candidates:
+            if self._compile_openvino(core, model, accelerator_candidates):
+                return
+
+        # 只在 AUTO 模式探测可选 CUDA；显式指定 OpenVINO CPU/GPU/NPU 时尊重
+        # 调用方。provider 缺失或 Session 初始化失败都只记录并继续 CPU 回落。
+        if is_onnx and self._onnx_cuda_mode == "auto" and self._device.upper() == "AUTO":
+            self._initialize_onnxruntime(path, use_cuda=True)
+            if self._available:
+                return
+
+        if model is not None and remaining_candidates:
+            if self._compile_openvino(core, model, remaining_candidates):
+                return
+
+        # OpenVINO 与 CUDA 都不通。ONNX 还有两个 CPU 后备解释器，IR XML 没有——
         # 用 cv2 去读 XML 只会得到虚假的成功状态。
-        if path.suffix.lower() == ".onnx":
-            self._initialize_onnxruntime(path)
+        if is_onnx:
+            self._initialize_onnxruntime(path, use_cuda=False)
             if self._available:
                 return
             self._initialize_opencv_dnn(path)
@@ -510,7 +563,13 @@ class OpenVinoLocalDetector:
         if not available:
             return [configured]
 
-        roots = {d.split(".", 1)[0].upper() for d in available}
+        def devices(root: str) -> list[str]:
+            # Core 会在同类设备超过一个时返回 GPU.0/GPU.1 这类完整名字。
+            # ``GPU`` 只是 GPU.0 的别名，若在这里压成根名称，后面的卡永远
+            # 没机会参与回落。因此保留运行时给出的具体标识和原始顺序。
+            return [d for d in available if d.split(".", 1)[0].upper() == root]
+
+        cpu_devices = devices("CPU") or ["CPU"]
         if configured.upper() != "AUTO":
             # 显式配了具体设备时尊重它，但仍然在后面挂上 CPU：用户要求的是
             # 「用这块加速器」，不是「没有加速器就整个瞎掉」。
@@ -518,18 +577,20 @@ class OpenVinoLocalDetector:
         else:
             # NPU 排在 GPU 前：有 NPU 的机器上它功耗低得多，而这个模型小到
             # 两者都远快于 CPU，此时省电比省几毫秒更值。
-            order = [d for d in ("NPU", "GPU") if d in roots]
+            order = devices("NPU") + devices("GPU")
 
         candidates = list(order)
-        candidates.append("CPU")
+        candidates.extend(cpu_devices)
         # 保序去重，避免 device="CPU" 时试两遍。
         seen: set[str] = set()
         return [d for d in candidates if not (d.upper() in seen or seen.add(d.upper()))]
 
-    def _compile_openvino(self, core: Any, model: Any) -> bool:
+    def _compile_openvino(
+        self, core: Any, model: Any, devices: Sequence[str]
+    ) -> bool:
         """逐个设备编译，成功即返回 True。全失败返回 False 交给 ORT。"""
         errors: list[str] = []
-        for device in self._openvino_device_candidates():
+        for device in devices:
             try:
                 compiled = self._compile_on_device(core, model, device)
             except Exception as exc:
@@ -557,11 +618,13 @@ class OpenVinoLocalDetector:
             self._runtime = "openvino"
             self._source_name = "openvino"
             self._resolved_device = device
-            self._device_fallbacks = tuple(errors)
+            self._device_fallbacks = (*self._device_fallbacks, *errors)
             self._last_error = None
             return True
-        self._openvino_error = "; ".join(errors)[:400] if errors else "no device compiled"
-        self._device_fallbacks = tuple(errors)
+        if errors:
+            previous = f"{self._openvino_error}; " if self._openvino_error else ""
+            self._openvino_error = f"{previous}{'; '.join(errors)}"[:400]
+            self._device_fallbacks = (*self._device_fallbacks, *errors)
         return False
 
     def _compile_on_device(self, core: Any, model: Any, device: str) -> Any:
@@ -630,24 +693,71 @@ class OpenVinoLocalDetector:
         """
         self._openmp = cap_openmp_threads(self._intra_op_threads)
 
-    def _initialize_onnxruntime(self, path: Path) -> None:
-        """用 ONNX Runtime 加载 ONNX 模型。
+    def _record_cuda_failure(self, message: str) -> None:
+        normalized = str(message or "CUDA initialization failed")[:300]
+        self._onnx_cuda_error = normalized
+        entry = f"CUDA: {normalized}"[:360]
+        if entry not in self._device_fallbacks:
+            self._device_fallbacks = (*self._device_fallbacks, entry)
 
-        只声明 CPU 提供者：宿主捆绑包只带了 ``onnxruntime.dll`` 和
-        ``onnxruntime_providers_shared.dll``，没有 CUDA/DirectML 提供者库，
-        请求它们只会得到警告和静默回退。
+    def _initialize_onnxruntime(self, path: Path, *, use_cuda: bool) -> None:
+        """用 ONNX Runtime 加载 ONNX；CUDA 探测失败时不冒充成功。
+
+        CUDA wheel、CUDA/cuDNN 动态库和显卡驱动都是可选项。先用
+        ``get_available_providers`` 判断 wheel 是否编入 provider，再创建 Session，
+        最后用 ``session.get_providers`` 验证 CUDA 真正排在首位。三关任意一关失败
+        都留下可观测原因，并由调用方继续 OpenVINO/ORT CPU 回落。
         """
+        label = "ONNX Runtime CUDA" if use_cuda else "ONNX Runtime"
         try:
             self._cap_openmp_before_import()
             import onnxruntime as ort  # type: ignore[import-not-found]
 
+            getter = getattr(ort, "get_available_providers", None)
+            if callable(getter):
+                self._onnx_available_providers = tuple(str(item) for item in getter())
+            else:
+                self._onnx_available_providers = ()
+            if use_cuda:
+                self._onnx_cuda_probed = True
+                if "CUDAExecutionProvider" not in self._onnx_available_providers:
+                    providers = ", ".join(self._onnx_available_providers) or "none reported"
+                    raise RuntimeError(
+                        f"CUDAExecutionProvider is unavailable; providers={providers}"
+                    )
+
             options = self._onnx_session_options(ort)
+            if use_cuda:
+                providers: list[Any] = [
+                    (
+                        "CUDAExecutionProvider",
+                        {"device_id": self._onnx_cuda_device_id},
+                    ),
+                    "CPUExecutionProvider",
+                ]
+            else:
+                providers = ["CPUExecutionProvider"]
             if options is None:
-                session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                session = ort.InferenceSession(str(path), providers=providers)
             else:
                 session = ort.InferenceSession(
-                    str(path), sess_options=options, providers=["CPUExecutionProvider"]
+                    str(path), sess_options=options, providers=providers
                 )
+            session_getter = getattr(session, "get_providers", None)
+            if callable(session_getter):
+                self._onnx_session_providers = tuple(
+                    str(item) for item in session_getter()
+                )
+            else:
+                self._onnx_session_providers = tuple(
+                    str(item[0] if isinstance(item, tuple) else item) for item in providers
+                )
+            if use_cuda and (
+                not self._onnx_session_providers
+                or self._onnx_session_providers[0] != "CUDAExecutionProvider"
+            ):
+                active = ", ".join(self._onnx_session_providers) or "none reported"
+                raise RuntimeError(f"CUDA provider did not activate; session providers={active}")
             inputs = session.get_inputs()
             if not inputs:
                 raise RuntimeError("ONNX model has no inputs")
@@ -665,11 +775,20 @@ class OpenVinoLocalDetector:
             self._onnx_session = session
             self._infer = self._run_onnxruntime
             self._available = True
-            self._runtime = "onnxruntime"
-            self._source_name = "onnxruntime"
+            self._runtime = "onnxruntime_cuda" if use_cuda else "onnxruntime"
+            self._source_name = self._runtime
+            self._resolved_device = (
+                f"CUDA.{self._onnx_cuda_device_id}" if use_cuda else "CPU"
+            )
+            if use_cuda:
+                self._onnx_cuda_error = None
             self._last_error = None
         except Exception as exc:
-            self._last_error = f"ONNX Runtime unavailable: {type(exc).__name__}: {exc}"[:500]
+            message = f"{type(exc).__name__}: {exc}"
+            if use_cuda:
+                self._record_cuda_failure(message)
+            else:
+                self._last_error = f"{label} unavailable: {message}"[:500]
 
     def _run_onnxruntime(self, frame: Any) -> Any:
         session = self._onnx_session
@@ -931,6 +1050,14 @@ class OpenVinoLocalDetector:
                 "device_fallbacks": list(self._device_fallbacks),
                 "openvino_error": self._openvino_error,
                 "openvino_devices": list(self._core_devices),
+                "onnxruntime": {
+                    "cuda_mode": self._onnx_cuda_mode,
+                    "cuda_device_id": self._onnx_cuda_device_id,
+                    "cuda_probed": self._onnx_cuda_probed,
+                    "available_providers": list(self._onnx_available_providers),
+                    "session_providers": list(self._onnx_session_providers),
+                    "cuda_error": self._onnx_cuda_error,
+                },
                 "model_path_configured": bool(self._model_path),
                 "model_path": self._model_path[-160:] if self._model_path else None,
                 "labels_path_configured": bool(self._labels_path),

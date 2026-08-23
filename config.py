@@ -190,6 +190,10 @@ class VisionConfig:
     model_path: str | None = None
     labels_path: str | None = None
     device: str = "AUTO"
+    # ONNX 模型的可选 NVIDIA 路径。auto 在 OpenVINO NPU/GPU 之后探测，prefer
+    # 把 CUDA 放在所有 OpenVINO 设备之前，disabled 完全跳过。依赖保持可选。
+    onnxruntime_cuda: str = "auto"
+    onnxruntime_cuda_device_id: int = 0
     fallback_backend: str = "none"
     confidence_threshold: float = 0.35
     input_width: int = 640
@@ -227,10 +231,12 @@ class VisionConfig:
     # 吞吐一模一样。``detector_interval_ms`` 管的是另一个轴：一秒里推几次。
     # 整条流水线实测 7.04 核 → 1.22 核，单次延迟 469ms → 328ms（少了抢核的线程）。
     # ``detector_threads`` 取 0 表示两个池子都不设上限，只留给基准测量。
-    # ``detector_interval_ms`` 取 0 表示不限速；它只限推理，不限给 agent 看的
-    # 帧缓存（后者由 frame_cache_interval_s 独立控制）。
+    # ``detector_interval_ms`` 是 CPU/未知设备的安全间隔；实际解析到 OpenVINO
+    # GPU/NPU 或 ORT CUDA 时改用 ``detector_accelerator_interval_ms``。两者取 0
+    # 都表示对应设备不限速；它们只限推理，不限给 agent 看的帧缓存。
     detector_threads: int = 2
     detector_interval_ms: int = 500
+    detector_accelerator_interval_ms: int = 500
     lifecycle_watermark_limit: int = 4096
     # 按标题定位采集窗口，非空时将窗口屏幕坐标作为采集区域传给帧源。
     # 仅限 Windows；其他平台静默忽略。窗口未找到时回落到全屏采集。
@@ -418,6 +424,11 @@ class PluginConfig:
         device = str(vision.get("device", "AUTO")).strip() or "AUTO"
         if len(device) > 32 or "\x00" in device:
             raise ValueError("vision.device must be a short non-empty string")
+        onnxruntime_cuda = str(
+            vision.get("onnxruntime_cuda", "auto")
+        ).strip().lower() or "auto"
+        if onnxruntime_cuda not in {"auto", "prefer", "disabled"}:
+            raise ValueError("vision.onnxruntime_cuda must be auto, prefer, or disabled")
         fallback_backend = str(vision.get("fallback_backend", "none")).strip().lower() or "none"
         if fallback_backend not in {"none", "opencv_hog"}:
             raise ValueError("vision.fallback_backend must be none or opencv_hog")
@@ -434,6 +445,13 @@ class PluginConfig:
             maximum=0.5,
             name="vision.min_box_ratio",
         )
+        detector_interval_ms = _bounded_int(
+            vision.get("detector_interval_ms"),
+            500,
+            minimum=0,
+            maximum=10000,
+            name="vision.detector_interval_ms",
+        )
         vision_config = VisionConfig(
             enabled=_boolean(vision.get("enabled"), False, name="vision.enabled"),
             source=vision_source,
@@ -442,6 +460,14 @@ class PluginConfig:
             model_path=model_path,
             labels_path=labels_path,
             device=device,
+            onnxruntime_cuda=onnxruntime_cuda,
+            onnxruntime_cuda_device_id=_bounded_int(
+                vision.get("onnxruntime_cuda_device_id"),
+                0,
+                minimum=0,
+                maximum=31,
+                name="vision.onnxruntime_cuda_device_id",
+            ),
             fallback_backend=fallback_backend,
             confidence_threshold=_finite_float(
                 vision.get("confidence_threshold"),
@@ -570,12 +596,13 @@ class PluginConfig:
                 maximum=32,
                 name="vision.detector_threads",
             ),
-            detector_interval_ms=_bounded_int(
-                vision.get("detector_interval_ms"),
-                500,
+            detector_interval_ms=detector_interval_ms,
+            detector_accelerator_interval_ms=_bounded_int(
+                vision.get("detector_accelerator_interval_ms"),
+                detector_interval_ms,
                 minimum=0,
                 maximum=10000,
-                name="vision.detector_interval_ms",
+                name="vision.detector_accelerator_interval_ms",
             ),
             lifecycle_watermark_limit=_bounded_int(
                 vision.get("lifecycle_watermark_limit"),

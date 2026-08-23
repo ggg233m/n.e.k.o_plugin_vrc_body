@@ -82,17 +82,27 @@ class PluginSmokeTests(unittest.TestCase):
         default = PluginConfig.from_mapping({})
         self.assertFalse(default.vision.enabled)
         self.assertEqual(default.vision.source, "none")
+        self.assertEqual(default.vision.onnxruntime_cuda, "auto")
+        self.assertEqual(default.vision.onnxruntime_cuda_device_id, 0)
         configured = PluginConfig.from_mapping({
             "vision": {
                 "enabled": True,
                 "source": "external",
                 "interval_ms": 50,
                 "queue_size": 2,
+                "detector_interval_ms": 500,
+                "detector_accelerator_interval_ms": 100,
+                "onnxruntime_cuda": "disabled",
+                "onnxruntime_cuda_device_id": 2,
             }
         })
         self.assertTrue(configured.vision.enabled)
         self.assertEqual(configured.vision.interval_ms, 50)
         self.assertEqual(configured.vision.queue_size, 2)
+        self.assertEqual(configured.vision.detector_interval_ms, 500)
+        self.assertEqual(configured.vision.detector_accelerator_interval_ms, 100)
+        self.assertEqual(configured.vision.onnxruntime_cuda, "disabled")
+        self.assertEqual(configured.vision.onnxruntime_cuda_device_id, 2)
         self.assertEqual(configured.vision.lifecycle_watermark_limit, 4096)
         self.assertEqual(configured.vision.monitor_index, -1)
         self.assertEqual(configured.vision.dxcam_device_idx, -1)
@@ -110,10 +120,20 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(selected.vision.dxcam_device_idx, 1)
         self.assertEqual(selected.vision.dxcam_output_idx, 0)
         self.assertEqual(selected.vision.dxcam_backend, "winrt")
+        inherited = PluginConfig.from_mapping({
+            "vision": {"detector_interval_ms": 250}
+        })
+        self.assertEqual(inherited.vision.detector_accelerator_interval_ms, 250)
+        preferred = PluginConfig.from_mapping({
+            "vision": {"onnxruntime_cuda": "prefer"}
+        })
+        self.assertEqual(preferred.vision.onnxruntime_cuda, "prefer")
         with self.assertRaisesRegex(ValueError, "vision.source"):
             PluginConfig.from_mapping({"vision": {"source": "unknown"}})
         with self.assertRaisesRegex(ValueError, "vision.dxcam_backend"):
             PluginConfig.from_mapping({"vision": {"dxcam_backend": "unknown"}})
+        with self.assertRaisesRegex(ValueError, "vision.onnxruntime_cuda"):
+            PluginConfig.from_mapping({"vision": {"onnxruntime_cuda": "required"}})
         with self.assertRaisesRegex(ValueError, "vision.monitor_index"):
             PluginConfig.from_mapping({"vision": {"monitor_index": -2}})
         with self.assertRaisesRegex(ValueError, "vision.interval_ms"):

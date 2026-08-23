@@ -134,6 +134,12 @@ labels_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_labels.jso
 # GPU 默认跑 FP16，但分数偏差只有 0.004（CPU 0.7846 vs GPU 0.7847），过 0.25
 # 阈值的框两边都是 9 个，所以下面的 confidence_threshold 不需要跟着改。
 device = "AUTO"
+# ONNX 模型的可选 NVIDIA 后端。auto 在 OpenVINO NPU/GPU 不可用时探测
+# ONNX Runtime 的 CUDAExecutionProvider；prefer 可让 NVIDIA 抢在 OpenVINO
+# NPU/GPU 前，disabled 完全跳过。没有 onnxruntime-gpu、CUDA 或 cuDNN 时记录
+# 原因并继续回落，不影响启动。
+onnxruntime_cuda = "auto"
+onnxruntime_cuda_device_id = 0
 # none（默认），或显式启用降级的 OpenCV HOG 仅人形回退。
 fallback_backend = "none"
 # 0.35 → 0.25：实测三帧真机对比，中距离的模型只打到 0.296，0.35 会整帧丢掉；
@@ -204,10 +210,30 @@ queue_size = 1
 # 全部装上之后的整条流水线实测：7.04 核 → 1.22 核，单次延迟反而从 469ms 降到
 # 328ms（少了 18 个线程抢核）。
 detector_threads = 2
-# 推理最小间隔。只限检测，不限给 agent 看的帧缓存（那个由
+# CPU/未知设备的推理最小间隔。只限检测，不限给 agent 看的帧缓存（那个由
 # frame_cache_interval_s 独立控制）。跳过的帧不写世界状态：补空观测会把
-# 「这一帧没看」伪造成「这一帧什么都没有」。0 表示不限速。
+# 「这一帧没看」伪造成「这一帧什么都没有」。0 表示不限速。CPU 单次推理
+# 258~354 ms，若也设成 100 ms，每次推完下一帧已经到期，会退化成连续满载。
 detector_interval_ms = 500
+#
+# 实际解析到 OpenVINO GPU/NPU 或 ORT CUDA 时改用下面的加速器间隔；设备编译
+# 失败、落回 OpenVINO CPU/ORT CPU/OpenCV 或状态未知时仍保留上面的 500 ms。
+# Arc GPU 单次只有 48 ms，500 ms 会变成感知延迟的主要来源。
+#
+# 实测（Arc A770，真实 VRChat 窗口 1161x766，各档跑 10 s）：
+#   间隔     帧率      感知延迟   检测器 CPU   GPU-3D（基线 77%）
+#   500ms   1.80/s      298ms      0.89 核      74.7%
+#   100ms   5.60/s       98ms      0.93 核      75.2%   <- 采纳
+#    50ms   6.50/s       74ms      0.88 核      72.6%
+#     0ms   6.40/s       48ms      0.85 核      69.4%
+#
+# 选 100 而不是更低：50 和 0 的帧率已经撞到 6.5/s 的天花板，那是 interval_ms
+# = 100 的采集节奏决定的，不是限速决定的。再往下调只是让循环空转着重复推同
+# 一批帧——要继续降延迟得先动采集间隔，而那会连带抬高 DXGI 的开销。
+#
+# CPU 在各档几乎不变（0.85~0.93 核），因为大头是采集和 OpenMP 收口，与推几次
+# 无关。GPU 也没有随帧率上升——推理只占 11.7 ms，剩下的是预处理，跑在 CPU 上。
+detector_accelerator_interval_ms = 100
 lifecycle_watermark_limit = 4096
 # 按窗口标题限定采集区域。非空时通过 FindWindow 取窗口坐标后只采集该矩形
 # 区域，而不是整块显示器。窗口未找到时回落到全屏采集。
