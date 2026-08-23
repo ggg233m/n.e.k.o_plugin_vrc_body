@@ -79,7 +79,7 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_awareness.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
 
-> ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。`VelocityX/Z` 只有角色移动时才回传，因此每条速度记录只是短时样本；静止沉默是正常现象，旧的 0 或移动速度超过时限后都会变成 `motion.available=false` / `velocity_feedback_quiet`，不会被伪装成当前零速度。导航器只接受本次前进命令之后的新样本，并在起步阶段保留 450 ms 宽限。
+> ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。`VelocityX/Z` 只有角色移动时才回传，因此每条速度记录只是短时样本；静止沉默是正常现象，旧的 0 或移动速度超过时限后都会变成 `motion.available=false` / `velocity_feedback_quiet`，OSC 层不会把它伪装成当前零速度。当前 Avatar 已成功回传过 X/Z 后，导航器会确认反馈能力；前进超过 450 ms 起步宽限仍然沉默时，才将沉默作为零速度累计，默认连续 4 tick 后进入绕行。Avatar 切换会清空能力确认。
 
 `motion` 除标量速度外还导出 `velocity_x` / `velocity_z` 原始轴值，以及按水平模长归一的
 `forward_ratio` / `slip_ratio`。这两个比值用于区分「畅通」与「撞墙」：VRChat 的角色控制器
@@ -153,7 +153,8 @@ DXcam/WinRT/MSS 句柄并解除自主导航，`POST /vision/start` 会创建全�
 未知、观测过期或世界带不确定性时立即释放输入。主 LLM 只负责目标和行为选择，
 AnyaDance 调度器仍以 120 Hz 发送最新姿态与控制器状态。定向目标必须携带最新世界
 快照中的精确 `target_id`。方位角和接近度在本地做轻量时序平滑，单帧低置信或漏检最多
-宽限 300 ms；世界不确定、整体观测过期或宽限到期仍会硬停车。本地 person 检测会把易变的 `openvino:track:N` 映射为当前
+宽限 300 ms；高速巡航进入宽限时会立即降到最低油门，把最坏盲走距离限制在约
+0.2 m。世界不确定、整体观测过期或宽限到期仍会硬停车。本地 person 检测会把易变的 `openvino:track:N` 映射为当前
 后端会话内稳定的 `avatar:session:<token>:<N>`，目标短暂离开视野并被分配新轨迹后，
 可通过最多 6 个多视角外观原型重新绑定；外观候选打平时，再用剔除人物框后的低分辨率
 背景指纹、15 秒内的短时几何和轨迹稳定度消歧。原轨迹 ID 保留在实体的 `attributes.track_entity_id` 中

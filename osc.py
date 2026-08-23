@@ -859,7 +859,8 @@ class VrchatOscBridge:
            样本，不是可以永久保持的状态。静止时没有新包完全正常，但旧的 0 或旧的
            移动速度都不能冒充当前速度；样本超过 ``max_age_ms`` 后统一返回
            ``available=false``。导航器会结合「前进命令何时开始」判断样本是不是本次
-           命令产生的，静止时的沉默不会被当成反馈故障或卡墙。
+           命令产生的。当前 Avatar 曾经回传过 X/Z 后，前进宽限结束后的持续沉默
+           才能解释为零速度；从未证明支持这些参数时仍保持不可观测。
         """
         try:
             limit_ms = max(0, int(max_age_ms))
@@ -883,6 +884,11 @@ class VrchatOscBridge:
             "reason": None,
             "expected": list(BUILTIN_MOTION_PARAMETERS),
             "present": sorted(records),
+            # X/Z 都曾由当前 Avatar 回传，才说明“移动时有反馈、静止时沉默”这套
+            # 语义已经得到证明。/avatar/change 会清空 records，不会错误继承能力。
+            "horizontal_feedback_confirmed": all(
+                name in records for name in ("VelocityX", "VelocityZ")
+            ),
             "link_age_ms": None if link_age_ms is None else round(link_age_ms, 1),
             "value_age_ms": None,
             "speed_mps": None,

@@ -215,13 +215,21 @@ class NavigatorTests(unittest.TestCase):
         self.assertLess(second.bearing_deg or 0.0, 40.0)
 
     def test_brief_target_dropout_uses_last_reliable_observation_then_stops(self) -> None:
-        self.assertEqual(self.navigator.tick().state, "advance")
+        live = self.navigator.tick()
+        self.assertEqual(live.state, "advance")
         self.world["entities"] = []
         self.world["status"]["revision"] = 4
         self.now[0] += 0.10
         grace = self.navigator.tick()
         self.assertEqual(grace.state, "advance")
+        self.assertEqual(grace.reason, "target_grace_slow")
         self.assertEqual(grace.observation_mode, "grace")
+        self.assertEqual(grace.y, self.navigator.config.min_forward_axis)
+        self.assertLess(grace.y, live.y)
+        self.assertEqual(
+            self.navigator.snapshot()["target_filter"]["grace_forward_axis"],
+            self.navigator.config.min_forward_axis,
+        )
 
         self.now[0] += 0.30
         stopped = self.navigator.tick()
@@ -370,7 +378,7 @@ class NavigatorTests(unittest.TestCase):
 
         实测 VRChat 的起步死区在 0.13 附近：y=0.10 完全不动，y=0.076（表观高度
         0.40 时算出的值）也完全不动。命令照发、accepted 照回，但 avatar 一动不
-        动，失速守卫读到真实的 0，攒够 8 tick 就误报 movement_stalled 并latch 住
+        动，失速守卫读到真实的 0，攒够 stall_ticks 就误报 movement_stalled 并latch 住
         ——一次误判会废掉这个目标的整段导航。
 
         所以「advance」必须名副其实：只要决定前进，油门就得过死区。
@@ -567,10 +575,13 @@ class NavigatorStallTests(unittest.TestCase):
             self.assertEqual(navigator.tick().state, "advance")
         self.assertFalse(navigator.snapshot()["stall"]["detectable"])
 
-    def test_velocity_silence_is_expected_while_idle_and_never_means_stalled(self) -> None:
-        # VelocityX/Z 只有角色移动时才回传。前进刚开始和静止时缺包都是正常的；
-        # 即使宽限后仍没有样本，也只能标记为不可检测，不能凭空判撞墙。
-        self.motion = {"available": False, "reason": "velocity_feedback_quiet"}
+    def test_unproven_velocity_silence_never_means_stalled(self) -> None:
+        # 当前 Avatar 从未成功回传过 X/Z 时，沉默仍然不可观测，不能凭空判撞墙。
+        self.motion = {
+            "available": False,
+            "reason": "velocity_feedback_quiet",
+            "horizontal_feedback_confirmed": False,
+        }
         navigator = self._navigator(motion_start_grace_s=0.45)
         self.assertEqual(navigator.tick().state, "advance")
         self.assertEqual(navigator.snapshot()["stall"]["feedback_state"], "awaiting_motion")
@@ -581,6 +592,63 @@ class NavigatorStallTests(unittest.TestCase):
             self.now[0] += 0.10
         stall = navigator.snapshot()["stall"]
         self.assertEqual(stall["feedback_state"], "unavailable_while_commanding")
+        self.assertFalse(stall["detectable"])
+        self.assertFalse(stall["stalled"])
+
+    def test_confirmed_velocity_silence_while_commanding_counts_as_zero(self) -> None:
+        navigator = self._navigator(motion_start_grace_s=0.45)
+        self.motion = {
+            "available": True,
+            "horizontal_speed_mps": 0.9,
+            "horizontal_feedback_confirmed": True,
+        }
+        self.assertEqual(navigator.tick().state, "advance")
+
+        # 起步宽限后没有任何新 X/Z：当前 Avatar 已证明移动时会回传，因此这里
+        # 就是实际没有移动。测试阈值为 3 tick，第三次应停车。
+        self.now[0] += 0.50
+        self.motion = {
+            "available": False,
+            "reason": "velocity_feedback_quiet",
+            "horizontal_feedback_confirmed": True,
+        }
+        self.assertEqual(navigator.tick().state, "advance")
+        counting = navigator.snapshot()["stall"]
+        self.assertTrue(counting["capability_confirmed"])
+        self.assertTrue(counting["detectable"])
+        self.assertEqual(counting["feedback_state"], "confirmed_silence_zero")
+        self.now[0] += 0.10
+        self.assertEqual(navigator.tick().state, "advance")
+        self.now[0] += 0.10
+        decision = navigator.tick()
+
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "movement_stalled")
+        stall = navigator.snapshot()["stall"]
+        self.assertTrue(stall["capability_confirmed"])
+        self.assertTrue(stall["stalled"])
+        self.assertEqual(stall["feedback_state"], "idle_not_required")
+
+    def test_avatar_change_can_revoke_confirmed_velocity_capability(self) -> None:
+        navigator = self._navigator(motion_start_grace_s=0.45)
+        self.motion = {
+            "available": True,
+            "horizontal_speed_mps": 0.9,
+            "horizontal_feedback_confirmed": True,
+        }
+        navigator.tick()
+        self.now[0] += 0.50
+        self.motion = {
+            "available": False,
+            "reason": "velocity_feedback_quiet",
+            "horizontal_feedback_confirmed": False,
+        }
+        for _ in range(6):
+            self.assertEqual(navigator.tick().state, "advance")
+            self.now[0] += 0.10
+
+        stall = navigator.snapshot()["stall"]
+        self.assertFalse(stall["capability_confirmed"])
         self.assertFalse(stall["detectable"])
         self.assertFalse(stall["stalled"])
 
@@ -638,7 +706,7 @@ class NavigatorStallTests(unittest.TestCase):
         实机复现（2026-08-23）：后端起来后 body output 默认是 disabled，
         scheduler.py 会把所有 INPUT_COMMANDS 直接拒掉。导航器一路算到
         advance / y=0.15，`_navigator_send_axes` 提交被拒，avatar 一动不动，
-        于是速度恒为 0、8 tick 后 latch 住，报 movement_stalled。
+        于是速度恒为 0、连续若干 tick 后 latch 住，报 movement_stalled。
 
         结论是假的：那一刻既没有墙，也没有镜子，只是忘了 body_enable。
         更糟的是它会把目标记进 _unreachable，于是「忘了 enable」会伪装成
@@ -711,7 +779,7 @@ class NavigatorStallTests(unittest.TestCase):
         """换目标解开闩锁，并给实体一次重试机会。镜面倒影会立刻再次触发失速。
 
         实机场景（tmp/play_1.jpg）：镜面倒影是画面里置信度最高的 person（0.84，
-        方位 +0.04°）。顶着镜子推 8 tick 之后闩锁生效，LLM 按 instructions
+        方位 +0.04°）。顶着镜子推满失速阈值之后闩锁生效，LLM 按 instructions
         第 26 条换一句目标——解开后倒影重新可选，但 3 tick 后又失速，行为收敛：
         每次新目标都顶 N tick 再停，而不是无限制前进。
         """

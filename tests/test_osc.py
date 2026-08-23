@@ -320,6 +320,7 @@ class OscMotionFeedbackTests(unittest.TestCase):
         motion = self.bridge.motion_feedback()
         self.assertFalse(motion["available"])
         self.assertEqual(motion["reason"], "velocity_feedback_quiet")
+        self.assertTrue(motion["horizontal_feedback_confirmed"])
         self.assertGreaterEqual(motion["value_age_ms"], 5000.0)
         self.assertLess(motion["link_age_ms"], 1.0)
 

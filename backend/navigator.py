@@ -68,7 +68,9 @@ class NavigatorConfig:
     # 等于没动。注意 0.15 这个阈值只在命令过得了死区时才有意义，见
     # min_forward_axis。
     stall_speed_mps: float = 0.15
-    stall_ticks: int = 8
+    # 能力已确认后的沉默或低速连续 4 tick 才算失速。加上 450 ms 起步宽限，
+    # 正面顶墙约 0.85 s 进入绕行；仍保留足够去抖，不因单个漏包误停。
+    stall_ticks: int = 4
     # VRChat 的起步死区。摇杆量低于它时 VRChat 完全不驱动 avatar，而导航器接近
     # 目标时会把前进轴按比例缩小，于是最后一段距离命令照发、人不动，失速守卫
     # 读到真实的 0 并误判撞墙。
@@ -84,7 +86,7 @@ class NavigatorConfig:
     motion_start_grace_s: float = 0.45
     # 失速过的目标要记多久「够不着」。闩锁只停住当前这次尝试，解不开「换个目标
     # 再选中同一个实体」的死循环：镜面倒影是画面里置信度最高的 person，重提目标
-    # 后 _select_target 照样挑它，于是又是 8 tick 顶墙。
+    # 后 _select_target 照样挑它，于是又会连续多个 tick 顶墙。
     #
     # 不做永久：挡在中间的可能是会走开的人，自己转过身之后墙也不在正前方了。
     # 45 s 足够 LLM 换个方向做别的事，又不至于把一次偶然的堵塞记成永久地形。
@@ -373,13 +375,16 @@ class LocalNavigator:
         self._stalled = False
         self._stall_goal_key: tuple[str, str, str] | None = None
         self._stall_goal_age: float | None = None
-        # target_id -> 记录到期的时刻。刻意不随换目标清空：「顶着它推了 8 tick
+        # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
         self._last_motion: dict[str, Any] | None = None
         self._forward_started_at: float | None = None
         self._motion_feedback_usable = False
         self._motion_feedback_state = "idle_not_required"
+        # usable 表示这一 tick 有可用于判定的事实；confirmed 表示当前 Avatar 已
+        # 证明移动时会回传 X/Z，因此命令期间的沉默也能成为“速度为零”的事实。
+        self._motion_feedback_capability_confirmed = False
         # 最近一次前进轴指令有没有真的发出去。None = 还没发过。
         # 由 _apply 写、_stall_guard 读，所以读到的是「上一 tick 那条」——这正是
         # 失速判据要的：这一 tick 的速度反映的就是上一条指令的结果。
@@ -496,8 +501,9 @@ class LocalNavigator:
         """把「命令发了但人没动」变成一次显式停车。
 
         检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是
-        唯一能区分「正在前进」和「顶着墙推摇杆」的回传。没有这个回传时本守卫
-        整体失效并放行——没数据不等于没动，不能凭空停车。
+        唯一能区分「正在前进」和「顶着墙推摇杆」的回传。当前 Avatar 从未证明
+        支持这个回传时，本守卫整体失效并放行；能力已经确认后，前进期间超过
+        起步宽限的沉默则正是“没有移动”的信号。
 
         判定会闩锁：停下之后速度当然还是 0，靠速度自己是解不开的。闩锁由
         _pre_tick_goal_check 在 _decide 之前处理；本方法只读取结果。
@@ -547,7 +553,23 @@ class LocalNavigator:
             return decision
 
         motion = self._sample_motion()
-        if motion is None or not motion.get("available"):
+        motion_available = bool(motion is not None and motion.get("available"))
+        explicit_capability = (
+            motion.get("horizontal_feedback_confirmed")
+            if isinstance(motion, Mapping)
+            else None
+        )
+        with self._lock:
+            if isinstance(explicit_capability, bool):
+                # OSC 桥在 Avatar 切换时清空参数并显式返回 false，旧能力不能继承。
+                self._motion_feedback_capability_confirmed = explicit_capability
+            elif motion_available:
+                # 兼容没有新字段的第三方 provider：给过可用水平速度就证明支持。
+                self._motion_feedback_capability_confirmed = True
+            capability_confirmed = self._motion_feedback_capability_confirmed
+
+        silence_as_zero = False
+        if not motion_available:
             with self._lock:
                 started_at = self._forward_started_at
                 self._motion_feedback_usable = False
@@ -555,50 +577,65 @@ class LocalNavigator:
                     self._motion_feedback_state = "awaiting_first_command"
                 elif now - started_at < self.config.motion_start_grace_s:
                     self._motion_feedback_state = "awaiting_motion"
+                elif (
+                    capability_confirmed
+                    and isinstance(motion, Mapping)
+                    and motion.get("reason") == "velocity_feedback_quiet"
+                ):
+                    # 当前 Avatar 已证明“移动时回传、静止时沉默”。命令已过起步
+                    # 宽限仍无新 X/Z，等价于本次速度为零，可累计正面失速。
+                    self._motion_feedback_usable = True
+                    self._motion_feedback_state = "confirmed_silence_zero"
+                    silence_as_zero = True
                 else:
-                    # VelocityX/Z 在静止时本就不回传。超过宽限仍没有样本只能说明
-                    # 「本次移动不可检测」，不能凭空断言已经撞墙。
+                    # 当前 Avatar 从未证明支持 X/Z；没数据仍然不等于没动。
                     self._motion_feedback_state = "unavailable_while_commanding"
-            return decision
-        value_age_ms = _finite(motion.get("value_age_ms"))
-        with self._lock:
-            started_at = self._forward_started_at
-        if value_age_ms is not None:
-            if started_at is None:
-                # _stall_guard 在 _apply 之前运行；第一 tick 看到的速度必然属于旧动作。
-                with self._lock:
-                    self._motion_feedback_usable = False
-                    self._motion_feedback_state = "awaiting_first_command"
+            if not silence_as_zero:
                 return decision
-            command_age_ms = max(0.0, now - started_at) * 1000.0
-            # 允许 5ms 的收包/时钟舍入误差。比本次命令年龄更老的样本来自静止前
-            # 或上一次移动，绝不能拿来证明这条命令正在生效。
-            if value_age_ms > command_age_ms + 5.0:
-                with self._lock:
-                    self._motion_feedback_usable = False
-                    self._motion_feedback_state = "sample_predates_command"
-                return decision
-            if now - started_at < self.config.motion_start_grace_s:
-                with self._lock:
-                    self._motion_feedback_usable = False
-                    self._motion_feedback_state = "starting"
-                return decision
-        speed = _finite(motion.get("horizontal_speed_mps"))
-        if speed is None:
+
+        if silence_as_zero:
+            speed = 0.0
+        else:
+            assert motion is not None
+            value_age_ms = _finite(motion.get("value_age_ms"))
             with self._lock:
-                self._motion_feedback_usable = False
-                self._motion_feedback_state = "invalid_motion_sample"
-            return decision
-        with self._lock:
-            self._motion_feedback_usable = True
-            self._motion_feedback_state = "active"
+                started_at = self._forward_started_at
+            if value_age_ms is not None:
+                if started_at is None:
+                    # _stall_guard 在 _apply 之前运行；第一 tick 看到的速度必然属于旧动作。
+                    with self._lock:
+                        self._motion_feedback_usable = False
+                        self._motion_feedback_state = "awaiting_first_command"
+                    return decision
+                command_age_ms = max(0.0, now - started_at) * 1000.0
+                # 允许 5ms 的收包/时钟舍入误差。比本次命令年龄更老的样本来自静止前
+                # 或上一次移动，绝不能拿来证明这条命令正在生效。
+                if value_age_ms > command_age_ms + 5.0:
+                    with self._lock:
+                        self._motion_feedback_usable = False
+                        self._motion_feedback_state = "sample_predates_command"
+                    return decision
+                if now - started_at < self.config.motion_start_grace_s:
+                    with self._lock:
+                        self._motion_feedback_usable = False
+                        self._motion_feedback_state = "starting"
+                    return decision
+            speed = _finite(motion.get("horizontal_speed_mps"))
+            if speed is None:
+                with self._lock:
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "invalid_motion_sample"
+                return decision
+            with self._lock:
+                self._motion_feedback_usable = True
+                self._motion_feedback_state = "active"
 
         # 斜撞墙：人在动，但动的方向不是前方。角色控制器把移动投影到墙面上，
         # 所以速度模长过得了 stall_speed_mps，纯速度判据永远不会触发，会一直
         # 贴着墙滑下去。forward_ratio 是 None 表示水平速度低于静止阈值，那属于
         # 下面的失速判据管的范围，这里不插手。
-        forward_ratio = _finite(motion.get("forward_ratio"))
-        slip_ratio = _finite(motion.get("slip_ratio"))
+        forward_ratio = None if silence_as_zero else _finite(motion.get("forward_ratio"))
+        slip_ratio = None if silence_as_zero else _finite(motion.get("slip_ratio"))
         sliding = False
         if forward_ratio is not None and speed >= self.config.stall_speed_mps:
             with self._lock:
@@ -737,6 +774,7 @@ class LocalNavigator:
                     "detectable": self._motion_feedback_usable,
                     "feedback_required": self._forward_started_at is not None,
                     "feedback_state": self._motion_feedback_state,
+                    "capability_confirmed": self._motion_feedback_capability_confirmed,
                     "motion_start_grace_ms": round(self.config.motion_start_grace_s * 1000.0, 1),
                     # 上一条前进指令是否被下游接受。false 表示命令被 scheduler
                     # 拒了（多半是 body output 还没 enable），此时失速判据整体
@@ -769,6 +807,7 @@ class LocalNavigator:
                 },
                 "target_filter": {
                     "grace_ms": round(self.config.target_grace_s * 1000.0, 1),
+                    "grace_forward_axis": self.config.min_forward_axis,
                     "bearing_ema_alpha": self.config.bearing_ema_alpha,
                     "range_ema_alpha": self.config.range_ema_alpha,
                     "grace_count": self._target_grace_count,
@@ -1014,9 +1053,14 @@ class LocalNavigator:
                 forward = self.config.min_forward_axis + brake_ratio * (
                     self.config.max_forward_axis - self.config.min_forward_axis
                 )
+            if observation_mode == "grace":
+                # 0.60 巡航速度下继续沿旧画面走满 300 ms，实测可能盲走约 0.67 m。
+                # 宽限只用于跨过一两帧检测抖动，立即降到最低档可把最坏距离压到
+                # 约 0.2 m；重新看到目标后下一次 10 Hz tick 会恢复正常速度。
+                forward = self.config.min_forward_axis
             return NavigationDecision(
                 "advance",
-                "target_centered",
+                "target_grace_slow" if observation_mode == "grace" else "target_centered",
                 target_id,
                 bearing,
                 distance,
@@ -1063,9 +1107,11 @@ class LocalNavigator:
             forward = self.config.min_forward_axis + brake_ratio * (
                 self.config.max_forward_axis - self.config.min_forward_axis
             )
+        if observation_mode == "grace":
+            forward = self.config.min_forward_axis
         return NavigationDecision(
             "advance",
-            "target_centered",
+            "target_grace_slow" if observation_mode == "grace" else "target_centered",
             target_id,
             bearing,
             distance,

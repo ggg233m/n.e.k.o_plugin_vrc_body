@@ -148,23 +148,26 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 「正在前进」和「顶着墙推摇杆」的回传。`VrchatOscBridge.motion_feedback()` 把这些内置
 参数汇总成 `body_awareness.vrchat_osc.motion`（`GET /snapshot` 的 `vrchat_osc.motion`
 也带同一份读数）。`VelocityX/Z` 只有角色移动时才回传，所以导航器只接受本次前进命令
-之后的新样本，并给起步保留 450 ms；静止或停包会显示 `velocity_feedback_quiet`，不会把
-历史 0 当成当前速度。获得可用的新样本后，连续 `stall_ticks` 次发出前进指令但实测
-水平速度低于 `stall_speed_mps` 时停车，`navigation.last_decision.reason` 变成
+之后的新样本，并给起步保留 450 ms；静止或停包会显示 `velocity_feedback_quiet`，OSC 层
+不会把历史 0 伪装成当前速度。当前 Avatar 的 X/Z 都曾成功回传后，导航器会设置
+`capability_confirmed=true`：此后前进超过起步宽限仍然沉默，就按零速度累计。连续默认
+4 tick 沉默或实测水平速度低于 `stall_speed_mps` 时停车，`navigation.last_decision.reason` 变成
 `movement_stalled`。水平速度用 `hypot(VelocityX, VelocityZ)`，不含 `VelocityY`——否则
 「贴着墙往下滑」会被读成「正在前进」。
 
 判定会闩锁：停下之后速度未知，靠速度自己解不开。导航器会先按有限预算尝试后退/沿
 滑行方向转身，预算用尽才把当前实体记为暂时不可达并交还高层决策。
-`navigation.stall.detectable=false` 表示当前没有可用于这次前进命令的新速度样本，「卡墙」这件事根本
-无法被观测到，**不是「没卡」**；此时整个判据失效并放行，不会把「读不到」当成
-「速度为零」而废掉导航。
+`navigation.stall.detectable=false` 且 `capability_confirmed=false` 表示当前 Avatar 从未
+证明支持水平速度回传，「卡墙」这件事根本无法被观测到，**不是「没卡」**；此时判据
+失效并放行。Avatar 切换会清空确认状态，不会继承上一个 Avatar 的能力。
 
 > ⚠️ 已实测确认（2026-08-23）：内置参数名有效，`VelocityX/Z` 是 avatar 本地系，且
 > 只在角色移动时回传。该 avatar 跑满速度为 `2.6667 m/s`，`y = 0.28`
 > 实测约为 `0.8 m/s`，`y = 0.30` 实测约为 `0.8889 m/s`。当前导航在目标框达到
 > 停止尺寸的 80% 前使用 `y = 0.60` 巡航，最后 20% 再线性降到 `y = 0.25`；
 > 不同 Avatar/世界的阈值仍需真机会话复核。
+> 若目标短暂漏检并进入 300 ms 视觉宽限，前进轴会立即限制为 `y = 0.25`，不会
+> 按 `y = 0.60` 沿旧画面继续盲走；重新获得新鲜观测后才恢复巡航。
 >
 > 另外 `motion` 现在还导出 `velocity_x` / `velocity_z` 与 `forward_ratio` / `slip_ratio`。
 > 比起只看 `horizontal_speed_mps` 是否塌到 0，这两个比值能区分「正面墙」和「斜撞墙正在
