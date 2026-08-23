@@ -33,7 +33,7 @@ class NavigatorConfig:
 
     tick_hz: float = 10.0
     pulse_ms: int = 220
-    max_forward_axis: float = 0.28
+    max_forward_axis: float = 0.60
     max_turn_axis: float = 0.35
     # 转向现在直接给角度（转虚拟 HMD），不再压成摇杆量。gain < 1 是刻意的：
     # bearing 来自上一帧观测，按整个偏差一次转到位会越过中心然后来回摆；
@@ -62,7 +62,8 @@ class NavigatorConfig:
     # 顶着墙推摇杆的判据。检测器只看画面，永远不会告诉你「前面有堵墙」；
     # VRChat 内置 Velocity 参数是唯一能说明「命令发了但人没动」的回传。
     #
-    # 已实机校准：max_forward_axis=0.28 实测 0.8 m/s，正常行走远高于阈值。
+    # 已实机校准：y=0.30 实测 0.8889 m/s、角色满速 2.6667 m/s。巡航使用
+    # y=0.60，最后 20% 接近区间才开始减速，同时依靠新鲜视觉及时刹车。
     # 收不到内置参数时整个判据自动失效（不阻断移动），这是刻意的——没数据不
     # 等于没动。注意 0.15 这个阈值只在命令过得了死区时才有意义，见
     # min_forward_axis。
@@ -75,9 +76,9 @@ class NavigatorConfig:
     # 实测（10 Hz 按住 220ms 脉冲，每档后接同方向 y=0.28 控制组证明前方是通的）：
     #   y=0.076 -> 0.0      y=0.10 -> 0.0     y=0.13 -> 0.1333
     #   y=0.15  -> 0.2222   y=0.20 -> 0.4444  y=0.28 -> 0.8
-    # 0.13 能动但仍低于 stall_speed_mps，所以取 0.15：既过死区，也保证真的在走
-    # 时速度高于失速阈值，两个判据不互相矛盾。
-    min_forward_axis: float = 0.15
+    # 用户连续实机评估认为 0.15 和 0.20 都过慢。最低档提高到 0.25，但它只在
+    # 即将达到停止尺寸时使用；中远距离直接使用巡航档。
+    min_forward_axis: float = 0.25
     # VelocityX/Z 只有角色实际移动时才回传。发出第一条前进命令后先给角色控制器
     # 一段起步时间；在此之前没有新速度样本是正常现象，不能计作卡墙。
     motion_start_grace_s: float = 0.45
@@ -998,11 +999,21 @@ class LocalNavigator:
                     observed_age_ms=observed_age,
                     observation_mode=observation_mode,
                 )
-            forward = _clamp(
-                (target_apparent - apparent) / target_apparent * self.config.max_forward_axis,
-                self.config.min_forward_axis,
-                self.config.max_forward_axis,
-            )
+            # 目标框达到停止尺寸的 80% 前保持巡航；最后 20% 才线性降到最低档。
+            # 旧线性/平方根曲线都过早减速，实机大部分时间只有 0.22~0.89 m/s。
+            brake_start = target_apparent * 0.80
+            if apparent <= brake_start:
+                forward = self.config.max_forward_axis
+            else:
+                brake_span = max(1e-6, target_apparent - brake_start)
+                brake_ratio = _clamp(
+                    (target_apparent - apparent) / brake_span,
+                    0.0,
+                    1.0,
+                )
+                forward = self.config.min_forward_axis + brake_ratio * (
+                    self.config.max_forward_axis - self.config.min_forward_axis
+                )
             return NavigationDecision(
                 "advance",
                 "target_centered",
@@ -1039,11 +1050,19 @@ class LocalNavigator:
                 observed_age_ms=observed_age,
                 observation_mode=observation_mode,
             )
-        forward = _clamp(
-            (distance - self.config.target_distance_m) / max(distance, 0.25) * self.config.max_forward_axis,
-            self.config.min_forward_axis,
-            self.config.max_forward_axis,
-        )
+        # 有米制深度时也只在目标距离外最后 50% 区间减速。
+        brake_span = self.config.target_distance_m * 0.50
+        if distance >= self.config.target_distance_m + brake_span:
+            forward = self.config.max_forward_axis
+        else:
+            brake_ratio = _clamp(
+                (distance - self.config.target_distance_m) / max(brake_span, 1e-6),
+                0.0,
+                1.0,
+            )
+            forward = self.config.min_forward_axis + brake_ratio * (
+                self.config.max_forward_axis - self.config.min_forward_axis
+            )
         return NavigationDecision(
             "advance",
             "target_centered",

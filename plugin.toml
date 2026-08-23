@@ -165,8 +165,9 @@ max_detections = 64
 min_box_ratio = 0.02
 min_box_width_ratio = 0.008
 min_box_height_ratio = 0.02
-# 会话级 Avatar 外观重识别。YOLO 的 track_id 变化后，用检测框颜色/布局特征恢复
-# 原稳定 ID。特征只保存在当前后端内存中；两个相同 Avatar 或镜像仍可能歧义。
+# 会话级 Avatar 外观重识别。YOLO 的 track_id 变化后，用最多 6 个多视角颜色/布局
+# 原型恢复稳定 ID；相似旧模板按背景指纹、15 秒内几何、长期稳定度依次消歧。特征只
+# 保留在当前后端内存中；两个相同 Avatar 或镜像仍可能歧义。
 identity_reid_enabled = true
 identity_reid_similarity = 0.90
 identity_reid_margin = 0.04

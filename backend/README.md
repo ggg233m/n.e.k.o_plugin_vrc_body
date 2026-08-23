@@ -161,8 +161,10 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 「速度为零」而废掉导航。
 
 > ⚠️ 已实测确认（2026-08-23）：内置参数名有效，`VelocityX/Z` 是 avatar 本地系，且
-> 只在角色移动时回传。该 avatar 跑满速度为 `2.6667 m/s`，`max_forward_axis = 0.28`
-> 实测约为 `0.8 m/s`；不同 Avatar/世界的阈值仍需真机会话复核。
+> 只在角色移动时回传。该 avatar 跑满速度为 `2.6667 m/s`，`y = 0.28`
+> 实测约为 `0.8 m/s`，`y = 0.30` 实测约为 `0.8889 m/s`。当前导航在目标框达到
+> 停止尺寸的 80% 前使用 `y = 0.60` 巡航，最后 20% 再线性降到 `y = 0.25`；
+> 不同 Avatar/世界的阈值仍需真机会话复核。
 >
 > 另外 `motion` 现在还导出 `velocity_x` / `velocity_z` 与 `forward_ratio` / `slip_ratio`。
 > 比起只看 `horizontal_speed_mps` 是否塌到 0，这两个比值能区分「正面墙」和「斜撞墙正在
@@ -257,9 +259,15 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 未启用 tracking 时按帧生成随机 UUID。
 
 内置 OpenVINO detector 会进一步把 Avatar 类轨迹交给 `AvatarIdentityRegistry`：同一
-track 直接延续身份，新 track 只有在外观相似度越过阈值且明显优于第二候选时才复用旧
-身份；同一帧不允许两个轨迹占用同一身份。外观不可提取、功能关闭或类别不是 Avatar
-时，会安全降级为上述 `{source}:track:{track_id}`。
+track 直接延续身份，并为每个身份有界保留最多 6 个正面/侧面/背面外观原型；新 track
+优先按最接近的历史视角匹配。多个旧模板同样相似时，优先比较剔除全部人物框后的
+4x8 低分辨率背景指纹；背景仍不明确时，仅在 15 秒内检测框几何明显连续，或某个模板的
+稳定观测数至少达到其他候选 3 倍时复用。其余歧义仍分配新 ID，同一帧不允许两个轨迹
+占用同一身份。外观不可提取、功能关闭或类别不是 Avatar 时，会安全降级为上述
+`{source}:track:{track_id}`。`identity_reid` 状态中的 `ambiguous_reused_count`、
+`context_reidentified_count`、`geometry_reidentified_count`、
+`established_reidentified_count`、`appearance_prototype_count` 和
+`context_prototype_count` 可用于区分真正重识别与模板增殖。
 
 视觉轨迹和会话身份只参与当前进程的导航，不进入 `world_memory.json`。外部 detector
 发布逐帧观测时应在实体 attributes 中设置 `memory_scope="observation"`；状态层也会

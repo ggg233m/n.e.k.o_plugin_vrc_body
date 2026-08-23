@@ -17,11 +17,13 @@ def _avatar_frame(
     *,
     top_color: tuple[int, int, int] = (220, 35, 45),
     bottom_color: tuple[int, int, int] = (35, 70, 220),
+    band_side: str = "left",
+    background_color: tuple[int, int, int] = (0, 0, 0),
 ):
     """生成位置可变、局部外观完全一致的测试 Avatar。"""
 
     assert np is not None
-    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    frame = np.full((80, 120, 3), background_color, dtype=np.uint8)
     left, top, right, bottom = bbox
     x0, x1 = round(left * 120), round(right * 120)
     y0, y1 = round(top * 80), round(bottom * 80)
@@ -30,7 +32,10 @@ def _avatar_frame(
     frame[middle:y1, x0:x1] = bottom_color
     # 加一条不对称饰带，让空间描述子不只依赖两块纯色。
     band_width = max(1, (x1 - x0) // 5)
-    frame[y0:y1, x0:x0 + band_width] = (235, 220, 45)
+    if band_side == "right":
+        frame[y0:y1, x1 - band_width:x1] = (235, 220, 45)
+    else:
+        frame[y0:y1, x0:x0 + band_width] = (235, 220, 45)
     return frame
 
 
@@ -105,6 +110,172 @@ class AvatarIdentityRegistryTests(unittest.TestCase):
 
         self.assertNotEqual(assignments[1].identity_id, assignments[2].identity_id)
         self.assertEqual(registry.status()["identity_count"], 2)
+
+    def test_ambiguous_reappearance_uses_decisive_recent_geometry(self) -> None:
+        registry = AvatarIdentityRegistry(session_token="test")
+        left_box = (0.05, 0.20, 0.30, 0.80)
+        right_box = (0.65, 0.20, 0.90, 0.80)
+        frame = np.maximum(_avatar_frame(left_box), _avatar_frame(right_box))
+        first = registry.assign(
+            [_detection(1, left_box), _detection(2, right_box)],
+            frame,
+            now=1.0,
+            source_name="openvino",
+        )
+
+        # 两个外观完全相同的目标曾同帧出现；新轨迹紧贴左侧旧位置时，几何证据
+        # 足够明确，可以复用左侧身份而不继续制造第三个 ID。
+        new_left_box = (0.07, 0.20, 0.32, 0.80)
+        reappeared = registry.assign(
+            [_detection(3, new_left_box)],
+            _avatar_frame(new_left_box),
+            now=12.0,
+            source_name="openvino",
+        )[3]
+        self.assertEqual(reappeared.identity_id, first[1].identity_id)
+        self.assertEqual(reappeared.method, "appearance_geometry_reid")
+        status = registry.status()
+        self.assertEqual(status["identity_count"], 2)
+        self.assertEqual(status["ambiguous_reused_count"], 1)
+
+    def test_ambiguous_reappearance_without_geometry_stays_separate(self) -> None:
+        registry = AvatarIdentityRegistry(session_token="test")
+        left_box = (0.05, 0.20, 0.30, 0.80)
+        right_box = (0.65, 0.20, 0.90, 0.80)
+        frame = np.maximum(_avatar_frame(left_box), _avatar_frame(right_box))
+        registry.assign(
+            [_detection(1, left_box), _detection(2, right_box)],
+            frame,
+            now=1.0,
+            source_name="openvino",
+        )
+
+        # 正中位置对左右两个身份同样合理，继续分配新 ID；不能为了稳定而猜错人。
+        middle_box = (0.375, 0.20, 0.625, 0.80)
+        ambiguous = registry.assign(
+            [_detection(3, middle_box)],
+            _avatar_frame(middle_box),
+            now=1.2,
+            source_name="openvino",
+        )[3]
+        self.assertEqual(ambiguous.method, "new_identity")
+        self.assertEqual(registry.status()["identity_count"], 3)
+
+    def test_scene_context_beats_misleading_screen_geometry(self) -> None:
+        registry = AvatarIdentityRegistry(session_token="test")
+        left_box = (0.05, 0.20, 0.30, 0.80)
+        right_box = (0.65, 0.20, 0.90, 0.80)
+        common = np.maximum(
+            _avatar_frame(left_box, background_color=(25, 25, 25)),
+            _avatar_frame(right_box, background_color=(25, 25, 25)),
+        )
+        first = registry.assign(
+            [_detection(1, left_box), _detection(2, right_box)],
+            common,
+            now=1.0,
+            source_name="openvino",
+        )
+
+        # 两个外观相同的身份后来分别出现在红、绿背景。重新进入红色场景时，
+        # 即使检测框更靠近右侧身份的旧位置，也应由背景指纹找回左侧身份。
+        registry.assign(
+            [_detection(1, left_box)],
+            _avatar_frame(left_box, background_color=(150, 20, 20)),
+            now=1.1,
+            source_name="openvino",
+        )
+        registry.assign(
+            [_detection(2, right_box)],
+            _avatar_frame(right_box, background_color=(20, 150, 20)),
+            now=1.2,
+            source_name="openvino",
+        )
+        near_right = (0.62, 0.20, 0.87, 0.80)
+        reacquired = registry.assign(
+            [_detection(3, near_right)],
+            _avatar_frame(near_right, background_color=(150, 20, 20)),
+            now=1.3,
+            source_name="openvino",
+        )[3]
+
+        self.assertEqual(reacquired.identity_id, first[1].identity_id)
+        self.assertEqual(reacquired.method, "appearance_context_reid")
+        self.assertEqual(registry.status()["context_reidentified_count"], 1)
+
+    def test_long_lived_identity_wins_over_one_frame_duplicate_when_geometry_is_ambiguous(self) -> None:
+        registry = AvatarIdentityRegistry(session_token="test")
+        left_box = (0.05, 0.20, 0.30, 0.80)
+        right_box = (0.65, 0.20, 0.90, 0.80)
+        frame = np.maximum(_avatar_frame(left_box), _avatar_frame(right_box))
+        first = registry.assign(
+            [_detection(1, left_box), _detection(2, right_box)],
+            frame,
+            now=1.0,
+            source_name="openvino",
+        )
+        # 左侧身份持续八帧，右侧只出现过一次；这是“稳定轨迹 + 一帧重复框”的
+        # 典型形态。视角移动到中间后几何打平，稳定度仍可阻止 ID 无限增殖。
+        for index in range(8):
+            registry.assign(
+                [_detection(1, left_box)],
+                _avatar_frame(left_box),
+                now=1.1 + index * 0.1,
+                source_name="openvino",
+            )
+        middle_box = (0.375, 0.20, 0.625, 0.80)
+        reacquired = registry.assign(
+            [_detection(3, middle_box)],
+            _avatar_frame(middle_box),
+            now=2.0,
+            source_name="openvino",
+        )[3]
+        self.assertEqual(reacquired.identity_id, first[1].identity_id)
+        self.assertEqual(reacquired.method, "appearance_established_reid")
+        self.assertEqual(registry.status()["established_reidentified_count"], 1)
+
+    def test_track_continuity_builds_a_bounded_multi_view_gallery(self) -> None:
+        registry = AvatarIdentityRegistry(session_token="test")
+        bbox = (0.10, 0.10, 0.40, 0.90)
+        front = _avatar_frame(bbox)
+        back = _avatar_frame(
+            bbox,
+            top_color=(40, 210, 210),
+            bottom_color=(170, 45, 190),
+            band_side="right",
+        )
+        identity = registry.assign(
+            [_detection(1, bbox)],
+            front,
+            now=1.0,
+            source_name="openvino",
+        )[1]
+        # 第 5 次轨迹观测会刷新描述子，把明显不同的背面视角加入原型库。
+        for index in range(4):
+            registry.assign(
+                [_detection(1, bbox)],
+                back,
+                now=1.1 + index * 0.1,
+                source_name="openvino",
+            )
+        status = registry.status()
+        self.assertGreaterEqual(status["appearance_prototype_count"], 2)
+        self.assertLessEqual(status["appearance_prototype_count"], status["max_appearance_prototypes"])
+
+        moved_box = (0.60, 0.10, 0.90, 0.90)
+        moved_back = _avatar_frame(
+            moved_box,
+            top_color=(40, 210, 210),
+            bottom_color=(170, 45, 190),
+            band_side="right",
+        )
+        reacquired = registry.assign(
+            [_detection(2, moved_box)],
+            moved_back,
+            now=2.0,
+            source_name="openvino",
+        )[2]
+        self.assertEqual(reacquired.identity_id, identity.identity_id)
+        self.assertEqual(reacquired.method, "appearance_reid")
 
     def test_expired_identity_is_not_reused(self) -> None:
         registry = AvatarIdentityRegistry(

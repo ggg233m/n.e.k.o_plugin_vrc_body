@@ -49,7 +49,7 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(decision.state, "advance")
         self.assertEqual(self.sent[0][0], "left")
         self.assertGreater(self.sent[0][3], 0)
-        self.assertLessEqual(self.sent[0][2], 0.28)
+        self.assertLessEqual(self.sent[0][2], self.navigator.config.max_forward_axis)
         self.assertGreater(self.sent[0][2], 0.0)
 
     def test_off_center_target_turns_without_forward_motion(self) -> None:
@@ -277,7 +277,7 @@ class NavigatorTests(unittest.TestCase):
         decision = self.navigator.tick()
         self.assertEqual(decision.state, "advance")
         self.assertGreater(self.sent[0][2], 0.0)
-        self.assertLessEqual(self.sent[0][2], 0.28)
+        self.assertLessEqual(self.sent[0][2], self.navigator.config.max_forward_axis)
 
         attributes["apparent_height"] = 0.6
         self.assertEqual(self.navigator.tick().state, "reached")
@@ -386,7 +386,7 @@ class NavigatorTests(unittest.TestCase):
                 decision = self.navigator.tick()
                 self.assertEqual(decision.state, "advance")
                 self.assertGreaterEqual(decision.y, minimum)
-                self.assertLessEqual(decision.y, 0.28)
+                self.assertLessEqual(decision.y, self.navigator.config.max_forward_axis)
 
         # 米制分支：距离刚过停止距离时同样会缩到死区以下。
         attributes.pop("apparent_height")
@@ -396,7 +396,7 @@ class NavigatorTests(unittest.TestCase):
                 decision = self.navigator.tick()
                 self.assertEqual(decision.state, "advance")
                 self.assertGreaterEqual(decision.y, minimum)
-                self.assertLessEqual(decision.y, 0.28)
+                self.assertLessEqual(decision.y, self.navigator.config.max_forward_axis)
 
         # 过死区的判据是「实际发出去的摇杆量」，不是决策对象里的数字。
         self.assertTrue(self.sent)
@@ -408,11 +408,34 @@ class NavigatorTests(unittest.TestCase):
         """死区下限还必须让实际速度高于失速阈值，否则两个判据自相矛盾。
 
         实测 y=0.13 能动但只有 0.1333 m/s，仍低于 stall_speed_mps=0.15——照样
-        会被判失速。下限取 0.15（实测 0.2222 m/s）才同时满足两边。
+        会被判失速。当前下限 0.20 还同时解决了 0.15 接近速度体感过慢的问题。
         """
         config = self.navigator.config
         self.assertGreaterEqual(config.min_forward_axis, 0.15)
         self.assertLessEqual(config.min_forward_axis, config.max_forward_axis)
+
+    def test_mid_range_target_uses_full_cruise_speed(self) -> None:
+        """目标尚未进入最后 20% 接近区间时使用完整巡航档。"""
+
+        attributes = self.world["entities"][0]["attributes"]
+        attributes.pop("distance_m")
+        attributes["apparent_height"] = 0.30
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "advance")
+        self.assertEqual(decision.y, self.navigator.config.max_forward_axis)
+
+    def test_near_target_brakes_below_cruise_speed(self) -> None:
+        """进入最后接近区间后仍要减速，不能全速撞向目标。"""
+
+        attributes = self.world["entities"][0]["attributes"]
+        attributes.pop("distance_m")
+        attributes["apparent_height"] = 0.52
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "advance")
+        self.assertGreaterEqual(decision.y, self.navigator.config.min_forward_axis)
+        self.assertLess(decision.y, self.navigator.config.max_forward_axis)
 
     def test_config_rejects_unbounded_speed(self) -> None:
         with self.assertRaises(ValueError):

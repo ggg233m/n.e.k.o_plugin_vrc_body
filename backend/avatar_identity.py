@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import secrets
 from typing import Any, Iterable, Mapping, Sequence
@@ -17,7 +17,20 @@ from typing import Any, Iterable, Mapping, Sequence
 _DEFAULT_LABELS = frozenset({"person", "player", "avatar", "人物", "玩家"})
 # track_id 已经提供短期连续性，无需每帧重复计算外观。按轨迹错峰刷新可避免多人
 # 场景在 10 Hz 感知循环里平白增加几十毫秒延迟。
-_DESCRIPTOR_REFRESH_OBSERVATIONS = 10
+_DESCRIPTOR_REFRESH_OBSERVATIONS = 5
+_MAX_APPEARANCE_PROTOTYPES = 6
+_PROTOTYPE_NOVELTY_THRESHOLD = 0.985
+# 跟踪 TTL 约 1.5 秒，而一次“转离目标、观察、再转回”实测常需 5~10 秒。背景
+# 一致时把几何连续窗口放宽到 15 秒；背景不一致的候选仍会在下面被提前排除。
+_AMBIGUITY_RECENCY_S = 15.0
+_AMBIGUITY_GEOMETRY_DISTANCE = 0.14
+_AMBIGUITY_GEOMETRY_MARGIN = 0.06
+_AMBIGUITY_ESTABLISHED_OBSERVATIONS = 8
+_AMBIGUITY_ESTABLISHED_RATIO = 3
+_MAX_CONTEXT_PROTOTYPES = 4
+_CONTEXT_NOVELTY_THRESHOLD = 0.985
+_CONTEXT_MATCH_THRESHOLD = 0.90
+_CONTEXT_MATCH_MARGIN = 0.025
 
 
 def _normalized_bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -133,11 +146,105 @@ def appearance_descriptor(
         return None
 
 
+def _context_descriptor(
+    frame: Any,
+    excluded_bboxes: Iterable[Sequence[float]] = (),
+) -> tuple[float, ...] | None:
+    """提取低分辨率背景指纹，只用于外观歧义时判断摄像机是否仍在同一视角。"""
+
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+
+        array = np.asarray(frame)
+        if array.ndim == 2:
+            array = np.repeat(array[..., None], 3, axis=2)
+        if array.ndim != 3 or array.shape[2] < 3 or min(array.shape[:2]) < 4:
+            return None
+        height, width = array.shape[:2]
+        stride_y = max(1, int(math.ceil(height / 24)))
+        stride_x = max(1, int(math.ceil(width / 32)))
+        sampled = array[::stride_y, ::stride_x, :3].astype(np.float32, copy=False)
+        finite = np.nan_to_num(sampled, nan=0.0, posinf=255.0, neginf=0.0)
+        if float(np.max(finite)) > 1.5:
+            finite = finite * (1.0 / 255.0)
+        rgb = np.clip(finite, 0.0, 1.0)
+        sampled_height, sampled_width = rgb.shape[:2]
+        valid = np.ones((sampled_height, sampled_width), dtype=bool)
+        # 人物本身已有独立的外观描述子；从场景指纹中剔除所有检测框，避免人物
+        # 移动、消失或多人遮挡被误判成摄像机切换了场景。
+        for raw_bbox in excluded_bboxes:
+            normalized = _normalized_bbox(raw_bbox)
+            if normalized is None:
+                continue
+            left, top, right, bottom = normalized
+            x0 = min(sampled_width - 1, max(0, int(math.floor(left * sampled_width))))
+            y0 = min(sampled_height - 1, max(0, int(math.floor(top * sampled_height))))
+            x1 = min(sampled_width, max(x0 + 1, int(math.ceil(right * sampled_width))))
+            y1 = min(sampled_height, max(y0 + 1, int(math.ceil(bottom * sampled_height))))
+            valid[y0:y1, x0:x1] = False
+        background_pixels = rgb[valid]
+        if background_pixels.size == 0:
+            return None
+        background_mean = np.mean(background_pixels, axis=0)
+        features: list[float] = []
+        for row in range(4):
+            y0 = sampled_height * row // 4
+            y1 = max(y0 + 1, sampled_height * (row + 1) // 4)
+            for column in range(8):
+                x0 = sampled_width * column // 8
+                x1 = max(x0 + 1, sampled_width * (column + 1) // 8)
+                block_rgb = rgb[y0:y1, x0:x1]
+                block = block_rgb[valid[y0:y1, x0:x1]]
+                # 整个网格都被人物覆盖时，以本帧其余背景的均值补洞。这样人物从
+                # 左侧移动到右侧不会让场景指纹本身跟着平移。
+                mean_rgb = background_mean if block.size == 0 else np.mean(block, axis=0)
+                color_sum = float(np.sum(mean_rgb))
+                chroma = mean_rgb / max(color_sum, 1e-4)
+                brightness = float(
+                    mean_rgb[0] * 0.299
+                    + mean_rgb[1] * 0.587
+                    + mean_rgb[2] * 0.114
+                )
+                features.extend((chroma * 0.75).tolist())
+                features.append(brightness * 0.25)
+        vector = np.asarray(features, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        if not math.isfinite(norm) or norm <= 1e-8:
+            return None
+        return tuple(float(item) for item in vector / norm)
+    except (ImportError, TypeError, ValueError, IndexError, FloatingPointError):
+        return None
+
+
 def _similarity(first: Sequence[float], second: Sequence[float]) -> float:
     if len(first) != len(second) or not first:
         return 0.0
     value = sum(float(left) * float(right) for left, right in zip(first, second))
     return min(1.0, max(-1.0, value)) if math.isfinite(value) else 0.0
+
+
+def _bbox_distance(
+    first: tuple[float, float, float, float] | None,
+    second: tuple[float, float, float, float] | None,
+) -> float:
+    """比较两次检测的粗几何，横向位移权重较低以容忍摄像机转向。"""
+
+    if first is None or second is None:
+        return math.inf
+    first_width = max(1e-4, first[2] - first[0])
+    first_height = max(1e-4, first[3] - first[1])
+    second_width = max(1e-4, second[2] - second[0])
+    second_height = max(1e-4, second[3] - second[1])
+    first_x = (first[0] + first[2]) * 0.5
+    first_y = (first[1] + first[3]) * 0.5
+    second_x = (second[0] + second[2]) * 0.5
+    second_y = (second[1] + second[3]) * 0.5
+    return (
+        abs(first_x - second_x) * 0.30
+        + abs(first_y - second_y) * 0.80
+        + abs(math.log(second_width / first_width)) * 0.16
+        + abs(math.log(second_height / first_height)) * 0.24
+    )
 
 
 @dataclass(frozen=True)
@@ -156,6 +263,15 @@ class _Identity:
     last_seen: float
     observations: int = 1
     active_track_id: int | None = None
+    last_bbox: tuple[float, float, float, float] | None = None
+    # 单一均值模板会把正面、侧面和背面互相“平均掉”。保留少量多视角原型，匹配
+    # 时取最相似视角；容量固定，不会随会话时间无限增长。
+    prototypes: list[tuple[float, ...]] = field(default_factory=list)
+    context_prototypes: list[tuple[float, ...]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.prototypes:
+            self.prototypes.append(self.descriptor)
 
 
 class AvatarIdentityRegistry:
@@ -186,6 +302,10 @@ class AvatarIdentityRegistry:
         self._new_count = 0
         self._reidentified_count = 0
         self._ambiguous_count = 0
+        self._ambiguous_reused_count = 0
+        self._geometry_reidentified_count = 0
+        self._established_reidentified_count = 0
+        self._context_reidentified_count = 0
 
     def _new_identity_id(self) -> str:
         identity_id = f"avatar:session:{self.session_token}:{self._next_identity}"
@@ -246,6 +366,144 @@ class AvatarIdentityRegistry:
         if norm > 1e-8 and math.isfinite(norm):
             identity.descriptor = tuple(item / norm for item in blended)
 
+        best_prototype = max(
+            (_similarity(item, descriptor) for item in identity.prototypes),
+            default=-1.0,
+        )
+        if best_prototype < _PROTOTYPE_NOVELTY_THRESHOLD:
+            identity.prototypes.append(descriptor)
+            if len(identity.prototypes) > _MAX_APPEARANCE_PROTOTYPES:
+                # 保留最初视角作为身份锚点，其余位置按时间先进先出。
+                identity.prototypes.pop(1)
+
+    @staticmethod
+    def _identity_similarity(identity: _Identity, descriptor: tuple[float, ...]) -> float:
+        return max(
+            [_similarity(identity.descriptor, descriptor)]
+            + [_similarity(prototype, descriptor) for prototype in identity.prototypes]
+        )
+
+    @staticmethod
+    def _update_context(
+        identity: _Identity,
+        descriptor: tuple[float, ...] | None,
+    ) -> None:
+        if descriptor is None:
+            return
+        best = max(
+            (_similarity(item, descriptor) for item in identity.context_prototypes),
+            default=-1.0,
+        )
+        if best >= _CONTEXT_NOVELTY_THRESHOLD:
+            return
+        identity.context_prototypes.append(descriptor)
+        if len(identity.context_prototypes) > _MAX_CONTEXT_PROTOTYPES:
+            identity.context_prototypes.pop(1)
+
+    @staticmethod
+    def _context_similarity(
+        identity: _Identity,
+        descriptor: tuple[float, ...] | None,
+    ) -> float | None:
+        if descriptor is None or not identity.context_prototypes:
+            return None
+        return max(_similarity(item, descriptor) for item in identity.context_prototypes)
+
+    def _resolve_ambiguous_candidate(
+        self,
+        candidates: Sequence[tuple[float, _Identity]],
+        bbox: tuple[float, float, float, float] | None,
+        context: tuple[float, ...] | None,
+        now: float,
+    ) -> tuple[_Identity, float, str] | None:
+        """在外观近似的旧模板间，用短时几何或显著稳定度消解冲突。
+
+        同帧仍可见的身份在调用前已经排除，因此这里不会把两个同时出现的相同
+        Avatar 合并。几何不明确且没有一个长期稳定模板时继续分配新 ID。
+        """
+
+        if not candidates:
+            return None
+        best_score = candidates[0][0]
+        near = [
+            (score, identity)
+            for score, identity in candidates
+            if score >= self.similarity_threshold
+            and best_score - score <= self.similarity_margin
+        ]
+
+        # 回到原视角时，全帧场景比“物体刚好落在同一屏幕位置”更可信。它只在多个
+        # 外观候选打平时参与，不会覆盖正常的 Avatar 外观匹配。
+        context_ranked = sorted(
+            (
+                (context_score, score, identity)
+                for score, identity in near
+                if (context_score := self._context_similarity(identity, context)) is not None
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if context_ranked:
+            context_score, score, identity = context_ranked[0]
+            second_context = context_ranked[1][0] if len(context_ranked) > 1 else -1.0
+            if (
+                context_score >= _CONTEXT_MATCH_THRESHOLD
+                and context_score - second_context >= _CONTEXT_MATCH_MARGIN
+            ):
+                self._context_reidentified_count += 1
+                return identity, score, "appearance_context_reid"
+
+        context_scores = {
+            identity.identity_id: self._context_similarity(identity, context)
+            for _score, identity in near
+        }
+        recent_geometry = sorted(
+            (
+                (_bbox_distance(identity.last_bbox, bbox), score, identity)
+                for score, identity in near
+                if now - identity.last_seen <= _AMBIGUITY_RECENCY_S
+                and (
+                    context is None
+                    or context_scores.get(identity.identity_id) is None
+                    or float(context_scores[identity.identity_id]) >= _CONTEXT_MATCH_THRESHOLD
+                )
+            ),
+            key=lambda item: item[0],
+        )
+        if recent_geometry and math.isfinite(recent_geometry[0][0]):
+            best_distance, score, identity = recent_geometry[0]
+            second_distance = recent_geometry[1][0] if len(recent_geometry) > 1 else math.inf
+            if (
+                best_distance <= _AMBIGUITY_GEOMETRY_DISTANCE
+                and second_distance - best_distance >= _AMBIGUITY_GEOMETRY_MARGIN
+            ):
+                self._geometry_reidentified_count += 1
+                return identity, score, "appearance_geometry_reid"
+
+        best_context = context_ranked[0][0] if context_ranked else None
+        established = sorted(
+            (
+                (score, identity)
+                for score, identity in near
+                if best_context is None
+                or context_scores.get(identity.identity_id) is None
+                or best_context - float(context_scores[identity.identity_id]) <= _CONTEXT_MATCH_MARGIN
+            ),
+            key=lambda item: item[1].observations,
+            reverse=True,
+        )
+        if established:
+            score, identity = established[0]
+            second_observations = established[1][1].observations if len(established) > 1 else 0
+            if (
+                identity.observations >= _AMBIGUITY_ESTABLISHED_OBSERVATIONS
+                and identity.observations
+                >= max(1, second_observations) * _AMBIGUITY_ESTABLISHED_RATIO
+            ):
+                self._established_reidentified_count += 1
+                return identity, score, "appearance_established_reid"
+        return None
+
     def assign(
         self,
         detections: Sequence[Any],
@@ -257,6 +515,15 @@ class AvatarIdentityRegistry:
         if not self.enabled:
             return {}
         self._prune(now)
+        context = _context_descriptor(
+            frame,
+            (
+                getattr(item, "bbox", ())
+                for item in detections
+                if str(getattr(item, "label", "") or "").strip().lower()
+                in self._eligible_labels
+            ),
+        )
         active_track_ids = {
             int(item.track_id)
             for item in detections
@@ -280,6 +547,7 @@ class AvatarIdentityRegistry:
             if raw_track_id is None or label not in self._eligible_labels:
                 continue
             track_id = int(raw_track_id)
+            bbox = _normalized_bbox(getattr(detection, "bbox", ()))
             track_entity_id = f"{str(source_name).replace(':', '_')}:track:{track_id}"
             bound_id = self._track_bindings.get(track_id)
             bound = self._identities.get(bound_id or "")
@@ -305,6 +573,8 @@ class AvatarIdentityRegistry:
                 bound.last_seen = now
                 bound.observations += 1
                 bound.active_track_id = track_id
+                bound.last_bbox = bbox
+                self._update_context(bound, context)
                 assigned_this_frame.add(bound.identity_id)
                 result[track_id] = IdentityAssignment(
                     bound.identity_id,
@@ -326,30 +596,47 @@ class AvatarIdentityRegistry:
                     continue
                 if identity.identity_id in reserved_identities:
                     continue
-                candidates.append((_similarity(identity.descriptor, descriptor), identity))
+                candidates.append((self._identity_similarity(identity, descriptor), identity))
             candidates.sort(key=lambda item: item[0], reverse=True)
             best_score = candidates[0][0] if candidates else -1.0
             second_score = candidates[1][0] if len(candidates) > 1 else -1.0
-            matched = (
+            matched = bool(
                 candidates
                 and best_score >= self.similarity_threshold
                 and best_score - second_score >= self.similarity_margin
             )
-            if matched:
-                identity = candidates[0][1]
+            resolved = None
+            if not matched and candidates and best_score >= self.similarity_threshold:
+                self._ambiguous_count += 1
+                resolved = self._resolve_ambiguous_candidate(candidates, bbox, context, now)
+                if resolved is not None:
+                    self._ambiguous_reused_count += 1
+            if matched or resolved is not None:
+                if resolved is None:
+                    identity = candidates[0][1]
+                    similarity = best_score
+                    method = "appearance_reid"
+                else:
+                    identity, similarity, method = resolved
                 self._bind(track_id, identity.identity_id)
                 self._update_descriptor(identity, descriptor, weight=0.05)
                 identity.last_seen = now
                 identity.observations += 1
                 identity.active_track_id = track_id
+                identity.last_bbox = bbox
+                self._update_context(identity, context)
                 self._reidentified_count += 1
-                method = "appearance_reid"
-                similarity: float | None = best_score
             else:
-                if candidates and best_score >= self.similarity_threshold:
-                    self._ambiguous_count += 1
                 identity_id = self._new_identity_id()
-                identity = _Identity(identity_id, label, descriptor, now, active_track_id=track_id)
+                identity = _Identity(
+                    identity_id,
+                    label,
+                    descriptor,
+                    now,
+                    active_track_id=track_id,
+                    last_bbox=bbox,
+                    context_prototypes=[] if context is None else [context],
+                )
                 self._identities[identity_id] = identity
                 self._bind(track_id, identity_id)
                 self._new_count += 1
@@ -376,11 +663,23 @@ class AvatarIdentityRegistry:
             "new_count": self._new_count,
             "reidentified_count": self._reidentified_count,
             "ambiguous_count": self._ambiguous_count,
+            "ambiguous_reused_count": self._ambiguous_reused_count,
+            "geometry_reidentified_count": self._geometry_reidentified_count,
+            "established_reidentified_count": self._established_reidentified_count,
+            "context_reidentified_count": self._context_reidentified_count,
             "similarity_threshold": self.similarity_threshold,
             "similarity_margin": self.similarity_margin,
             "retention_s": self.retention_s,
             "max_identities": self.max_identities,
             "descriptor_refresh_observations": _DESCRIPTOR_REFRESH_OBSERVATIONS,
+            "max_appearance_prototypes": _MAX_APPEARANCE_PROTOTYPES,
+            "appearance_prototype_count": sum(
+                len(identity.prototypes) for identity in self._identities.values()
+            ),
+            "max_context_prototypes": _MAX_CONTEXT_PROTOTYPES,
+            "context_prototype_count": sum(
+                len(identity.context_prototypes) for identity in self._identities.values()
+            ),
             "persistent": False,
         }
 
