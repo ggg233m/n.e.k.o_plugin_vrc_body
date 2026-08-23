@@ -143,6 +143,14 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 身份特征只在内存保留，默认 30 分钟，后端重启后重新编号；它不是 VRChat
 `usr_`/`avtr_`，相同 Avatar、镜像和大幅换装/视角仍可能产生歧义。
 
+多人场景下，先读取 `world_observe`，再调用 `vrc_vision_frame` 并设置
+`overlay=true`。图上的 `T1/T2` 是单帧临时编号，同次工具结果会在
+`overlay.candidates` 中返回它们到完整 `target_id` 的映射。多模态 LLM 只负责从本次
+候选中排除看起来像海报、屏幕、镜像或无法判断的目标；提交 `vrc_autonomy_goal` 时必须
+使用映射中的完整 ID，不能提交 T 编号。JPEG、同帧检测实体和 revision 只在内存中的
+单槽对象保存，下一组直接覆盖；不写临时图片、不保留历史、不增加世界持久化次数。
+`overlay.paired!=true`、`drawn=false`、候选为空或 `skew_warning=true` 时保持停止并重新观察。
+
 ### 卡墙判据（movement_stalled）
 
 检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是唯一能区分

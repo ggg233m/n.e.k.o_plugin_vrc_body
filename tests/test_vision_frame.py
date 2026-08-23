@@ -12,6 +12,7 @@ from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.vision import (
+    VisionObservation,
     VisionRuntime,
     draw_detection_overlay,
     encode_frame_jpeg,
@@ -219,6 +220,22 @@ class FrameCacheTests(unittest.TestCase):
         self.assertTrue(cache_status["cached"])
         self.assertAlmostEqual(cache_status["age_ms"], 250.0, places=1)
         self.assertNotIn("data", cache_status)
+        self.assertEqual(cache_status["storage"], "memory_single_slot")
+        self.assertFalse(cache_status["persistent"])
+
+    def test_frame_cache_never_opens_a_disk_file(self) -> None:
+        """运行时缓存只能编码进内存，不能把高频画面写成临时文件。"""
+
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        writes_before = runtime.snapshot()["memory"]["persistence_write_count"]
+        with mock.patch("builtins.open", side_effect=AssertionError("disk write attempted")):
+            self.assertTrue(runtime._cache_frame(_FakeImage(640, 360), clock.now))
+            self.assertTrue(runtime.latest_frame()["available"])
+        self.assertEqual(
+            runtime.snapshot()["memory"]["persistence_write_count"],
+            writes_before,
+        )
 
     def test_frames_never_leak_into_world_state(self) -> None:
         """约束二：帧只喂理解，不产生实体也不产生事件。
@@ -252,8 +269,23 @@ class OverlayGeometryTests(unittest.TestCase):
     def test_normalized_bbox_maps_to_pixels(self) -> None:
         [box] = overlay_boxes_geometry([self._box([0.25, 0.5, 0.75, 1.0])], width=960, height=640)
         self.assertEqual(box["rect"], (240, 320, 720, 640))
+        self.assertEqual(box["ref"], "T1")
+        self.assertEqual(box["id"], "e1")
         self.assertEqual(box["label"], "person")
         self.assertEqual(box["confidence"], 0.5)
+
+    def test_refs_are_dense_and_only_assigned_to_drawable_entities(self) -> None:
+        boxes = overlay_boxes_geometry(
+            [
+                self._box([1.2, 1.2, 1.8, 1.9]),
+                {**self._box([0.1, 0.1, 0.4, 0.8]), "id": "entity:2"},
+                {**self._box([0.5, 0.1, 0.9, 0.8]), "id": "entity:3"},
+            ],
+            width=100,
+            height=80,
+        )
+        self.assertEqual([box["ref"] for box in boxes], ["T1", "T2"])
+        self.assertEqual([box["id"] for box in boxes], ["entity:2", "entity:3"])
 
     def test_edge_touching_boxes_survive_and_fill_the_canvas(self) -> None:
         """贴边不是越界；0..1 整幅框必须画得出来，否则最近的目标反而没框。"""
@@ -324,7 +356,7 @@ class OverlayGeometryTests(unittest.TestCase):
 
 
 class OverlayFrameTests(unittest.TestCase):
-    """``latest_frame(overlay=True)`` 的行为：报错位、不污染缓存、缺依赖时降级。"""
+    """``latest_frame(overlay=True)`` 只使用与像素同批次的内存检测结果。"""
 
     def _runtime(self, clock: _Clock, **kwargs) -> VisionRuntime:
         return VisionRuntime(
@@ -344,6 +376,31 @@ class OverlayFrameTests(unittest.TestCase):
             "attributes": dict(attributes),
         }
 
+    @staticmethod
+    def _cache_paired(
+        runtime: VisionRuntime,
+        clock: _Clock,
+        entities,
+        *,
+        frame=None,
+        frame_id: str = "test-frame-1",
+        observed_at: float | None = None,
+    ) -> None:
+        paired_at = clock.now if observed_at is None else observed_at
+        observation = VisionObservation(
+            entities=tuple(entities),
+            source="test_detector",
+            observed_at=paired_at,
+            frame_id=frame_id,
+        )
+        world = runtime.ingest(observation)
+        runtime._cache_frame(
+            _FakeImage(640, 360) if frame is None else frame,
+            clock.now,
+            observation=observation,
+            world=world,
+        )
+
     def test_overlay_is_opt_in_and_absent_by_default(self) -> None:
         clock = _Clock()
         runtime = self._runtime(clock)
@@ -354,7 +411,7 @@ class OverlayFrameTests(unittest.TestCase):
         """没有实体不是故障：给原图、说 0 个框，别让看图这条路整体失败。"""
         clock = _Clock()
         runtime = self._runtime(clock)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        self._cache_paired(runtime, clock, [])
         plain = runtime.latest_frame()["data"]
         result = runtime.latest_frame(overlay=True)
         self.assertTrue(result["available"])
@@ -370,41 +427,78 @@ class OverlayFrameTests(unittest.TestCase):
         """缓存里必须留原始像素：唤醒推送用的是同一份，烧了框就再也还原不回来。"""
         clock = _Clock()
         runtime = self._runtime(clock)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
-        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("track:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         before = runtime.latest_frame()["data"]
         runtime.latest_frame(overlay=True)
         self.assertEqual(runtime.latest_frame()["data"], before)
 
-    def test_skew_is_computed_from_frame_age_and_world_age(self) -> None:
-        """一秒前的像素配现在的框，等于伪造位置。错位量必须报出来。"""
+    def test_newer_world_updates_never_replace_the_entities_paired_with_pixels(self) -> None:
+        """缓存之后世界继续更新，也只能画原帧同批次的实体。"""
         clock = _Clock()
         runtime = self._runtime(clock, frame_cache_interval_s=1.0)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("paired:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         clock.advance(0.9)
-        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        runtime.store.ingest(
+            [self._entity("newer:2", [0.5, 0.2, 0.9, 0.9])],
+            observed_at=clock.now,
+        )
         clock.advance(0.1)
         overlay = runtime.latest_frame(overlay=True)["overlay"]
+        self.assertTrue(overlay["paired"])
+        self.assertEqual(overlay["frame_id"], "test-frame-1")
         self.assertAlmostEqual(overlay["frame_age_ms"], 1000.0, places=0)
-        self.assertAlmostEqual(overlay["world_age_ms"], 100.0, places=0)
-        self.assertAlmostEqual(overlay["skew_ms"], 900.0, places=0)
+        self.assertAlmostEqual(overlay["world_age_ms"], 1000.0, places=0)
+        self.assertEqual(overlay["skew_ms"], 0.0)
+        self.assertEqual(overlay["entities_available"], 1)
 
-    def test_large_skew_is_flagged_so_it_cannot_be_read_as_simultaneous(self) -> None:
+    def test_old_but_still_allowed_pair_never_gains_artificial_skew(self) -> None:
         clock = _Clock()
         runtime = self._runtime(clock, frame_cache_interval_s=1.0)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("track:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         clock.advance(2.0)
         runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
         overlay = runtime.latest_frame(max_age_ms=5000, overlay=True)["overlay"]
-        self.assertTrue(overlay["skew_warning"])
+        self.assertEqual(overlay["skew_ms"], 0.0)
+        self.assertNotIn("skew_warning", overlay)
 
     def test_fresh_frame_and_fresh_world_are_not_flagged(self) -> None:
         clock = _Clock()
         runtime = self._runtime(clock, frame_cache_interval_s=1.0)
-        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("track:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         overlay = runtime.latest_frame(overlay=True)["overlay"]
         self.assertNotIn("skew_warning", overlay)
+
+    def test_unpaired_frame_never_draws_boxes_from_the_latest_world(self) -> None:
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        runtime._cache_frame(_FakeImage(640, 360), clock.now)
+        runtime.store.ingest(
+            [self._entity("newer:1", [0.2, 0.2, 0.6, 0.9])],
+            observed_at=clock.now,
+        )
+
+        overlay = runtime.latest_frame(overlay=True)["overlay"]
+
+        self.assertFalse(overlay["paired"])
+        self.assertFalse(overlay["drawn"])
+        self.assertEqual(overlay["reason"], "frame_detection_pair_unavailable")
+        self.assertEqual(overlay["candidates"], [])
 
     def test_unavailable_frames_are_never_overlaid(self) -> None:
         """没有画面时叠框无从谈起，也不能因此多出一个 overlay 字段。"""
@@ -419,8 +513,11 @@ class OverlayFrameTests(unittest.TestCase):
         """看不到框是降级，掉帧才是故障：给原图 + 说明原因，而不是报 unavailable。"""
         clock = _Clock()
         runtime = self._runtime(clock)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
-        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("track:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         plain = runtime.latest_frame()["data"]
         with mock.patch(
             "neko_anyadance_body.backend.vision.draw_detection_overlay",
@@ -432,12 +529,16 @@ class OverlayFrameTests(unittest.TestCase):
         self.assertFalse(result["overlay"]["drawn"])
         self.assertIn("Pillow", result["overlay"]["reason"])
         self.assertEqual(result["overlay"]["entities_available"], 1)
+        self.assertEqual(result["overlay"]["candidates"], [])
 
     def test_undecodable_cached_frame_still_returns_the_frame(self) -> None:
         clock = _Clock()
         runtime = self._runtime(clock)
-        runtime._cache_frame(_FakeImage(640, 360), clock.now)
-        runtime.store.ingest([self._entity("track:1", [0.2, 0.2, 0.6, 0.9])], observed_at=clock.now)
+        self._cache_paired(
+            runtime,
+            clock,
+            [self._entity("track:1", [0.2, 0.2, 0.6, 0.9])],
+        )
         result = runtime.latest_frame(overlay=True)
         # _FakeImage 存的是伪 JPEG，真 Pillow 解不开；两种环境下都不能变成 unavailable。
         self.assertTrue(result["available"])
@@ -459,20 +560,114 @@ class OverlayFrameTests(unittest.TestCase):
         Image.new("RGB", (120, 90), (12, 12, 12)).save(buf, format="JPEG", quality=80)
         clock = _Clock()
         runtime = self._runtime(clock)
-        runtime._cache_frame(buf.getvalue(), clock.now)
-        runtime.store.ingest(
+        self._cache_paired(
+            runtime,
+            clock,
             [
                 self._entity("track:1", [0.2, 0.2, 0.6, 0.9]),
                 self._entity("track:2", [1.4, 1.4, 1.8, 1.9]),
                 self._entity("track:3", [0.5, 0.5, 0.5, 0.5]),
             ],
-            observed_at=clock.now,
+            frame=buf.getvalue(),
         )
         overlay = runtime.latest_frame(overlay=True)["overlay"]
         self.assertTrue(overlay["drawn"], overlay.get("reason"))
         self.assertEqual(overlay["entities_available"], 3)
         self.assertEqual(overlay["boxes_drawn"], 1)
         self.assertEqual(overlay["boxes_skipped"], 2)
+        self.assertEqual(overlay["candidates"][0]["ref"], "T1")
+        self.assertEqual(overlay["candidates"][0]["target_id"], "track:1")
+
+    def test_overlay_returns_exact_temporary_ref_to_target_id_mapping(self) -> None:
+        """LLM 看到的 T 编号必须能从同一次工具结果无损解析回稳定实体 ID。"""
+
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+        except Exception:  # pragma: no cover - 取决于机器上有没有可选依赖
+            self.skipTest("Pillow is not installed")
+        buf = BytesIO()
+        Image.new("RGB", (160, 100), (12, 12, 12)).save(buf, format="JPEG", quality=80)
+        clock = _Clock()
+        runtime = self._runtime(clock)
+        self._cache_paired(
+            runtime,
+            clock,
+            [
+                self._entity("avatar:session:test:7", [0.05, 0.1, 0.45, 0.9]),
+                self._entity("avatar:session:test:9", [0.55, 0.1, 0.95, 0.9]),
+            ],
+            frame=buf.getvalue(),
+        )
+
+        overlay = runtime.latest_frame(overlay=True)["overlay"]
+
+        self.assertTrue(overlay["drawn"], overlay.get("reason"))
+        self.assertEqual(overlay["revision"], runtime.snapshot()["status"]["revision"])
+        self.assertEqual(
+            [(item["ref"], item["target_id"]) for item in overlay["candidates"]],
+            [
+                ("T1", "avatar:session:test:7"),
+                ("T2", "avatar:session:test:9"),
+            ],
+        )
+
+    def test_process_frame_atomically_caches_detector_result_with_its_pixels(self) -> None:
+        """生产入口必须自动配对，不能只让测试辅助方法能构造配对缓存。"""
+
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+        except Exception:  # pragma: no cover - 取决于机器上有没有可选依赖
+            self.skipTest("Pillow is not installed")
+
+        class Detector:
+            name = "paired_detector"
+
+            @staticmethod
+            def status():
+                return {"available": True}
+
+            @staticmethod
+            def observe(_frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "avatar:session:test:11",
+                        "label": "person",
+                        "confidence": 0.93,
+                        "bbox": [0.1, 0.1, 0.8, 0.9],
+                    },),
+                    source="paired_detector",
+                    observed_at=now,
+                    frame_id="openvino-11",
+                )
+
+        buf = BytesIO()
+        Image.new("RGB", (160, 100), (12, 12, 12)).save(buf, format="JPEG", quality=80)
+        clock = _Clock()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=clock),
+            detector=Detector(),
+            clock=clock,
+            frame_cache_max_width=0,
+        )
+
+        runtime.process_frame(buf.getvalue(), observed_at=clock.now)
+        result = runtime.latest_frame(overlay=True)
+
+        self.assertEqual(result["frame_id"], "openvino-11")
+        self.assertTrue(result["overlay"]["paired"])
+        self.assertEqual(result["overlay"]["skew_ms"], 0.0)
+        self.assertEqual(
+            result["overlay"]["candidates"][0]["target_id"],
+            "avatar:session:test:11",
+        )
+        cache_status = runtime.status()["frame_cache"]
+        self.assertEqual(cache_status["storage"], "memory_single_slot")
+        self.assertFalse(cache_status["persistent"])
+        self.assertEqual(cache_status["frame_id"], "openvino-11")
 
 
 class DrawDetectionOverlayTests(unittest.TestCase):
@@ -496,14 +691,17 @@ class DrawDetectionOverlayTests(unittest.TestCase):
         return buf.getvalue()
 
     def test_drawing_reports_how_many_boxes_landed_on_the_image(self) -> None:
+        geometry = []
         data, drawn = draw_detection_overlay(
             self._jpeg(),
             [
                 {"id": "a", "label": "person", "confidence": 0.83, "bbox": [0.1, 0.1, 0.5, 0.9]},
                 {"id": "b", "label": "person", "confidence": 0.4, "bbox": [1.4, 1.4, 1.9, 1.9]},
             ],
+            geometry_out=geometry,
         )
         self.assertEqual(drawn, 1)
+        self.assertEqual([(box["ref"], box["id"]) for box in geometry], [("T1", "a")])
         self.assertTrue(data.startswith(b"\xff\xd8"))
 
     def test_drawing_changes_pixels_and_leaves_the_input_bytes_alone(self) -> None:
@@ -562,6 +760,56 @@ class VisionFrameServiceTests(unittest.TestCase):
         # JSON 走不了 bytes；原始字段必须换掉而不是并存。
         self.assertNotIn("data", result)
         self.assertEqual(len(base64.b64decode(result["data_base64"])), result["bytes"])
+
+    def test_overlay_candidate_mapping_survives_service_serialization(self) -> None:
+        """图像转成 base64 传输时，T 编号到完整 ID 的映射不能被一起删掉。"""
+
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+        except Exception:  # pragma: no cover - 取决于机器上有没有可选依赖
+            self.skipTest("Pillow is not installed")
+        buf = BytesIO()
+        Image.new("RGB", (120, 90), (12, 12, 12)).save(buf, format="JPEG", quality=80)
+        clock = _Clock()
+        runtime = VisionRuntime(WorldStateStore(clock=clock), clock=clock, frame_cache_max_width=0)
+        observation = VisionObservation(
+            entities=({
+                "id": "avatar:session:test:4",
+                "label": "person",
+                "confidence": 0.9,
+                "bbox": [0.1, 0.1, 0.9, 0.9],
+            },),
+            source="test_detector",
+            observed_at=clock.now,
+            frame_id="service-frame-1",
+        )
+        world = runtime.ingest(observation)
+        runtime._cache_frame(
+            buf.getvalue(),
+            clock.now,
+            observation=observation,
+            world=world,
+        )
+
+        result = self._service(runtime).vision_frame(overlay=True)
+
+        self.assertTrue(result["available"])
+        self.assertIn("data_base64", result)
+        self.assertTrue(result["overlay"]["paired"])
+        self.assertEqual(result["overlay"]["frame_id"], "service-frame-1")
+        self.assertEqual(
+            result["overlay"]["candidates"],
+            [{
+                "ref": "T1",
+                "target_id": "avatar:session:test:4",
+                "label": "person",
+                "confidence": 0.9,
+                "bearing_deg": None,
+                "clipped": False,
+            }],
+        )
 
     def test_unavailable_frames_carry_no_payload(self) -> None:
         clock = _Clock()

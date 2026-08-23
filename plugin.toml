@@ -175,9 +175,10 @@ identity_reid_retention_s = 1800.0
 identity_reid_max_identities = 128
 semantic_backend = "openai_compatible"
 semantic_max_per_minute = 30
-# 给 agent 看的单槽帧缓存。这条路径与 world_state 完全无关：帧只喂理解，不
+# 给 agent 看的单槽内存帧缓存。这条路径与 world_state 完全无关：帧只喂理解，不
 # 产生实体也不产生事件，更不能用来满足 body_reach_and_grab 的 preconditions。
-# 编码只在采集线程里按 frame_cache_interval_s 做一次，之后所有拉取命中缓存。
+# 检测完成后 JPEG、同帧实体和 revision 一起覆盖内存单槽；不写临时图片、不保留
+# 历史、不增加世界持久化写入。编码按 frame_cache_interval_s 限流。
 frame_cache_interval_s = 1.0
 # 降采样宽度。给 LLM 的图不需要原始分辨率——降采样同时压低 token 成本和
 # 「盯着模糊像素脑补」的风险。0 表示不缩放。

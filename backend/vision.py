@@ -234,8 +234,15 @@ def overlay_boxes_geometry(
             confidence = float(item.get("confidence") or 0.0)
         except (TypeError, ValueError, OverflowError):
             confidence = 0.0
+        target_id = str(item.get("id") or "").strip()
+        # 没有实体 ID 的框无法被 LLM 安全地交给导航器。宁可不画，也不能生成一个
+        # 看得见却无法解析回 target_id 的 T 编号。
+        if not target_id:
+            continue
         result.append({
-            "id": str(item.get("id") or ""),
+            # T 编号只对本次叠框结果有效；真正提交导航时仍必须使用 target_id。
+            "ref": f"T{len(result) + 1}",
+            "id": target_id,
             "label": str(item.get("label") or "?"),
             "confidence": confidence,
             "rect": (left, top, right, bottom),
@@ -251,8 +258,12 @@ def draw_detection_overlay(
     *,
     quality: int = 70,
     warning: str | None = None,
+    geometry_out: list[dict[str, Any]] | None = None,
 ) -> tuple[bytes, int]:
     """在 JPEG 副本上画检测框，返回 ``(数据, 画出的框数)``。
+
+    ``geometry_out`` 用于把同一次绘制生成的临时 T 编号交给调用方，进而随工具
+    结果返回完整 target_id；它不改变原有返回值，外部诊断调用仍可只取数量。
 
     调用方传入的是已编码的 JPEG 字节；这里解码、绘制、重新编码，**绝不写回
     帧缓存**——缓存里必须保留原始像素，否则唤醒推送会拿到烧了框的图，而那张图
@@ -275,6 +286,10 @@ def draw_detection_overlay(
     except Exception as exc:
         raise ValueError(f"frame cannot be decoded: {exc}") from exc
     geometry = overlay_boxes_geometry(boxes, width=image.size[0], height=image.size[1])
+    if geometry_out is not None:
+        # 调用方传入新列表收集与本次画面完全相同的 T 编号映射。复制字典，避免
+        # 后续绘制代码意外把内部对象暴露给 JSON 返回值。
+        geometry_out.extend(dict(box) for box in geometry)
     draw = ImageDraw.Draw(image)
     for box in geometry:
         left, top, right, bottom = box["rect"]
@@ -282,7 +297,9 @@ def draw_detection_overlay(
         # 函数用，看图的人必须能一眼分辨。
         color = (255, 96, 0) if box["clipped"] else (0, 224, 96)
         draw.rectangle((left, top, right, bottom), outline=color, width=3)
-        caption = f"{box['label']} {box['confidence']:.2f}"
+        # T1/T2 比完整 session ID 更容易被多模态模型从 960px 图里读出；完整 ID
+        # 通过 overlay.candidates 同步返回，不能从图片文字里猜。
+        caption = f"{box['ref']} {box['label']} {box['confidence']:.2f}"
         if box["clipped"]:
             caption += " CLIPPED"
         bearing = box.get("bearing_deg")
@@ -1682,19 +1699,30 @@ class VisionRuntime:
                 "reason": self._capture_reason,
             }
 
-    def _cache_frame(self, frame: Any, captured_at: float) -> None:
-        """按间隔把最新帧编码进单槽缓存。
+    def _cache_frame(
+        self,
+        frame: Any,
+        captured_at: float,
+        *,
+        observation: VisionObservation | None = None,
+        world: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """按间隔把最新帧编码进单槽内存缓存。
 
         必须在帧被 ``_release_frame`` 释放之前调用。编码失败只记录原因，绝不
         让采集或检测因此中断——看不到图是降级，掉帧是故障。
+
+        ``observation`` 与 ``world`` 同时提供时，把该检测批次中实际出现的实体
+        和 JPEG 放进同一个内存对象。它不创建文件、不保留历史，也不额外调用
+        ``store.ingest``；下一次成功缓存会直接覆盖整组数据。
         """
         if self._frame_cache_interval_s < 0:
-            return
+            return False
         with self._lock:
             last = self._frame_cache_at
             interval = self._frame_cache_interval_s
         if last is not None and (captured_at - last) < interval:
-            return
+            return False
         try:
             data, width, height = encode_frame_jpeg(
                 frame,
@@ -1704,7 +1732,62 @@ class VisionRuntime:
         except Exception as exc:
             with self._lock:
                 self._frame_cache_error = f"{type(exc).__name__}: {exc}"[:256]
-            return
+            return False
+        detection_pair: dict[str, Any] | None = None
+        if observation is not None and isinstance(world, Mapping):
+            exact_ids: set[str] = set()
+            for item in observation.entities:
+                try:
+                    raw: Mapping[str, Any] = (
+                        {
+                            "id": item.id,
+                            "label": item.label,
+                            "confidence": item.confidence,
+                            "bbox": item.bbox,
+                            "state": item.state,
+                            "attributes": item.attributes,
+                            "relations": item.relations,
+                            "source": item.source,
+                            "observed_at": item.observed_at,
+                            "ttl_s": item.ttl_s,
+                        }
+                        if isinstance(item, WorldEntity)
+                        else item
+                    )
+                    normalized = WorldEntity.from_mapping(
+                        raw,
+                        now=captured_at,
+                        default_source=observation.source,
+                        default_ttl_s=float(getattr(self.store, "default_ttl_s", 2.0)),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                exact_ids.add(normalized.id)
+            paired_entities = tuple(
+                dict(item)
+                for item in (world.get("entities") or ())
+                if isinstance(item, Mapping) and str(item.get("id") or "") in exact_ids
+            )
+            status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+            try:
+                revision = int(status.get("revision", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                revision = 0
+            try:
+                paired_observed_at = (
+                    min(captured_at, float(observation.observed_at))
+                    if observation.observed_at is not None
+                    else captured_at
+                )
+            except (TypeError, ValueError, OverflowError):
+                paired_observed_at = captured_at
+            detection_pair = {
+                "frame_id": observation.frame_id or f"{observation.source}-{revision}",
+                "revision": revision,
+                "captured_at": captured_at,
+                "observed_at": paired_observed_at,
+                "entities": paired_entities,
+            }
         with self._lock:
             self._frame_cache = {
                 "data": data,
@@ -1712,9 +1795,11 @@ class VisionRuntime:
                 "width": width,
                 "height": height,
                 "bytes": len(data),
+                "detection_pair": detection_pair,
             }
             self._frame_cache_at = captured_at
             self._frame_cache_error = None
+        return True
 
     def latest_frame(self, *, max_age_ms: int = 3000, overlay: bool = False) -> dict[str, Any]:
         """返回最近一次缓存的画面，超龄或采集停止时明确拒绝。
@@ -1771,8 +1856,16 @@ class VisionRuntime:
             "bytes": cached["bytes"],
             "data": cached["data"],
         }
+        detection_pair = cached.get("detection_pair")
+        if isinstance(detection_pair, Mapping):
+            result["frame_id"] = str(detection_pair.get("frame_id") or "") or None
+            result["revision"] = int(detection_pair.get("revision", 0) or 0)
         if overlay:
-            result = self._apply_overlay(result, frame_age_ms=age_ms, now=now)
+            result = self._apply_overlay(
+                result,
+                frame_age_ms=age_ms,
+                detection_pair=detection_pair,
+            )
         return result
 
     def _apply_overlay(
@@ -1780,43 +1873,66 @@ class VisionRuntime:
         frame: dict[str, Any],
         *,
         frame_age_ms: float,
-        now: float,
+        detection_pair: Any,
     ) -> dict[str, Any]:
-        """把当前世界实体画到帧副本上，并报告两者的时间差。
+        """只把与缓存像素同批次的检测实体画到副本上。
 
-        帧缓存按 ``frame_cache_interval_s`` 限流，世界快照却是最新的——两者能差
-        接近一个间隔。把一秒前的像素配上现在的框，等于告诉看图的人「这个人现在
-        在这个位置」，而那是伪造。所以 ``skew_ms`` 必须报出来，超过半个采集间隔
-        时还要烧到图上：JSON 字段会被忽略，画面上的红条不会。
+        这里绝不读取最新 ``world.snapshot``。像素和框在检测完成后已经原子地放进
+        同一个单槽内存对象；没有配对数据就明确降级，不能拿旧图叠新框。
         """
-        snapshot = self._mask_stopped_snapshot(self.store.snapshot(now=now))
-        entities = snapshot.get("entities") or []
-        world_age_ms = snapshot.get("status", {}).get("last_observation_age_ms")
+        if not isinstance(detection_pair, Mapping):
+            frame["overlay"] = {
+                "requested": True,
+                "paired": False,
+                "revision": None,
+                "frame_id": None,
+                "frame_age_ms": round(frame_age_ms, 1),
+                "world_age_ms": None,
+                "skew_ms": None,
+                "entities_available": 0,
+                "candidates": [],
+                "drawn": False,
+                "reason": "frame_detection_pair_unavailable",
+            }
+            return frame
+        entities = list(detection_pair.get("entities") or ())
         try:
-            world_age = float(world_age_ms) if world_age_ms is not None else None
+            captured_at = float(detection_pair.get("captured_at"))
+            observed_at = float(detection_pair.get("observed_at"))
+            skew_ms = abs(captured_at - observed_at) * 1000.0
+            world_age_ms = frame_age_ms + (captured_at - observed_at) * 1000.0
         except (TypeError, ValueError, OverflowError):
-            world_age = None
-        # 帧龄与世界龄都是「距今多久」，所以两者之差就是像素与框之间的错位。
-        skew_ms = abs(frame_age_ms - world_age) if world_age is not None else None
+            skew_ms = math.inf
+            world_age_ms = None
+        try:
+            revision = int(detection_pair.get("revision", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            revision = 0
         overlay_status: dict[str, Any] = {
             "requested": True,
+            "paired": True,
+            "revision": revision,
+            "frame_id": str(detection_pair.get("frame_id") or "") or None,
             "frame_age_ms": round(frame_age_ms, 1),
-            "world_age_ms": round(world_age, 1) if world_age is not None else None,
-            "skew_ms": round(skew_ms, 1) if skew_ms is not None else None,
+            "world_age_ms": round(world_age_ms, 1) if world_age_ms is not None else None,
+            "skew_ms": round(skew_ms, 1) if math.isfinite(skew_ms) else None,
             "entities_available": len(entities),
+            # 只有真正烧进图里的框才会出现在这里。绘制失败时保持空列表，避免
+            # LLM 在没看见 T 编号的情况下仅凭 JSON 猜目标。
+            "candidates": [],
         }
         warning = None
-        if skew_ms is not None and skew_ms > max(250.0, self._frame_cache_interval_s * 500.0):
-            warning = (
-                f"SKEW {skew_ms:.0f}ms: boxes are from a different moment than these pixels"
-            )
+        if not math.isfinite(skew_ms) or skew_ms > 250.0:
+            warning = "PAIR INVALID" if not math.isfinite(skew_ms) else f"PAIR SKEW {skew_ms:.0f}ms"
             overlay_status["skew_warning"] = True
         try:
+            drawn_geometry: list[dict[str, Any]] = []
             data, drawn = draw_detection_overlay(
                 frame["data"],
                 entities,
                 quality=self._frame_cache_quality,
                 warning=warning,
+                geometry_out=drawn_geometry,
             )
         except Exception as exc:
             # 画不出框就给原图。看不到框是降级，掉帧才是故障。
@@ -1827,6 +1943,17 @@ class VisionRuntime:
         overlay_status["drawn"] = True
         overlay_status["boxes_drawn"] = drawn
         overlay_status["boxes_skipped"] = max(0, len(entities) - drawn)
+        overlay_status["candidates"] = [
+            {
+                "ref": str(box["ref"]),
+                "target_id": str(box["id"]),
+                "label": str(box["label"]),
+                "confidence": round(float(box["confidence"]), 4),
+                "bearing_deg": box.get("bearing_deg"),
+                "clipped": bool(box.get("clipped")),
+            }
+            for box in drawn_geometry
+        ]
         frame["data"] = data
         frame["bytes"] = len(data)
         frame["overlay"] = overlay_status
@@ -1895,6 +2022,11 @@ class VisionRuntime:
             frame_cache_at = self._frame_cache_at
             frame_cache_error = self._frame_cache_error
             frame_cache_interval_s = self._frame_cache_interval_s
+            frame_pair = (
+                self._frame_cache.get("detection_pair")
+                if isinstance(self._frame_cache, Mapping)
+                else None
+            )
             detect_interval_s = self._detect_interval_s
             detect_skipped = self._detect_skipped
             obscured_frames = self._obscured_frames
@@ -1924,6 +2056,19 @@ class VisionRuntime:
             # 混进感知结论。
             "frame_cache": {
                 "cached": frame_cached,
+                "storage": "memory_single_slot",
+                "persistent": False,
+                "paired": isinstance(frame_pair, Mapping),
+                "frame_id": (
+                    str(frame_pair.get("frame_id") or "") or None
+                    if isinstance(frame_pair, Mapping)
+                    else None
+                ),
+                "revision": (
+                    int(frame_pair.get("revision", 0) or 0)
+                    if isinstance(frame_pair, Mapping)
+                    else None
+                ),
                 "age_ms": (
                     None if frame_cache_at is None
                     else round(max(0.0, (self._clock() - frame_cache_at) * 1000.0), 1)
@@ -2108,9 +2253,6 @@ class VisionRuntime:
             observation_now = min(processing_now, float(observed_at)) if observed_at is not None else processing_now
         except (TypeError, ValueError, OverflowError):
             observation_now = processing_now
-        # 在检测之前缓存：帧在 worker 的 finally 里就会被释放，之后再想编码
-        # 只能拿到已关闭的句柄。缓存自身按间隔限流，不是每帧都编。
-        self._cache_frame(frame, processing_now)
         if source_obscured:
             return self._observe_obscured(processing_now, observation_now)
         # attach_vision/set_backends 可能与采集线程并行；在锁内取得稳定引用，
@@ -2118,6 +2260,7 @@ class VisionRuntime:
         with self._lock:
             detector = self.detector
             semantic = self.semantic
+        cache_written = False
         try:
             detector_available = detector is not None
             if detector is not None:
@@ -2144,7 +2287,20 @@ class VisionRuntime:
                 # 「这一帧什么都没有」，实体全部消失；不写则由 store 自己让
                 # age_ms 长上去，「多久之前看到的」仍然是真话。
                 if detect_due:
-                    self.ingest(detector.observe(frame, now=observation_now), _reactivate=False)
+                    detector_observation = detector.observe(frame, now=observation_now)
+                    detector_world = self.ingest(detector_observation, _reactivate=False)
+                    # worker 只会在 process_frame 返回后释放 frame，所以检测完成后
+                    # 仍可安全编码。此时像素、实体、revision 一次写入同一个单槽
+                    # 内存对象，不需要磁盘临时文件。
+                    cache_written = self._cache_frame(
+                        frame,
+                        observation_now,
+                        observation=detector_observation,
+                        world=detector_world,
+                    )
+            else:
+                # 没有可用检测器时仍允许主 LLM 看原图，但 overlay 会明确报告未配对。
+                cache_written = self._cache_frame(frame, observation_now)
             if semantic is not None and self.capture_state()["active"]:
                 with self._lock:
                     semantic_due = (
@@ -2165,6 +2321,9 @@ class VisionRuntime:
         except Exception as exc:
             with self._lock:
                 self._last_error = f"{type(exc).__name__}: {exc}"[:500]
+            if not cache_written:
+                # 推理失败时保留看原图的能力；没有配对元数据，因此绝不会误画框。
+                self._cache_frame(frame, observation_now)
         self.store.set_backend_status("vision_runtime", self.status())
         result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
         result["vision"] = self.status()

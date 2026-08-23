@@ -314,7 +314,8 @@ VRC_AUTONOMY_GOAL = {
     "name": "vrc_autonomy_goal",
     "description": (
         "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。"
-        "approach/follow/interact/socialize 必须同时提供最新世界快照中的精确 target_id。"
+        "任何朝视觉实体移动的目标都必须提供最新世界快照中的精确 target_id；"
+        "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
     ),
     "parameters": {
         "type": "object",
@@ -325,7 +326,7 @@ VRC_AUTONOMY_GOAL = {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 96,
-                "description": "目标实体在最新世界快照中的精确 id；定向移动和交互时必填。",
+                "description": "目标实体在最新世界快照中的精确 id；不能填写临时 T1/T2 编号。",
             },
         },
         "required": ["goal"],
@@ -401,7 +402,8 @@ VRC_VISION_FRAME = {
         "对方是谁、菜单开着没、界面上写了什么。看到的一切都是画面猜测，只能用来理解，"
         "不能写进 world_state，也不能拿来满足 body_reach_and_grab 的 preconditions——"
         "那条路必须用 world_observe 给出的 entity_id 与置信度。画面过期或采集已停止时"
-        "返回 available=false，此时按看不见处理，不要沿用上一次看到的内容。"
+        "返回 available=false，此时按看不见处理，不要沿用上一次看到的内容。overlay=true"
+        "时图中 T1/T2 与结果 overlay.candidates 的 target_id 一一对应，只对本次画面有效。"
     ),
     "parameters": {
         "type": "object",
@@ -418,10 +420,11 @@ VRC_VISION_FRAME = {
                 "default": False,
                 "description": (
                     "叠加检测框，用于对照「检测器看到的」与「画面里实际有的」——"
-                    "例如确认某个高分实体圈的是真人还是墙上的立绘。框来自世界快照，"
-                    "而画面按间隔缓存，两者可能不同时刻；返回的 overlay.skew_ms 就是这个"
-                    "错位量，够大时画面顶部会有红色警告条。叠了框也不改变性质：画面结论"
-                    "仍然只是低置信视觉猜测，不能写进 world_state。"
+                    "例如确认某个高分实体圈的是真人还是墙上的立绘。框与 JPEG 来自同一次"
+                    "本地检测，并以单槽内存对象配对；overlay.paired=true 才能使用。没有"
+                    "同帧配对时返回 drawn=false，不会拿旧图叠最新世界。叠了框也不改变"
+                    "性质：画面结论仍然只是低置信视觉猜测，不能写进 world_state。成功时"
+                    "结果还会返回 overlay.candidates，将临时 T 编号映射到完整 target_id。"
                 ),
             },
         },

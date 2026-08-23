@@ -215,8 +215,9 @@ class VisionConfig:
     identity_reid_max_identities: int = 128
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
-    # 给 agent 看的单槽帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
-    # 不产生实体也不产生事件。编码按间隔做一次，之后所有拉取都命中缓存。
+    # 给 agent 看的单槽内存帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
+    # 不产生实体也不产生事件。检测完成后把 JPEG 与同帧实体原子配对，编码按间隔
+    # 做一次；不创建临时图片、不保留历史，也不增加世界持久化写入。
     frame_cache_interval_s: float = 1.0
     frame_max_width: int = 960
     frame_jpeg_quality: int = 70

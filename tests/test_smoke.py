@@ -59,6 +59,10 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
         self.assertIn("body_awareness", BODY_AI_INSTRUCTIONS)
         self.assertIn("accepted=true", BODY_AI_INSTRUCTIONS)
+        self.assertIn("overlay.candidates", BODY_AI_INSTRUCTIONS)
+        self.assertIn("real_avatar", BODY_AI_INSTRUCTIONS)
+        self.assertIn("overlay.candidates", tool_defs.VRC_VISION_FRAME["description"])
+        self.assertIn("不能填写临时 T1/T2", tool_defs.VRC_AUTONOMY_GOAL["parameters"]["properties"]["target_id"]["description"])
         declared_gestures = tool_defs.BODY_GESTURE["parameters"]["properties"]["name"]["enum"]
         self.assertEqual(set(declared_gestures), set(GESTURE_NAMES))
 
