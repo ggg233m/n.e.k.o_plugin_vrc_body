@@ -1012,12 +1012,22 @@ class LocalPerceptionTests(unittest.TestCase):
                 "input_height": 320,
                 "horizontal_fov_deg": 100,
                 "max_detections": 12,
+                "identity_reid_enabled": True,
+                "identity_reid_similarity": 0.92,
+                "identity_reid_margin": 0.06,
+                "identity_reid_retention_s": 900,
+                "identity_reid_max_identities": 48,
             },
         })
         self.assertEqual(config.vision.model_path, "models/yolox.xml")
         self.assertEqual(config.vision.fallback_backend, "opencv_hog")
         self.assertEqual(config.vision.input_width, 320)
         self.assertEqual(config.vision.max_detections, 12)
+        self.assertTrue(config.vision.identity_reid_enabled)
+        self.assertEqual(config.vision.identity_reid_similarity, 0.92)
+        self.assertEqual(config.vision.identity_reid_margin, 0.06)
+        self.assertEqual(config.vision.identity_reid_retention_s, 900)
+        self.assertEqual(config.vision.identity_reid_max_identities, 48)
 
 
 class OpenMpCapTests(unittest.TestCase):

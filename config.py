@@ -206,6 +206,13 @@ class VisionConfig:
     min_box_ratio: float = 0.02
     min_box_width_ratio: float | None = 0.008
     min_box_height_ratio: float | None = 0.02
+    # 仅当前后端会话有效的 Avatar 外观重识别。它把易变 track_id 映射为稳定
+    # entity_id；不落盘，也不声称获得 VRChat 的 usr_/avtr_ 身份。
+    identity_reid_enabled: bool = True
+    identity_reid_similarity: float = 0.90
+    identity_reid_margin: float = 0.04
+    identity_reid_retention_s: float = 1800.0
+    identity_reid_max_identities: int = 128
     semantic_backend: str = "openai_compatible"
     semantic_max_per_minute: int = 30
     # 给 agent 看的单槽帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
@@ -516,6 +523,39 @@ class PluginConfig:
                 legacy=shared_box_ratio if "min_box_ratio" in vision else None,
                 default=0.02,
                 name="vision.min_box_height_ratio",
+            ),
+            identity_reid_enabled=_boolean(
+                vision.get("identity_reid_enabled"),
+                True,
+                name="vision.identity_reid_enabled",
+            ),
+            identity_reid_similarity=_finite_float(
+                vision.get("identity_reid_similarity"),
+                0.90,
+                minimum=0.5,
+                maximum=0.999,
+                name="vision.identity_reid_similarity",
+            ),
+            identity_reid_margin=_finite_float(
+                vision.get("identity_reid_margin"),
+                0.04,
+                minimum=0.0,
+                maximum=0.5,
+                name="vision.identity_reid_margin",
+            ),
+            identity_reid_retention_s=_finite_float(
+                vision.get("identity_reid_retention_s"),
+                1800.0,
+                minimum=1.0,
+                maximum=86400.0,
+                name="vision.identity_reid_retention_s",
+            ),
+            identity_reid_max_identities=_bounded_int(
+                vision.get("identity_reid_max_identities"),
+                128,
+                minimum=1,
+                maximum=1024,
+                name="vision.identity_reid_max_identities",
             ),
             semantic_backend=semantic_backend,
             semantic_max_per_minute=_bounded_int(

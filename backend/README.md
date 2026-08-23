@@ -101,7 +101,7 @@ python backend/debug_cli.py --port 48912 --token dev stop-movement
 python backend/debug_cli.py --port 48912 --token dev controller --side left --control stick --y 0.35 --duration-ms 600
 python backend/debug_cli.py --port 48912 --token dev autonomy-arm
 python backend/debug_cli.py --port 48912 --token dev autonomy-goal --goal "探索附近的入口"
-python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind follow --target-id "openvino:track:7" --goal "跟随这个玩家"
+python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind follow --target-id "avatar:session:abcd1234:7" --goal "跟随这个玩家"
 python backend/debug_cli.py --port 48912 --token dev autonomy-stop
 ```
 
@@ -132,6 +132,13 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 `approach`、`follow`、`interact`、`socialize` 必须提供最新世界快照中的精确
 `target_id`；实体暂时消失时不会回退到同标签目标。转向命令会同时按观测 revision、
 本地冷却和 scheduler 的 `heading.turning` 状态门控，上一条相对转角落地前不会叠加。
+
+OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会话级外观重识别。
+对外实体 ID 是 `avatar:session:<session_token>:<number>`；底层易变的
+`openvino:track:<number>` 放在 `attributes.track_entity_id`，重新进入视野后可据此确认
+是否发生换轨。导航必须使用实体主 `id`，不要锁定诊断用的 `track_entity_id`。
+身份特征只在内存保留，默认 30 分钟，后端重启后重新编号；它不是 VRChat
+`usr_`/`avtr_`，相同 Avatar、镜像和大幅换装/视角仍可能产生歧义。
 
 ### 卡墙判据（movement_stalled）
 
@@ -245,6 +252,11 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 `{source}:track:{track_id}`；状态层对缺少 `id` 的旧调用仍兼容使用
 `stable_entity_id(source, label, track_id)`，但它只适合类别不可变的来源。不要在
 未启用 tracking 时按帧生成随机 UUID。
+
+内置 OpenVINO detector 会进一步把 Avatar 类轨迹交给 `AvatarIdentityRegistry`：同一
+track 直接延续身份，新 track 只有在外观相似度越过阈值且明显优于第二候选时才复用旧
+身份；同一帧不允许两个轨迹占用同一身份。外观不可提取、功能关闭或类别不是 Avatar
+时，会安全降级为上述 `{source}:track:{track_id}`。
 
 直接接入外部世界日志前必须做字段翻译：日志适配器要把事件映射为 `type`、稳定的
 `target_id`、canonical `source`，并在 `player_left` 同批提供 `remove_entity_ids`；

@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .vision import VisionObservation
+from .avatar_identity import AvatarIdentityRegistry
 from .world_state import stable_track_entity_id
 
 
@@ -341,6 +342,11 @@ class OpenVinoLocalDetector:
         min_box_height_ratio: float | None = None,
         track_iou_threshold: float = 0.25,
         track_ttl_s: float = 1.5,
+        identity_reid_enabled: bool = True,
+        identity_reid_similarity: float = 0.90,
+        identity_reid_margin: float = 0.04,
+        identity_reid_retention_s: float = 1800.0,
+        identity_reid_max_identities: int = 128,
         intra_op_threads: int = 2,
         fallback_backend: str = "none",
         infer: Callable[[Any], Mapping[str, Any] | Any] | None = None,
@@ -397,6 +403,13 @@ class OpenVinoLocalDetector:
         self._min_box_width_ratio = width_ratio
         self._min_box_height_ratio = height_ratio
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
+        self._identity_registry = AvatarIdentityRegistry(
+            enabled=identity_reid_enabled,
+            similarity_threshold=identity_reid_similarity,
+            similarity_margin=identity_reid_margin,
+            retention_s=identity_reid_retention_s,
+            max_identities=identity_reid_max_identities,
+        )
         # 推理线程上限。0 表示不设置，沿用运行时自己的默认（CPU EP 会开到物理
         # 核数）——留这个出口给需要裸速度的基准测量，部署配置不该用它。
         self._intra_op_threads = min(32, max(0, int(intra_op_threads)))
@@ -1068,6 +1081,8 @@ class OpenVinoLocalDetector:
                 "nms_iou_threshold": self._nms_iou_threshold,
                 "min_box_width_ratio": self._min_box_width_ratio,
                 "min_box_height_ratio": self._min_box_height_ratio,
+                # 身份只在当前后端进程内稳定，不落盘，也不冒充 VRChat usr_/avtr_。
+                "identity_reid": dict(self._identity_registry.status()),
                 # 0 表示没设上限。上限必须能从 /perception 直接读到，否则「配了
                 # 但没生效」和「配对了」在外面看起来完全一样。
                 "intra_op_threads": self._intra_op_threads,
@@ -1410,8 +1425,19 @@ class OpenVinoLocalDetector:
             ))
         return self._suppress_overlaps(detections)
 
-    def _entities(self, detections: list[_Detection], now: float) -> tuple[dict[str, Any], ...]:
+    def _entities(
+        self,
+        detections: list[_Detection],
+        frame: Any,
+        now: float,
+    ) -> tuple[dict[str, Any], ...]:
         self._tracker.update(detections, now)
+        identities = self._identity_registry.assign(
+            detections,
+            frame,
+            now=now,
+            source_name=self._source_name,
+        )
         entities: list[dict[str, Any]] = []
         fov_half = self._horizontal_fov_deg / 2.0
         for detection in detections:
@@ -1432,8 +1458,12 @@ class OpenVinoLocalDetector:
             # 0.97/0.03: NPC 坐在地上时摄像机在站立视高，bbox 底边实测稳定
             # 在 0.991，永远够不到 0.999。放宽到 0.97 与 navigator.py 一致。
             clipped = top <= 0.03 or bottom >= 0.97
+            track_entity_id = stable_track_entity_id(self._source_name, track_id)
+            identity = identities.get(track_id)
             entities.append({
-                "id": stable_track_entity_id(self._source_name, track_id),
+                # 外观可用时发布会话稳定身份；track_entity_id 始终保留，便于诊断
+                # 跟踪器是否换号。外观提取失败则保持原来的轨迹 ID，安全降级。
+                "id": identity.identity_id if identity is not None else track_entity_id,
                 "track_id": track_id,
                 "label": detection.label,
                 "confidence": detection.confidence,
@@ -1448,6 +1478,18 @@ class OpenVinoLocalDetector:
                     "apparent_height": round(apparent_height, 5),
                     "apparent_height_clipped": clipped,
                     "depth": "unknown",
+                    "track_entity_id": track_entity_id,
+                    "identity_scope": "session" if identity is not None else "track",
+                    "identity_method": (
+                        identity.method if identity is not None else "appearance_unavailable"
+                    ),
+                    "identity_similarity": (
+                        None
+                        if identity is None or identity.similarity is None
+                        else round(identity.similarity, 4)
+                    ),
+                    # 明确标出这不是已验证的 VRChat 玩家/Avatar 资源身份。
+                    "identity_authoritative": False,
                 },
             })
         # 只添加检测框直接支持的几何关系；不能仅凭视觉上的接近推断语义关系。
@@ -1515,7 +1557,7 @@ class OpenVinoLocalDetector:
                     remove_ids = tuple(raw.get("remove_entity_ids") or ())
                     remove_source = raw.get("remove_source")
                 else:
-                    entities = self._entities(self._decode_rows(raw), now)
+                    entities = self._entities(self._decode_rows(raw), frame, now)
                     events = ()
                     extra_uncertainties = (
                         tuple(str(item)[:160] for item in (raw.get("uncertainties") or ())[:16])

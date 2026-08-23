@@ -234,6 +234,11 @@ class BackendService:
                 min_box_ratio=self.config.vision.min_box_ratio,
                 min_box_width_ratio=self.config.vision.min_box_width_ratio,
                 min_box_height_ratio=self.config.vision.min_box_height_ratio,
+                identity_reid_enabled=self.config.vision.identity_reid_enabled,
+                identity_reid_similarity=self.config.vision.identity_reid_similarity,
+                identity_reid_margin=self.config.vision.identity_reid_margin,
+                identity_reid_retention_s=self.config.vision.identity_reid_retention_s,
+                identity_reid_max_identities=self.config.vision.identity_reid_max_identities,
                 fallback_backend=self.config.vision.fallback_backend,
                 intra_op_threads=self.config.vision.detector_threads,
             )
