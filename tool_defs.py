@@ -312,12 +312,21 @@ VRC_AUTONOMY_STATUS = {
 
 VRC_AUTONOMY_GOAL = {
     "name": "vrc_autonomy_goal",
-    "description": "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。",
+    "description": (
+        "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。"
+        "approach/follow/interact/socialize 必须同时提供最新世界快照中的精确 target_id。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "goal": {"type": "string", "minLength": 1, "maxLength": 256},
             "kind": {"type": "string", "enum": ["explore", "approach", "follow", "interact", "socialize"]},
+            "target_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 96,
+                "description": "目标实体在最新世界快照中的精确 id；定向移动和交互时必填。",
+            },
         },
         "required": ["goal"],
     },

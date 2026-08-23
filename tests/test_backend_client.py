@@ -19,6 +19,7 @@ from neko_anyadance_body.backend.client import (
     BackendClient,
     BackendRejected,
     BackendUnavailable,
+    RemoteAutonomy,
     RemoteScheduler,
     RemoteVision,
 )
@@ -27,6 +28,30 @@ from neko_anyadance_body.backend.vision import VisionObservation
 
 
 class BackendClientTests(unittest.TestCase):
+    def test_remote_autonomy_forwards_exact_target_id(self) -> None:
+        calls = []
+
+        class RecordingClient:
+            def fast_request(self, method, path, payload):
+                calls.append((method, path, payload))
+                return {"accepted": True}
+
+        result = RemoteAutonomy(RecordingClient()).goal(
+            "follow that player",
+            "follow",
+            "openvino:track:7",
+        )
+        self.assertTrue(result["accepted"])
+        self.assertEqual(calls, [(
+            "POST",
+            "/autonomy/goal",
+            {
+                "text": "follow that player",
+                "kind": "follow",
+                "target_id": "openvino:track:7",
+            },
+        )])
+
     def test_detector_interval_uses_override_only_for_resolved_accelerators(self) -> None:
         config = SimpleNamespace(
             detector_interval_ms=500,

@@ -14,12 +14,14 @@ from typing import Any, Callable, Mapping
 
 
 ALLOWED_GOAL_KINDS = frozenset({"explore", "approach", "follow", "interact", "socialize"})
+TARGETED_GOAL_KINDS = frozenset({"approach", "follow", "interact", "socialize"})
 
 
 @dataclass
 class AutonomyGoal:
     kind: str
     text: str
+    target_id: str | None
     created_at: float
 
 
@@ -79,19 +81,43 @@ class AutonomyRuntime:
                 self._disarm_locked(str(reason)[:160])
         return self.snapshot()
 
-    def submit_goal(self, text: Any, kind: Any = "explore") -> dict[str, Any]:
+    def submit_goal(
+        self,
+        text: Any,
+        kind: Any = "explore",
+        target_id: Any = None,
+    ) -> dict[str, Any]:
         normalized_text = str(text or "").strip()[:256]
         normalized_kind = str(kind or "explore").strip().lower()
+        normalized_target_id = str(target_id or "").replace("\x00", "").strip()[:96] or None
         if not normalized_text:
-            return {"accepted": False, "reason": "goal must not be empty", **self.snapshot()}
+            return {"accepted": False, **self.snapshot(), "reason": "goal must not be empty"}
         if normalized_kind not in ALLOWED_GOAL_KINDS:
-            return {"accepted": False, "reason": "unsupported autonomy goal kind", **self.snapshot()}
+            return {
+                "accepted": False,
+                **self.snapshot(),
+                "reason": "unsupported autonomy goal kind",
+            }
+        # 接近、跟随和交互会驱动 avatar，不能靠“person”等标签模糊选择。
+        # 调用方必须从最新世界快照里显式锁定一个实体，避免海报、镜像或旁人被
+        # 高置信度检测框误选后触发移动。
+        if normalized_kind in TARGETED_GOAL_KINDS and normalized_target_id is None:
+            return {
+                "accepted": False,
+                **self.snapshot(),
+                "reason": "target_id is required for targeted autonomy goals",
+            }
         with self._lock:
             self._refresh_locked()
             if self._state != "armed":
                 result = {"accepted": False, "reason": self._reason, **self.snapshot()}
                 return result
-            self._goal = AutonomyGoal(normalized_kind, normalized_text, self._clock())
+            self._goal = AutonomyGoal(
+                normalized_kind,
+                normalized_text,
+                normalized_target_id,
+                self._clock(),
+            )
             self._reason = "goal_accepted_pending_perception"
             return {"accepted": True, "reason": None, **self.snapshot()}
 
@@ -166,6 +192,7 @@ class AutonomyRuntime:
                 "goal": None if self._goal is None else {
                     "kind": self._goal.kind,
                     "text": self._goal.text,
+                    "target_id": self._goal.target_id,
                     "age_seconds": round(max(0.0, now - self._goal.created_at), 2),
                 },
                 "capabilities": {
@@ -181,4 +208,4 @@ class AutonomyRuntime:
         return result
 
 
-__all__ = ["AutonomyRuntime", "ALLOWED_GOAL_KINDS"]
+__all__ = ["AutonomyRuntime", "ALLOWED_GOAL_KINDS", "TARGETED_GOAL_KINDS"]

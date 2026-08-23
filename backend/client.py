@@ -639,9 +639,17 @@ class RemoteAutonomy:
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}
 
-    def goal(self, text: str, kind: str = "explore") -> dict[str, Any]:
+    def goal(
+        self,
+        text: str,
+        kind: str = "explore",
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            return _control_request(self.client, "POST", "/autonomy/goal", {"text": text, "kind": kind})
+            payload = {"text": text, "kind": kind}
+            if target_id:
+                payload["target_id"] = target_id
+            return _control_request(self.client, "POST", "/autonomy/goal", payload)
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}
 

@@ -1678,14 +1678,30 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         return Ok(await asyncio.to_thread(self._backend_client.autonomy.snapshot))
 
     @llm_tool(**VRC_AUTONOMY_GOAL)
-    async def vrc_autonomy_goal(self, *, goal: Any = "", text: Any = None, kind: Any = "explore", **_: Any):
+    async def vrc_autonomy_goal(
+        self,
+        *,
+        goal: Any = "",
+        text: Any = None,
+        kind: Any = "explore",
+        target_id: Any = None,
+        **_: Any,
+    ):
         normalized_text = str(goal if text is None else text or "").replace("\x00", "").strip()
         if not normalized_text or len(normalized_text) > 256:
             return Ok({"accepted": False, "reason": "text must be between 1 and 256 characters"})
         normalized_kind = _enum("kind", kind, ("explore", "approach", "follow", "interact", "socialize"))
+        normalized_target_id = str(target_id or "").replace("\x00", "").strip()
+        if len(normalized_target_id) > 96:
+            return Ok({"accepted": False, "reason": "target_id must not exceed 96 characters"})
         if not self._backend_client:
             return Ok({"accepted": False, "reason": "backend is not initialized"})
-        return Ok(await asyncio.to_thread(self._backend_client.autonomy.goal, normalized_text, normalized_kind))
+        return Ok(await asyncio.to_thread(
+            self._backend_client.autonomy.goal,
+            normalized_text,
+            normalized_kind,
+            normalized_target_id or None,
+        ))
 
     @llm_tool(**VRC_AUTONOMY_STOP)
     async def vrc_autonomy_stop(self, *, reason: Any = "autonomy_stop", **_: Any):

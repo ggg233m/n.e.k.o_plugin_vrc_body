@@ -306,6 +306,7 @@ class BackendService:
             send_turn=self._navigator_send_turn,
             release_inputs=self._navigator_release_inputs,
             motion_provider=self._navigator_motion_feedback,
+            turn_state_provider=self._navigator_turn_state,
         )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
@@ -674,7 +675,12 @@ class BackendService:
     def autonomy_disarm(self, reason: Any = "manual_disarm") -> dict[str, Any]:
         return {"accepted": True, **self.autonomy.disarm(str(reason or "manual_disarm"))}
 
-    def autonomy_goal(self, text: Any, kind: Any = "explore") -> dict[str, Any]:
+    def autonomy_goal(
+        self,
+        text: Any,
+        kind: Any = "explore",
+        target_id: Any = None,
+    ) -> dict[str, Any]:
         normalized_kind = str(kind or "explore").strip().lower()
         if normalized_kind in {"approach", "follow", "interact", "socialize"}:
             vision = self.vision.snapshot().get("vision") or {}
@@ -685,7 +691,7 @@ class BackendService:
                     "reason": "semantic vision is degraded; only safe exploration is allowed",
                     **self.autonomy.snapshot(),
                 }
-        return self.autonomy.submit_goal(text, kind)
+        return self.autonomy.submit_goal(text, kind, target_id)
 
     def autonomy_stop(self, reason: Any = "autonomy_stop") -> dict[str, Any]:
         return {"accepted": True, **self.autonomy.stop(str(reason or "autonomy_stop"))}
@@ -1161,6 +1167,17 @@ class BackendService:
         if osc is None:
             return {"available": False, "reason": "osc_unavailable"}
         return osc.motion_feedback()
+
+    def _navigator_turn_state(self) -> dict[str, Any]:
+        """给导航器返回虚拟 HMD 转向是否仍在执行或收尾。"""
+        scheduler = self.scheduler
+        if scheduler is None:
+            return {"available": False, "turning": False}
+        snapshot = scheduler.snapshot()
+        heading = snapshot.get("heading") if isinstance(snapshot, Mapping) else None
+        if not isinstance(heading, Mapping):
+            return {"available": False, "turning": False}
+        return {"available": True, **dict(heading)}
 
     def send_avatar_parameter(self, name: str, value: Any) -> tuple[bool, str | None]:
         if self.osc is None:

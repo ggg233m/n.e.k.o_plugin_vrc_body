@@ -99,7 +99,9 @@ class AutonomyAndWorldTests(unittest.TestCase):
             session_ttl_s=600.0,
         )
         self.assertTrue(runtime.arm()["armed"])
-        self.assertTrue(runtime.submit_goal("walk to the person", "approach")["accepted"])
+        self.assertTrue(runtime.submit_goal(
+            "walk to the person", "approach", "vision:person:1"
+        )["accepted"])
 
         def world(available: bool, revision: int) -> dict:
             return {"available": available, "entities": [], "events": [],
@@ -120,6 +122,29 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertTrue(recovered["armed"])
         self.assertIsNotNone(recovered["goal"])
 
+    def test_targeted_goal_requires_and_preserves_exact_entity_id(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+
+        missing = runtime.submit_goal("walk to the person", "approach")
+        self.assertFalse(missing["accepted"])
+        self.assertEqual(
+            missing["reason"],
+            "target_id is required for targeted autonomy goals",
+        )
+
+        accepted = runtime.submit_goal(
+            "walk to the person",
+            "approach",
+            "vision:person:7",
+        )
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["goal"]["target_id"], "vision:person:7")
+
     def test_degraded_does_not_resurrect_a_disarmed_session(self) -> None:
         """恢复边不能把已经 disarm 的会话弄活。
 
@@ -135,7 +160,7 @@ class AutonomyAndWorldTests(unittest.TestCase):
             session_ttl_s=600.0,
         )
         runtime.arm()
-        runtime.submit_goal("walk to the person", "approach")
+        runtime.submit_goal("walk to the person", "approach", "vision:person:1")
         runtime.disarm("manual_disarm")
         self.assertIsNone(runtime.snapshot()["goal"])
 

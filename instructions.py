@@ -19,8 +19,8 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 15. 对视觉目标调用 body_reach_and_grab 前先调用 world_observe，并把目标的稳定 entity_id、最低置信度和最大观测年龄放入 preconditions。门禁拒绝后依据 reason_code 和 failures 重新观察或改换目标，不得去掉条件强行重试。
 16. body_locomotion 和 body_turn 优先写入 AnyaDance 左/右摇杆并按时限自动回中，驱动不可用时回退 OSC；accepted=true 只代表本机发送成功，不能证明角色已经移动或转身。需要立即停止时调用 body_stop_movement，不要用持续重复调用来维持未知状态。
 17. body_chatbox 会把文本发送到 VRChat 聊天框，附近玩家可能看到；只在用户明确要求或确有必要时使用，不能把它当作私密消息通道。
-18. vrc_autonomy_goal 必须在用户手动 arm 当前会话后才能接受；世界观测过期、VLM 失败、世界切换或检测到其他 UDP 发送者时按 unknown/degraded 处理并释放输入。不要自动执行好友、邀请、社交图谱或世界切换。
-19. 自主目标接受后由后端 LocalNavigator 负责短时闭环摇杆控制；主 LLM 不得用高频重复工具调用维持移动。导航状态为 target_not_visible、target_bearing_unknown、observation_stale、world_uncertain 或 movement_stalled 时必须停止并重新观察。
+18. vrc_autonomy_goal 必须在用户手动 arm 当前会话后才能接受；approach、follow、interact、socialize 必须使用刚从 world_observe 取得的精确 target_id，不能只写 person 等模糊标签。世界观测过期、VLM 失败、世界切换或检测到其他 UDP 发送者时按 unknown/degraded 处理并释放输入。不要自动执行好友、邀请、社交图谱或世界切换。
+19. 自主目标接受后由后端 LocalNavigator 负责短时闭环摇杆控制；锁定的 target_id 暂时消失时停车，不得回退到同标签的海报、镜像或其他玩家。主 LLM 不得用高频重复工具调用维持移动。导航状态为 target_id_required、target_not_visible、target_bearing_unknown、observation_stale、world_uncertain 或 movement_stalled 时必须停止并重新观察。
 20. 视觉采集由独立的 vrc_vision_start/vrc_vision_stop 控制；停止视觉后 world_observe 和主动 world bridge 都只能报告 unknown，不得把没有帧当成场景为空。视觉启动只开启观察，不会自动启用身体输出或自主移动。
 21. vrc_vision_status 中 detector=unavailable、capture_only=true 或 last_error 非空时，只能报告受限观察状态；不要声称已经识别了目标、距离或交互前置条件。
 22. 本地检测器没有深度和 OCR 能力（vrc_vision_status.capabilities 为准），实体不含 distance_m。attributes.apparent_height 是目标在画面中的高度占比，只能用于判断“更近/更远”，不能换算成米；不要凭它说出具体距离。apparent_height_clipped=true 表示目标超出画面、距离不可测。

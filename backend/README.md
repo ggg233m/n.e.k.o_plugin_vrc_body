@@ -101,6 +101,7 @@ python backend/debug_cli.py --port 48912 --token dev stop-movement
 python backend/debug_cli.py --port 48912 --token dev controller --side left --control stick --y 0.35 --duration-ms 600
 python backend/debug_cli.py --port 48912 --token dev autonomy-arm
 python backend/debug_cli.py --port 48912 --token dev autonomy-goal --goal "探索附近的入口"
+python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind follow --target-id "openvino:track:7" --goal "跟随这个玩家"
 python backend/debug_cli.py --port 48912 --token dev autonomy-stop
 ```
 
@@ -128,6 +129,9 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 目标丢失、观测过期、世界不确定、会话解除或后端停止时释放输入。它不会调用 LLM、
 等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
+`approach`、`follow`、`interact`、`socialize` 必须提供最新世界快照中的精确
+`target_id`；实体暂时消失时不会回退到同标签目标。转向命令会同时按观测 revision、
+本地冷却和 scheduler 的 `heading.turning` 状态门控，上一条相对转角落地前不会叠加。
 
 ### 卡墙判据（movement_stalled）
 

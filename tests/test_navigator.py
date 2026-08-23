@@ -22,8 +22,15 @@ class NavigatorTests(unittest.TestCase):
         }
         self.goal = {
             "state": "armed",
-            "goal": {"kind": "approach", "text": "approach the door", "age_seconds": 1.0},
+            "goal": {
+                "kind": "approach",
+                "text": "approach the door",
+                "target_id": "vision:door:1",
+                "age_seconds": 1.0,
+            },
         }
+        self.now = [100.0]
+        self.turn_state = {"available": True, "turning": False}
         self.sent: list[tuple[str, float, float, int]] = []
         self.turns: list[float] = []
         self.released: list[str] = []
@@ -33,6 +40,8 @@ class NavigatorTests(unittest.TestCase):
             send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
             send_turn=lambda delta: self.turns.append(delta) or True,
             release_inputs=lambda side: self.released.append(side),
+            turn_state_provider=lambda: self.turn_state,
+            clock=lambda: self.now[0],
         )
 
     def test_centered_target_emits_bounded_forward_pulse(self) -> None:
@@ -94,6 +103,7 @@ class NavigatorTests(unittest.TestCase):
 
         # 新观测到了才允许再转一次——去重压的是重复，不是转向本身。
         self.world["status"]["revision"] = 4
+        self.now[0] += 0.21
         self.assertEqual(self.navigator.tick().state, "turn")
         self.assertEqual(len(self.turns), 2)
         self.assertEqual(self.navigator.snapshot()["turn"]["last_revision"], 4)
@@ -120,7 +130,7 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(len(rejected), 3)
         self.assertIsNone(navigator.snapshot()["turn"]["last_revision"])
 
-    def test_unversioned_world_still_turns_every_tick(self) -> None:
+    def test_unversioned_world_still_turns_after_each_cooldown(self) -> None:
         # 不发 revision 的世界源，观测之间无从区分。此时按 revision 去重会把
         # 所有观测认成同一次，转向永远只发一条——「一条都不转」比「多转几度」
         # 坏得多。
@@ -128,7 +138,47 @@ class NavigatorTests(unittest.TestCase):
         self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
         for _ in range(4):
             self.assertEqual(self.navigator.tick().state, "turn")
+            self.now[0] += 0.21
         self.assertEqual(len(self.turns), 4)
+
+    def test_new_observation_waits_until_scheduler_turn_finishes(self) -> None:
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
+        self.navigator.tick()
+        self.assertEqual(len(self.turns), 1)
+
+        # 即使新视觉帧已经到达，HMD 仍在执行上一条相对转角时也不能叠加。
+        self.turn_state["turning"] = True
+        self.world["status"]["revision"] = 4
+        self.now[0] += 0.30
+        self.navigator.tick()
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(
+            self.navigator.snapshot()["turn"]["settling_suppressed_count"],
+            1,
+        )
+
+        self.turn_state["turning"] = False
+        self.navigator.tick()
+        self.assertEqual(len(self.turns), 2)
+        self.assertEqual(self.navigator.snapshot()["turn"]["last_revision"], 4)
+
+    def test_submit_race_is_covered_by_turn_cooldown(self) -> None:
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
+        self.navigator.tick()
+        self.world["status"]["revision"] = 4
+
+        # scheduler 还没来得及把 turning 置为 true 时，本地冷却负责挡住竞态窗口。
+        self.now[0] += 0.10
+        self.navigator.tick()
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(
+            self.navigator.snapshot()["turn"]["cooldown_suppressed_count"],
+            1,
+        )
+
+        self.now[0] += 0.11
+        self.navigator.tick()
+        self.assertEqual(len(self.turns), 2)
 
     def test_unknown_or_stale_world_releases_active_axis(self) -> None:
         self.navigator.tick()
@@ -238,6 +288,26 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.released, [])
 
+    def test_targeted_goal_without_id_is_rejected_by_navigation_guard(self) -> None:
+        self.goal["goal"].pop("target_id")
+        decision = self.navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "target_id_required")
+        self.assertEqual(self.sent, [])
+
+    def test_explicit_target_never_falls_back_to_similar_entity(self) -> None:
+        self.world["entities"] = [{
+            "id": "vision:door:2",
+            "label": "door",
+            "confidence": 0.99,
+            "visible": True,
+            "attributes": {"bearing_deg": 0.0, "distance_m": 2.0},
+        }]
+        decision = self.navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "target_not_visible")
+        self.assertEqual(self.sent, [])
+
     def test_approach_never_emits_a_command_below_vrchat_deadzone(self) -> None:
         """越接近目标，前进轴越小——小到 VRChat 直接忽略，人就停在原地。
 
@@ -290,6 +360,8 @@ class NavigatorTests(unittest.TestCase):
     def test_config_rejects_unbounded_speed(self) -> None:
         with self.assertRaises(ValueError):
             NavigatorConfig(max_forward_axis=0.9)
+        with self.assertRaises(ValueError):
+            NavigatorConfig(turn_cooldown_s=3.0)
 
     def test_config_rejects_minimum_throttle_above_maximum(self) -> None:
         # 下限高于上限时 _clamp 会静默返回上限，把「最小油门」变成「全速」。
@@ -315,7 +387,12 @@ class NavigatorStallTests(unittest.TestCase):
         }
         self.goal = {
             "state": "armed",
-            "goal": {"kind": "approach", "text": "walk to the person", "age_seconds": 1.0},
+            "goal": {
+                "kind": "approach",
+                "text": "walk to the person",
+                "target_id": "vision:person:1",
+                "age_seconds": 1.0,
+            },
         }
         self.motion: dict[str, object] = {"available": True, "horizontal_speed_mps": 0.9}
         self.sent: list[tuple[str, float, float, int]] = []
@@ -366,7 +443,10 @@ class NavigatorStallTests(unittest.TestCase):
             navigator.tick()
         self.assertTrue(navigator.snapshot()["stall"]["stalled"])
 
-        self.goal["goal"] = {"kind": "follow", "text": "follow the person", "age_seconds": 0.5}
+        self.goal["goal"] = {
+            "kind": "follow", "text": "follow the person",
+            "target_id": "vision:person:1", "age_seconds": 0.5,
+        }
         self.motion["horizontal_speed_mps"] = 0.9
         self.assertEqual(navigator.tick().state, "advance")
         self.assertFalse(navigator.snapshot()["stall"]["stalled"])
@@ -381,7 +461,10 @@ class NavigatorStallTests(unittest.TestCase):
         self.assertTrue(navigator.snapshot()["stall"]["stalled"])
 
         # 换目标文字（语义接近但 key 不同） → _unreachable 清空，latch 解除。
-        self.goal["goal"] = {"kind": "approach", "text": "approach person", "age_seconds": 0.5}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "approach person",
+            "target_id": "vision:person:1", "age_seconds": 0.5,
+        }
         self.motion["horizontal_speed_mps"] = 0.9
         self.assertEqual(navigator.tick().state, "advance")
 
@@ -510,7 +593,10 @@ class NavigatorStallTests(unittest.TestCase):
 
         # 换目标：_pre_tick_goal_check 清空 _unreachable，倒影重新可选。
         # 前两 tick advance（stall_ticks < threshold），第三 tick 再次 stalled。
-        self.goal["goal"] = {"kind": "follow", "text": "follow the person", "age_seconds": 0.5}
+        self.goal["goal"] = {
+            "kind": "follow", "text": "follow the person",
+            "target_id": "vision:person:1", "age_seconds": 0.5,
+        }
         d1 = navigator.tick()
         d2 = navigator.tick()
         d3 = navigator.tick()
@@ -535,7 +621,10 @@ class NavigatorStallTests(unittest.TestCase):
             "visible": True,
             "attributes": {"bearing_deg": 0.0, "apparent_height": 0.2},
         })
-        self.goal["goal"] = {"kind": "approach", "text": "walk to the person", "age_seconds": 0.1}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "walk to the person",
+            "target_id": "vision:person:2", "age_seconds": 0.1,
+        }
         self.motion["horizontal_speed_mps"] = 0.9
         decision = navigator.tick()
         self.assertEqual(decision.state, "advance")
@@ -568,7 +657,10 @@ class NavigatorStallTests(unittest.TestCase):
 
         # 换目标文字 → _unreachable 清空，实体重新可选，立刻再次触发失速，
         # 重新进入 _unreachable。
-        self.goal["goal"] = {"kind": "approach", "text": "go find the person", "age_seconds": 1.0}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "go find the person",
+            "target_id": "vision:person:1", "age_seconds": 1.0,
+        }
         for _ in range(3):
             navigator.tick()
         self.assertTrue(navigator.snapshot()["stall"]["stalled"])
@@ -576,7 +668,10 @@ class NavigatorStallTests(unittest.TestCase):
 
         # 再换回相同目标文字（age_seconds 倒退，触发 renewed 但 goal_key 未变），
         # _unreachable 不清空——latch 解开了，但实体还被记着。
-        self.goal["goal"] = {"kind": "approach", "text": "go find the person", "age_seconds": 0.5}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "go find the person",
+            "target_id": "vision:person:1", "age_seconds": 0.5,
+        }
         d = navigator.tick()
         # stall latch 解开，但 unreachable 未清，所以仍然 stop。
         self.assertEqual(d.state, "stop")
@@ -586,7 +681,10 @@ class NavigatorStallTests(unittest.TestCase):
         clock["now"] += 46.0
         self.motion["horizontal_speed_mps"] = 0.9
         # 需要再触发一次 renewed（age 继续倒退），否则 stall latch 还锁着。
-        self.goal["goal"] = {"kind": "approach", "text": "go find the person", "age_seconds": 0.1}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "go find the person",
+            "target_id": "vision:person:1", "age_seconds": 0.1,
+        }
         d2 = navigator.tick()
         self.assertEqual(d2.state, "advance")
         self.assertEqual(navigator.snapshot()["stall"]["unreachable_targets"], [])
@@ -597,7 +695,10 @@ class NavigatorStallTests(unittest.TestCase):
         for _ in range(3):
             navigator.tick()
         self.assertEqual(navigator.snapshot()["stall"]["unreachable_targets"], [])
-        self.goal["goal"] = {"kind": "approach", "text": "walk to the person", "age_seconds": 0.1}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "walk to the person",
+            "target_id": "vision:person:1", "age_seconds": 0.1,
+        }
         self.motion["horizontal_speed_mps"] = 0.9
         self.assertEqual(navigator.tick().state, "advance")
 
@@ -625,7 +726,12 @@ class NavigatorAutoRecoverTests(unittest.TestCase):
         }
         self.goal = {
             "state": "armed",
-            "goal": {"kind": "approach", "text": "walk to the person", "age_seconds": 1.0},
+            "goal": {
+                "kind": "approach",
+                "text": "walk to the person",
+                "target_id": "vision:person:1",
+                "age_seconds": 1.0,
+            },
         }
         # 畅通：全速前进，前进分量占满。
         self.motion: dict[str, object] = {
@@ -732,7 +838,10 @@ class NavigatorAutoRecoverTests(unittest.TestCase):
             navigator.tick()
         self.assertEqual(navigator.snapshot()["stall"]["recover_attempts"], 1)
 
-        self.goal["goal"] = {"kind": "approach", "text": "try the other side", "age_seconds": 1.0}
+        self.goal["goal"] = {
+            "kind": "approach", "text": "try the other side",
+            "target_id": "vision:person:1", "age_seconds": 1.0,
+        }
         navigator.tick()
         self.assertEqual(navigator.snapshot()["stall"]["recover_attempts"], 0)
 

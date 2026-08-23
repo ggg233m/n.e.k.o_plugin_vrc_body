@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .autonomy import TARGETED_GOAL_KINDS
 from .world_state import blocking_uncertainties
 
 
@@ -18,6 +19,7 @@ AxisSender = Callable[[str, float, float, int], bool]
 TurnSender = Callable[[float], bool]
 ReleaseSender = Callable[[str], None]
 SnapshotProvider = Callable[[], Mapping[str, Any]]
+TurnStateProvider = Callable[[], Mapping[str, Any]]
 
 # 目标贴到画面上下边时表观高度会饱和，无法再作为距离的单调函数。此时按一个
 # 更低的比例判定「已到达」，避免因为读数封顶而一直前进撞上对方。安全边界留在
@@ -38,6 +40,11 @@ class NavigatorConfig:
     # 留一点余量让 10 Hz 的闭环收敛。
     turn_gain: float = 0.8
     max_turn_deg: float = 45.0
+    # scheduler 接收相对转角后还要异步推进 HMD 朝向，并额外保留约 250ms 的收尾
+    # 帧。新视觉帧可能在转向落地前就到达，因此仅按 revision 去重仍会叠加多条
+    # 相对转角。状态门控负责等待真实完成；该冷却同时覆盖 submit 到 scheduler
+    # 出队之间 turning 尚未变成 true 的短暂竞态。
+    turn_cooldown_s: float = 0.20
     max_observation_age_ms: int = 2500
     min_confidence: float = 0.40
     bearing_deadband_deg: float = 8.0
@@ -117,6 +124,8 @@ class NavigatorConfig:
             raise ValueError("navigator.turn_gain must be between 0.1 and 1")
         if not 5.0 <= float(self.max_turn_deg) <= 180.0:
             raise ValueError("navigator.max_turn_deg must be between 5 and 180")
+        if not 0.0 <= float(self.turn_cooldown_s) <= 2.0:
+            raise ValueError("navigator.turn_cooldown_s must be between 0 and 2")
         if not 100 <= int(self.max_observation_age_ms) <= 5000:
             raise ValueError("navigator.max_observation_age_ms must be between 100 and 5000")
         if not 0.1 <= float(self.min_confidence) <= 1.0:
@@ -297,6 +306,7 @@ class LocalNavigator:
         send_turn: TurnSender,
         release_inputs: ReleaseSender,
         motion_provider: SnapshotProvider | None = None,
+        turn_state_provider: TurnStateProvider | None = None,
         config: NavigatorConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -309,6 +319,9 @@ class LocalNavigator:
         # 可选：VRChat 内置 Velocity 参数。没有它时导航器行为与之前完全一致，
         # 只是无法察觉卡墙——这是降级，不是故障。
         self._motion_provider = motion_provider
+        # 可选：scheduler 的 heading 状态。没有该回传时仍用本地冷却限速，
+        # 保持独立测试和第三方适配器可用。
+        self._turn_state_provider = turn_state_provider
         self._clock = clock
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -322,7 +335,7 @@ class LocalNavigator:
         self._stall_ticks = 0
         self._stall_count = 0
         self._stalled = False
-        self._stall_goal_key: tuple[str, str] | None = None
+        self._stall_goal_key: tuple[str, str, str] | None = None
         self._stall_goal_age: float | None = None
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「顶着它推了 8 tick
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
@@ -347,7 +360,10 @@ class LocalNavigator:
         # 世界我已经转过了」，是观测的属性而不是目标的属性。换目标时观测没变，
         # 照样不该再转一次。
         self._last_turn_revision: int | None = None
+        self._last_turn_sent_at: float | None = None
         self._turn_suppressed_count = 0
+        self._turn_settling_suppressed_count = 0
+        self._turn_cooldown_suppressed_count = 0
 
     def start(self) -> bool:
         with self._lock:
@@ -379,7 +395,7 @@ class LocalNavigator:
             world = self._world_provider()
             self._pre_tick_goal_check(goal_state)
             decision = self._stall_guard(self._decide(goal_state, world, now), goal_state)
-            self._apply(decision)
+            self._apply(decision, now)
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
@@ -402,7 +418,11 @@ class LocalNavigator:
         _decide 之前就可以消除这个一拍延迟。
         """
         goal = _mapping((goal_state or {}).get("goal")) or {}
-        goal_key = (str(goal.get("kind") or ""), str(goal.get("text") or ""))
+        goal_key = (
+            str(goal.get("kind") or ""),
+            str(goal.get("text") or ""),
+            str(goal.get("target_id") or ""),
+        )
         goal_age = _finite(goal.get("age_seconds"))
         with self._lock:
             previous_key = self._stall_goal_key
@@ -615,7 +635,15 @@ class LocalNavigator:
                     # sent 是正常的（tick 频率本就高于出帧频率）；两者相等则说明
                     # 去重没生效，转向正在按 tick/观测 的倍数超调。
                     "last_revision": self._last_turn_revision,
+                    "last_sent_age_ms": (
+                        None
+                        if self._last_turn_sent_at is None
+                        else round(max(0.0, now - self._last_turn_sent_at) * 1000.0, 1)
+                    ),
+                    "cooldown_ms": round(self.config.turn_cooldown_s * 1000.0, 1),
                     "suppressed_count": self._turn_suppressed_count,
+                    "settling_suppressed_count": self._turn_settling_suppressed_count,
+                    "cooldown_suppressed_count": self._turn_cooldown_suppressed_count,
                 },
                 "stall": {
                     # detectable=false 表示收不到 VRChat 内置 Velocity 参数，
@@ -678,6 +706,11 @@ class LocalNavigator:
         age_s = _finite(goal.get("age_seconds"))
         if age_s is not None and age_s > self.config.max_goal_age_s:
             return NavigationDecision("stop", "goal_expired")
+        goal_kind = str(goal.get("kind") or "").strip().lower()
+        if goal_kind in TARGETED_GOAL_KINDS and not str(goal.get("target_id") or "").strip():
+            # 运行时通常已在提交阶段拒绝；这里再守一次，避免旧客户端或直接注入的
+            # goal 绕过 API 后重新退化成按 person 标签随机选目标。
+            return NavigationDecision("stop", "target_id_required")
         if not isinstance(world, Mapping) or not bool(world.get("available")):
             return NavigationDecision("stop", "world_unknown")
         uncertainties = blocking_uncertainties(world.get("uncertainties"))
@@ -808,6 +841,10 @@ class LocalNavigator:
                 continue
             label = str(raw.get("label") or "").strip().lower()
             entity_id = str(raw.get("id") or "").strip().lower()
+            # 显式锁定后绝不回退到文字匹配。目标暂时消失应停车等待，而不是把同类
+            # 海报、镜像或另一个玩家当成原目标继续走过去。
+            if target_id and entity_id != target_id:
+                continue
             if raw.get("visible") is False:
                 continue
             # 与 _decide 里 target_id 的取法保持一致，否则记账和跳过对不上。
@@ -854,7 +891,54 @@ class LocalNavigator:
         with self._lock:
             return self._last_turn_revision == revision
 
-    def _apply(self, decision: NavigationDecision) -> None:
+    def _turn_gate_reason(self, now: float) -> str | None:
+        """判断上一条相对转向是否已经真正落地。"""
+        provider = self._turn_state_provider
+        if provider is not None:
+            try:
+                state = provider()
+            except Exception:
+                state = {}
+            if isinstance(state, Mapping) and bool(state.get("turning")):
+                return "settling"
+        with self._lock:
+            last_sent_at = self._last_turn_sent_at
+        if (
+            last_sent_at is not None
+            and now - last_sent_at < self.config.turn_cooldown_s
+        ):
+            return "cooldown"
+        return None
+
+    def _record_turn_suppressed(self, reason: str) -> None:
+        with self._lock:
+            self._turn_suppressed_count += 1
+            if reason == "settling":
+                self._turn_settling_suppressed_count += 1
+            elif reason == "cooldown":
+                self._turn_cooldown_suppressed_count += 1
+
+    def _send_gated_turn(
+        self,
+        delta_deg: float,
+        now: float,
+        *,
+        revision: int | None = None,
+    ) -> bool:
+        gate_reason = self._turn_gate_reason(now)
+        if gate_reason is not None:
+            self._record_turn_suppressed(gate_reason)
+            return False
+        if not self._send_turn(delta_deg):
+            return False
+        with self._lock:
+            self._command_count += 1
+            self._last_turn_sent_at = now
+            if revision is not None:
+                self._last_turn_revision = revision
+        return True
+
+    def _apply(self, decision: NavigationDecision, now: float) -> None:
         if decision.state == "turn":
             # 转向不占摇杆，所以不进 _active_side：它是 play space 的朝向，不是
             # 需要按住再松开的输入。但前进摇杆必须先松——边走边转会让 bearing
@@ -862,13 +946,13 @@ class LocalNavigator:
             if self._active_side is not None:
                 self._safe_release()
             if self._turn_already_sent(decision.revision):
-                with self._lock:
-                    self._turn_suppressed_count += 1
+                self._record_turn_suppressed("revision")
                 return
-            if self._send_turn(decision.turn_deg):
-                with self._lock:
-                    self._command_count += 1
-                    self._last_turn_revision = decision.revision
+            self._send_gated_turn(
+                decision.turn_deg,
+                now,
+                revision=decision.revision,
+            )
             return
         if decision.state == "advance" and decision.side:
             if self._active_side == "right":
@@ -893,6 +977,9 @@ class LocalNavigator:
                 self._send_axes("left", 0.0, decision.y, decision.pulse_ms)
             else:
                 self._safe_release()
+            # recover 决策已经在失速守卫里消耗了一次有限预算，若在这里静默抑制，
+            # 会出现“预算用掉了但实际没转”的假恢复。它由速度反馈触发且不是视觉
+            # revision 的重复命令，因此保持一次决策对应一次真实提交。
             if self._send_turn(decision.turn_deg):
                 with self._lock:
                     self._command_count += 1

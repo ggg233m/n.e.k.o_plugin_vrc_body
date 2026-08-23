@@ -184,6 +184,7 @@ def main() -> int:
     autonomy_goal = sub.add_parser("autonomy-goal")
     autonomy_goal.add_argument("--goal", required=True)
     autonomy_goal.add_argument("--kind", default="explore")
+    autonomy_goal.add_argument("--target-id", default=None)
     autonomy_stop = sub.add_parser("autonomy-stop")
     autonomy_stop.add_argument("--reason", default="autonomy_stop")
     action = sub.add_parser("action")
@@ -289,7 +290,10 @@ def main() -> int:
         elif args.command == "autonomy-disarm":
             result = request(args.host, args.port, args.token, "POST", "/autonomy/disarm", {"reason": args.reason})
         elif args.command == "autonomy-goal":
-            result = request(args.host, args.port, args.token, "POST", "/autonomy/goal", {"text": args.goal, "kind": args.kind})
+            payload = {"text": args.goal, "kind": args.kind}
+            if args.target_id:
+                payload["target_id"] = args.target_id
+            result = request(args.host, args.port, args.token, "POST", "/autonomy/goal", payload)
         elif args.command == "autonomy-stop":
             result = request(args.host, args.port, args.token, "POST", "/autonomy/stop", {"reason": args.reason})
         elif args.command == "shutdown":

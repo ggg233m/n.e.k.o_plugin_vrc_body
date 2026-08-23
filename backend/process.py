@@ -196,7 +196,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             elif self.path == "/autonomy/disarm":
                 result = self.server.service.autonomy_disarm(value.get("reason"))
             elif self.path == "/autonomy/goal":
-                result = self.server.service.autonomy_goal(value.get("text"), value.get("kind", "explore"))
+                result = self.server.service.autonomy_goal(
+                    value.get("text"),
+                    value.get("kind", "explore"),
+                    value.get("target_id"),
+                )
             elif self.path == "/autonomy/stop":
                 result = self.server.service.autonomy_stop(value.get("reason"))
             elif self.path == "/vision/start":
