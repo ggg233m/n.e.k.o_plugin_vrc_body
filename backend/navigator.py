@@ -6,12 +6,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import re
 import threading
 import time
 from typing import Any, Callable, Mapping
 
-from .autonomy import TARGETED_GOAL_KINDS
 from .world_state import blocking_uncertainties
 
 
@@ -923,10 +921,11 @@ class LocalNavigator:
         age_s = _finite(goal.get("age_seconds"))
         if age_s is not None and age_s > self.config.max_goal_age_s:
             return NavigationDecision("stop", "goal_expired")
-        goal_kind = str(goal.get("kind") or "").strip().lower()
-        if goal_kind in TARGETED_GOAL_KINDS and not str(goal.get("target_id") or "").strip():
-            # 运行时通常已在提交阶段拒绝；这里再守一次，避免旧客户端或直接注入的
-            # goal 绕过 API 后重新退化成按 person 标签随机选目标。
+        target_id = str(goal.get("target_id") or "").strip()
+        if not target_id:
+            # 目标选择属于 LLM/规划器：本地环只执行已经锁定的实体。explore 可以
+            # 在上层作为观察请求存在，但没有精确 ID 时不得按文字、标签或置信度
+            # 自行挑门、海报或玩家，更不能在目标丢失后静默换人。
             return NavigationDecision("stop", "target_id_required")
         if not isinstance(world, Mapping) or not bool(world.get("available")):
             return NavigationDecision("stop", "world_unknown")
@@ -1132,18 +1131,17 @@ class LocalNavigator:
     ) -> Mapping[str, Any] | None:
         if not isinstance(raw_entities, (list, tuple)):
             return None
-        text = str(goal.get("text") or "").strip().lower()
         target_id = str(goal.get("target_id") or "").strip().lower()
-        tokens = [token for token in re.split(r"[^\w\u3400-\u9fff-]+", text) if len(token) >= 2]
-        candidates: list[tuple[int, float, Mapping[str, Any]]] = []
+        if not target_id:
+            return None
+        candidates: list[tuple[float, Mapping[str, Any]]] = []
         for raw in raw_entities:
             if not isinstance(raw, Mapping):
                 continue
-            label = str(raw.get("label") or "").strip().lower()
             entity_id = str(raw.get("id") or "").strip().lower()
-            # 显式锁定后绝不回退到文字匹配。目标暂时消失应停车等待，而不是把同类
-            # 海报、镜像或另一个玩家当成原目标继续走过去。
-            if target_id and entity_id != target_id:
+            # 这里只做精确 ID 查找。目标暂时消失应停车等待，而不是根据 goal 文本、
+            # label 或检测置信度把海报、镜像、门或另一个玩家选成新目标。
+            if entity_id != target_id:
                 continue
             if raw.get("visible") is False:
                 continue
@@ -1151,22 +1149,10 @@ class LocalNavigator:
             if skip_ids and str(raw.get("id") or "")[:96] in skip_ids:
                 continue
             confidence = _finite(raw.get("confidence")) or 0.0
-            score = 0
-            if target_id and entity_id == target_id:
-                score += 100
-            if entity_id and entity_id in text:
-                score += 20
-            if label and label in text:
-                score += 15
-            score += sum(2 for token in tokens if token in label or token in entity_id)
-            if score <= 0 and goal.get("kind") == "explore" and label in {"door", "portal", "entrance", "path", "入口", "门", "传送门"}:
-                score = 1
-            if score > 0:
-                candidates.append((score, confidence, raw))
+            candidates.append((confidence, raw))
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return candidates[0][2]
+        return max(candidates, key=lambda item: item[0])[1]
 
     def _turn_already_sent(self, revision: int) -> bool:
         """同一次观测只转一次。

@@ -100,7 +100,7 @@ python backend/debug_cli.py --port 48912 --token dev chatbox --text '你好'
 python backend/debug_cli.py --port 48912 --token dev stop-movement
 python backend/debug_cli.py --port 48912 --token dev controller --side left --control stick --y 0.35 --duration-ms 600
 python backend/debug_cli.py --port 48912 --token dev autonomy-arm
-python backend/debug_cli.py --port 48912 --token dev autonomy-goal --goal "探索附近的入口"
+python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind explore --target-id "vision:door:1" --goal "探索这个入口"
 python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind follow --target-id "avatar:session:abcd1234:7" --goal "跟随这个玩家"
 python backend/debug_cli.py --port 48912 --token dev autonomy-stop
 ```
@@ -130,8 +130,9 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 停止时释放输入。它不会调用 LLM、
 等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
-`approach`、`follow`、`interact`、`socialize` 必须提供最新世界快照中的精确
-`target_id`；实体暂时消失时不会回退到同标签目标。目标方位在同侧做 EMA 平滑，明显跨过
+任何朝视觉实体移动的目标都必须提供由 LLM 从最新世界快照中选出的精确
+`target_id`；无 ID 的探索请求只停留在观察/规划阶段。本地导航不按 goal 文本、实体标签或
+置信度自动选目标，实体暂时消失时也不会回退到同标签目标。目标方位在同侧做 EMA 平滑，明显跨过
 中心时立即采用新方向。生产转向发送器把每个新 revision 的比例修正换成“当前 yaw + 修正”
 的绝对目标，上一段尚未结束也能安全重定向；同一 revision 仍只发送一次。
 

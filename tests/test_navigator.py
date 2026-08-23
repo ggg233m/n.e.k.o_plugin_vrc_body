@@ -360,6 +360,61 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(decision.reason, "target_id_required")
         self.assertEqual(self.sent, [])
 
+    def test_explore_without_id_never_auto_selects_a_visible_entity(self) -> None:
+        """探索文本不能绕过 LLM 的实体选择，自动锁定门或高置信目标。"""
+
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "探索附近的入口",
+            "age_seconds": 1.0,
+        }
+        self.world["entities"] = [
+            {
+                "id": "vision:door:2",
+                "label": "entrance",
+                "confidence": 0.99,
+                "visible": True,
+                "attributes": {"bearing_deg": 0.0, "distance_m": 2.0},
+            },
+            {
+                "id": "vision:person:9",
+                "label": "person",
+                "confidence": 1.0,
+                "visible": True,
+                "attributes": {"bearing_deg": 0.0, "distance_m": 1.0},
+            },
+        ]
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "target_id_required")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.turns, [])
+
+    def test_explore_with_explicit_id_tracks_only_that_entity(self) -> None:
+        """goal 文本提到其他实体时，也只能执行 LLM 给出的 target_id。"""
+
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "查看 vision:door:2 附近，然后去入口",
+            "target_id": "vision:door:1",
+            "age_seconds": 1.0,
+        }
+        self.world["entities"].append({
+            "id": "vision:door:2",
+            "label": "entrance",
+            "confidence": 1.0,
+            "visible": True,
+            "attributes": {"bearing_deg": 30.0, "distance_m": 1.0},
+        })
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "advance")
+        self.assertEqual(decision.target_id, "vision:door:1")
+        self.assertEqual(self.turns, [])
+
     def test_explicit_target_never_falls_back_to_similar_entity(self) -> None:
         self.world["entities"] = [{
             "id": "vision:door:2",
