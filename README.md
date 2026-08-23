@@ -79,7 +79,7 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_awareness.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
 
-> ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。内置参数仍然只有在 Avatar 的参数列表里存在时才会驱动并回传；名字对不上或 Avatar 没配就一个都收不到。此时 `motion.available=false` 并给出 `reason`（`no_feedback_received` / `feedback_stale` / `velocity_parameters_absent`），**不会退化成“速度为零”**。新鲜度按链路年龄判定而不是取值年龄：VRChat 参数是变化驱动的，站着不动时速度恒为 0 就不再有新消息，取值年龄单独报告为 `value_age_ms`。
+> ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。`VelocityX/Z` 只有角色移动时才回传，因此每条速度记录只是短时样本；静止沉默是正常现象，旧的 0 或移动速度超过时限后都会变成 `motion.available=false` / `velocity_feedback_quiet`，不会被伪装成当前零速度。导航器只接受本次前进命令之后的新样本，并在起步阶段保留 450 ms 宽限。
 
 `motion` 除标量速度外还导出 `velocity_x` / `velocity_z` 原始轴值，以及按水平模长归一的
 `forward_ratio` / `slip_ratio`。这两个比值用于区分「畅通」与「撞墙」：VRChat 的角色控制器
@@ -152,11 +152,13 @@ DXcam/WinRT/MSS 句柄并解除自主导航，`POST /vision/start` 会创建全�
 授权后，以约 10 Hz 根据新鲜视觉实体生成受限的短摇杆脉冲；目标不可见、方位或距离
 未知、观测过期或世界带不确定性时立即释放输入。主 LLM 只负责目标和行为选择，
 AnyaDance 调度器仍以 120 Hz 发送最新姿态与控制器状态。定向目标必须携带最新世界
-快照中的精确 `target_id`。本地 person 检测会把易变的 `openvino:track:N` 映射为当前
+快照中的精确 `target_id`。方位角和接近度在本地做轻量时序平滑，单帧低置信或漏检最多
+宽限 300 ms；世界不确定、整体观测过期或宽限到期仍会硬停车。本地 person 检测会把易变的 `openvino:track:N` 映射为当前
 后端会话内稳定的 `avatar:session:<token>:<N>`，目标短暂离开视野并被分配新轨迹后，
 可通过检测框外观重新绑定；原轨迹 ID 保留在实体的 `attributes.track_entity_id` 中
-用于诊断。锁定目标消失时导航器停车，不会回退选择同标签的海报、镜像或其他玩家。
-相对转向还会等待调度器的虚拟 HMD 转向和收尾帧完成，避免新检测帧过早叠加转角。
+用于诊断。锁定目标消失时不会回退选择同标签的海报、镜像或其他玩家。每个新视觉 revision
+都把比例转向修正换算为“当前实际 yaw + 修正”的绝对目标，可以在上一段平滑转身仍执行时
+连续重定向，不再等待收尾，也不会把相对角度叠加成超调。
 
 这个稳定 ID 不是 VRChat 的 `usr_`/`avtr_`，后端重启后会变化，也无法可靠区分使用
 完全相同 Avatar 的玩家或镜中像；有歧义时系统宁可分配新 ID，也不把两个可见目标合并。
@@ -170,6 +172,11 @@ AnyaDance 调度器仍以 120 Hz 发送最新姿态与控制器状态。定向�
 当前仓库不接入世界日志解析器或 Contact 总线，也不安装动作生成模型；自主运行时只
 管理手动授权、世界新鲜度和安全释放，不自动执行好友、邀请或世界切换。模型通过独立
 detector 或 sidecar 接口接入，并由配置显式启用，不把未启用功能的状态塞进插件主流程。
+
+`world_memory.persist_world` 只保存可跨进程复用的世界事实。逐帧检测轨迹、
+`avatar:session:*`、synthetic 实体以及显式标记 `attributes.memory_scope="observation"`
+的外部观测不会写盘；旧版本已经保存的此类实体会在下次启动时自动清除。持久化负载
+使用稳定格式，内容没有变化时不会随 10 Hz 感知循环重复写文件。
 
 ## N.E.K.O VMC 待机中转
 

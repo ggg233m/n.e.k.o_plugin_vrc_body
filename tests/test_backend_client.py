@@ -267,6 +267,25 @@ class BackendClientTests(unittest.TestCase):
         self.assertFalse(turn_ok)
         self.assertIn("scheduler", turn_reason or "")
 
+    def test_navigator_turn_uses_current_yaw_correction_semantics(self) -> None:
+        # scheduler 的 delta 会叠加到旧 target；导航闭环必须基于当前实际 yaw 生成
+        # 新的绝对目标，才能在上一段尚未结束时连续修正而不超调。
+        class HeadingScheduler:
+            def __init__(self) -> None:
+                self.params: list[dict] = []
+
+            def submit(self, kind, params):
+                self.assert_kind = kind
+                self.params.append(dict(params))
+                return {"accepted": True}
+
+        service = BackendService({"input": {"primary": "anyadance"}}, Path.cwd())
+        scheduler = HeadingScheduler()
+        service.scheduler = scheduler  # type: ignore[assignment]
+        self.assertTrue(service._navigator_send_turn(20.0))
+        self.assertEqual(scheduler.params, [{"correction_deg": 20.0}])
+        self.assertTrue(service.navigator.snapshot()["turn"]["continuous_retarget"])
+
     def test_osc_batch_is_bounded_and_records_dispatch_latency(self) -> None:
         service = BackendService({}, Path.cwd())
 

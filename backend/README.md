@@ -125,13 +125,15 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 适合高频循环；高频调用可以使用常驻 JSON-lines 控制会话：
 
 自主目标被接受后，`LocalNavigator` 以约 10 Hz 运行在后端本地。它只接受新鲜、可见、
-置信度足够且带方位提示的世界实体；每次只发送 220 ms 左右的受限摇杆脉冲，并在
-目标丢失、观测过期、世界不确定、会话解除或后端停止时释放输入。它不会调用 LLM、
+置信度足够且带方位提示的世界实体；每次只发送 220 ms 左右的受限摇杆脉冲。单帧低置信
+或漏检最多复用最后可靠观测 300 ms，宽限到期、观测过期、世界不确定、会话解除或后端
+停止时释放输入。它不会调用 LLM、
 等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
 `approach`、`follow`、`interact`、`socialize` 必须提供最新世界快照中的精确
-`target_id`；实体暂时消失时不会回退到同标签目标。转向命令会同时按观测 revision、
-本地冷却和 scheduler 的 `heading.turning` 状态门控，上一条相对转角落地前不会叠加。
+`target_id`；实体暂时消失时不会回退到同标签目标。目标方位在同侧做 EMA 平滑，明显跨过
+中心时立即采用新方向。生产转向发送器把每个新 revision 的比例修正换成“当前 yaw + 修正”
+的绝对目标，上一段尚未结束也能安全重定向；同一 revision 仍只发送一次。
 
 OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会话级外观重识别。
 对外实体 ID 是 `avatar:session:<session_token>:<number>`；底层易变的
@@ -145,21 +147,22 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是唯一能区分
 「正在前进」和「顶着墙推摇杆」的回传。`VrchatOscBridge.motion_feedback()` 把这些内置
 参数汇总成 `body_awareness.vrchat_osc.motion`（`GET /snapshot` 的 `vrchat_osc.motion`
-也带同一份读数），导航器每 tick 采样一次：连续 `stall_ticks` 次发出前进指令但实测
+也带同一份读数）。`VelocityX/Z` 只有角色移动时才回传，所以导航器只接受本次前进命令
+之后的新样本，并给起步保留 450 ms；静止或停包会显示 `velocity_feedback_quiet`，不会把
+历史 0 当成当前速度。获得可用的新样本后，连续 `stall_ticks` 次发出前进指令但实测
 水平速度低于 `stall_speed_mps` 时停车，`navigation.last_decision.reason` 变成
 `movement_stalled`。水平速度用 `hypot(VelocityX, VelocityZ)`，不含 `VelocityY`——否则
 「贴着墙往下滑」会被读成「正在前进」。
 
-判定会闩锁：停下之后速度当然还是 0，靠速度自己解不开。闩锁只在换目标或重新提交
-目标时解除，导航器不会自作主张侧移绕行——绕行还是放弃由 LLM 决定。
-`navigation.stall.detectable=false` 表示这台机器收不到内置参数，「卡墙」这件事根本
+判定会闩锁：停下之后速度未知，靠速度自己解不开。导航器会先按有限预算尝试后退/沿
+滑行方向转身，预算用尽才把当前实体记为暂时不可达并交还高层决策。
+`navigation.stall.detectable=false` 表示当前没有可用于这次前进命令的新速度样本，「卡墙」这件事根本
 无法被观测到，**不是「没卡」**；此时整个判据失效并放行，不会把「读不到」当成
 「速度为零」而废掉导航。
 
-> ⚠️ `stall_speed_mps = 0.15` 和 `stall_ticks = 8` 仍是估算值，需要**真机会话校准**。
-> 已实测确认（2026-08-23）：内置参数名有效，`VelocityX/Z` 是 avatar 本地系，该 avatar
-> 跑满速度为 `2.6667 m/s`。但 `max_forward_axis = 0.28` 对应的实际速度还没单独标定过，
-> 单元测试全绿不能说明这两个默认值是对的。
+> ⚠️ 已实测确认（2026-08-23）：内置参数名有效，`VelocityX/Z` 是 avatar 本地系，且
+> 只在角色移动时回传。该 avatar 跑满速度为 `2.6667 m/s`，`max_forward_axis = 0.28`
+> 实测约为 `0.8 m/s`；不同 Avatar/世界的阈值仍需真机会话复核。
 >
 > 另外 `motion` 现在还导出 `velocity_x` / `velocity_z` 与 `forward_ratio` / `slip_ratio`。
 > 比起只看 `horizontal_speed_mps` 是否塌到 0，这两个比值能区分「正面墙」和「斜撞墙正在
@@ -257,6 +260,12 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 track 直接延续身份，新 track 只有在外观相似度越过阈值且明显优于第二候选时才复用旧
 身份；同一帧不允许两个轨迹占用同一身份。外观不可提取、功能关闭或类别不是 Avatar
 时，会安全降级为上述 `{source}:track:{track_id}`。
+
+视觉轨迹和会话身份只参与当前进程的导航，不进入 `world_memory.json`。外部 detector
+发布逐帧观测时应在实体 attributes 中设置 `memory_scope="observation"`；状态层也会
+兼容识别旧版 `*:track:*`、`avatar:session:*` 和已知本地检测来源。`GET /perception`
+的 `memory.transient_entities_persisted=false` 表示此边界生效，
+`memory.persistence_write_count` 可用于确认没有随每个视觉帧重复写盘。
 
 直接接入外部世界日志前必须做字段翻译：日志适配器要把事件映射为 `type`、稳定的
 `target_id`、canonical `source`，并在 `player_left` 同批提供 `remove_entity_ids`；

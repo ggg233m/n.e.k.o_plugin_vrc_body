@@ -299,18 +299,27 @@ class OscMotionFeedbackTests(unittest.TestCase):
         motion = self.bridge.motion_feedback()
         self.assertAlmostEqual(motion["forward_ratio"], 1.0, places=3)
 
-    def test_standing_still_stays_available_because_freshness_follows_the_link(self) -> None:
-        # VRChat 的参数是变化驱动的：站着不动时速度恒为 0，就不会再有新消息。
-        # 若按取值年龄判新鲜度，站住不动几秒后速度反而变成「不可知」——正好把
-        # 唯一能确认「我没在动」的时刻丢掉。
+    def test_fresh_vertical_velocity_does_not_refresh_old_horizontal_motion(self) -> None:
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 1.0)
+        self.now[0] += 3.0
+        self.wall[0] += 3.0
+        self._feed("VelocityY", -2.0)
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
+
+    def test_old_zero_is_not_kept_alive_by_other_osc_traffic(self) -> None:
+        # 实机确认 VelocityX/Z 只在角色移动时回传。其他参数还在更新也不能给旧的
+        # 0 速度续命，否则下一次前进会把「上一次静止」误判成「这次撞墙」。
         self._feed("VelocityX", 0.0)
         self._feed("VelocityZ", 0.0)
         self.now[0] += 5.0
         self.wall[0] += 5.0
         self.bridge._last_receive_at_monotonic = self.now[0]  # 心跳仍在，只是速度没变
         motion = self.bridge.motion_feedback()
-        self.assertTrue(motion["available"], motion["reason"])
-        self.assertEqual(motion["horizontal_speed_mps"], 0.0)
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
         self.assertGreaterEqual(motion["value_age_ms"], 5000.0)
         self.assertLess(motion["link_age_ms"], 1.0)
 
@@ -322,28 +331,19 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.now[0] += 30.0
         motion = self.bridge.motion_feedback(max_age_ms=2000)
         self.assertFalse(motion["available"])
-        self.assertEqual(motion["reason"], "feedback_stale")
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
         self.assertIsNone(motion["speed_mps"])
 
-    def test_silence_after_a_resting_reading_stays_available_indefinitely(self) -> None:
-        """站着不动时链路必然安静，不能因此判不可用。
-
-        VRChat 的参数是变化驱动的：站住之后速度恒为 0，一个包都不会再来，链路
-        年龄和取值年龄一起无上限地涨。此前用 2 秒链路年龄上限判 stale，等于把
-        「站着没动」这个唯一能确认静止的读数，在静止满 2 秒后必然丢掉——而导航器
-        的卡墙判据正是靠它区分「顶着墙」和「在走」。
-
-        判据换成看最后那个取值与沉默是否矛盾：静止 + 沉默不矛盾，保持可用。
-        """
+    def test_silence_after_a_resting_reading_becomes_unavailable(self) -> None:
+        """静止沉默是正常现象，但旧读数不能冒充当前实时速度。"""
         self._feed("VelocityX", 0.0)
         self._feed("VelocityZ", 0.0)
         self.now[0] += 600.0
         self.wall[0] += 600.0
         motion = self.bridge.motion_feedback(max_age_ms=2000)
-        self.assertTrue(motion["available"], motion["reason"])
-        self.assertEqual(motion["horizontal_speed_mps"], 0.0)
-        # 可用，但面板要能看出这是靠静止取值兜住的沉默，不是活跃回传。
-        self.assertEqual(motion["reason"], "link_quiet_at_rest")
+        self.assertFalse(motion["available"])
+        self.assertIsNone(motion["horizontal_speed_mps"])
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
         self.assertGreaterEqual(motion["link_age_ms"], 600_000.0)
 
     def test_pushing_into_a_wall_counts_as_moving_so_silence_is_still_stale(self) -> None:
@@ -358,11 +358,10 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.now[0] += 30.0
         motion = self.bridge.motion_feedback(max_age_ms=2000)
         self.assertFalse(motion["available"])
-        self.assertEqual(motion["reason"], "feedback_stale")
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
 
-    def test_quiet_link_at_rest_is_not_flagged_while_feedback_is_fresh(self) -> None:
-        # link_quiet_at_rest 只描述「沉默但可信」。回传还新鲜时不该带这个标记，
-        # 否则面板无法区分活跃回传和靠静止兜住的沉默。
+    def test_fresh_zero_sample_is_temporarily_available(self) -> None:
+        # 即使实机通常不发静止 0，刚收到的样本仍是有效事实；只是不能永久缓存。
         self._feed("VelocityX", 0.0)
         self._feed("VelocityZ", 0.0)
         motion = self.bridge.motion_feedback(max_age_ms=2000)

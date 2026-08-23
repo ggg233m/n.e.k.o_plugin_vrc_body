@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
@@ -24,6 +27,121 @@ from neko_anyadance_body.backend.world_state import (
 
 
 class WorldStateStoreTests(unittest.TestCase):
+    def test_transient_visual_entities_are_not_persisted_or_rewritten_per_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "world.json"
+            now = [1.0]
+            store = WorldStateStore(
+                clock=lambda: now[0],
+                persistence_path=path,
+                persist_world=True,
+                persist_players=False,
+            )
+            store.ingest(
+                entities=[
+                    {"id": "world:cup", "label": "cup", "source": "vision"},
+                    {
+                        "id": "avatar:session:test:1",
+                        "label": "person",
+                        "source": "openvino",
+                        "attributes": {
+                            "identity_scope": "session",
+                            "track_entity_id": "openvino:track:1",
+                        },
+                    },
+                    {"id": "openvino:track:2", "label": "person", "source": "openvino"},
+                    {"id": "onnxruntime:track:3", "label": "person", "source": "onnxruntime"},
+                    {"id": "synthetic:person:test", "label": "person", "source": "fixture"},
+                    {"id": "openvino:person:4", "label": "person", "source": "openvino"},
+                    {
+                        "id": "custom:observation:5",
+                        "label": "person",
+                        "source": "external",
+                        "attributes": {"memory_scope": "observation"},
+                    },
+                ],
+                events=[
+                    {
+                        "type": "door_opened",
+                        "target_id": "world:cup",
+                        "source": "world_sim",
+                    },
+                    {
+                        "type": "avatar_seen",
+                        "target_id": "avatar:session:test:1",
+                        "source": "openvino",
+                    },
+                ],
+                source="vision",
+            )
+            self.assertEqual(store.snapshot()["memory"]["persistence_write_count"], 1)
+
+            # 只有逐帧视觉内容和单调时钟发生变化时，稳定持久化负载不变，不应
+            # 再 replace 文件。
+            now[0] = 2.0
+            store.ingest(
+                entities=[{
+                    "id": "avatar:session:test:2",
+                    "label": "person",
+                    "source": "openvino",
+                    "attributes": {"memory_scope": "observation"},
+                }],
+                source="openvino",
+            )
+            self.assertEqual(store.snapshot()["memory"]["persistence_write_count"], 1)
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([item["id"] for item in payload["entities"]], ["world:cup"])
+            self.assertEqual([item["type"] for item in payload["events"]], ["door_opened"])
+            self.assertFalse({"age_ms", "ttl_ms", "visible"} & payload["entities"][0].keys())
+            self.assertNotIn("age_ms", payload["events"][0])
+
+            loaded = WorldStateStore(
+                clock=lambda: now[0],
+                persistence_path=path,
+                persist_world=True,
+                persist_players=False,
+            ).snapshot()
+            self.assertEqual([item["id"] for item in loaded["entities"]], ["world:cup"])
+            self.assertEqual([item["type"] for item in loaded["events"]], ["door_opened"])
+            self.assertFalse(loaded["memory"]["transient_entities_persisted"])
+
+    def test_persist_players_does_not_persist_session_avatar_or_visual_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "world.json"
+            store = WorldStateStore(
+                clock=lambda: 1.0,
+                persistence_path=path,
+                persist_world=True,
+                persist_players=True,
+            )
+            store.ingest(
+                entities=[
+                    {
+                        "id": "vrchat:player:usr_1",
+                        "label": "player",
+                        "source": "vrchat_log",
+                    },
+                    {
+                        "id": "avatar:session:test:1",
+                        "label": "person",
+                        "source": "openvino",
+                    },
+                    {
+                        "id": "openvino:track:1",
+                        "label": "person",
+                        "source": "openvino",
+                    },
+                ],
+                source="vision",
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["id"] for item in payload["entities"]],
+                ["vrchat:player:usr_1"],
+            )
+
     def test_blocking_uncertainties_filters_capability_boundaries_only(self) -> None:
         self.assertEqual(
             blocking_uncertainties(["depth_unavailable", "ocr_unavailable", "opencv_hog_person_only"]),

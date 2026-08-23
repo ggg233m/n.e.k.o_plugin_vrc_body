@@ -74,7 +74,8 @@ parameter_cache_size = 256
 # 前四个是本插件自己驱动的动作状态参数；后六个是 VRChat 内置 Avatar 参数，
 # 用于确认角色是否真的在移动（`accepted=true` 只代表本机发送成功）。
 #
-# ✅ 内置参数名已实机验证（2026-08-23），VelocityX/Z 为 avatar 本地系。但只有在
+# ✅ 内置参数名已实机验证（2026-08-23），VelocityX/Z 为 avatar 本地系，且只有角色
+# 移动时才回传。旧速度不会永久缓存为当前状态；静止时缺包属于正常现象。但只有在
 # avatar 的参数列表里存在时 VRChat 才会驱动并回传。收不到时
 # body_awareness.vrchat_osc.motion 报 available=false，
 # 不会把「没数据」当成「速度为零」。
@@ -95,6 +96,8 @@ manual_arm = true
 session_ttl_minutes = 30
 
 [world_memory]
+# 只保存可复用的 world:* 等世界事实。检测轨迹、avatar:session:*、synthetic
+# 实体和 memory_scope="observation" 的外部观测始终只存在于当前会话。
 persist_world = true
 persist_players = false
 

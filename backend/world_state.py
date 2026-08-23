@@ -19,6 +19,41 @@ from typing import Any, Iterable, Mapping
 VRCHAT_LOG_SOURCE = "vrchat_log"
 VRCHAT_PLAYER_ID_PREFIX = "vrchat:player:"
 
+# 这些来源发布的是逐帧视觉假设，不是可以跨后端进程复用的世界事实。显式的
+# memory_scope 是新适配器首选；来源表与 ID 规则用于清理旧版本已经写盘的数据。
+_TRANSIENT_VISION_SOURCES = frozenset({
+    "openvino",
+    "onnxruntime",
+    "opencv_hog",
+    "yolo",
+    "local_detector",
+})
+_TRANSIENT_MEMORY_SCOPES = frozenset({
+    "observation",
+    "frame",
+    "track",
+    "session",
+    "transient",
+})
+
+
+def _transient_entity_id(value: Any) -> bool:
+    entity_id = _text(value, limit=96).lower()
+    return (
+        entity_id.startswith("avatar:session:")
+        or entity_id.startswith("synthetic:")
+        or ":track:" in entity_id
+    )
+
+
+def _transient_source(value: Any) -> bool:
+    source = _text(value, limit=48).lower()
+    return (
+        source in _TRANSIENT_VISION_SOURCES
+        or source.startswith("synthetic")
+        or source.endswith("_test")
+    )
+
 # 这些不确定性描述的是感知能力的永久边界，而不是当前观测不可信。检测器正常
 # 工作时它们会一直存在，所以不能让它们阻断移动：否则检测器越正常，导航越死。
 # 白名单之外的一切（世界切换、观测过期、并发发送者等）仍然阻断——未知的新
@@ -305,6 +340,10 @@ class WorldStateStore:
         self._persistence_path = Path(persistence_path) if persistence_path else None
         self._persist_world = bool(persist_world and self._persistence_path)
         self._persist_players = bool(persist_players)
+        # 缓存稳定序列化结果。视觉 worker 可能 10 Hz 调用 ingest；如果真正可持久
+        # 化的事实没有变化，就不应每帧 replace 同一个文件。
+        self._last_persistence_serialized: str | None = None
+        self._persistence_write_count = 0
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._entities: dict[str, WorldEntity] = {}
@@ -328,6 +367,17 @@ class WorldStateStore:
             self._load_persisted()
 
     def _persist_allowed_entity(self, entity: WorldEntity) -> bool:
+        attributes = entity.attributes or {}
+        memory_scope = _text(attributes.get("memory_scope"), limit=32).lower()
+        identity_scope = _text(attributes.get("identity_scope"), limit=32).lower()
+        if (
+            _transient_entity_id(entity.id)
+            or memory_scope in _TRANSIENT_MEMORY_SCOPES
+            or identity_scope in {"track", "session"}
+            or bool(attributes.get("track_entity_id"))
+            or any(_transient_source(source) for source in entity.source)
+        ):
+            return False
         if self._persist_players:
             return True
         return not entity.id.startswith(VRCHAT_PLAYER_ID_PREFIX) and not any(
@@ -336,6 +386,10 @@ class WorldStateStore:
         )
 
     def _persist_allowed_event(self, event: WorldEvent) -> bool:
+        if _transient_entity_id(event.target_id) or any(
+            _transient_source(source) for source in event.source
+        ):
+            return False
         if self._persist_players:
             return True
         kind = event.kind.lower()
@@ -349,21 +403,37 @@ class WorldStateStore:
             return
         try:
             now = self._clock()
-            entities = [
-                item.to_dict(now=now)
-                for item in self._entities.values()
-                if self._persist_allowed_entity(item)
-            ][: self.max_entities]
-            events = [
-                item.to_dict(now=now)
-                for item in self._events
-                if self._persist_allowed_event(item)
-            ][: self.event_history_size]
+            entities = []
+            for item in self._entities.values():
+                if not self._persist_allowed_entity(item):
+                    continue
+                serialized = item.to_dict(now=now)
+                # age/visible 是当前进程单调时钟的派生值，既不能跨进程复用，也会
+                # 让内容哈希每帧变化。加载时仍按既有策略给事实新的短期 TTL。
+                for key in ("age_ms", "ttl_ms", "visible"):
+                    serialized.pop(key, None)
+                entities.append(serialized)
+                if len(entities) >= self.max_entities:
+                    break
+            events = []
+            for item in self._events:
+                if not self._persist_allowed_event(item):
+                    continue
+                serialized_event = item.to_dict(now=now)
+                serialized_event.pop("age_ms", None)
+                events.append(serialized_event)
+                if len(events) >= self.event_history_size:
+                    break
             payload = {"version": 1, "entities": entities, "events": events}
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if encoded == self._last_persistence_serialized:
+                return
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            temporary.write_text(encoded, encoding="utf-8")
             temporary.replace(path)
+            self._last_persistence_serialized = encoded
+            self._persistence_write_count += 1
         except Exception:
             # Persistence is advisory and must never interfere with control or
             # perception updates.
@@ -388,6 +458,9 @@ class WorldStateStore:
                 event = WorldEvent.from_mapping(raw, now=now, default_source="world_memory")
                 if self._persist_allowed_event(event):
                     self._events.append(event)
+            # 旧版本可能包含视觉轨迹、会话 ID 和每帧变化的 age_ms。加载后立刻按
+            # 新规则重写一次，不必等下一帧才能清除磁盘上的脏数据。
+            self._persist_locked()
         except Exception:
             return
 
@@ -868,6 +941,8 @@ class WorldStateStore:
                 "memory": {
                     "persist_world": self._persist_world,
                     "persist_players": self._persist_players,
+                    "transient_entities_persisted": False,
+                    "persistence_write_count": self._persistence_write_count,
                     "raw_frames_persisted": False,
                     "chat_persisted": False,
                 },

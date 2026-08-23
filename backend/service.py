@@ -312,6 +312,7 @@ class BackendService:
             release_inputs=self._navigator_release_inputs,
             motion_provider=self._navigator_motion_feedback,
             turn_state_provider=self._navigator_turn_state,
+            turn_retarget_supported=True,
         )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
@@ -1154,7 +1155,10 @@ class BackendService:
         scheduler = self.scheduler
         if scheduler is None:
             return False
-        result = scheduler.submit("turn", {"delta_deg": float(delta_deg)})
+        # scheduler 的 delta_deg 是相对上一个 target 累加，上一段尚未结束时重发会
+        # 超调。correction_deg 则由 scheduler 基于未归一化的当前实际 yaw 计算目标，
+        # 既能连续重定向，也不会在 0/360° 边界误转一整圈。
+        result = scheduler.submit("turn", {"correction_deg": float(delta_deg)})
         return bool(result.get("accepted"))
 
     def _navigator_release_inputs(self, side: str = "all") -> None:
@@ -1178,7 +1182,10 @@ class BackendService:
         scheduler = self.scheduler
         if scheduler is None:
             return {"available": False, "turning": False}
-        snapshot = scheduler.snapshot()
+        try:
+            snapshot = scheduler.snapshot()
+        except Exception:
+            return {"available": False, "turning": False}
         heading = snapshot.get("heading") if isinstance(snapshot, Mapping) else None
         if not isinstance(heading, Mapping):
             return {"available": False, "turning": False}

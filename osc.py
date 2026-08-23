@@ -726,6 +726,7 @@ class VrchatOscBridge:
 
     def _handle_message(self, address: str, arguments: tuple[Any, ...]) -> None:
         now_wall = self._wall_clock()
+        now_mono = self._clock()
         if address == "/avatar/change" and arguments:
             avatar_id = str(arguments[0])[:256]
             with self._lock:
@@ -739,7 +740,12 @@ class VrchatOscBridge:
             name = address[len(prefix):]
             if not name or len(name) > 256:
                 return
-            record = {"value": self._safe_value(arguments[0]), "received_at_unix": now_wall}
+            record = {
+                "value": self._safe_value(arguments[0]),
+                "received_at_unix": now_wall,
+                # 控制判据必须用单调时钟；系统时间校准不能让旧速度突然变新。
+                "received_at_monotonic": now_mono,
+            }
             with self._lock:
                 self._parameters.pop(name, None)
                 self._parameters[name] = record
@@ -849,19 +855,11 @@ class VrchatOscBridge:
            不过内置参数只有在 avatar 的参数列表里存在时才会被驱动并回传；换一个没配
            的 avatar 就一个都收不到。此时返回 ``available=false`` 并给出 ``expected``，
            绝不猜一个速度出来。
-        2. **静止时的沉默要靠取值自证，链路年龄单独判不出来。** VRChat 的参数是
-           变化驱动的：站着不动时速度恒为 0，于是**一个包都不会来**，链路年龄和
-           取值年龄一起变老。所以「安静」和「断了」无法只靠入站流量区分，得看
-           最后那个取值跟沉默是否自相矛盾：
-
-           - 最后报的是 ~0 速度 → 沉默正是「没变化」的证据，可用性保持，速度
-             继续读 0。这是站住不动时唯一正确的读法，也是唯一能确认「我没在动」
-             的时刻，不能丢。
-           - 最后报的是在动 → 沉默与之矛盾：真在移动就会持续有速度更新。持续
-             沉默说明链路是在运动中断掉的，此时把最后已知速度当现值就是撒谎，
-             按 ``feedback_stale`` 判不可用。
-
-           取值年龄始终单独报告为 ``value_age_ms``，不参与可用性判定。
+        2. **VelocityX/Z 只在角色移动时回传。** 因此速度记录是一次短命的运动
+           样本，不是可以永久保持的状态。静止时没有新包完全正常，但旧的 0 或旧的
+           移动速度都不能冒充当前速度；样本超过 ``max_age_ms`` 后统一返回
+           ``available=false``。导航器会结合「前进命令何时开始」判断样本是不是本次
+           命令产生的，静止时的沉默不会被当成反馈故障或卡墙。
         """
         try:
             limit_ms = max(0, int(max_age_ms))
@@ -911,6 +909,7 @@ class VrchatOscBridge:
 
         axes: dict[str, float] = {}
         newest_received: float | None = None
+        newest_received_mono: float | None = None
         for name in _VELOCITY_AXIS_PARAMETERS:
             record = records.get(name)
             if record is None:
@@ -919,12 +918,23 @@ class VrchatOscBridge:
             if value is None:
                 continue
             axes[name] = value
-            received = _numeric(record.get("received_at_unix"))
-            if received is not None and (newest_received is None or received > newest_received):
-                newest_received = received
+            # 水平移动反馈只能由 X/Z 刷新；跳跃产生的新 VelocityY 不能给一条旧的
+            # 水平速度续命，否则贴墙下落会被误读成仍在向前走。
+            if name in {"VelocityX", "VelocityZ"}:
+                received = _numeric(record.get("received_at_unix"))
+                if received is not None and (newest_received is None or received > newest_received):
+                    newest_received = received
+                received_mono = _numeric(record.get("received_at_monotonic"))
+                if received_mono is not None and (
+                    newest_received_mono is None or received_mono > newest_received_mono
+                ):
+                    newest_received_mono = received_mono
         if not axes:
             # 参数名可能不对，也可能 avatar 根本没配。两者都不是「速度为零」。
             result["reason"] = "velocity_parameters_absent"
+            return result
+        if "VelocityX" not in axes and "VelocityZ" not in axes:
+            result["reason"] = "horizontal_velocity_parameters_absent"
             return result
 
         vx = axes.get("VelocityX", 0.0)
@@ -933,18 +943,21 @@ class VrchatOscBridge:
         horizontal = math.hypot(vx, vz)
         speed = math.sqrt(horizontal * horizontal + vy * vy)
 
-        # 链路安静下来时，唯一能判断「安静」还是「断了」的证据就是最后那个取值：
-        # 静止时没有变化所以本就该没有包，在动时却必须持续有速度更新。用平移速度
-        # 判定，不看 AngularY——原地匀速转身时 AngularY 恒定同样不发包，而那时
-        # 平移速度确实是 0，把它算成「在动」会白丢一次有效读数。
-        if limit_ms and link_age_ms > limit_ms and speed > _RESTING_SPEED_MPS:
-            result["reason"] = "feedback_stale"
+        if newest_received_mono is not None:
+            value_age_ms = max(0.0, (now_mono - newest_received_mono) * 1000.0)
+        else:
+            # 兼容进程内可能由旧测试/适配器注入的历史记录。
+            value_age_ms = (
+                None if newest_received is None else max(0.0, (now_wall - newest_received) * 1000.0)
+            )
+        result["value_age_ms"] = None if value_age_ms is None else round(value_age_ms, 1)
+        # VelocityX/Z 只在移动时回传，所以任何旧速度（包括旧的 0）都只是历史样本。
+        # 不能用其他 OSC 参数的活跃度替它续命，也不能把静止沉默伪造成实时零速度。
+        if value_age_ms is None or (limit_ms and value_age_ms > limit_ms):
+            result["reason"] = "velocity_feedback_quiet"
             return result
 
         result["available"] = True
-        result["value_age_ms"] = (
-            None if newest_received is None else round(max(0.0, (now_wall - newest_received) * 1000.0), 1)
-        )
         result["horizontal_speed_mps"] = round(horizontal, 4)
         result["vertical_speed_mps"] = round(vy, 4)
         result["speed_mps"] = round(speed, 4)
@@ -956,10 +969,6 @@ class VrchatOscBridge:
         if horizontal > _RESTING_SPEED_MPS:
             result["forward_ratio"] = round(vz / horizontal, 4)
             result["slip_ratio"] = round(vx / horizontal, 4)
-        if limit_ms and link_age_ms > limit_ms:
-            # 可用，但要让面板看出这是「靠静止取值兜住的沉默」而不是活跃回传。
-            result["reason"] = "link_quiet_at_rest"
-
         angular = _numeric((records.get("AngularY") or {}).get("value"))
         if angular is not None:
             result["angular_speed"] = round(angular, 4)

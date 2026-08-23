@@ -814,7 +814,12 @@ class BodyScheduler:
         if params.get("halt"):
             self._halt_yaw()
             return
-        if "yaw_deg" in params:
+        if "correction_deg" in params:
+            # 导航闭环的连续重定向语义：相对“当前实际 yaw”修正，而不是相对上一条
+            # 尚未完成的 target 累加。必须在持有未归一化内部角度的调度器里计算；
+            # snapshot 的 0..360° 会丢掉圈数，跨零点时可能误转整整一圈。
+            target = self._yaw_rad + math.radians(float(params["correction_deg"]))
+        elif "yaw_deg" in params:
             target = math.radians(float(params["yaw_deg"]))
         else:
             target = self._yaw_target_rad + math.radians(float(params.get("delta_deg", 0.0)))

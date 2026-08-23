@@ -1490,6 +1490,8 @@ class OpenVinoLocalDetector:
                     ),
                     # 明确标出这不是已验证的 VRChat 玩家/Avatar 资源身份。
                     "identity_authoritative": False,
+                    # 检测框只属于当前观测，不得进入跨进程 world_memory。
+                    "memory_scope": "observation",
                 },
             })
         # 只添加检测框直接支持的几何关系；不能仅凭视觉上的接近推断语义关系。

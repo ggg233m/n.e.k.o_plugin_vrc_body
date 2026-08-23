@@ -180,6 +180,63 @@ class NavigatorTests(unittest.TestCase):
         self.navigator.tick()
         self.assertEqual(len(self.turns), 2)
 
+    def test_absolute_turn_sender_can_retarget_while_previous_turn_is_running(self) -> None:
+        # 生产发送器把修正换成基于当前 yaw 的绝对目标，因此新视觉帧可以直接更新
+        # 尚未完成的转向，不必等 scheduler 收尾数百毫秒。
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
+            release_inputs=lambda side: None,
+            turn_state_provider=lambda: self.turn_state,
+            turn_retarget_supported=True,
+            clock=lambda: self.now[0],
+        )
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 30.0
+        navigator.tick()
+        self.turn_state["turning"] = True
+        self.world["status"]["revision"] = 4
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 20.0
+        self.now[0] += 0.05
+        navigator.tick()
+        self.assertEqual(len(self.turns), 2)
+        self.assertTrue(navigator.snapshot()["turn"]["continuous_retarget"])
+
+    def test_target_filter_smooths_same_side_bearing_jitter(self) -> None:
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 40.0
+        first = self.navigator.tick()
+        self.world["status"]["revision"] = 4
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 20.0
+        self.now[0] += 0.21
+        second = self.navigator.tick()
+        self.assertEqual(first.bearing_deg, 40.0)
+        self.assertGreater(second.bearing_deg or 0.0, 20.0)
+        self.assertLess(second.bearing_deg or 0.0, 40.0)
+
+    def test_brief_target_dropout_uses_last_reliable_observation_then_stops(self) -> None:
+        self.assertEqual(self.navigator.tick().state, "advance")
+        self.world["entities"] = []
+        self.world["status"]["revision"] = 4
+        self.now[0] += 0.10
+        grace = self.navigator.tick()
+        self.assertEqual(grace.state, "advance")
+        self.assertEqual(grace.observation_mode, "grace")
+
+        self.now[0] += 0.30
+        stopped = self.navigator.tick()
+        self.assertEqual(stopped.state, "stop")
+        self.assertEqual(stopped.reason, "target_not_visible")
+
+    def test_world_uncertainty_never_uses_target_grace(self) -> None:
+        self.navigator.tick()
+        self.world["entities"] = []
+        self.world["uncertainties"] = ["capture_failed"]
+        self.now[0] += 0.05
+        decision = self.navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "world_uncertain")
+
     def test_unknown_or_stale_world_releases_active_axis(self) -> None:
         self.navigator.tick()
         self.assertEqual(self.navigator.snapshot()["active_side"], "left")
@@ -395,6 +452,7 @@ class NavigatorStallTests(unittest.TestCase):
             },
         }
         self.motion: dict[str, object] = {"available": True, "horizontal_speed_mps": 0.9}
+        self.now = [100.0]
         self.sent: list[tuple[str, float, float, int]] = []
         self.turns: list[float] = []
         self.released: list[str] = []
@@ -411,6 +469,7 @@ class NavigatorStallTests(unittest.TestCase):
             release_inputs=lambda side: self.released.append(side),
             motion_provider=(lambda: self.motion) if motion_provider is ... else motion_provider,
             config=NavigatorConfig(stall_ticks=3, **overrides),
+            clock=lambda: self.now[0],
         )
 
     def test_moving_forward_never_trips_the_stall_guard(self) -> None:
@@ -484,6 +543,57 @@ class NavigatorStallTests(unittest.TestCase):
         for _ in range(10):
             self.assertEqual(navigator.tick().state, "advance")
         self.assertFalse(navigator.snapshot()["stall"]["detectable"])
+
+    def test_velocity_silence_is_expected_while_idle_and_never_means_stalled(self) -> None:
+        # VelocityX/Z 只有角色移动时才回传。前进刚开始和静止时缺包都是正常的；
+        # 即使宽限后仍没有样本，也只能标记为不可检测，不能凭空判撞墙。
+        self.motion = {"available": False, "reason": "velocity_feedback_quiet"}
+        navigator = self._navigator(motion_start_grace_s=0.45)
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.snapshot()["stall"]["feedback_state"], "awaiting_motion")
+
+        self.now[0] += 0.60
+        for _ in range(10):
+            self.assertEqual(navigator.tick().state, "advance")
+            self.now[0] += 0.10
+        stall = navigator.snapshot()["stall"]
+        self.assertEqual(stall["feedback_state"], "unavailable_while_commanding")
+        self.assertFalse(stall["detectable"])
+        self.assertFalse(stall["stalled"])
+
+    def test_cached_velocity_from_before_forward_command_is_ignored(self) -> None:
+        # motion_feedback 可能还缓存着上一次移动的值。样本年龄大于本次命令年龄，
+        # 无论它是不是 0，都不属于这次动作，不能参与失速计数。
+        self.motion = {
+            "available": True,
+            "horizontal_speed_mps": 0.0,
+            "value_age_ms": 5000.0,
+        }
+        navigator = self._navigator(motion_start_grace_s=0.45)
+        navigator.tick()
+        self.now[0] += 0.60
+        for _ in range(5):
+            self.assertEqual(navigator.tick().state, "advance")
+            self.now[0] += 0.10
+        stall = navigator.snapshot()["stall"]
+        self.assertEqual(stall["feedback_state"], "sample_predates_command")
+        self.assertEqual(stall["consecutive_ticks"], 0)
+
+    def test_fresh_post_command_velocity_can_still_confirm_a_stall(self) -> None:
+        self.motion = {
+            "available": True,
+            "horizontal_speed_mps": 0.0,
+            "value_age_ms": 5000.0,
+        }
+        navigator = self._navigator(motion_start_grace_s=0.45)
+        navigator.tick()
+        self.now[0] += 0.50
+        self.motion["value_age_ms"] = 0.0
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        decision = navigator.tick()
+        self.assertEqual(decision.state, "stop")
+        self.assertEqual(decision.reason, "movement_stalled")
 
     def test_turning_in_place_does_not_reset_the_stall_counter(self) -> None:
         # 顶着墙时导航器会在 advance/turn 之间抖动。若 turn 清零计数，卡墙就

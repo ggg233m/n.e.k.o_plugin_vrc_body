@@ -47,6 +47,11 @@ class NavigatorConfig:
     turn_cooldown_s: float = 0.20
     max_observation_age_ms: int = 2500
     min_confidence: float = 0.40
+    # 检测置信度偶发掉一帧或短暂漏检时，继续使用最后一条可靠观测一小段时间。
+    # 只覆盖视觉抖动；世界不确定、观测整体过期和目标切换仍会立即停车。
+    target_grace_s: float = 0.30
+    bearing_ema_alpha: float = 0.65
+    range_ema_alpha: float = 0.50
     bearing_deadband_deg: float = 8.0
     target_distance_m: float = 1.25
     # 表观高度（归一化检测框高度）是二维检测器唯一能实测的接近度指标。它随
@@ -73,6 +78,9 @@ class NavigatorConfig:
     # 0.13 能动但仍低于 stall_speed_mps，所以取 0.15：既过死区，也保证真的在走
     # 时速度高于失速阈值，两个判据不互相矛盾。
     min_forward_axis: float = 0.15
+    # VelocityX/Z 只有角色实际移动时才回传。发出第一条前进命令后先给角色控制器
+    # 一段起步时间；在此之前没有新速度样本是正常现象，不能计作卡墙。
+    motion_start_grace_s: float = 0.45
     # 失速过的目标要记多久「够不着」。闩锁只停住当前这次尝试，解不开「换个目标
     # 再选中同一个实体」的死循环：镜面倒影是画面里置信度最高的 person，重提目标
     # 后 _select_target 照样挑它，于是又是 8 tick 顶墙。
@@ -130,6 +138,12 @@ class NavigatorConfig:
             raise ValueError("navigator.max_observation_age_ms must be between 100 and 5000")
         if not 0.1 <= float(self.min_confidence) <= 1.0:
             raise ValueError("navigator.min_confidence must be between 0.1 and 1")
+        if not 0.0 <= float(self.target_grace_s) <= 1.0:
+            raise ValueError("navigator.target_grace_s must be between 0 and 1")
+        if not 0.05 <= float(self.bearing_ema_alpha) <= 1.0:
+            raise ValueError("navigator.bearing_ema_alpha must be between 0.05 and 1")
+        if not 0.05 <= float(self.range_ema_alpha) <= 1.0:
+            raise ValueError("navigator.range_ema_alpha must be between 0.05 and 1")
         if not 1.0 <= float(self.bearing_deadband_deg) <= 30.0:
             raise ValueError("navigator.bearing_deadband_deg must be between 1 and 30")
         if not 0.25 <= float(self.target_distance_m) <= 5.0:
@@ -146,6 +160,8 @@ class NavigatorConfig:
             raise ValueError("navigator.min_forward_axis must be between 0.05 and 0.6")
         if float(self.min_forward_axis) > float(self.max_forward_axis):
             raise ValueError("navigator.min_forward_axis must not exceed max_forward_axis")
+        if not 0.0 <= float(self.motion_start_grace_s) <= 3.0:
+            raise ValueError("navigator.motion_start_grace_s must be between 0 and 3")
         if not 0.0 <= float(self.unreachable_ttl_s) <= 600.0:
             raise ValueError("navigator.unreachable_ttl_s must be between 0 and 600")
         if not 0.0 <= float(self.slip_forward_ratio) <= 1.0:
@@ -174,6 +190,7 @@ class NavigationDecision:
     revision: int = 0
     observed_age_ms: float | None = None
     turn_deg: float = 0.0
+    observation_mode: str = "live"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -189,7 +206,21 @@ class NavigationDecision:
             "revision": self.revision,
             "observed_age_ms": None if self.observed_age_ms is None else round(self.observed_age_ms, 1),
             "turn_deg": round(self.turn_deg, 2),
+            "observation_mode": self.observation_mode,
         }
+
+
+@dataclass(frozen=True)
+class _TargetObservation:
+    """同一个目标最近一条经过平滑的可靠视觉观测。"""
+
+    target_id: str
+    bearing_deg: float
+    distance_m: float | None
+    apparent_height: float | None
+    apparent_clipped: bool
+    revision: int
+    observed_at: float
 
 
 def _finite(value: Any) -> float | None:
@@ -307,6 +338,7 @@ class LocalNavigator:
         release_inputs: ReleaseSender,
         motion_provider: SnapshotProvider | None = None,
         turn_state_provider: TurnStateProvider | None = None,
+        turn_retarget_supported: bool = False,
         config: NavigatorConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -322,6 +354,9 @@ class LocalNavigator:
         # 可选：scheduler 的 heading 状态。没有该回传时仍用本地冷却限速，
         # 保持独立测试和第三方适配器可用。
         self._turn_state_provider = turn_state_provider
+        # true 表示发送器会把每次相对修正换算成「基于当前朝向的绝对目标」。这种
+        # 发送器可以在上一段平滑转向仍在执行时安全重定向，不会把相对角度累加超调。
+        self._turn_retarget_supported = bool(turn_retarget_supported)
         self._clock = clock
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -341,6 +376,9 @@ class LocalNavigator:
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
         self._last_motion: dict[str, Any] | None = None
+        self._forward_started_at: float | None = None
+        self._motion_feedback_usable = False
+        self._motion_feedback_state = "idle_not_required"
         # 最近一次前进轴指令有没有真的发出去。None = 还没发过。
         # 由 _apply 写、_stall_guard 读，所以读到的是「上一 tick 那条」——这正是
         # 失速判据要的：这一 tick 的速度反映的就是上一条指令的结果。
@@ -364,6 +402,8 @@ class LocalNavigator:
         self._turn_suppressed_count = 0
         self._turn_settling_suppressed_count = 0
         self._turn_cooldown_suppressed_count = 0
+        self._target_observation: _TargetObservation | None = None
+        self._target_grace_count = 0
 
     def start(self) -> bool:
         with self._lock:
@@ -394,7 +434,7 @@ class LocalNavigator:
             goal_state = self._goal_provider()
             world = self._world_provider()
             self._pre_tick_goal_check(goal_state)
-            decision = self._stall_guard(self._decide(goal_state, world, now), goal_state)
+            decision = self._stall_guard(self._decide(goal_state, world, now), goal_state, now)
             self._apply(decision, now)
             with self._lock:
                 self._last_error = None
@@ -442,6 +482,7 @@ class LocalNavigator:
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
                 if goal_key != previous_key:
                     self._unreachable.clear()
+                    self._target_observation = None
             self._stall_goal_key = goal_key
             self._stall_goal_age = goal_age
 
@@ -449,6 +490,7 @@ class LocalNavigator:
         self,
         decision: NavigationDecision,
         goal_state: Mapping[str, Any] | None,
+        now: float,
     ) -> NavigationDecision:
         """把「命令发了但人没动」变成一次显式停车。
 
@@ -499,14 +541,56 @@ class LocalNavigator:
             # axis_send_ok is None（从没发过）时正常走速度判据——这是首次。
             with self._lock:
                 self._stall_ticks = 0
+                self._motion_feedback_usable = False
+                self._motion_feedback_state = "command_rejected"
             return decision
 
         motion = self._sample_motion()
         if motion is None or not motion.get("available"):
+            with self._lock:
+                started_at = self._forward_started_at
+                self._motion_feedback_usable = False
+                if started_at is None:
+                    self._motion_feedback_state = "awaiting_first_command"
+                elif now - started_at < self.config.motion_start_grace_s:
+                    self._motion_feedback_state = "awaiting_motion"
+                else:
+                    # VelocityX/Z 在静止时本就不回传。超过宽限仍没有样本只能说明
+                    # 「本次移动不可检测」，不能凭空断言已经撞墙。
+                    self._motion_feedback_state = "unavailable_while_commanding"
             return decision
+        value_age_ms = _finite(motion.get("value_age_ms"))
+        with self._lock:
+            started_at = self._forward_started_at
+        if value_age_ms is not None:
+            if started_at is None:
+                # _stall_guard 在 _apply 之前运行；第一 tick 看到的速度必然属于旧动作。
+                with self._lock:
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "awaiting_first_command"
+                return decision
+            command_age_ms = max(0.0, now - started_at) * 1000.0
+            # 允许 5ms 的收包/时钟舍入误差。比本次命令年龄更老的样本来自静止前
+            # 或上一次移动，绝不能拿来证明这条命令正在生效。
+            if value_age_ms > command_age_ms + 5.0:
+                with self._lock:
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "sample_predates_command"
+                return decision
+            if now - started_at < self.config.motion_start_grace_s:
+                with self._lock:
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "starting"
+                return decision
         speed = _finite(motion.get("horizontal_speed_mps"))
         if speed is None:
+            with self._lock:
+                self._motion_feedback_usable = False
+                self._motion_feedback_state = "invalid_motion_sample"
             return decision
+        with self._lock:
+            self._motion_feedback_usable = True
+            self._motion_feedback_state = "active"
 
         # 斜撞墙：人在动，但动的方向不是前方。角色控制器把移动投影到墙面上，
         # 所以速度模长过得了 stall_speed_mps，纯速度判据永远不会触发，会一直
@@ -644,11 +728,15 @@ class LocalNavigator:
                     "suppressed_count": self._turn_suppressed_count,
                     "settling_suppressed_count": self._turn_settling_suppressed_count,
                     "cooldown_suppressed_count": self._turn_cooldown_suppressed_count,
+                    "continuous_retarget": self._turn_retarget_supported,
                 },
                 "stall": {
                     # detectable=false 表示收不到 VRChat 内置 Velocity 参数，
                     # 「卡墙」这件事在本次会话里根本无法被观测到——不是「没卡」。
-                    "detectable": bool(self._last_motion and self._last_motion.get("available")),
+                    "detectable": self._motion_feedback_usable,
+                    "feedback_required": self._forward_started_at is not None,
+                    "feedback_state": self._motion_feedback_state,
+                    "motion_start_grace_ms": round(self.config.motion_start_grace_s * 1000.0, 1),
                     # 上一条前进指令是否被下游接受。false 表示命令被 scheduler
                     # 拒了（多半是 body output 还没 enable），此时失速判据整体
                     # 失效——速度为零是因为没发命令，不是因为撞墙。
@@ -678,6 +766,15 @@ class LocalNavigator:
                     ),
                     "unreachable_ttl_s": self.config.unreachable_ttl_s,
                 },
+                "target_filter": {
+                    "grace_ms": round(self.config.target_grace_s * 1000.0, 1),
+                    "bearing_ema_alpha": self.config.bearing_ema_alpha,
+                    "range_ema_alpha": self.config.range_ema_alpha,
+                    "grace_count": self._target_grace_count,
+                    "target_id": (
+                        None if self._target_observation is None else self._target_observation.target_id
+                    ),
+                },
             }
 
     def _run(self) -> None:
@@ -691,6 +788,86 @@ class LocalNavigator:
             deadline = now + period
             self.tick()
         self._safe_release()
+
+    def _record_target_observation(
+        self,
+        *,
+        target_id: str,
+        bearing: float,
+        distance: float | None,
+        apparent: float | None,
+        apparent_clipped: bool,
+        revision: int,
+        observed_age_ms: float,
+        now: float,
+    ) -> _TargetObservation:
+        """记录可靠目标，并对新视觉帧做轻量指数平滑。"""
+        with self._lock:
+            previous = self._target_observation
+            def smooth(old: float | None, new: float | None, alpha: float) -> float | None:
+                if new is None:
+                    return None
+                if old is None:
+                    return new
+                return old + alpha * (new - old)
+
+            same_target = previous is not None and previous.target_id == target_id
+            old_distance = previous.distance_m if same_target and previous is not None else None
+            old_apparent = previous.apparent_height if same_target and previous is not None else None
+            # 接近停止边界时只允许滤波延迟“目标变远”，不延迟“目标已经更近”。
+            # 否则表观高度突然越过停止线时还会多走几帧，平滑反而损害安全。
+            filtered_distance = (
+                distance
+                if distance is not None and old_distance is not None and distance < old_distance
+                else smooth(old_distance, distance, self.config.range_ema_alpha)
+            )
+            filtered_apparent = (
+                apparent
+                if apparent is not None and old_apparent is not None and apparent > old_apparent
+                else smooth(old_apparent, apparent, self.config.range_ema_alpha)
+            )
+            old_bearing = previous.bearing_deg if same_target and previous is not None else None
+            # 明显跨过画面中心时立即采用新方向，不能让 EMA 的惯性再朝旧方向转一帧；
+            # 同侧的小幅检测框抖动才做平滑。
+            filtered_bearing = (
+                bearing
+                if old_bearing is not None
+                and old_bearing * bearing < 0.0
+                and abs(bearing) > self.config.bearing_deadband_deg
+                else smooth(old_bearing, bearing, self.config.bearing_ema_alpha)
+            )
+            observation = _TargetObservation(
+                target_id=target_id,
+                bearing_deg=float(filtered_bearing),
+                distance_m=filtered_distance,
+                apparent_height=filtered_apparent,
+                apparent_clipped=bool(apparent_clipped),
+                revision=revision,
+                observed_at=now - max(0.0, observed_age_ms) / 1000.0,
+            )
+            self._target_observation = observation
+            return observation
+
+    def _cached_target_for_goal(
+        self,
+        goal: Mapping[str, Any],
+        skip_ids: set[str],
+        now: float,
+    ) -> _TargetObservation | None:
+        """只在很短的视觉抖动窗口内复用同一目标的可靠观测。"""
+        with self._lock:
+            observation = self._target_observation
+            if observation is None:
+                return None
+            goal_target = str(goal.get("target_id") or "").strip().lower()
+            if goal_target and observation.target_id.lower() != goal_target:
+                return None
+            if observation.target_id in skip_ids:
+                return None
+            if now - observation.observed_at > self.config.target_grace_s:
+                return None
+            self._target_grace_count += 1
+            return observation
 
     def _decide(
         self,
@@ -724,21 +901,57 @@ class LocalNavigator:
 
         skip = self._unreachable_ids()
         entity = self._select_target(goal, world.get("entities"), skip)
-        if entity is None:
-            # 区分「没看到匹配的东西」和「看到了但刚证明够不着」。两者对 LLM 的
-            # 下一步完全不同：前者该换个方向看，后者该换个目标或先转身。
+        observation: _TargetObservation | None = None
+        failure_reason = "target_not_visible"
+        failure_target_id = str(goal.get("target_id") or "")[:96] or None
+        if entity is not None:
+            failure_target_id = str(entity.get("id") or "")[:96] or None
+            confidence = _finite(entity.get("confidence")) or 0.0
+            if entity.get("visible") is False or confidence < self.config.min_confidence:
+                failure_reason = "target_low_confidence"
+            else:
+                bearing, distance, apparent, apparent_clipped = _spatial_hint(entity)
+                if bearing is None:
+                    failure_reason = "target_bearing_unknown"
+                else:
+                    observation = self._record_target_observation(
+                        target_id=failure_target_id or "",
+                        bearing=bearing,
+                        distance=distance,
+                        apparent=apparent,
+                        apparent_clipped=apparent_clipped,
+                        revision=revision,
+                        observed_age_ms=observed_age,
+                        now=now,
+                    )
+
+        if observation is None:
+            # 区分「没看到匹配的东西」和「看到了但刚证明够不着」。不可达是硬状态，
+            # 不能被视觉宽限覆盖；普通漏检/低置信才允许短暂复用最后可靠观测。
             if skip and self._select_target(goal, world.get("entities"), frozenset()) is not None:
                 return NavigationDecision(
                     "stop", "target_unreachable", revision=revision, observed_age_ms=observed_age
                 )
-            return NavigationDecision("stop", "target_not_visible", revision=revision, observed_age_ms=observed_age)
-        target_id = str(entity.get("id") or "")[:96] or None
-        confidence = _finite(entity.get("confidence")) or 0.0
-        if entity.get("visible") is False or confidence < self.config.min_confidence:
-            return NavigationDecision("stop", "target_low_confidence", target_id=target_id, revision=revision, observed_age_ms=observed_age)
-        bearing, distance, apparent, apparent_clipped = _spatial_hint(entity)
-        if bearing is None:
-            return NavigationDecision("stop", "target_bearing_unknown", target_id=target_id, revision=revision, observed_age_ms=observed_age)
+            observation = self._cached_target_for_goal(goal, skip, now)
+            if observation is None:
+                return NavigationDecision(
+                    "stop",
+                    failure_reason,
+                    target_id=failure_target_id,
+                    revision=revision,
+                    observed_age_ms=observed_age,
+                )
+            observation_mode = "grace"
+            revision = observation.revision
+            observed_age = max(observed_age, max(0.0, now - observation.observed_at) * 1000.0)
+        else:
+            observation_mode = "live"
+
+        target_id = observation.target_id or None
+        bearing = observation.bearing_deg
+        distance = observation.distance_m
+        apparent = observation.apparent_height
+        apparent_clipped = observation.apparent_clipped
         if abs(bearing) > self.config.bearing_deadband_deg:
             # 转向直接给角度，不再经摇杆。bearing 本身就是「要转多少度才能把目标
             # 转到画面中央」，压成摇杆量再靠脉冲时长积分只会丢精度；而且 VR 模式
@@ -765,6 +978,7 @@ class LocalNavigator:
                 revision,
                 observed_age,
                 turn_deg=turn_deg,
+                observation_mode=observation_mode,
             )
         # 优先使用表观高度：这是二维检测器唯一实测得到的接近度指标。必须排在
         # ``distance is None`` 之前，否则不带深度适配器的检测器永远走不到这里。
@@ -782,6 +996,7 @@ class LocalNavigator:
                     distance,
                     revision=revision,
                     observed_age_ms=observed_age,
+                    observation_mode=observation_mode,
                 )
             forward = _clamp(
                 (target_apparent - apparent) / target_apparent * self.config.max_forward_axis,
@@ -800,11 +1015,30 @@ class LocalNavigator:
                 self.config.pulse_ms,
                 revision,
                 observed_age,
+                observation_mode=observation_mode,
             )
         if distance is None:
-            return NavigationDecision("stop", "target_distance_unknown", target_id, bearing, None, revision=revision, observed_age_ms=observed_age)
+            return NavigationDecision(
+                "stop",
+                "target_distance_unknown",
+                target_id,
+                bearing,
+                None,
+                revision=revision,
+                observed_age_ms=observed_age,
+                observation_mode=observation_mode,
+            )
         if distance <= self.config.target_distance_m:
-            return NavigationDecision("reached", "target_in_interaction_range", target_id, bearing, distance, revision=revision, observed_age_ms=observed_age)
+            return NavigationDecision(
+                "reached",
+                "target_in_interaction_range",
+                target_id,
+                bearing,
+                distance,
+                revision=revision,
+                observed_age_ms=observed_age,
+                observation_mode=observation_mode,
+            )
         forward = _clamp(
             (distance - self.config.target_distance_m) / max(distance, 0.25) * self.config.max_forward_axis,
             self.config.min_forward_axis,
@@ -822,6 +1056,7 @@ class LocalNavigator:
             self.config.pulse_ms,
             revision,
             observed_age,
+            observation_mode=observation_mode,
         )
 
     def _select_target(
@@ -891,8 +1126,12 @@ class LocalNavigator:
         with self._lock:
             return self._last_turn_revision == revision
 
-    def _turn_gate_reason(self, now: float) -> str | None:
-        """判断上一条相对转向是否已经真正落地。"""
+    def _turn_gate_reason(self, now: float, revision: int | None) -> str | None:
+        """判断当前发送器能否安全接收下一条视觉转向修正。"""
+        if self._turn_retarget_supported and revision is not None and revision > 0:
+            # 每个视觉 revision 最多发送一次，而发送器把修正换算成基于当前 yaw 的
+            # 绝对目标；上一段还没结束也可以直接重定向，不会发生相对角度累加。
+            return None
         provider = self._turn_state_provider
         if provider is not None:
             try:
@@ -925,7 +1164,7 @@ class LocalNavigator:
         *,
         revision: int | None = None,
     ) -> bool:
-        gate_reason = self._turn_gate_reason(now)
+        gate_reason = self._turn_gate_reason(now, revision)
         if gate_reason is not None:
             self._record_turn_suppressed(gate_reason)
             return False
@@ -962,6 +1201,14 @@ class LocalNavigator:
                 # 记下「这条前进指令到底发出去了吗」。失速守卫必须能区分
                 # 「发了但人没动」（真卡墙）和「压根没发」（body 未 enable）。
                 self._axis_send_ok = bool(sent)
+                if sent and self._forward_started_at is None:
+                    self._forward_started_at = now
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "awaiting_motion"
+                elif not sent:
+                    self._forward_started_at = None
+                    self._motion_feedback_usable = False
+                    self._motion_feedback_state = "command_rejected"
             if sent:
                 with self._lock:
                     self._active_side = "left"
@@ -990,6 +1237,9 @@ class LocalNavigator:
         with self._lock:
             active = self._active_side
             self._active_side = None
+            self._forward_started_at = None
+            self._motion_feedback_usable = False
+            self._motion_feedback_state = "idle_not_required"
         if active is not None:
             try:
                 self._release_inputs("all")

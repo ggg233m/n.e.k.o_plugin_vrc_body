@@ -483,6 +483,14 @@ class SchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(hip_after[1], hip_before[1], places=3)
         self.assertAlmostEqual(hip_after[2], -hip_before[2], places=3)
 
+    def test_navigation_correction_retargets_from_current_yaw_not_old_target(self) -> None:
+        # 当前实际 yaw=-10°、旧目标=+90° 时，再修正 +20° 应把新目标放在 +10°；
+        # 若继续相对旧 target 累加就会变成 +110°，造成明显控制延迟和超调。
+        self.scheduler._yaw_rad = math.radians(-10.0)
+        self.scheduler._yaw_target_rad = math.radians(90.0)
+        self.scheduler._apply_turn_command({"correction_deg": 20.0})
+        self.assertAlmostEqual(math.degrees(self.scheduler._yaw_target_rad), 10.0, places=6)
+
     def test_reported_yaw_stays_inside_one_revolution(self) -> None:
         """朝向必须落在 [0, 360)。
 
