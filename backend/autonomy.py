@@ -1,8 +1,6 @@
-"""Session-scoped VRChat autonomy guardrails.
+"""会话级 VRChat 自主操作护栏。
 
-This module deliberately owns authorization and freshness, not perception or
-high-frequency movement.  A planner can use the state to decide what to do,
-while the body scheduler remains the only writer of AnyaDance frames.
+本模块刻意仅负责授权与时效检查，不涉及感知或高频运动控制。规划器可依据此状态决定执行何种操作，而身体调度器仍是唯一负责写入 AnyaDance 动画帧的组件。
 """
 
 from __future__ import annotations
@@ -12,9 +10,106 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .world_state import blocking_uncertainties
+
 
 ALLOWED_GOAL_KINDS = frozenset({"explore", "approach", "follow", "interact", "socialize"})
 TARGETED_GOAL_KINDS = frozenset({"approach", "follow", "interact", "socialize"})
+ALLOWED_SELECTOR_TYPES = frozenset({"npc", "player", "avatar", "person", "humanoid", "object"})
+_SELECTOR_KEYS = frozenset({"semantic_type", "label", "min_confidence"})
+_CONSTRAINT_KEYS = frozenset({"max_duration_s", "max_scan_turns", "max_forward_axis"})
+
+
+def _finite_number(value: Any, name: str, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
+    return parsed
+
+
+def _normalize_selector(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("selector must be an object")
+    unknown = set(value) - _SELECTOR_KEYS
+    if unknown:
+        raise ValueError(f"selector contains unsupported fields: {', '.join(sorted(map(str, unknown)))}")
+    result: dict[str, Any] = {}
+    semantic_type = str(value.get("semantic_type") or "").replace("\x00", "").strip().lower()
+    if semantic_type:
+        if semantic_type not in ALLOWED_SELECTOR_TYPES:
+            raise ValueError("selector.semantic_type is unsupported")
+        result["semantic_type"] = semantic_type
+    label = str(value.get("label") or "").replace("\x00", "").strip()[:64]
+    if label:
+        result["label"] = label
+    if value.get("min_confidence") is not None:
+        result["min_confidence"] = _finite_number(
+            value.get("min_confidence"),
+            "selector.min_confidence",
+            0.0,
+            1.0,
+        )
+    if not result:
+        raise ValueError("selector must contain semantic_type or label")
+    return result
+
+
+def _normalize_constraints(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("constraints must be an object")
+    unknown = set(value) - _CONSTRAINT_KEYS
+    if unknown:
+        raise ValueError(f"constraints contains unsupported fields: {', '.join(sorted(map(str, unknown)))}")
+    result: dict[str, Any] = {}
+    if value.get("max_duration_s") is not None:
+        result["max_duration_s"] = _finite_number(
+            value.get("max_duration_s"),
+            "constraints.max_duration_s",
+            1.0,
+            600.0,
+        )
+    if value.get("max_scan_turns") is not None:
+        raw_turns = value.get("max_scan_turns")
+        if isinstance(raw_turns, bool):
+            raise ValueError("constraints.max_scan_turns must be an integer")
+        try:
+            turns = int(raw_turns)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("constraints.max_scan_turns must be an integer") from exc
+        if turns != raw_turns or not 1 <= turns <= 32:
+            raise ValueError("constraints.max_scan_turns must be between 1 and 32")
+        result["max_scan_turns"] = turns
+    if value.get("max_forward_axis") is not None:
+        result["max_forward_axis"] = _finite_number(
+            value.get("max_forward_axis"),
+            "constraints.max_forward_axis",
+            0.05,
+            1.0,
+        )
+    return result or None
+
+
+def _normalize_revision(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("based_on_revision must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("based_on_revision must be a non-negative integer") from exc
+    if parsed != value or parsed < 0:
+        raise ValueError("based_on_revision must be a non-negative integer")
+    return parsed
 
 
 @dataclass
@@ -22,6 +117,9 @@ class AutonomyGoal:
     kind: str
     text: str
     target_id: str | None
+    selector: dict[str, Any] | None
+    constraints: dict[str, Any] | None
+    based_on_revision: int | None
     created_at: float
 
 
@@ -86,10 +184,19 @@ class AutonomyRuntime:
         text: Any,
         kind: Any = "explore",
         target_id: Any = None,
+        selector: Any = None,
+        constraints: Any = None,
+        based_on_revision: Any = None,
     ) -> dict[str, Any]:
         normalized_text = str(text or "").strip()[:256]
         normalized_kind = str(kind or "explore").strip().lower()
         normalized_target_id = str(target_id or "").replace("\x00", "").strip()[:96] or None
+        try:
+            normalized_selector = _normalize_selector(selector)
+            normalized_constraints = _normalize_constraints(constraints)
+            normalized_revision = _normalize_revision(based_on_revision)
+        except ValueError as exc:
+            return {"accepted": False, **self.snapshot(), "reason": str(exc)}
         if not normalized_text:
             return {"accepted": False, **self.snapshot(), "reason": "goal must not be empty"}
         if normalized_kind not in ALLOWED_GOAL_KINDS:
@@ -112,10 +219,19 @@ class AutonomyRuntime:
             if self._state != "armed":
                 result = {"accepted": False, "reason": self._reason, **self.snapshot()}
                 return result
+            if normalized_revision is not None and normalized_revision > self._world_revision:
+                return {
+                    "accepted": False,
+                    **self.snapshot(),
+                    "reason": "based_on_revision is newer than current world revision",
+                }
             self._goal = AutonomyGoal(
                 normalized_kind,
                 normalized_text,
                 normalized_target_id,
+                normalized_selector,
+                normalized_constraints,
+                normalized_revision,
                 self._clock(),
             )
             self._reason = "goal_accepted_pending_perception"
@@ -154,6 +270,24 @@ class AutonomyRuntime:
             if self._goal is None:
                 return
             if not bool(world.get("available")):
+                status_age = None
+                try:
+                    status_age = float(status.get("last_observation_age_ms"))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                uncertainties = set(blocking_uncertainties(world.get("uncertainties")))
+                fresh_empty_explore = (
+                    self._goal.kind == "explore"
+                    and self._goal.selector is not None
+                    and world.get("capture_active") is not False
+                    and status_age is not None
+                    and status_age <= 2500.0
+                    and not (uncertainties - {"no_recent_visual_observation"})
+                )
+                if fresh_empty_explore:
+                    self._state = "armed"
+                    self._reason = "goal_waiting_for_explorer"
+                    return
                 self._state = "degraded"
                 self._reason = "world_observation_unknown"
                 self._release_inputs()
@@ -193,6 +327,11 @@ class AutonomyRuntime:
                     "kind": self._goal.kind,
                     "text": self._goal.text,
                     "target_id": self._goal.target_id,
+                    "selector": None if self._goal.selector is None else dict(self._goal.selector),
+                    "constraints": (
+                        None if self._goal.constraints is None else dict(self._goal.constraints)
+                    ),
+                    "based_on_revision": self._goal.based_on_revision,
                     "age_seconds": round(max(0.0, now - self._goal.created_at), 2),
                 },
                 "capabilities": {
@@ -208,4 +347,9 @@ class AutonomyRuntime:
         return result
 
 
-__all__ = ["AutonomyRuntime", "ALLOWED_GOAL_KINDS", "TARGETED_GOAL_KINDS"]
+__all__ = [
+    "ALLOWED_GOAL_KINDS",
+    "ALLOWED_SELECTOR_TYPES",
+    "AutonomyRuntime",
+    "TARGETED_GOAL_KINDS",
+]

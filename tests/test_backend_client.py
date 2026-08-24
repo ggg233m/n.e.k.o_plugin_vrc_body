@@ -40,6 +40,9 @@ class BackendClientTests(unittest.TestCase):
             "follow that player",
             "follow",
             "openvino:track:7",
+            {"semantic_type": "player"},
+            {"max_duration_s": 30},
+            41,
         )
         self.assertTrue(result["accepted"])
         self.assertEqual(calls, [(
@@ -49,6 +52,9 @@ class BackendClientTests(unittest.TestCase):
                 "text": "follow that player",
                 "kind": "follow",
                 "target_id": "openvino:track:7",
+                "selector": {"semantic_type": "player"},
+                "constraints": {"max_duration_s": 30},
+                "based_on_revision": 41,
             },
         )])
 

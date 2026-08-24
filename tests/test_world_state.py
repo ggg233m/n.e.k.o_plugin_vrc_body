@@ -10,6 +10,8 @@ import unittest
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.vision import (
     MssFrameSource,
+    SemanticCandidateCache,
+    SemanticJob,
     VisionObservation,
     VisionRuntime,
     VisionWorker,
@@ -587,6 +589,68 @@ class WorldStateStoreTests(unittest.TestCase):
         self.assertEqual(result["changes"]["removed_entity_ids"], [])
         self.assertEqual(result["entities"][0]["id"], "shared")
 
+    def test_revision_journal_pages_intermediate_events_without_raw_frames(self) -> None:
+        now = [1.0]
+        store = WorldStateStore(clock=lambda: now[0], revision_history_size=16)
+        store.ingest(
+            entities=[{"id": "npc", "label": "npc", "confidence": 0.8}],
+            events=[{"type": "npc_waved", "target_id": "npc", "confidence": 0.9}],
+            source="openai_vlm",
+        )
+        now[0] = 2.0
+        store.ingest(
+            entities=[{"id": "npc", "label": "npc", "confidence": 0.85}],
+            source="openai_vlm",
+        )
+
+        first = store.delta(after_revision=0, wait_ms=0, limit=1)["journal"]
+        self.assertTrue(first["has_more"])
+        self.assertEqual(first["entries"][0]["events"][0]["type"], "npc_waved")
+        self.assertFalse(first["persistent"])
+        self.assertNotIn("frame", first["entries"][0])
+
+        second = store.journal(first["through_revision"], limit=8)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(second["entries"][0]["entities"][0]["confidence"], 0.85)
+
+    def test_revision_journal_reports_when_a_consumer_falls_behind_capacity(self) -> None:
+        now = [0.0]
+        store = WorldStateStore(clock=lambda: now[0], revision_history_size=16)
+        for index in range(20):
+            now[0] = float(index)
+            store.ingest(
+                entities=[{"id": "npc", "label": "npc", "confidence": 0.8}],
+                source="openai_vlm",
+            )
+
+        journal = store.journal(0, limit=64)
+
+        self.assertTrue(journal["truncated"])
+        self.assertEqual(len(journal["entries"]), 16)
+        self.assertGreater(journal["earliest_revision"], 1)
+        self.assertEqual(store.snapshot()["memory"]["revision_journal"]["entry_count"], 16)
+
+    def test_semantic_candidate_ids_do_not_merge_on_tiny_bbox_overlap(self) -> None:
+        cache = SemanticCandidateCache(clock=lambda: 1.0, session_token="test")
+        job = SemanticJob(
+            data=b"not-an-image",
+            captured_at=1.0,
+            frame_id="frame-1",
+            revision=1,
+            world={"entities": []},
+        )
+
+        first, _ = cache.bind({
+            "label": "npc a", "semantic_type": "npc", "confidence": 0.9,
+            "bbox": [0.0, 0.1, 0.4, 0.5],
+        }, job=job)
+        second, _ = cache.bind({
+            "label": "npc b", "semantic_type": "npc", "confidence": 0.9,
+            "bbox": [0.39, 0.1, 0.79, 0.5],
+        }, job=job)
+
+        self.assertNotEqual(first["id"], second["id"])
+
 
 class _Detector:
     name = "fake_yolo"
@@ -814,19 +878,167 @@ class VisionRuntimeTests(unittest.TestCase):
             clock=lambda: now[0],
         )
 
-        runtime.process_frame(object())
-        now[0] = 0.25
-        runtime.process_frame(object())
-        now[0] = 1.1
-        runtime.process_frame(object())
+        try:
+            runtime.process_frame(b"jpeg")
+            deadline = time.monotonic() + 1.0
+            while semantic.calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            now[0] = 0.25
+            runtime.process_frame(b"jpeg")
+            now[0] = 1.1
+            runtime.process_frame(b"jpeg")
+            deadline = time.monotonic() + 1.0
+            while semantic.calls < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
 
-        self.assertEqual(detector.calls, 3)
-        self.assertEqual(semantic.calls, 2)
-        snapshot = runtime.snapshot()
-        self.assertEqual(snapshot["status"]["entity_count"], 1)
-        self.assertEqual(snapshot["status"]["event_count"], 2)
-        self.assertTrue(snapshot["vision"]["detector"]["available"])
-        self.assertTrue(snapshot["vision"]["semantic"]["available"])
+            self.assertEqual(detector.calls, 3)
+            self.assertEqual(semantic.calls, 2)
+            snapshot = runtime.snapshot()
+            self.assertEqual(snapshot["status"]["entity_count"], 1)
+            self.assertEqual(snapshot["status"]["event_count"], 2)
+            self.assertTrue(snapshot["vision"]["detector"]["available"])
+            self.assertTrue(snapshot["vision"]["semantic"]["available"])
+            self.assertEqual(snapshot["vision"]["semantic_worker"]["processed"], 2)
+        finally:
+            runtime.close()
+
+    def test_semantic_worker_does_not_block_detection_and_binds_stable_id(self) -> None:
+        class SlowSemantic:
+            name = "slow_vlm"
+
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, world, now):
+                self.started.set()
+                self.release.wait(1.0)
+                return VisionObservation(
+                    entities=({
+                        "label": "white seated npc",
+                        "semantic_type": "npc",
+                        "confidence": 0.91,
+                        "bbox": [0.2, 0.3, 0.45, 0.8],
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                )
+
+        now = [5.0]
+        semantic = SlowSemantic()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            semantic=semantic,
+            semantic_cooldown_s=0.1,
+            clock=lambda: now[0],
+        )
+        try:
+            started = time.perf_counter()
+            runtime.process_frame(b"jpeg")
+            elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(semantic.started.wait(0.5))
+            semantic.release.set()
+            deadline = time.monotonic() + 1.0
+            candidate_id = None
+            while time.monotonic() < deadline:
+                candidates = runtime.status()["semantic_candidates"]["candidates"]
+                if candidates:
+                    candidate_id = candidates[0]["id"]
+                    break
+                time.sleep(0.005)
+            self.assertIsNotNone(candidate_id)
+            self.assertTrue(str(candidate_id).startswith("semantic:session:"))
+            self.assertFalse(runtime.status()["semantic_candidates"]["persistent"])
+
+            now[0] = 5.2
+            runtime.process_frame(b"jpeg", force_semantic=True)
+            deadline = time.monotonic() + 1.0
+            while runtime.status()["semantic_worker"]["processed"] < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            candidates = runtime.status()["semantic_candidates"]["candidates"]
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["id"], candidate_id)
+            self.assertEqual(candidates[0]["semantic_type"], "npc")
+        finally:
+            semantic.release.set()
+            runtime.close()
+
+    def test_slow_semantic_result_enriches_a_later_local_frame_instead_of_replaying_old_time(self) -> None:
+        class BoxDetector:
+            name = "box_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "avatar:session:test:1",
+                        "label": "person",
+                        "confidence": 0.95,
+                        "bbox": [0.2, 0.3, 0.45, 0.8],
+                        "attributes": {"bearing_deg": -15.0, "apparent_height": 0.5},
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                )
+
+        class DelayedSemantic:
+            name = "delayed_vlm"
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, world, now):
+                self.started.set()
+                self.release.wait(1.0)
+                return VisionObservation(
+                    entities=({
+                        "label": "white seated npc",
+                        "semantic_type": "npc",
+                        "confidence": 0.9,
+                        "bbox": [0.2, 0.3, 0.45, 0.8],
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                )
+
+        now = [0.0]
+        semantic = DelayedSemantic()
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=BoxDetector(),
+            semantic=semantic,
+            semantic_cooldown_s=60.0,
+            clock=lambda: now[0],
+        )
+        try:
+            runtime.process_frame(b"jpeg", observed_at=0.0)
+            self.assertTrue(semantic.started.wait(0.5))
+            now[0] = 10.0
+            semantic.release.set()
+            deadline = time.monotonic() + 1.0
+            while not runtime.status()["semantic_candidates"]["candidates"] and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+            # 旧 VLM 帧的 observed_at=0 已经过期；分类必须等当前 detector 再确认位置。
+            current = runtime.process_frame(b"jpeg", observed_at=10.0)
+            entity = current["entities"][0]
+            self.assertEqual(entity["id"], "avatar:session:test:1")
+            self.assertEqual(entity["attributes"]["semantic_type"], "npc")
+            self.assertTrue(entity["attributes"]["semantic_verified"])
+            self.assertLess(entity["age_ms"], 10.0)
+        finally:
+            semantic.release.set()
+            runtime.close()
 
     def test_detect_interval_throttles_inference_without_erasing_the_world(self) -> None:
         """检测占空比是 CPU 上限的第二个轴，但跳帧不能变成"看到了空场景"。
@@ -1041,6 +1253,8 @@ class VisionRuntimeTests(unittest.TestCase):
         delta = runtime.delta(after_revision=0, wait_ms=0)
         self.assertFalse(delta["world"]["available"])
         self.assertEqual(delta["changes"]["entities"], [])
+        self.assertEqual(delta["journal"]["entries"], [])
+        self.assertEqual(delta["journal"]["through_revision"], delta["revision"])
         self.assertFalse(delta["navigation"]["safe_navigation"])
 
         runtime.set_capture_state(True, "running")

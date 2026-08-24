@@ -630,6 +630,7 @@ class BackendService:
             self.navigator.stop()
             self._stop_vmc_calibration()
             self._stop_vision_worker_locked(reason="backend_stopped")
+            self.vision.close()
             if self.driver_log:
                 self.driver_log.stop()
             if self.osc:
@@ -686,6 +687,9 @@ class BackendService:
         text: Any,
         kind: Any = "explore",
         target_id: Any = None,
+        selector: Any = None,
+        constraints: Any = None,
+        based_on_revision: Any = None,
     ) -> dict[str, Any]:
         normalized_kind = str(kind or "explore").strip().lower()
         if normalized_kind in {"approach", "follow", "interact", "socialize"}:
@@ -697,7 +701,14 @@ class BackendService:
                     "reason": "semantic vision is degraded; only safe exploration is allowed",
                     **self.autonomy.snapshot(),
                 }
-        return self.autonomy.submit_goal(text, kind, target_id)
+        return self.autonomy.submit_goal(
+            text,
+            kind,
+            target_id,
+            selector,
+            constraints,
+            based_on_revision,
+        )
 
     def autonomy_stop(self, reason: Any = "autonomy_stop") -> dict[str, Any]:
         return {"accepted": True, **self.autonomy.stop(str(reason or "autonomy_stop"))}

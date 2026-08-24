@@ -100,6 +100,7 @@ python backend/debug_cli.py --port 48912 --token dev chatbox --text '你好'
 python backend/debug_cli.py --port 48912 --token dev stop-movement
 python backend/debug_cli.py --port 48912 --token dev controller --side left --control stick --y 0.35 --duration-ms 600
 python backend/debug_cli.py --port 48912 --token dev autonomy-arm
+python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind explore --goal "寻找 NPC" --selector-json '{"semantic_type":"npc","min_confidence":0.7}' --constraints-json '{"max_scan_turns":16,"max_forward_axis":0.3}' --based-on-revision 42
 python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind explore --target-id "vision:door:1" --goal "探索这个入口"
 python backend/debug_cli.py --port 48912 --token dev autonomy-goal --kind follow --target-id "avatar:session:abcd1234:7" --goal "跟随这个玩家"
 python backend/debug_cli.py --port 48912 --token dev autonomy-stop

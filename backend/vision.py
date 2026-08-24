@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import secrets
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -1353,9 +1354,49 @@ class OpenAICompatibleSemanticBackend:
         schema = {
             "type": "object",
             "properties": {
-                "entities": {"type": "array"},
-                "events": {"type": "array"},
-                "uncertainties": {"type": "array"},
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "semantic_type": {
+                                "type": "string",
+                                "enum": ["npc", "player", "avatar", "person", "humanoid", "object", "unknown"],
+                            },
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "bbox": {
+                                "anyOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                        "minItems": 4,
+                                        "maxItems": 4,
+                                    },
+                                    {"type": "null"},
+                                ]
+                            },
+                            "state": {"type": "string"},
+                        },
+                        "required": ["id", "label", "semantic_type", "confidence", "bbox", "state"],
+                        "additionalProperties": False,
+                    },
+                },
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "target_id": {"type": ["string", "null"]},
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        },
+                        "required": ["type", "target_id", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+                "uncertainties": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["entities", "events", "uncertainties"],
             "additionalProperties": False,
@@ -1365,7 +1406,13 @@ class OpenAICompatibleSemanticBackend:
             "temperature": 0,
             "response_format": {"type": "json_schema", "json_schema": {"name": "vrc_world", "strict": True, "schema": schema}},
             "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Describe only observable VRChat world entities, interactions, spatial relations and events. Do not identify players or reproduce chat."},
+                {"type": "text", "text": (
+                    "Find and classify observable VRChat entities, including small, seated, crouched, "
+                    "white or low-contrast NPCs that a standing-person detector may miss. Return a "
+                    "normalized [left, top, right, bottom] bbox for every localized entity and classify "
+                    "it as npc, player, avatar, person, humanoid, object or unknown. Do not identify "
+                    "players, infer hidden entities, or reproduce chat."
+                )},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + self._frame_data(frame)}},
             ]}],
         }
@@ -1393,6 +1440,518 @@ class OpenAICompatibleSemanticBackend:
         except Exception as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"[:256]
             raise
+
+
+def _semantic_entity_mapping(value: WorldEntity | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(value, WorldEntity):
+        return {
+            "id": value.id,
+            "label": value.label,
+            "confidence": value.confidence,
+            "bbox": value.bbox,
+            "state": value.state,
+            "attributes": dict(value.attributes or {}),
+            "relations": tuple(value.relations),
+            "source": tuple(value.source),
+            "observed_at": value.observed_at,
+            "ttl_s": value.ttl_s,
+        }
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _semantic_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(item) for item in value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(item) for item in (left, top, right, bottom)):
+        return None
+    left, top, right, bottom = (
+        min(1.0, max(0.0, left)),
+        min(1.0, max(0.0, top)),
+        min(1.0, max(0.0, right)),
+        min(1.0, max(0.0, bottom)),
+    )
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _semantic_iou(
+    first: tuple[float, float, float, float] | None,
+    second: tuple[float, float, float, float] | None,
+) -> float:
+    if first is None or second is None:
+        return 0.0
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    if intersection <= 0.0:
+        return 0.0
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return 0.0 if union <= 0.0 else intersection / union
+
+
+def _semantic_type(value: Mapping[str, Any]) -> str:
+    attributes = value.get("attributes") if isinstance(value.get("attributes"), Mapping) else {}
+    raw = value.get("semantic_type") or attributes.get("semantic_type") or value.get("label") or "unknown"
+    normalized = str(raw).replace("\x00", "").strip().lower()[:32]
+    aliases = {
+        "non-player character": "npc",
+        "character": "humanoid",
+        "anime character": "humanoid",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {
+        "npc", "player", "avatar", "person", "humanoid", "object", "unknown"
+    } else "unknown"
+
+
+def _semantic_crop(data: bytes, bbox: tuple[float, float, float, float] | None) -> bytes | None:
+    if bbox is None:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore[import-not-found]
+
+        image = Image.open(BytesIO(data)).convert("RGB")
+        width, height = image.size
+        box = (
+            max(0, min(width - 1, int(round(bbox[0] * width)))),
+            max(0, min(height - 1, int(round(bbox[1] * height)))),
+            max(1, min(width, int(round(bbox[2] * width)))),
+            max(1, min(height, int(round(bbox[3] * height)))),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        crop = image.crop(box)
+        output = BytesIO()
+        crop.save(output, format="JPEG", quality=65)
+        return output.getvalue()
+    except Exception:
+        return None
+
+
+def _semantic_descriptor(data: bytes | None) -> tuple[float, ...] | None:
+    if not data:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore[import-not-found]
+
+        image = Image.open(BytesIO(data)).convert("RGB").resize((8, 8))
+        return tuple(float(item) / 255.0 for pixel in image.getdata() for item in pixel)
+    except Exception:
+        return None
+
+
+def _semantic_similarity(
+    first: tuple[float, ...] | None,
+    second: tuple[float, ...] | None,
+) -> float:
+    if first is None or second is None or len(first) != len(second) or not first:
+        return 0.0
+    difference = sum(abs(a - b) for a, b in zip(first, second)) / len(first)
+    return max(0.0, 1.0 - difference)
+
+
+@dataclass(frozen=True)
+class SemanticJob:
+    data: bytes
+    captured_at: float
+    frame_id: str
+    revision: int
+    world: Mapping[str, Any]
+
+
+class SemanticCandidateCache:
+    """只驻留内存的语义候选与外观原型。"""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        max_candidates: int = 32,
+        ttl_s: float = 30.0,
+        session_token: str | None = None,
+    ) -> None:
+        self._clock = clock
+        self.max_candidates = max(4, min(128, int(max_candidates)))
+        self.ttl_s = max(5.0, min(300.0, float(ttl_s)))
+        self.session_token = str(session_token or secrets.token_hex(4))[:24]
+        self._lock = threading.RLock()
+        self._items: dict[str, dict[str, Any]] = {}
+        self._next_id = 1
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [
+            candidate_id
+            for candidate_id, item in self._items.items()
+            if now - float(item.get("received_at", now)) > self.ttl_s
+        ]
+        for candidate_id in expired:
+            self._items.pop(candidate_id, None)
+        if len(self._items) <= self.max_candidates:
+            return
+        ranked = sorted(
+            self._items.items(),
+            key=lambda pair: float(pair[1].get("received_at", 0.0)),
+            reverse=True,
+        )[: self.max_candidates]
+        self._items = dict(ranked)
+
+    def _new_id_locked(self) -> str:
+        value = f"semantic:session:{self.session_token}:{self._next_id}"
+        self._next_id += 1
+        return value
+
+    def bind(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        job: SemanticJob,
+    ) -> tuple[dict[str, Any], str | None]:
+        now = self._clock()
+        bbox = _semantic_bbox(raw.get("bbox"))
+        semantic_type = _semantic_type(raw)
+        crop = _semantic_crop(job.data, bbox)
+        descriptor = _semantic_descriptor(crop)
+        matched_id: str | None = None
+        matched_iou = 0.0
+
+        # 先复用同一帧 YOLO 已经建立的稳定 ID；语义层只补分类，不拆出第二个实体。
+        for item in job.world.get("entities") or ():
+            if not isinstance(item, Mapping):
+                continue
+            overlap = _semantic_iou(bbox, _semantic_bbox(item.get("bbox")))
+            if overlap >= 0.30 and overlap > matched_iou:
+                candidate_id = str(item.get("id") or "").strip()
+                if candidate_id:
+                    matched_id = candidate_id
+                    matched_iou = overlap
+
+        with self._lock:
+            self._prune_locked(now)
+            if matched_id is None and bbox is not None:
+                best_score = 0.0
+                for candidate_id, item in self._items.items():
+                    if str(item.get("semantic_type") or "unknown") != semantic_type:
+                        continue
+                    overlap = _semantic_iou(bbox, item.get("bbox"))
+                    appearance = _semantic_similarity(descriptor, item.get("descriptor"))
+                    # 轻微擦边不构成同一实体；否则两个相邻角色只要框有一像素
+                    # 重叠就会永久共用 ID。外观可独立匹配，但也要过高阈值。
+                    score = max(
+                        overlap if overlap >= 0.30 else 0.0,
+                        appearance if appearance >= 0.88 else 0.0,
+                    )
+                    if score > best_score:
+                        best_score = score
+                        matched_id = candidate_id
+            explicit_id = str(raw.get("id") or "").replace("\x00", "").strip()[:96]
+            if matched_id is None:
+                # 没有框的语义事实可以保留显式世界 ID；可定位候选必须使用会话 ID，
+                # 防止模型每次随意生成的新名字破坏稳定绑定。
+                matched_id = explicit_id if bbox is None and explicit_id else self._new_id_locked()
+
+            previous = self._items.get(matched_id, {})
+            candidate = {
+                "id": matched_id,
+                "semantic_type": semantic_type,
+                "label": str(raw.get("label") or semantic_type or "unknown")[:64],
+                "confidence": min(1.0, max(0.0, float(raw.get("confidence") or 0.0))),
+                "bbox": bbox,
+                "first_observed_at": previous.get("first_observed_at", job.captured_at),
+                "last_observed_at": job.captured_at,
+                "received_at": now,
+                "frame_id": job.frame_id,
+                "revision": job.revision,
+                "state": str(raw.get("state") or "visible")[:64],
+                "attributes": (
+                    dict(raw.get("attributes") or {})
+                    if isinstance(raw.get("attributes"), Mapping) else {}
+                ),
+                "crop": crop if crop is not None else previous.get("crop"),
+                "descriptor": descriptor if descriptor is not None else previous.get("descriptor"),
+            }
+            self._items[matched_id] = candidate
+            self._prune_locked(now)
+
+        attributes = dict(raw.get("attributes") or {}) if isinstance(raw.get("attributes"), Mapping) else {}
+        if bbox is not None:
+            center_x = (bbox[0] + bbox[2]) * 0.5
+            center_y = (bbox[1] + bbox[3]) * 0.5
+            attributes.setdefault("screen_center", [round(center_x, 5), round(center_y, 5)])
+            attributes.setdefault("screen_size", [round(bbox[2] - bbox[0], 5), round(bbox[3] - bbox[1], 5)])
+            attributes.setdefault("bearing_deg", round((center_x - 0.5) * 90.0, 3))
+            attributes.setdefault("apparent_height", round(bbox[3] - bbox[1], 5))
+        attributes.update({
+            "semantic_type": semantic_type,
+            "semantic_verified": semantic_type != "unknown",
+            "semantic_source_frame_id": job.frame_id,
+            "semantic_source_revision": job.revision,
+            "identity_scope": "session",
+            "identity_method": "semantic_bbox_appearance",
+            "memory_scope": "session",
+        })
+        normalized = dict(raw)
+        normalized.update({
+            "id": matched_id,
+            "label": str(raw.get("label") or semantic_type or "unknown")[:64],
+            "bbox": bbox,
+            "state": str(raw.get("state") or "visible")[:64],
+            "attributes": attributes,
+            "source": ["openai_vlm"],
+            "observed_at": job.captured_at,
+            "ttl_s": min(5.0, max(0.5, float(raw.get("ttl_s") or 2.0))),
+        })
+        return normalized, explicit_id or None
+
+    def enrich_observation(
+        self,
+        observation: VisionObservation,
+        *,
+        frame: Any,
+        now: float,
+    ) -> VisionObservation:
+        """把已完成的慢语义分类附着到当前检测帧。
+
+        VLM 返回时它分析的原帧通常已经落后数秒，不能把旧时间戳伪装成当前
+        事实。这里等待下一次本地检测重新看到同一稳定 ID，再把分类作为缓存属性
+        附着；实体的位置和 observed_at 始终来自当前本地帧。
+        """
+        with self._lock:
+            self._prune_locked(now)
+            cached = {candidate_id: dict(item) for candidate_id, item in self._items.items()}
+        if not cached or not observation.entities:
+            return observation
+
+        encoded_frame: bytes | None = frame if isinstance(frame, bytes) else None
+        enriched: list[WorldEntity | Mapping[str, Any]] = []
+        for value in observation.entities:
+            raw = _semantic_entity_mapping(value)
+            entity_id = str(raw.get("id") or "")[:96]
+            candidate = cached.get(entity_id)
+            candidate_id = entity_id if candidate is not None else ""
+            bbox = _semantic_bbox(raw.get("bbox"))
+
+            if candidate is None and bbox is not None:
+                # ID 注册表短暂重建时先尝试严格同屏框重叠；仍不匹配才计算 8x8
+                # 外观描述子。阈值刻意偏高，宁可等下一轮 VLM 也不把相似角色串号。
+                best_score = 0.0
+                current_descriptor: tuple[float, ...] | None = None
+                for cached_id, item in cached.items():
+                    overlap = _semantic_iou(bbox, item.get("bbox"))
+                    score = overlap if overlap >= 0.55 else 0.0
+                    if score <= best_score and item.get("descriptor") is not None:
+                        if encoded_frame is None:
+                            try:
+                                encoded_frame, _, _ = encode_frame_jpeg(frame, max_width=960, quality=65)
+                            except Exception:
+                                encoded_frame = b""
+                        if current_descriptor is None and encoded_frame:
+                            current_descriptor = _semantic_descriptor(
+                                _semantic_crop(encoded_frame, bbox)
+                            )
+                        appearance = _semantic_similarity(current_descriptor, item.get("descriptor"))
+                        if appearance >= 0.94:
+                            score = max(score, appearance)
+                    if score > best_score:
+                        best_score = score
+                        candidate = item
+                        candidate_id = cached_id
+
+            semantic_type = str((candidate or {}).get("semantic_type") or "unknown")
+            if candidate is None or semantic_type == "unknown":
+                enriched.append(value)
+                continue
+
+            attributes = dict(raw.get("attributes") or {}) if isinstance(raw.get("attributes"), Mapping) else {}
+            semantic_attributes = candidate.get("attributes")
+            if isinstance(semantic_attributes, Mapping):
+                for key, item in semantic_attributes.items():
+                    attributes.setdefault(str(key)[:64], item)
+            attributes.update({
+                "semantic_type": semantic_type,
+                "semantic_verified": True,
+                "semantic_candidate_id": candidate_id,
+                "semantic_source_frame_id": candidate.get("frame_id"),
+                "semantic_source_revision": candidate.get("revision"),
+                "semantic_result_age_ms": round(
+                    max(0.0, now - float(candidate.get("received_at", now))) * 1000.0,
+                    1,
+                ),
+                "semantic_memory_scope": "session",
+            })
+            sources = raw.get("source")
+            if isinstance(sources, str):
+                source_values = [sources]
+            elif isinstance(sources, (list, tuple, set)):
+                source_values = [str(item) for item in sources]
+            else:
+                source_values = []
+            source_values.append("openai_vlm")
+            local_confidence = min(1.0, max(0.0, float(raw.get("confidence") or 0.0)))
+            semantic_confidence = min(1.0, max(0.0, float(candidate.get("confidence") or 0.0)))
+            raw.update({
+                "label": str(candidate.get("label") or raw.get("label") or semantic_type)[:64],
+                "confidence": min(local_confidence, semantic_confidence),
+                "attributes": attributes,
+                "source": list(dict.fromkeys(source_values))[:8],
+                # observed_at/框/距离故意不改，必须继续代表当前本地检测帧。
+            })
+            enriched.append(raw)
+        return replace(observation, entities=tuple(enriched))
+
+    def snapshot(self) -> dict[str, Any]:
+        now = self._clock()
+        with self._lock:
+            self._prune_locked(now)
+            candidates = []
+            total_bytes = 0
+            for item in self._items.values():
+                crop = item.get("crop")
+                crop_bytes = len(crop) if isinstance(crop, bytes) else 0
+                total_bytes += crop_bytes
+                candidates.append({
+                    "id": item.get("id"),
+                    "semantic_type": item.get("semantic_type"),
+                    "label": item.get("label"),
+                    "confidence": item.get("confidence"),
+                    "bbox": list(item["bbox"]) if item.get("bbox") is not None else None,
+                    "frame_id": item.get("frame_id"),
+                    "revision": item.get("revision"),
+                    "observation_age_ms": round(max(0.0, now - float(item.get("last_observed_at", now))) * 1000.0, 1),
+                    "result_age_ms": round(max(0.0, now - float(item.get("received_at", now))) * 1000.0, 1),
+                    "crop_bytes": crop_bytes,
+                })
+            return {
+                "storage": "memory_bounded",
+                "persistent": False,
+                "ttl_s": self.ttl_s,
+                "max_candidates": self.max_candidates,
+                "candidate_count": len(candidates),
+                "bytes": total_bytes,
+                "candidates": candidates,
+            }
+
+
+class SemanticWorker:
+    """VLM 单槽异步 worker；慢推理不能阻塞检测与导航。"""
+
+    def __init__(self, runtime: "VisionRuntime", *, clock: Callable[[], float] = time.monotonic) -> None:
+        self.runtime = runtime
+        self._clock = clock
+        self.queue: Queue[SemanticJob] = Queue(maxsize=1)
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._submitted = 0
+        self._processed = 0
+        self._dropped = 0
+        self._last_submit_at: float | None = None
+        self._last_result_at: float | None = None
+        self._last_latency_ms: float | None = None
+        self._last_error: str | None = None
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="neko-semantic-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def submit(self, job: SemanticJob) -> bool:
+        self._ensure_started()
+        try:
+            self.queue.put_nowait(job)
+        except Full:
+            try:
+                self.queue.get_nowait()
+            except Empty:
+                pass
+            with self._lock:
+                self._dropped += 1
+            try:
+                self.queue.put_nowait(job)
+            except Full:
+                return False
+        with self._lock:
+            self._submitted += 1
+            self._last_submit_at = self._clock()
+        return True
+
+    def clear(self) -> None:
+        while True:
+            try:
+                self.queue.get_nowait()
+            except Empty:
+                break
+            with self._lock:
+                self._dropped += 1
+
+    def stop(self, timeout_s: float = 2.0) -> None:
+        self._stop.set()
+        self.clear()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, timeout_s))
+        with self._lock:
+            alive = thread is not None and thread.is_alive()
+            self._running = bool(alive)
+            if not alive:
+                self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self.queue.get(timeout=0.2)
+            except Empty:
+                continue
+            started = self._clock()
+            try:
+                self.runtime._process_semantic_job(job)
+                with self._lock:
+                    self._processed += 1
+                    self._last_result_at = self._clock()
+                    self._last_latency_ms = round(max(0.0, self._last_result_at - started) * 1000.0, 3)
+                    self._last_error = None
+            except Exception as exc:
+                with self._lock:
+                    self._last_result_at = self._clock()
+                    self._last_latency_ms = round(max(0.0, self._last_result_at - started) * 1000.0, 3)
+                    self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+        with self._lock:
+            self._running = False
+
+    def status(self) -> dict[str, Any]:
+        now = self._clock()
+        with self._lock:
+            return {
+                "running": self._running,
+                "queue_size": 1,
+                "queue_depth": self.queue.qsize(),
+                "submitted": self._submitted,
+                "processed": self._processed,
+                "dropped": self._dropped,
+                "last_submit_age_ms": None if self._last_submit_at is None else round(max(0.0, now - self._last_submit_at) * 1000.0, 1),
+                "last_result_age_ms": None if self._last_result_at is None else round(max(0.0, now - self._last_result_at) * 1000.0, 1),
+                "last_latency_ms": self._last_latency_ms,
+                "last_error": self._last_error,
+            }
 
 
 @dataclass(frozen=True)
@@ -1650,6 +2209,8 @@ class VisionRuntime:
         self._observation_callback = observation_callback
         self._lock = threading.Lock()
         self._last_semantic_at: float | None = None
+        self._semantic_candidates = SemanticCandidateCache(clock=clock)
+        self._semantic_worker = SemanticWorker(self, clock=clock)
         # 检测最小间隔。线程上限管的是「一次推理占几个核」，这个管的是「一秒里
         # 推几次」——两者相乘才是实际 CPU 占用，少任何一个都收不住。0 表示每帧
         # 都检测（保持既有行为，也是所有现存测试的假设）。
@@ -1690,6 +2251,10 @@ class VisionRuntime:
                 # 而 agent 无法区分「刚才」和「现在」。
                 self._frame_cache = None
                 self._frame_cache_at = None
+        if not active:
+            # 尚未开始的旧语义任务必须丢掉；已经在推理的任务返回后也会经过
+            # captured_at/采集门控，最多进入候选记忆，不能伪装成当前可见实体。
+            self._semantic_worker.clear()
         self.store.set_backend_status("vision_runtime", self.status())
 
     def capture_state(self) -> dict[str, Any]:
@@ -1698,6 +2263,114 @@ class VisionRuntime:
                 "active": self._capture_active,
                 "reason": self._capture_reason,
             }
+
+    def close(self) -> None:
+        """停止仅属于运行时的异步语义线程。"""
+        self._semantic_worker.stop()
+
+    def _build_semantic_job(self, frame: Any, captured_at: float) -> SemanticJob:
+        data: bytes | None = None
+        frame_id: str | None = None
+        with self._lock:
+            cached = self._frame_cache
+            cached_at = self._frame_cache_at
+            if (
+                isinstance(cached, Mapping)
+                and cached_at is not None
+                and abs(float(cached_at) - float(captured_at)) <= 1e-6
+                and isinstance(cached.get("data"), bytes)
+            ):
+                data = cached["data"]
+                pair = cached.get("detection_pair")
+                if isinstance(pair, Mapping):
+                    frame_id = str(pair.get("frame_id") or "") or None
+        if data is None:
+            data, _, _ = encode_frame_jpeg(
+                frame,
+                max_width=self._frame_cache_max_width,
+                quality=self._frame_cache_quality,
+            )
+        world = self.store.snapshot(now=self._clock())
+        status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+        try:
+            revision = int(status.get("revision", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            revision = 0
+        return SemanticJob(
+            data=bytes(data),
+            captured_at=float(captured_at),
+            frame_id=frame_id or f"semantic-source-{revision}-{int(captured_at * 1000)}",
+            revision=revision,
+            world=world,
+        )
+
+    def _normalize_semantic_observation(
+        self,
+        observation: VisionObservation,
+        job: SemanticJob,
+    ) -> VisionObservation:
+        entities: list[Mapping[str, Any]] = []
+        id_map: dict[str, str] = {}
+        for item in observation.entities:
+            raw = _semantic_entity_mapping(item)
+            if not raw:
+                continue
+            try:
+                normalized, original_id = self._semantic_candidates.bind(raw, job=job)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            entities.append(normalized)
+            if original_id:
+                id_map[original_id] = str(normalized.get("id") or "")
+
+        events: list[Mapping[str, Any]] = []
+        for item in observation.events:
+            raw_event: dict[str, Any]
+            if isinstance(item, WorldEvent):
+                raw_event = {
+                    "type": item.kind,
+                    "target_id": item.target_id,
+                    "confidence": item.confidence,
+                    "data": dict(item.data or {}),
+                    "source": tuple(item.source),
+                }
+            elif isinstance(item, Mapping):
+                raw_event = dict(item)
+            else:
+                continue
+            old_target = str(raw_event.get("target_id") or "")
+            if old_target in id_map:
+                raw_event["target_id"] = id_map[old_target]
+            raw_event["source"] = ["openai_vlm"]
+            raw_event["observed_at"] = job.captured_at
+            events.append(raw_event)
+
+        return VisionObservation(
+            entities=tuple(entities),
+            events=tuple(events),
+            source="openai_vlm",
+            observed_at=job.captured_at,
+            frame_id=job.frame_id,
+            uncertainties=tuple(observation.uncertainties),
+        )
+
+    def _process_semantic_job(self, job: SemanticJob) -> None:
+        with self._lock:
+            semantic = self.semantic
+        if semantic is None:
+            return
+        observation = semantic.observe(
+            job.data,
+            world=job.world,
+            now=job.captured_at,
+        )
+        if not isinstance(observation, VisionObservation):
+            raise ValueError("semantic backend must return VisionObservation")
+        normalized = self._normalize_semantic_observation(observation, job)
+        # 停止采集后仍允许候选缓存保留刚完成的分类，但绝不把旧结果发布成当前世界。
+        if not self.capture_state()["active"]:
+            return
+        self.ingest(normalized, _reactivate=False)
 
     def _cache_frame(
         self,
@@ -2009,6 +2682,14 @@ class VisionRuntime:
             "removed_entity_ids": [],
             "removed_entity_count": 0,
         }
+        # 停止采集后旧账本也属于过期视觉信息。推进 through_revision 让消费者
+        # 丢弃游标以前的历史，但绝不把这些实体/事件重新注入主 LLM。
+        journal = dict(result.get("journal") or {})
+        journal["entries"] = []
+        journal["has_more"] = False
+        journal["truncated"] = False
+        journal["through_revision"] = int(result.get("revision", 0) or 0)
+        result["journal"] = journal
         return result
 
     def status(self) -> dict[str, Any]:
@@ -2051,6 +2732,8 @@ class VisionRuntime:
             "capture_reason": capture_reason,
             "detector": backend_status(detector, label="detector"),
             "semantic": backend_status(semantic, label="semantic"),
+            "semantic_worker": self._semantic_worker.status(),
+            "semantic_candidates": self._semantic_candidates.snapshot(),
             "optional_dependencies": optional_dependency_status(),
             # 画面缓存独立于世界状态；这里只报告它是否可用，不把画面内容
             # 混进感知结论。
@@ -2102,6 +2785,8 @@ class VisionRuntime:
         with self._lock:
             self.detector = detector
             self.semantic = semantic
+            self._last_semantic_at = None
+        self._semantic_worker.clear()
         self.store.set_backend_status("vision_runtime", self.status())
 
     def ingest(
@@ -2288,6 +2973,11 @@ class VisionRuntime:
                 # age_ms 长上去，「多久之前看到的」仍然是真话。
                 if detect_due:
                     detector_observation = detector.observe(frame, now=observation_now)
+                    detector_observation = self._semantic_candidates.enrich_observation(
+                        detector_observation,
+                        frame=frame,
+                        now=processing_now,
+                    )
                     detector_world = self.ingest(detector_observation, _reactivate=False)
                     # worker 只会在 process_frame 返回后释放 frame，所以检测完成后
                     # 仍可安全编码。此时像素、实体、revision 一次写入同一个单槽
@@ -2309,13 +2999,10 @@ class VisionRuntime:
                         or processing_now - self._last_semantic_at >= self.semantic_cooldown_s
                     )
                 if semantic_due:
-                    with self._lock:
-                        self._last_semantic_at = processing_now
-                    self.ingest(semantic.observe(
-                        frame,
-                        world=self.store.snapshot(now=processing_now),
-                        now=observation_now,
-                    ), _reactivate=False)
+                    job = self._build_semantic_job(frame, observation_now)
+                    if self._semantic_worker.submit(job):
+                        with self._lock:
+                            self._last_semantic_at = processing_now
             with self._lock:
                 self._last_error = None
         except Exception as exc:

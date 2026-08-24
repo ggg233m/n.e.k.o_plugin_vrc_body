@@ -63,6 +63,10 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("real_avatar", BODY_AI_INSTRUCTIONS)
         self.assertIn("overlay.candidates", tool_defs.VRC_VISION_FRAME["description"])
         self.assertIn("不能填写临时 T1/T2", tool_defs.VRC_AUTONOMY_GOAL["parameters"]["properties"]["target_id"]["description"])
+        goal_properties = tool_defs.VRC_AUTONOMY_GOAL["parameters"]["properties"]
+        self.assertIn("selector", goal_properties)
+        self.assertIn("constraints", goal_properties)
+        self.assertIn("based_on_revision", goal_properties)
         declared_gestures = tool_defs.BODY_GESTURE["parameters"]["properties"]["name"]["enum"]
         self.assertEqual(set(declared_gestures), set(GESTURE_NAMES))
 

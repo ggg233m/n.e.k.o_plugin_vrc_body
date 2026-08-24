@@ -314,8 +314,11 @@ VRC_AUTONOMY_GOAL = {
     "name": "vrc_autonomy_goal",
     "description": (
         "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。"
-        "任何朝视觉实体移动的目标都必须提供最新世界快照中的精确 target_id；"
+        "approach/follow/interact/socialize 必须提供最新世界快照中的精确 target_id；"
         "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
+        "explore 可以不提供 target_id，改用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
+        "本地 Explorer 找到目标后只会将其保持在视野中央，不会自动接近。"
+        "应把 world_observe.decision_context.through_revision 原样写入 based_on_revision。"
     ),
     "parameters": {
         "type": "object",
@@ -327,6 +330,34 @@ VRC_AUTONOMY_GOAL = {
                 "minLength": 1,
                 "maxLength": 96,
                 "description": "目标实体在最新世界快照中的精确 id；不能填写临时 T1/T2 编号。",
+            },
+            "selector": {
+                "type": "object",
+                "description": "仅供 explore 搜索使用的语义选择器；它不是实体 id。",
+                "properties": {
+                    "semantic_type": {
+                        "type": "string",
+                        "enum": ["npc", "player", "avatar", "person", "humanoid", "object"],
+                    },
+                    "label": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                },
+                "additionalProperties": False,
+            },
+            "constraints": {
+                "type": "object",
+                "description": "本地执行器必须兑现的有界搜索约束。",
+                "properties": {
+                    "max_duration_s": {"type": "number", "minimum": 1.0, "maximum": 600.0},
+                    "max_scan_turns": {"type": "integer", "minimum": 1, "maximum": 32},
+                    "max_forward_axis": {"type": "number", "minimum": 0.05, "maximum": 1.0},
+                },
+                "additionalProperties": False,
+            },
+            "based_on_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "生成此目标时看到的世界 revision；迟到决策会在执行前重新校验。",
             },
         },
         "required": ["goal"],
@@ -369,7 +400,12 @@ BODY_AWARENESS = {
 
 WORLD_OBSERVE = {
     "name": "world_observe",
-    "description": "读取最近的视觉世界状态。结果来自可选的 VRChat 画面检测器/VLM，包含目标、事件、置信度和不确定性；没有新观测时必须按 unknown 处理，不能把空结果当成世界为空。",
+    "description": (
+        "读取最近的视觉世界状态，以及主 LLM 尚未确认消费的内存 revision 决策上下文。"
+        "decision_context 会把重复位置更新压成每个实体的 first/latest 轨迹，并保留离散事件；"
+        "生成自主目标时把 through_revision 写入 based_on_revision，只有目标被接受后才会确认消费。"
+        "结果来自可选的 VRChat 画面检测器/VLM；没有新观测时必须按 unknown 处理，不能把空结果当成世界为空。"
+    ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 

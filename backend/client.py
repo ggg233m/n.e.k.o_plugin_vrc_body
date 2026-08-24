@@ -644,11 +644,20 @@ class RemoteAutonomy:
         text: str,
         kind: str = "explore",
         target_id: str | None = None,
+        selector: Mapping[str, Any] | None = None,
+        constraints: Mapping[str, Any] | None = None,
+        based_on_revision: int | None = None,
     ) -> dict[str, Any]:
         try:
             payload = {"text": text, "kind": kind}
             if target_id:
                 payload["target_id"] = target_id
+            if selector is not None:
+                payload["selector"] = dict(selector)
+            if constraints is not None:
+                payload["constraints"] = dict(constraints)
+            if based_on_revision is not None:
+                payload["based_on_revision"] = int(based_on_revision)
             return _control_request(self.client, "POST", "/autonomy/goal", payload)
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}
@@ -757,6 +766,15 @@ class RemoteVision:
                 "navigation": {"status": "unknown", "safe_navigation": False},
                 "social": {"status": "unknown", "players_persisted": False, "chat_persisted": False},
                 "uncertainty": ["backend_unavailable"],
+                "journal": {
+                    "storage": "memory_bounded",
+                    "persistent": False,
+                    "after_revision": int(after_revision),
+                    "through_revision": int(after_revision),
+                    "truncated": False,
+                    "has_more": False,
+                    "entries": [],
+                },
                 "changes": {"entities": [], "events": [], "removed_entity_ids": [], "removed_entity_count": 0},
                 "error": str(exc),
             }

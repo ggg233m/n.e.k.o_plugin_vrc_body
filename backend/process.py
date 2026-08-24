@@ -200,6 +200,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("text"),
                     value.get("kind", "explore"),
                     value.get("target_id"),
+                    value.get("selector"),
+                    value.get("constraints"),
+                    value.get("based_on_revision"),
                 )
             elif self.path == "/autonomy/stop":
                 result = self.server.service.autonomy_stop(value.get("reason"))

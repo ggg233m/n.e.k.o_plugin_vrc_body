@@ -185,6 +185,17 @@ def main() -> int:
     autonomy_goal.add_argument("--goal", required=True)
     autonomy_goal.add_argument("--kind", default="explore")
     autonomy_goal.add_argument("--target-id", default=None)
+    autonomy_goal.add_argument(
+        "--selector-json",
+        default=None,
+        help='semantic selector object, for example {"semantic_type":"npc"}',
+    )
+    autonomy_goal.add_argument(
+        "--constraints-json",
+        default=None,
+        help="bounded local Explorer constraints object",
+    )
+    autonomy_goal.add_argument("--based-on-revision", type=int, default=None)
     autonomy_stop = sub.add_parser("autonomy-stop")
     autonomy_stop.add_argument("--reason", default="autonomy_stop")
     action = sub.add_parser("action")
@@ -293,6 +304,12 @@ def main() -> int:
             payload = {"text": args.goal, "kind": args.kind}
             if args.target_id:
                 payload["target_id"] = args.target_id
+            if args.selector_json:
+                payload["selector"] = _json_arg(args.selector_json, None)
+            if args.constraints_json:
+                payload["constraints"] = _json_arg(args.constraints_json, None)
+            if args.based_on_revision is not None:
+                payload["based_on_revision"] = args.based_on_revision
             result = request(args.host, args.port, args.token, "POST", "/autonomy/goal", payload)
         elif args.command == "autonomy-stop":
             result = request(args.host, args.port, args.token, "POST", "/autonomy/stop", {"reason": args.reason})

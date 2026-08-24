@@ -27,6 +27,8 @@ _TRANSIENT_VISION_SOURCES = frozenset({
     "opencv_hog",
     "yolo",
     "local_detector",
+    "openai_vlm",
+    "semantic_vlm",
 })
 _TRANSIENT_MEMORY_SCOPES = frozenset({
     "observation",
@@ -41,6 +43,7 @@ def _transient_entity_id(value: Any) -> bool:
     entity_id = _text(value, limit=96).lower()
     return (
         entity_id.startswith("avatar:session:")
+        or entity_id.startswith("semantic:session:")
         or entity_id.startswith("synthetic:")
         or ":track:" in entity_id
     )
@@ -314,6 +317,7 @@ class WorldStateStore:
         max_removals: int = 256,
         lifecycle_watermark_limit: int = 4096,
         event_history_size: int = 64,
+        revision_history_size: int = 512,
         default_ttl_s: float = 2.0,
         clock: Any = time.monotonic,
         persistence_path: str | Path | None = None,
@@ -325,6 +329,7 @@ class WorldStateStore:
             or max_removals < 1
             or lifecycle_watermark_limit < 1
             or event_history_size < 1
+            or revision_history_size < 1
         ):
             raise ValueError("world state bounds must be positive")
         self.max_entities = max_entities
@@ -335,6 +340,7 @@ class WorldStateStore:
             max(self.max_removals, int(lifecycle_watermark_limit)),
         )
         self.event_history_size = event_history_size
+        self.revision_history_size = min(4096, max(16, int(revision_history_size)))
         self.default_ttl_s = min(60.0, max(0.1, float(default_ttl_s)))
         self._clock = clock
         self._persistence_path = Path(persistence_path) if persistence_path else None
@@ -354,6 +360,9 @@ class WorldStateStore:
         self._observation_count = 0
         self._revision = 0
         self._last_changes: dict[str, Any] = {"removed_entity_ids": [], "removed_entity_count": 0}
+        # 决策账本只在内存中保留。它记录每次 revision 的真实变化，而不是保存
+        # 原始帧；慢 LLM 返回后可以补读中间事件，不需要把 10 Hz 像素写进硬盘。
+        self._revision_journal: deque[dict[str, Any]] = deque(maxlen=self.revision_history_size)
         # 精确的生命周期删除和来源/世界重置都会留下水印；
         # 否则延迟的检测器帧可能会复活已离场的实体。
         self._delete_watermarks: dict[tuple[str, str], float] = {}
@@ -384,6 +393,63 @@ class WorldStateStore:
             source.startswith("vrchat_player") or source == VRCHAT_LOG_SOURCE
             for source in entity.source
         )
+
+    def _append_revision_locked(
+        self,
+        *,
+        kind: str,
+        received_at: float,
+        observed_at: float,
+        entities: Iterable[WorldEntity] = (),
+        events: Iterable[WorldEvent] = (),
+        removed_entity_ids: Iterable[str] = (),
+        uncertainties: Iterable[str] = (),
+    ) -> None:
+        """追加一条有界内存 revision 记录；调用方必须持有 ``_lock``。"""
+        entity_items = [item.to_dict(now=received_at) for item in list(entities)[: self.max_entities]]
+        event_items = [item.to_dict(now=received_at) for item in list(events)[: self.event_history_size]]
+        removed = [_text(item, limit=96) for item in list(removed_entity_ids)[: self.max_removals]]
+        self._revision_journal.append({
+            "revision": self._revision,
+            "kind": _text(kind, default="observation", limit=32) or "observation",
+            "received_at_monotonic": received_at,
+            "observed_at_monotonic": observed_at,
+            "entities": entity_items,
+            "events": event_items,
+            "removed_entity_ids": [item for item in removed if item],
+            "uncertainties": [_text(item, limit=160) for item in list(uncertainties)[:16] if _text(item, limit=160)],
+        })
+
+    def _journal_since_locked(self, cursor: int, limit: int) -> dict[str, Any]:
+        """返回 cursor 之后的账本页；调用方必须持有 ``_lock``。"""
+        entries = list(self._revision_journal)
+        earliest = int(entries[0]["revision"]) if entries else self._revision + 1
+        latest = int(entries[-1]["revision"]) if entries else self._revision
+        eligible = [item for item in entries if int(item.get("revision", 0)) > cursor]
+        page = eligible[:limit]
+        through = int(page[-1]["revision"]) if page else min(cursor, self._revision)
+        return {
+            "storage": "memory_bounded",
+            "persistent": False,
+            "capacity": self.revision_history_size,
+            "earliest_revision": earliest,
+            "latest_revision": latest,
+            "after_revision": cursor,
+            "through_revision": through,
+            "truncated": bool(entries and cursor < earliest - 1),
+            "has_more": len(eligible) > len(page),
+            # 返回副本，避免调用方改写账本里仍在等待其他消费者读取的嵌套列表。
+            "entries": [
+                {
+                    **dict(item),
+                    "entities": [dict(entity) for entity in item.get("entities", ())],
+                    "events": [dict(event) for event in item.get("events", ())],
+                    "removed_entity_ids": list(item.get("removed_entity_ids", ())),
+                    "uncertainties": list(item.get("uncertainties", ())),
+                }
+                for item in page
+            ],
+        }
 
     def _persist_allowed_event(self, event: WorldEvent) -> bool:
         if _transient_entity_id(event.target_id) or any(
@@ -677,6 +743,7 @@ class WorldStateStore:
             ):
                 raise ValueError("VRChat player_left target_id has an invalid namespace")
         removed_entity_ids: list[str] = []
+        upserted_entities: list[WorldEntity] = []
         with self._lock:
             # 先建立删除水位，再处理 upsert；同一时间戳的离场优先，
             # 迟到的旧检测帧不会把玩家复活。
@@ -708,6 +775,7 @@ class WorldStateStore:
                 previous = self._entities.get(entity.id)
                 if previous is None or entity.observed_at >= previous.observed_at:
                     self._entities[entity.id] = entity
+                    upserted_entities.append(entity)
                     self._clear_superseded_watermarks(entity)
             if len(self._entities) > self.max_entities:
                 ranked = sorted(
@@ -732,6 +800,15 @@ class WorldStateStore:
                 "removed_entity_ids": [],
                 "removed_entity_count": 0,
             })
+            self._append_revision_locked(
+                kind="observation",
+                received_at=received_at,
+                observed_at=now,
+                entities=upserted_entities,
+                events=normalized_events,
+                removed_entity_ids=removed_entity_ids,
+                uncertainties=normalized_uncertainties,
+            )
             self._persist_locked()
             self._changed.notify_all()
         return snapshot
@@ -886,6 +963,13 @@ class WorldStateStore:
                 "removed_entity_ids": list(removed),
                 "removed_entity_count": len(removed),
             }
+            self._append_revision_locked(
+                kind="source_reset",
+                received_at=received_at,
+                observed_at=reset_at,
+                events=normalized_events,
+                removed_entity_ids=removed,
+            )
             self._persist_locked()
             self._changed.notify_all()
             return len(removed)
@@ -904,6 +988,12 @@ class WorldStateStore:
             self._observation_count = 0
             self._revision += 1
             self._last_changes = {"removed_entity_ids": [], "removed_entity_count": 0}
+            cleared_at = self._clock()
+            self._append_revision_locked(
+                kind="clear",
+                received_at=cleared_at,
+                observed_at=cleared_at,
+            )
             self._persist_locked()
             self._changed.notify_all()
 
@@ -945,8 +1035,35 @@ class WorldStateStore:
                     "persistence_write_count": self._persistence_write_count,
                     "raw_frames_persisted": False,
                     "chat_persisted": False,
+                    "revision_journal": {
+                        "storage": "memory_bounded",
+                        "persistent": False,
+                        "capacity": self.revision_history_size,
+                        "entry_count": len(self._revision_journal),
+                        "earliest_revision": (
+                            int(self._revision_journal[0]["revision"])
+                            if self._revision_journal else None
+                        ),
+                        "latest_revision": (
+                            int(self._revision_journal[-1]["revision"])
+                            if self._revision_journal else None
+                        ),
+                    },
                 },
             }
+
+    def journal(self, after_revision: int = 0, *, limit: int = 128) -> dict[str, Any]:
+        """读取纯内存决策账本，不等待也不改变消费游标。"""
+        try:
+            cursor = max(0, int(after_revision))
+        except (TypeError, ValueError, OverflowError):
+            cursor = 0
+        try:
+            item_limit = min(256, max(1, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            item_limit = 128
+        with self._lock:
+            return self._journal_since_locked(cursor, item_limit)
 
     def delta(
         self,
@@ -985,6 +1102,7 @@ class WorldStateStore:
             snapshot = self.snapshot()
             revision = int((snapshot.get("status") or {}).get("revision", self._revision))
             change_payload = dict(self._last_changes)
+            journal = self._journal_since_locked(cursor, min(256, max(1, item_limit)))
             return {
                 "revision": revision,
                 "after_revision": cursor,
@@ -1004,6 +1122,7 @@ class WorldStateStore:
                     "chat_persisted": False,
                 },
                 "uncertainty": list(snapshot.get("uncertainties") or ()),
+                "journal": journal,
                 "changes": {
                     "entities": list(snapshot.get("entities") or [])[:item_limit],
                     "events": list(snapshot.get("events") or [])[:item_limit],

@@ -75,6 +75,30 @@ class DebugCliTests(unittest.TestCase):
         self.assertEqual(calls[0][0][4], "/osc/chatbox")
         self.assertEqual(calls[0][0][5], {"text": "hello", "immediate": False})
 
+    def test_autonomy_goal_forwards_selector_constraints_and_revision(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        def fake_request(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"accepted": True}
+
+        argv = [
+            "debug_cli.py", "--token", "dev", "autonomy-goal",
+            "--goal", "寻找 NPC", "--kind", "explore",
+            "--selector-json", '{"semantic_type":"npc","min_confidence":0.7}',
+            "--constraints-json", '{"max_scan_turns":16,"max_forward_axis":0.3}',
+            "--based-on-revision", "42",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(debug_cli, "request", fake_request):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(debug_cli.main(), 0)
+
+        self.assertEqual(calls[0][0][4], "/autonomy/goal")
+        payload = calls[0][0][5]
+        self.assertEqual(payload["selector"]["semantic_type"], "npc")
+        self.assertEqual(payload["constraints"]["max_scan_turns"], 16)
+        self.assertEqual(payload["based_on_revision"], 42)
+
     def test_persistent_shell_reuses_one_session(self) -> None:
         class FakeClient:
             def __init__(self, host, port, token):

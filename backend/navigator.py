@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .explorer import ExplorerStateMachine
 from .world_state import blocking_uncertainties
 
 
@@ -408,6 +409,10 @@ class LocalNavigator:
         self._turn_cooldown_suppressed_count = 0
         self._target_observation: _TargetObservation | None = None
         self._target_grace_count = 0
+        self._explorer = ExplorerStateMachine(
+            default_max_duration_s=min(90.0, self.config.max_goal_age_s),
+            default_forward_axis=min(0.45, self.config.max_forward_axis),
+        )
 
     def start(self) -> bool:
         with self._lock:
@@ -439,7 +444,8 @@ class LocalNavigator:
             world = self._world_provider()
             self._pre_tick_goal_check(goal_state)
             decision = self._stall_guard(self._decide(goal_state, world, now), goal_state, now)
-            self._apply(decision, now)
+            applied = self._apply(decision, now)
+            self._explorer.record_applied(decision.reason, applied)
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
@@ -813,6 +819,7 @@ class LocalNavigator:
                         None if self._target_observation is None else self._target_observation.target_id
                     ),
                 },
+                "explorer": self._explorer.snapshot(),
             }
 
     def _run(self) -> None:
@@ -923,10 +930,77 @@ class LocalNavigator:
             return NavigationDecision("stop", "goal_expired")
         target_id = str(goal.get("target_id") or "").strip()
         if not target_id:
-            # 目标选择属于 LLM/规划器：本地环只执行已经锁定的实体。explore 可以
-            # 在上层作为观察请求存在，但没有精确 ID 时不得按文字、标签或置信度
-            # 自行挑门、海报或玩家，更不能在目标丢失后静默换人。
-            return NavigationDecision("stop", "target_id_required")
+            if str(goal.get("kind") or "").strip().lower() != "explore":
+                return NavigationDecision("stop", "target_id_required")
+            if not isinstance(goal.get("selector"), Mapping):
+                # 自由文本仍然不能驱动本地自动选人；只有经过 schema 校验的明确
+                # selector 才能启用 Explorer。
+                return NavigationDecision("stop", "target_id_required")
+            if not isinstance(world, Mapping) or world.get("capture_active") is False:
+                return NavigationDecision("stop", "world_unknown")
+            status = _mapping(world.get("status")) or {}
+            revision = int(_finite(status.get("revision")) or 0)
+            observed_age = _finite(status.get("last_observation_age_ms"))
+            if observed_age is None or observed_age > self.config.max_observation_age_ms:
+                return NavigationDecision(
+                    "stop", "observation_stale", revision=revision, observed_age_ms=observed_age
+                )
+            # 空画面会带 no_recent_visual_observation，但 fresh status 证明这一帧
+            # 确实刚被处理过；搜索时允许它表示“当前方向没候选”。其他不确定性
+            # （遮挡、世界切换、后端错误）仍然立即停车。
+            uncertainties = [
+                item for item in blocking_uncertainties(world.get("uncertainties"))
+                if item != "no_recent_visual_observation"
+            ]
+            if uncertainties:
+                return NavigationDecision(
+                    "stop", "world_uncertain", revision=revision, observed_age_ms=observed_age
+                )
+            directive = self._explorer.decide(
+                goal,
+                world,
+                max_turn_deg=self.config.max_turn_deg,
+                turn_gain=self.config.turn_gain,
+                bearing_deadband_deg=self.config.bearing_deadband_deg,
+                navigator_max_forward_axis=self.config.max_forward_axis,
+                skip_ids=self._unreachable_ids(),
+            )
+            if directive.state == "turn":
+                # 搜索扫描是固定 45° 的离散步，不是视觉 bearing 修正。必须等上一
+                # 步真实落地后再记一次预算；传 revision=0 会走 turning/cooldown
+                # 门控，避免 continuous-retarget 模式在 0.8 秒里“账面转满一圈”。
+                turn_revision = (
+                    0
+                    if directive.reason in {"explore_scan", "explore_reacquire_scan"}
+                    else revision
+                )
+                return NavigationDecision(
+                    "turn",
+                    directive.reason,
+                    directive.target_id,
+                    directive.bearing_deg,
+                    revision=turn_revision,
+                    observed_age_ms=observed_age,
+                    turn_deg=directive.turn_deg,
+                )
+            if directive.state == "advance":
+                return NavigationDecision(
+                    "advance",
+                    directive.reason,
+                    side="left",
+                    y=directive.forward_axis,
+                    pulse_ms=self.config.pulse_ms,
+                    revision=revision,
+                    observed_age_ms=observed_age,
+                )
+            return NavigationDecision(
+                "reached" if directive.state == "found" else "stop",
+                directive.reason,
+                directive.target_id,
+                directive.bearing_deg,
+                revision=revision,
+                observed_age_ms=observed_age,
+            )
         if not isinstance(world, Mapping) or not bool(world.get("available")):
             return NavigationDecision("stop", "world_unknown")
         uncertainties = blocking_uncertainties(world.get("uncertainties"))
@@ -1228,7 +1302,7 @@ class LocalNavigator:
                 self._last_turn_revision = revision
         return True
 
-    def _apply(self, decision: NavigationDecision, now: float) -> None:
+    def _apply(self, decision: NavigationDecision, now: float) -> bool:
         if decision.state == "turn":
             # 转向不占摇杆，所以不进 _active_side：它是 play space 的朝向，不是
             # 需要按住再松开的输入。但前进摇杆必须先松——边走边转会让 bearing
@@ -1237,13 +1311,12 @@ class LocalNavigator:
                 self._safe_release()
             if self._turn_already_sent(decision.revision):
                 self._record_turn_suppressed("revision")
-                return
-            self._send_gated_turn(
+                return False
+            return self._send_gated_turn(
                 decision.turn_deg,
                 now,
                 revision=decision.revision,
             )
-            return
         if decision.state == "advance" and decision.side:
             if self._active_side == "right":
                 self._release_inputs("right")
@@ -1264,7 +1337,7 @@ class LocalNavigator:
                 with self._lock:
                     self._active_side = "left"
                     self._command_count += 1
-            return
+            return bool(sent)
         if decision.state == "recover":
             # 绕行是「先退开、再转身」。后退轴可选：斜撞墙时人还在动，直接转
             # 就行；正面墙才需要先退一步，免得贴着墙角转身蹭不出去。
@@ -1278,11 +1351,13 @@ class LocalNavigator:
             # recover 决策已经在失速守卫里消耗了一次有限预算，若在这里静默抑制，
             # 会出现“预算用掉了但实际没转”的假恢复。它由速度反馈触发且不是视觉
             # revision 的重复命令，因此保持一次决策对应一次真实提交。
-            if self._send_turn(decision.turn_deg):
+            turn_sent = self._send_turn(decision.turn_deg)
+            if turn_sent:
                 with self._lock:
                     self._command_count += 1
-            return
+            return bool(turn_sent)
         self._safe_release()
+        return False
 
     def _safe_release(self) -> None:
         with self._lock:

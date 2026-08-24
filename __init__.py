@@ -166,6 +166,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._world_bridge_signature: str | None = None
         # 上一次每个实体的 (距离档, 方位档)，用于判断「靠近」而不是「存在」。
         self._world_bridge_entity_states: dict[str, tuple[str, str]] = {}
+        # 主 LLM 的消费游标与后台 bridge 游标分离：bridge 可以持续读世界，
+        # LLM 思考十秒后仍能从自己最后确认的 revision 补齐中间变化。
+        self._llm_consumed_revision = 0
+        self._llm_pending_revision = 0
         self._frame_budget = FrameBudget(self._body_config.vision.frame_max_per_minute)
         self._ui_event_lock = threading.Lock()
         self._ui_events: deque[dict[str, Any]] = deque(maxlen=40)
@@ -211,6 +215,8 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._host_vmc = self._backend_client.host_vmc
             self._vision = self._backend_client.vision
             # 后端进程已重建，世界修订号从新实例重新开始。
+            self._llm_consumed_revision = 0
+            self._llm_pending_revision = 0
             self._start_world_context_bridge(reset_cursor=True)
         else:
             self._scheduler = None
@@ -303,6 +309,124 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             await task
         except asyncio.CancelledError:
             pass
+
+    @staticmethod
+    def _journal_changes(delta: Mapping[str, Any]) -> dict[str, Any]:
+        """把一页 revision 账本压成可判别的变化，不丢失中间事件。"""
+        fallback = delta.get("changes") if isinstance(delta.get("changes"), Mapping) else {}
+        journal = delta.get("journal") if isinstance(delta.get("journal"), Mapping) else {}
+        entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+        if not entries:
+            return {
+                "entities": list(fallback.get("entities") or ())[:64],
+                "events": list(fallback.get("events") or ())[:64],
+                "removed_entity_ids": list(fallback.get("removed_entity_ids") or ())[:64],
+                "removed_entity_count": int(fallback.get("removed_entity_count", 0) or 0),
+            }
+
+        latest_entities: dict[str, dict[str, Any]] = {}
+        events: list[dict[str, Any]] = []
+        removed: list[str] = []
+        removed_seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            for entity in entry.get("entities") or ():
+                if not isinstance(entity, Mapping):
+                    continue
+                entity_id = str(entity.get("id") or "")[:96]
+                if entity_id:
+                    # 同一实体只需保留本页最后状态；离散事件仍逐条保存。
+                    latest_entities[entity_id] = dict(entity)
+                    removed_seen.discard(entity_id)
+            for event in entry.get("events") or ():
+                if isinstance(event, Mapping) and len(events) < 64:
+                    events.append(dict(event))
+            for item in entry.get("removed_entity_ids") or ():
+                entity_id = str(item or "")[:96]
+                latest_entities.pop(entity_id, None)
+                if entity_id and entity_id not in removed_seen and len(removed) < 64:
+                    removed_seen.add(entity_id)
+                    removed.append(entity_id)
+        return {
+            "entities": list(latest_entities.values())[:64],
+            "events": events,
+            "removed_entity_ids": removed,
+            "removed_entity_count": len(removed),
+        }
+
+    @staticmethod
+    def _decision_context(entries: Iterable[Any]) -> dict[str, Any]:
+        """把高频账本压成 LLM 可消费的轨迹摘要，完整保留离散事件。"""
+        tracks: dict[str, dict[str, Any]] = {}
+        events: list[dict[str, Any]] = []
+        removed: list[str] = []
+        uncertainties: list[str] = []
+        seen_removed: set[str] = set()
+        seen_uncertainties: set[str] = set()
+        revision_count = 0
+        entity_update_count = 0
+        event_count = 0
+        removed_count = 0
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            revision_count += 1
+            revision = int(entry.get("revision", 0) or 0)
+            for raw in entry.get("entities") or ():
+                if not isinstance(raw, Mapping):
+                    continue
+                entity_id = str(raw.get("id") or "")[:96]
+                if not entity_id:
+                    continue
+                entity_update_count += 1
+                item = dict(raw)
+                current = tracks.get(entity_id)
+                if current is None:
+                    tracks[entity_id] = {
+                        "entity_id": entity_id,
+                        "first_revision": revision,
+                        "last_revision": revision,
+                        "update_count": 1,
+                        "first": item,
+                        "latest": item,
+                    }
+                else:
+                    current["last_revision"] = revision
+                    current["update_count"] = int(current.get("update_count", 0)) + 1
+                    current["latest"] = item
+            for raw in entry.get("events") or ():
+                if isinstance(raw, Mapping):
+                    event_count += 1
+                    if len(events) < 512:
+                        events.append({**dict(raw), "revision": revision})
+            for raw in entry.get("removed_entity_ids") or ():
+                entity_id = str(raw or "")[:96]
+                if entity_id and entity_id not in seen_removed:
+                    seen_removed.add(entity_id)
+                    removed_count += 1
+                    if len(removed) < 256:
+                        removed.append(entity_id)
+            for raw in entry.get("uncertainties") or ():
+                value = str(raw or "")[:160]
+                if value and value not in seen_uncertainties and len(uncertainties) < 32:
+                    seen_uncertainties.add(value)
+                    uncertainties.append(value)
+        return {
+            "revision_count": revision_count,
+            "entity_update_count": entity_update_count,
+            "entity_track_count": len(tracks),
+            "entity_tracks": list(tracks.values())[-128:],
+            "entity_tracks_truncated": len(tracks) > 128,
+            "event_count": event_count,
+            "events": events,
+            "events_truncated": event_count > len(events),
+            "removed_entity_count": removed_count,
+            "removed_entity_ids": removed,
+            "removed_entities_truncated": removed_count > len(removed),
+            "uncertainties_seen": uncertainties,
+            "coalescing": "first_latest_per_entity_all_discrete_events",
+        }
 
     @staticmethod
     def _world_context_text(delta: Mapping[str, Any], reasons: Iterable[str] = ()) -> str:
@@ -400,9 +524,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 continue
             previous_revision = self._world_bridge_revision
             revision = int(delta.get("revision", previous_revision) or previous_revision)
+            journal = delta.get("journal") if isinstance(delta.get("journal"), Mapping) else {}
+            entries = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+            # 有分页时只推进到本页末尾，下一轮继续补读；直接跳到最新 revision
+            # 会让 burst 中间的挥手、离场等事件永远消失。
+            through_revision = int(journal.get("through_revision", revision) or revision)
+            next_revision = through_revision if entries or journal.get("has_more") else revision
             # 即使捕获暂时停止，也要推进游标；否则重启后会把旧历史重新注入
             # 主 LLM。停止期间只保留游标，不发布任何世界内容。
-            self._world_bridge_revision = max(previous_revision, revision)
+            self._world_bridge_revision = max(previous_revision, next_revision)
             if delta.get("capture_active") is False:
                 self._world_bridge_signature = None
                 # 捕获停止期间的历史不能留着：恢复后画面里的人一律按「新出现」
@@ -410,11 +540,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 self._world_bridge_entity_states = {}
                 await asyncio.sleep(0.1)
                 continue
-            changed = bool(delta.get("changed")) and revision > previous_revision
+            changed = bool(delta.get("changed")) and next_revision > previous_revision
             if not changed:
                 await asyncio.sleep(0.05)
                 continue
-            changes = delta.get("changes") if isinstance(delta.get("changes"), Mapping) else {}
+            changes = self._journal_changes(delta)
+            context_delta = dict(delta)
+            context_delta["changes"] = changes
             signature = delta_signature(changes)
             if signature == self._world_bridge_signature:
                 continue
@@ -446,7 +578,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 # 伪造“已停止”，继续沿用当前 delta 的保守内容。
                 pass
             parts: list[dict[str, Any]] = [
-                {"type": "text", "text": self._world_context_text(delta, reasons)}
+                {"type": "text", "text": self._world_context_text(context_delta, reasons)}
             ]
             if wake:
                 # 只有唤醒才配图。宿主对 respond 的图是延迟到主动回合真正下发
@@ -1317,13 +1449,67 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
 
     @llm_tool(**WORLD_OBSERVE)
     async def world_observe(self, **_: Any):
-        """返回最新的视觉世界快照，不阻塞插件事件循环。"""
+        """返回最新世界及 LLM 尚未确认消费的 revision 决策上下文。"""
         if self._vision is None:
             return Ok({
                 "available": False,
                 "uncertainties": ["backend_unavailable"],
             })
-        return Ok(await asyncio.to_thread(self._vision.snapshot))
+        after_revision = self._llm_consumed_revision
+        cursor = after_revision
+        entries: list[dict[str, Any]] = []
+        truncated = False
+        has_more = False
+        # 账本容量最多 512；分八页读取，避免后端单个 HTTP 响应无限膨胀。
+        for _ in range(8):
+            delta = await asyncio.to_thread(
+                self._vision.delta,
+                cursor,
+                wait_ms=0,
+                limit=64,
+            )
+            if not isinstance(delta, Mapping):
+                break
+            journal = delta.get("journal") if isinstance(delta.get("journal"), Mapping) else {}
+            page = journal.get("entries") if isinstance(journal.get("entries"), list) else []
+            entries.extend(dict(item) for item in page if isinstance(item, Mapping))
+            truncated = truncated or bool(journal.get("truncated"))
+            has_more = bool(journal.get("has_more"))
+            through = int(journal.get("through_revision", cursor) or cursor)
+            if through <= cursor:
+                break
+            cursor = through
+            if not has_more:
+                break
+
+        snapshot = await asyncio.to_thread(self._vision.snapshot)
+        if not isinstance(snapshot, Mapping):
+            snapshot = {"available": False, "uncertainties": ["invalid_world_snapshot"]}
+        result = dict(snapshot)
+        status = result.get("status") if isinstance(result.get("status"), Mapping) else {}
+        current_revision = int(status.get("revision", cursor) or cursor)
+        # snapshot 与最后一页 journal 之间仍可能有新帧到达。当前快照可以展示
+        # 最新实体，但只有 cursor 以前的离散事件确实被本回合读过；绝不能因为
+        # snapshot 又前进了几版就把尚未分页读取的事件一并确认掉。
+        through_revision = min(current_revision, cursor)
+        self._llm_pending_revision = max(self._llm_pending_revision, through_revision)
+        result["decision_context"] = {
+            "storage": "memory_bounded",
+            "persistent": False,
+            "raw_frames_persisted": False,
+            "after_revision": after_revision,
+            "through_revision": through_revision,
+            "current_revision": current_revision,
+            "snapshot_ahead_revisions": max(0, current_revision - through_revision),
+            "truncated": truncated,
+            "has_more": has_more,
+            "changes": self._decision_context(entries),
+            "acknowledge_with": {
+                "tool": "vrc_autonomy_goal",
+                "based_on_revision": through_revision,
+            },
+        }
+        return Ok(result)
 
     @llm_tool(**VRC_VISION_STATUS)
     async def vrc_vision_status(self, **_: Any):
@@ -1685,6 +1871,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         text: Any = None,
         kind: Any = "explore",
         target_id: Any = None,
+        selector: Any = None,
+        constraints: Any = None,
+        based_on_revision: Any = None,
         **_: Any,
     ):
         normalized_text = str(goal if text is None else text or "").replace("\x00", "").strip()
@@ -1694,14 +1883,41 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         normalized_target_id = str(target_id or "").replace("\x00", "").strip()
         if len(normalized_target_id) > 96:
             return Ok({"accepted": False, "reason": "target_id must not exceed 96 characters"})
+        if selector is not None and not isinstance(selector, Mapping):
+            return Ok({"accepted": False, "reason": "selector must be an object"})
+        if constraints is not None and not isinstance(constraints, Mapping):
+            return Ok({"accepted": False, "reason": "constraints must be an object"})
+        normalized_revision = None
+        if based_on_revision is not None:
+            normalized_revision = _integer(
+                "based_on_revision",
+                based_on_revision,
+                minimum=0,
+                maximum=2_147_483_647,
+            )
         if not self._backend_client:
             return Ok({"accepted": False, "reason": "backend is not initialized"})
-        return Ok(await asyncio.to_thread(
+        result = await asyncio.to_thread(
             self._backend_client.autonomy.goal,
             normalized_text,
             normalized_kind,
             normalized_target_id or None,
-        ))
+            None if selector is None else dict(selector),
+            None if constraints is None else dict(constraints),
+            normalized_revision,
+        )
+        if (
+            isinstance(result, Mapping)
+            and result.get("accepted")
+            and normalized_revision is not None
+        ):
+            # 只有后端真正接收了基于该视图的决策才确认消费；被拒绝的迟到
+            # 决策不会清掉账本，下一次 world_observe 仍能看到这些变化。
+            self._llm_consumed_revision = max(
+                self._llm_consumed_revision,
+                min(normalized_revision, self._llm_pending_revision),
+            )
+        return Ok(result)
 
     @llm_tool(**VRC_AUTONOMY_STOP)
     async def vrc_autonomy_stop(self, *, reason: Any = "autonomy_stop", **_: Any):

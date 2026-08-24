@@ -392,6 +392,108 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(self.turns, [])
 
+    def test_explore_selector_scans_a_fresh_empty_view_without_llm_ticks(self) -> None:
+        """明确 selector 可以启动本地扫描；新鲜空帧不是采集故障。"""
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "寻找 NPC",
+            "selector": {"semantic_type": "npc", "min_confidence": 0.7},
+            "constraints": {"max_scan_turns": 16, "max_forward_axis": 0.3},
+            "age_seconds": 1.0,
+        }
+        self.world.update({
+            "available": False,
+            "entities": [],
+            "uncertainties": ["no_recent_visual_observation", "depth_unavailable"],
+        })
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "turn")
+        self.assertEqual(decision.reason, "explore_scan")
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(self.navigator.snapshot()["explorer"]["llm_calls_in_loop"], 0)
+
+        # scheduler 仍在完成这次 45° 转身时，即使视觉 revision 连续增加也不能
+        # 消耗下一次扫描预算。
+        self.turn_state["turning"] = True
+        for revision in (4, 5, 6):
+            self.world["status"]["revision"] = revision
+            self.navigator.tick()
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(self.navigator.snapshot()["explorer"]["scan_turns"], 1)
+
+    def test_explorer_advances_after_one_full_scan_and_respects_axis_constraint(self) -> None:
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "寻找 NPC",
+            "selector": {"semantic_type": "npc"},
+            "constraints": {"max_scan_turns": 16, "max_forward_axis": 0.3},
+            "age_seconds": 1.0,
+        }
+        self.world.update({
+            "available": False,
+            "entities": [],
+            "uncertainties": ["no_recent_visual_observation"],
+        })
+        for revision in range(3, 11):
+            self.world["status"]["revision"] = revision
+            self.now[0] += 0.21
+            self.assertEqual(self.navigator.tick().reason, "explore_scan")
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "advance")
+        self.assertEqual(decision.reason, "explore_advance")
+        self.assertAlmostEqual(decision.y, 0.3)
+
+    def test_explorer_only_locks_a_semantically_verified_npc_and_does_not_approach(self) -> None:
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "找到白色 NPC",
+            "selector": {"semantic_type": "npc", "label": "白色"},
+            "age_seconds": 1.0,
+        }
+        self.world["entities"] = [{
+            "id": "avatar:session:test:7",
+            "label": "白色 NPC",
+            "confidence": 0.91,
+            "visible": True,
+            "attributes": {
+                "semantic_type": "npc",
+                "semantic_verified": True,
+                "bearing_deg": 0.0,
+            },
+        }]
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.state, "reached")
+        self.assertEqual(decision.reason, "explore_target_found")
+        self.assertEqual(decision.target_id, "avatar:session:test:7")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.navigator.snapshot()["explorer"]["locked_target_id"], decision.target_id)
+
+    def test_generic_person_box_cannot_satisfy_npc_selector(self) -> None:
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "寻找 NPC",
+            "selector": {"semantic_type": "npc"},
+            "age_seconds": 1.0,
+        }
+        self.world["entities"] = [{
+            "id": "avatar:session:test:7",
+            "label": "person",
+            "confidence": 0.99,
+            "visible": True,
+            "attributes": {"bearing_deg": 0.0},
+        }]
+
+        decision = self.navigator.tick()
+
+        self.assertEqual(decision.reason, "explore_scan")
+        self.assertIsNone(decision.target_id)
+
     def test_explore_with_explicit_id_tracks_only_that_entity(self) -> None:
         """goal 文本提到其他实体时，也只能执行 LLM 给出的 target_id。"""
 

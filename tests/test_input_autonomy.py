@@ -145,6 +145,79 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertTrue(accepted["accepted"])
         self.assertEqual(accepted["goal"]["target_id"], "vision:person:7")
 
+    def test_explore_goal_preserves_selector_constraints_and_revision(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        runtime.update_world({
+            "available": True,
+            "entities": [],
+            "events": [],
+            "status": {"revision": 12},
+        })
+
+        accepted = runtime.submit_goal(
+            "find the npc",
+            "explore",
+            selector={"semantic_type": "npc", "min_confidence": 0.7},
+            constraints={"max_duration_s": 120, "max_scan_turns": 8, "max_forward_axis": 0.4},
+            based_on_revision=12,
+        )
+
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["goal"]["selector"]["semantic_type"], "npc")
+        self.assertEqual(accepted["goal"]["constraints"]["max_scan_turns"], 8)
+        self.assertEqual(accepted["goal"]["based_on_revision"], 12)
+
+    def test_fresh_empty_observation_keeps_selector_explore_armed(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        self.assertTrue(runtime.submit_goal(
+            "find the npc",
+            "explore",
+            selector={"semantic_type": "npc"},
+        )["accepted"])
+
+        runtime.update_world({
+            "available": False,
+            "entities": [],
+            "events": [],
+            "uncertainties": ["no_recent_visual_observation", "depth_unavailable"],
+            "status": {"revision": 1, "last_observation_age_ms": 20},
+        })
+
+        snapshot = runtime.snapshot()
+        self.assertEqual(snapshot["state"], "armed")
+        self.assertEqual(snapshot["reason"], "goal_waiting_for_explorer")
+
+    def test_goal_rejects_unknown_fields_and_future_revision(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        runtime.update_world({
+            "available": True,
+            "entities": [],
+            "events": [],
+            "status": {"revision": 4},
+        })
+
+        invalid = runtime.submit_goal("find", selector={"semantic_type": "npc", "prompt": "x"})
+        self.assertFalse(invalid["accepted"])
+        self.assertIn("unsupported fields", invalid["reason"])
+        future = runtime.submit_goal("find", based_on_revision=5)
+        self.assertFalse(future["accepted"])
+        self.assertEqual(future["reason"], "based_on_revision is newer than current world revision")
+
     def test_degraded_does_not_resurrect_a_disarmed_session(self) -> None:
         """恢复边不能把已经 disarm 的会话弄活。
 
