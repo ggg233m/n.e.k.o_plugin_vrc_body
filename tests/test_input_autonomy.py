@@ -227,6 +227,45 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertEqual(accepted["goal"]["constraints"]["max_scan_turns"], 8)
         self.assertEqual(accepted["goal"]["based_on_revision"], 12)
 
+    def test_depart_is_local_but_wander_requires_an_llm_planned_step(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+        )
+        runtime.arm()
+
+        depart = runtime.submit_goal(
+            "离开这里",
+            "depart",
+            constraints={"max_duration_s": 2.0, "max_forward_axis": 0.35},
+        )
+        self.assertTrue(depart["accepted"], depart)
+        self.assertIsNone(depart["goal"]["target_id"])
+
+        missing_direction = runtime.submit_goal(
+            "随便逛逛",
+            "wander",
+            constraints={"max_duration_s": 2.0, "max_forward_axis": 0.45},
+        )
+        self.assertFalse(missing_direction["accepted"])
+        self.assertIn("turn_deg", missing_direction["reason"])
+
+        too_long = runtime.submit_goal(
+            "随便逛逛",
+            "wander",
+            constraints={"turn_deg": -30.0, "max_duration_s": 4.0},
+        )
+        self.assertFalse(too_long["accepted"])
+
+        wander = runtime.submit_goal(
+            "往右前方逛逛",
+            "wander",
+            constraints={"turn_deg": -30.0, "max_duration_s": 2.0, "max_forward_axis": 0.45},
+        )
+        self.assertTrue(wander["accepted"], wander)
+        self.assertIsNone(wander["goal"]["selector"])
+        self.assertEqual(wander["goal"]["constraints"]["turn_deg"], -30.0)
+
     def test_fresh_empty_observation_keeps_selector_explore_armed(self) -> None:
         runtime = AutonomyRuntime(
             world_provider=lambda: {},

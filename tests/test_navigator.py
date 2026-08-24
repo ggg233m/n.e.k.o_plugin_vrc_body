@@ -52,6 +52,90 @@ class NavigatorTests(unittest.TestCase):
         self.assertLessEqual(self.sent[0][2], self.navigator.config.max_forward_axis)
         self.assertGreater(self.sent[0][2], 0.0)
 
+    def test_depart_backs_away_then_completes(self) -> None:
+        completed: list[str] = []
+        self.navigator._complete_goal = completed.append
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "depart",
+                "text": "离开这里",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"max_duration_s": 2.0},
+            },
+        }
+
+        moving = self.navigator.tick()
+        self.assertEqual(moving.state, "retreat")
+        self.assertEqual(moving.reason, "depart_back_away")
+        self.assertLess(self.sent[-1][2], 0.0)
+
+        self.goal["goal"]["age_seconds"] = 2.0
+        finished = self.navigator.tick()
+        self.assertEqual(finished.reason, "depart_complete")
+        self.assertEqual(completed, ["depart_complete"])
+        self.assertEqual(
+            self.navigator.snapshot()["behavior"]["last_outcome"]["reason"],
+            "depart_complete",
+        )
+
+    def test_wander_executes_exactly_one_llm_planned_step(self) -> None:
+        completed: list[str] = []
+        self.navigator._complete_goal = completed.append
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "随便走走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": -30.0, "max_duration_s": 2.0},
+            },
+        }
+
+        turning = self.navigator.tick()
+        self.assertEqual(turning.reason, "wander_llm_turn")
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(self.turns[0], -30.0)
+
+        self.turn_state["turning"] = True
+        self.now[0] += 0.1
+        settling = self.navigator.tick()
+        self.assertEqual(settling.reason, "wander_turn_settling")
+        self.assertEqual(len(self.turns), 1)
+
+        self.turn_state["turning"] = False
+        self.now[0] += 0.3
+        moving = self.navigator.tick()
+        self.assertEqual(moving.reason, "wander_forward")
+        self.assertGreater(self.sent[-1][2], 0.0)
+
+        # 单段走完就停车并结束目标；导航器不能自行决定下一条方向。
+        self.now[0] += 2.1
+        self.goal["goal"]["age_seconds"] = 2.5
+        segment_done = self.navigator.tick()
+        self.assertEqual(segment_done.reason, "wander_step_complete")
+        self.assertEqual(self.released[-1], "all")
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(completed, ["wander_step_complete"])
+
+    def test_wander_zero_turn_means_llm_explicitly_chose_straight(self) -> None:
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "前面看起来可通行，直走一小段",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+
+        decision = self.navigator.tick()
+        self.assertEqual(decision.reason, "wander_forward")
+        self.assertEqual(self.turns, [])
+
     def test_off_center_target_turns_without_forward_motion(self) -> None:
         """目标偏右就必须往右转，而且不能同时前进。
 
@@ -1371,6 +1455,37 @@ class NavigatorAutoRecoverTests(unittest.TestCase):
         for _ in range(12):
             self.assertEqual(navigator.tick().state, "advance")
         self.assertEqual(navigator.snapshot()["stall"]["slip_count"], 0)
+
+    def test_wander_uses_stricter_slip_guard_for_live_wall_reading(self) -> None:
+        """自由巡航把实机 0.738 的前进占比识别为贴墙滑行。
+
+        普通目标导航仍沿用全局 0.55 校准值；wander 没有目标方位替它持续纠偏，
+        所以连续三 tick 低于 0.85 就应自行绕墙。
+        """
+        self.goal["goal"] = {
+            "kind": "wander",
+            "text": "随便走走",
+            "target_id": None,
+            "age_seconds": 1.0,
+            "constraints": {"turn_deg": -20.0, "max_duration_s": 2.0},
+        }
+        self.motion["horizontal_speed_mps"] = 1.1475
+        self.motion["forward_ratio"] = 0.7377
+        self.motion["slip_ratio"] = -0.6752
+        navigator = self._navigator(slip_ticks=5, turn_cooldown_s=0.0)
+
+        self.assertEqual(navigator.tick().reason, "wander_llm_turn")
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        decision = navigator.tick()
+        self.assertEqual(decision.state, "recover")
+        self.assertTrue(decision.reason.startswith("auto_recover_slide"))
+        self.assertLess(decision.turn_deg, 0.0)
+
+        snapshot = navigator.snapshot()
+        self.assertEqual(snapshot["stall"]["slip_threshold_ticks"], 3)
+        self.assertEqual(snapshot["stall"]["slip_forward_ratio"], 0.85)
+        self.assertEqual(NavigatorConfig().slip_forward_ratio, 0.55)
 
     def test_real_measured_head_on_wall_uses_the_speed_judgement(self) -> None:
         # 另一次实测：正面撞墙时速度直接塌到 0.062，低于失速阈值，

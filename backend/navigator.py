@@ -26,6 +26,16 @@ GoalCompleter = Callable[[str], None]
 # 代码里而不是配置项。
 _CLIPPED_REACH_FACTOR = 0.6
 
+# wander 是 LLM 根据当前画面规划的一条短路段，不是本地随机漫游。导航器只负责
+# 执行、避撞和停车；每段完成后由宿主带一张新画面唤醒 LLM 决定下一段。
+_WANDER_DEFAULT_STEP_S = 2.0
+_WANDER_MAX_STEP_S = 3.0
+# 闲逛时没有“目标方向”可以容忍斜走；forward_ratio=0.738 的实机贴墙滑行对
+# 普通目标导航尚可接受，对自由巡航则应尽快绕开。这里只收紧 wander，不改变
+# 已经用正负样本校准过的全局 0.55 阈值。
+_WANDER_SLIP_FORWARD_RATIO = 0.85
+_WANDER_SLIP_TICKS = 3
+
 
 @dataclass(frozen=True)
 class NavigatorConfig:
@@ -403,6 +413,10 @@ class LocalNavigator:
         self._behavior_outcome_sequence = 0
         self._behavior_last_outcome: dict[str, Any] | None = None
         self._behavior_outcome_notified: tuple[tuple[str, str, str], str] | None = None
+        # wander 只执行 LLM 已经选定的一条短路段，不保存轨迹、不写磁盘，也不
+        # 自己挑下一条路线。
+        self._wander_turn_sent = False
+        self._wander_segment_started_at: float | None = None
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
@@ -477,6 +491,18 @@ class LocalNavigator:
             decision = self._stall_guard(directed_decision, goal_state, now)
             applied = self._apply(decision, now)
             self._explorer.record_applied(decision.reason, applied)
+            if applied:
+                goal = _mapping((goal_state or {}).get("goal")) or {}
+                goal_kind = str(goal.get("kind") or "").strip().lower()
+                with self._lock:
+                    if decision.reason == "wander_llm_turn":
+                        self._wander_turn_sent = True
+                    elif decision.reason == "wander_forward" and self._wander_segment_started_at is None:
+                        self._wander_segment_started_at = now
+                    elif decision.state == "recover" and goal_kind == "wander":
+                        # 绕墙转向已经改变了路线；从转向完成后重新给这一段完整预算，
+                        # 避免刚绕开墙就被旧路段计时器立刻要求再转一次。
+                        self._wander_segment_started_at = now
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
@@ -526,6 +552,11 @@ class LocalNavigator:
                 next_kind = goal_key[0].strip().lower()
                 self._behavior_phase = "acquire" if next_kind == "approach_observe" else "idle"
                 self._behavior_phase_started_at = None
+                constraints = _mapping(goal.get("constraints")) or {}
+                turn_deg = _finite(constraints.get("turn_deg"))
+                # turn_deg=0 明确表示 LLM 选择直行，不需要伪造一条零度转向命令。
+                self._wander_turn_sent = bool(turn_deg is not None and abs(turn_deg) <= 0.5)
+                self._wander_segment_started_at = None
                 # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
                 # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
@@ -541,6 +572,8 @@ class LocalNavigator:
             "approach_observe_complete",
             "approach_observe_target_lost",
             "explore_duration_exhausted",
+            "depart_complete",
+            "wander_step_complete",
             "goal_expired",
         }
         if decision.reason not in terminal_reasons or self._complete_goal is None:
@@ -671,6 +704,8 @@ class LocalNavigator:
         outcome_reasons = {
             "approach_observe_complete",
             "approach_observe_target_lost",
+            "depart_complete",
+            "wander_step_complete",
             "movement_stalled",
             "target_unreachable",
         }
@@ -713,6 +748,19 @@ class LocalNavigator:
         """
         with self._lock:
             stalled = self._stalled
+
+        goal = _mapping((goal_state or {}).get("goal")) or {}
+        goal_kind = str(goal.get("kind") or "").strip().lower()
+        slip_forward_ratio = (
+            max(self.config.slip_forward_ratio, _WANDER_SLIP_FORWARD_RATIO)
+            if goal_kind == "wander"
+            else self.config.slip_forward_ratio
+        )
+        slip_threshold_ticks = (
+            min(self.config.slip_ticks, _WANDER_SLIP_TICKS)
+            if goal_kind == "wander"
+            else self.config.slip_ticks
+        )
 
         if decision.state != "advance":
             # 转身和停车都不算尝试前进；不清零计数，以免「转一下再撞」反复重置。
@@ -842,9 +890,9 @@ class LocalNavigator:
         sliding = False
         if forward_ratio is not None and speed >= self.config.stall_speed_mps:
             with self._lock:
-                if forward_ratio < self.config.slip_forward_ratio:
+                if forward_ratio < slip_forward_ratio:
                     self._slip_ticks += 1
-                    sliding = self._slip_ticks >= self.config.slip_ticks
+                    sliding = self._slip_ticks >= slip_threshold_ticks
                 else:
                     self._slip_ticks = 0
 
@@ -956,7 +1004,7 @@ class LocalNavigator:
                 "last_decision": decision,
                 "last_error": self._last_error,
                 "behavior": {
-                    "policy": "acquire_orient_approach_settle_observe",
+                    "policy": "acquire_orient_approach_settle_observe_or_bounded_free_roam",
                     "phase": self._behavior_phase,
                     "phase_age_ms": (
                         None
@@ -970,6 +1018,13 @@ class LocalNavigator:
                         if self._behavior_last_outcome is None
                         else dict(self._behavior_last_outcome)
                     ),
+                    "wander_turn_sent": self._wander_turn_sent,
+                    "wander_segment_age_ms": (
+                        None
+                        if self._wander_segment_started_at is None
+                        else round(max(0.0, now - self._wander_segment_started_at) * 1000.0, 1)
+                    ),
+                    "wander_step_max_ms": round(_WANDER_MAX_STEP_S * 1000.0, 1),
                 },
                 "turn": {
                     # 转向是相对位移，同一次观测重发会累加。suppressed 高于
@@ -1007,8 +1062,16 @@ class LocalNavigator:
                     # 斜撞墙：人在动但前进分量被墙压住。纯速度判据看不见这种撞墙，
                     # 因为速度模长还在阈值之上。
                     "slip_ticks": self._slip_ticks,
-                    "slip_threshold_ticks": self.config.slip_ticks,
-                    "slip_forward_ratio": self.config.slip_forward_ratio,
+                    "slip_threshold_ticks": (
+                        min(self.config.slip_ticks, _WANDER_SLIP_TICKS)
+                        if self._stall_goal_key and self._stall_goal_key[0] == "wander"
+                        else self.config.slip_ticks
+                    ),
+                    "slip_forward_ratio": (
+                        max(self.config.slip_forward_ratio, _WANDER_SLIP_FORWARD_RATIO)
+                        if self._stall_goal_key and self._stall_goal_key[0] == "wander"
+                        else self.config.slip_forward_ratio
+                    ),
                     "slip_count": self._slip_count,
                     # 自动绕行：撞墙后先自己转身重试，预算用尽才闩锁交还 LLM。
                     # attempts 达到 limit 且 stalled=true 表示「怎么绕都出不去」，
@@ -1143,6 +1206,9 @@ class LocalNavigator:
         age_s = _finite(goal.get("age_seconds"))
         if age_s is not None and age_s > self.config.max_goal_age_s:
             return NavigationDecision("stop", "goal_expired")
+        goal_kind = str(goal.get("kind") or "").strip().lower()
+        if goal_kind in {"depart", "wander"}:
+            return self._free_roam_decision(goal, world, now)
         target_id = str(goal.get("target_id") or "").strip()
         if not target_id:
             if str(goal.get("kind") or "").strip().lower() != "explore":
@@ -1444,6 +1510,105 @@ class LocalNavigator:
             observation_mode=observation_mode,
         )
 
+    def _free_roam_decision(
+        self,
+        goal: Mapping[str, Any],
+        world: Mapping[str, Any] | None,
+        now: float,
+    ) -> NavigationDecision:
+        """执行有限后退或一条由 LLM 规划的闲逛路段，不伪造导航对象。"""
+        kind = str(goal.get("kind") or "").strip().lower()
+        constraints = _mapping(goal.get("constraints")) or {}
+        age_s = _finite(goal.get("age_seconds")) or 0.0
+        duration = _finite(constraints.get("max_duration_s"))
+        duration = (2.0 if kind == "depart" else _WANDER_DEFAULT_STEP_S) if duration is None else duration
+        if kind == "depart" and age_s >= duration:
+            return NavigationDecision("stop", "depart_complete")
+
+        max_axis = _finite(constraints.get("max_forward_axis"))
+        axis = min(
+            self.config.max_forward_axis,
+            0.35 if kind == "depart" else 0.45,
+            self.config.max_forward_axis if max_axis is None else max_axis,
+        )
+        if kind == "depart":
+            # 短时后退只用于离开当前观察点，不依赖人物框，也不把倒退速度套进
+            # “向前分量”失速判据。
+            return NavigationDecision(
+                "retreat",
+                "depart_back_away",
+                side="left",
+                y=-axis,
+                pulse_ms=self.config.pulse_ms,
+            )
+
+        if not isinstance(world, Mapping) or world.get("capture_active") is False:
+            return NavigationDecision("stop", "world_unknown")
+        status = _mapping(world.get("status")) or {}
+        revision = int(_finite(status.get("revision")) or 0)
+        observed_age = _finite(status.get("last_observation_age_ms"))
+        if observed_age is None or observed_age > self.config.max_observation_age_ms:
+            return NavigationDecision(
+                "stop", "observation_stale", revision=revision, observed_age_ms=observed_age
+            )
+        uncertainties = [
+            item for item in blocking_uncertainties(world.get("uncertainties"))
+            if item != "no_recent_visual_observation"
+        ]
+        if uncertainties:
+            return NavigationDecision(
+                "stop", "world_uncertain", revision=revision, observed_age_ms=observed_age
+            )
+        turn_deg = _finite(constraints.get("turn_deg"))
+        if turn_deg is None:
+            # 正常入口会在 AutonomyRuntime 拒绝这种目标；这里仍做最后一道防御，
+            # 保证第三方 provider 不能让导航器自行决定路线。
+            return NavigationDecision(
+                "stop",
+                "wander_direction_required",
+                revision=revision,
+                observed_age_ms=observed_age,
+            )
+        duration = min(_WANDER_MAX_STEP_S, max(1.0, duration))
+        with self._lock:
+            turn_sent = self._wander_turn_sent
+            segment_started_at = self._wander_segment_started_at
+        if not turn_sent:
+            return NavigationDecision(
+                "turn",
+                "wander_llm_turn",
+                revision=0,
+                observed_age_ms=observed_age,
+                turn_deg=turn_deg,
+            )
+        if self._turn_gate_reason(now, None) is not None:
+            return NavigationDecision(
+                "stop",
+                "wander_turn_settling",
+                revision=revision,
+                observed_age_ms=observed_age,
+            )
+        if (
+            segment_started_at is not None
+            and now - segment_started_at >= duration
+        ):
+            # 一条路段完成就停车并释放目标。下一条方向必须由 LLM 看新画面后提交。
+            return NavigationDecision(
+                "stop",
+                "wander_step_complete",
+                revision=revision,
+                observed_age_ms=observed_age,
+            )
+        return NavigationDecision(
+            "advance",
+            "wander_forward",
+            side="left",
+            y=axis,
+            pulse_ms=self.config.pulse_ms,
+            revision=revision,
+            observed_age_ms=observed_age,
+        )
+
     def _select_target(
         self,
         goal: Mapping[str, Any],
@@ -1564,6 +1729,19 @@ class LocalNavigator:
                 now,
                 revision=decision.revision,
             )
+        if decision.state == "retreat" and decision.side:
+            if self._active_side == "right":
+                self._release_inputs("right")
+            sent = self._send_axes("left", decision.x, decision.y, decision.pulse_ms)
+            with self._lock:
+                self._axis_send_ok = bool(sent)
+                self._forward_started_at = None
+                self._motion_feedback_usable = False
+                self._motion_feedback_state = "retreat_not_evaluated"
+                if sent:
+                    self._active_side = "left"
+                    self._command_count += 1
+            return bool(sent)
         if decision.state == "advance" and decision.side:
             if self._active_side == "right":
                 self._release_inputs("right")
@@ -1602,6 +1780,9 @@ class LocalNavigator:
             if turn_sent:
                 with self._lock:
                     self._command_count += 1
+                    # 让下一 tick 也经过转向冷却门控。否则 scheduler 尚未来得及把
+                    # turning 置为 true 时，导航器可能立刻再次压下前进轴。
+                    self._last_turn_sent_at = now
             return bool(turn_sent)
         self._safe_release()
         return False

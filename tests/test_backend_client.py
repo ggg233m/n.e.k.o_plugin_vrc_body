@@ -424,7 +424,9 @@ class BackendClientTests(unittest.TestCase):
                 text="走过去看看",
                 target_type="npc",
             )
-            self.assertTrue(pending["accepted"], pending)
+            self.assertFalse(pending["accepted"], pending)
+            self.assertTrue(pending["semantic_request_accepted"], pending)
+            self.assertFalse(pending["completed"])
             self.assertTrue(pending["pending_semantic"])
             self.assertFalse(pending["movement_started"])
             self.assertEqual(pending["reason_code"], "semantic_target_pending")
@@ -454,6 +456,172 @@ class BackendClientTests(unittest.TestCase):
                 "avatar:session:test:pending",
             )
             self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+        finally:
+            service.vision.close()
+
+    def test_late_background_approach_does_not_repeat_recent_completed_behavior(self) -> None:
+        service = BackendService({}, Path.cwd())
+        service.autonomy_arm()
+        recent = {
+            "behavior": {
+                "last_outcome": {
+                    "reason": "approach_observe_complete",
+                    "occurred_at_monotonic": time.monotonic() - 4.0,
+                }
+            }
+        }
+        with patch.object(service.navigator, "snapshot", return_value=recent):
+            result = service.autonomy_intent("approach", target_type="npc")
+        self.assertTrue(result["accepted"], result)
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["movement_started"])
+        self.assertEqual(result["reason_code"], "recent_approach_already_completed")
+        self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+
+    def test_cancelled_semantic_request_clears_matching_pending_intent(self) -> None:
+        service = BackendService(
+            {"vision": {"semantic_backend": "main_llm"}},
+            Path.cwd(),
+        )
+        request_id = "semantic-request:test:expired"
+        service._pending_semantic_intent = {
+            "request_id": request_id,
+            "action": "approach",
+            "selector": {"semantic_type": "npc"},
+        }
+        with service.vision._lock:
+            service.vision._main_llm_last_cancelled_request_id = request_id
+            service.vision._main_llm_last_cancel_reason = "request_expired"
+
+        cancelled = service.main_llm_semantic_request(request_id)
+        self.assertEqual(cancelled["reason"], "request_cancelled")
+        self.assertFalse(cancelled["pending_navigation"]["accepted"])
+        self.assertFalse(cancelled["pending_navigation"]["movement_started"])
+        self.assertEqual(
+            cancelled["pending_navigation"]["reason_code"],
+            "semantic_confirmation_expired",
+        )
+        self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+
+    def test_high_level_wander_only_accepts_an_llm_planned_local_step(self) -> None:
+        service = BackendService({}, Path.cwd())
+        service.vision.set_capture_state(True, "test")
+        service.world_state.ingest(
+            entities=[{
+                "id": "avatar:session:test:roam",
+                "label": "person",
+                "confidence": 0.9,
+                "bbox": [0.3, 0.2, 0.6, 0.9],
+                "attributes": {"bearing_deg": 0.0, "apparent_height": 0.7},
+            }],
+            source="test",
+        )
+        service.autonomy_arm()
+        departed = service.autonomy_intent(
+            "depart",
+            text="离开这里",
+            constraints={"max_duration_s": 2.0},
+        )
+        self.assertTrue(departed["accepted"], departed)
+        self.assertEqual(departed["goal"]["kind"], "depart")
+        self.assertTrue(departed["movement_started"])
+
+        unplanned = service.autonomy_intent(
+            "wander",
+            text="随便走走",
+            constraints={"max_duration_s": 2.0},
+        )
+        self.assertFalse(unplanned["accepted"])
+        self.assertEqual(unplanned["reason_code"], "wander_direction_frame_unavailable")
+        self.assertFalse(unplanned["movement_started"])
+
+        wandered = service.autonomy_intent(
+            "wander",
+            text="往左前方走一小段",
+            constraints={"turn_deg": 25.0, "max_duration_s": 2.0},
+        )
+        self.assertTrue(wandered["accepted"], wandered)
+        self.assertEqual(wandered["goal"]["kind"], "wander")
+        self.assertEqual(wandered["goal"]["constraints"]["turn_deg"], 25.0)
+        self.assertEqual(wandered["resolved_by"], "llm_planned_local_step")
+
+    def test_wander_without_agent_direction_is_routed_back_to_main_llm_frame(self) -> None:
+        """后台 Agent 漏掉角度时只建看图任务，主模型提交前绝不移动。"""
+        class Detector:
+            name = "test_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=(),
+                    source=self.name,
+                    observed_at=now,
+                    frame_id="wander-route-frame",
+                )
+
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_backends(detector=Detector())
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+
+            pending = service.autonomy_intent(
+                "wander",
+                text="去逛逛吧",
+                constraints={"max_duration_s": 2.0},
+            )
+            self.assertFalse(pending["accepted"], pending)
+            self.assertTrue(pending["route_request_accepted"], pending)
+            self.assertTrue(pending["pending_route"])
+            self.assertFalse(pending["movement_started"])
+            self.assertEqual(pending["reason_code"], "wander_direction_pending")
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+
+            request = service.main_llm_semantic_request()
+            self.assertTrue(request["available"])
+            self.assertEqual(request["reason"], "agent_wander_direction_unresolved")
+            self.assertEqual(request["route_planning"]["text"], "去逛逛吧")
+            self.assertEqual(
+                request["route_planning"]["constraints"]["max_duration_s"],
+                2.0,
+            )
+
+            wrong_commit = service.main_llm_semantic_commit(
+                request["request_id"],
+                request["revision"],
+                [],
+            )
+            self.assertFalse(wrong_commit["accepted"])
+            self.assertEqual(wrong_commit["reason_code"], "wander_goal_commit_required")
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+
+            started = service.autonomy_goal(
+                "去逛逛吧",
+                "wander",
+                constraints={"turn_deg": 0.0, "max_duration_s": 2.0},
+                based_on_revision=request["revision"],
+            )
+            self.assertTrue(started["accepted"], started)
+            self.assertEqual(started["goal"]["constraints"]["turn_deg"], 0.0)
+            self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+            self.assertEqual(
+                service.main_llm_semantic_request()["reason"],
+                "no_pending_request",
+            )
         finally:
             service.vision.close()
 

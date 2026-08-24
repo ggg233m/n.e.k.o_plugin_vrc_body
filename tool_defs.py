@@ -319,6 +319,9 @@ VRC_AUTONOMY_GOAL = {
         "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
         "explore 可以不提供 target_id，改用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
         "本地 Explorer 找到目标后只会将其保持在视野中央，不会自动接近。"
+        "wander 只执行一条由多模态 LLM 根据最新画面规划的短路段，必须在 constraints.turn_deg"
+        "明确相对转角；收到主模型闲逛路线任务时直接用本工具提交 wander，不能改调用"
+        "vrc_semantic_commit。该路段停止后会带新画面再次唤醒 LLM，导航器不会自行选择下一方向。"
         "应把 world_observe.decision_context.through_revision 原样写入 based_on_revision。"
     ),
     "parameters": {
@@ -328,11 +331,14 @@ VRC_AUTONOMY_GOAL = {
             "kind": {
                 "type": "string",
                 "enum": [
-                    "explore", "approach", "approach_observe", "follow", "interact", "socialize",
+                    "explore", "wander", "depart",
+                    "approach", "approach_observe", "follow", "interact", "socialize",
                 ],
                 "description": (
                     "用户说“过去看看”时使用 approach_observe：后端一次完成朝向、接近、"
-                    "停稳和观察；不要拆成多个 approach/观察调用。"
+                    "停稳和观察；不要拆成多个 approach/观察调用。用户要求离开当前观察点"
+                    "时使用 depart；用户说随便走走、逛逛，或用“走吧”确认刚提出的闲逛时，"
+                    "先看最新画面，再用 wander 提交一条带 turn_deg 的短路段。"
                 ),
             },
             "target_id": {
@@ -374,6 +380,12 @@ VRC_AUTONOMY_GOAL = {
                     "max_forward_axis": {"type": "number", "minimum": 0.05, "maximum": 1.0},
                     "settle_seconds": {"type": "number", "minimum": 0.2, "maximum": 3.0},
                     "observe_seconds": {"type": "number", "minimum": 0.5, "maximum": 10.0},
+                    "turn_deg": {
+                        "type": "number",
+                        "minimum": -45.0,
+                        "maximum": 45.0,
+                        "description": "wander 必填：LLM 选择的相对转角；正数左转、负数右转，0 为直行。",
+                    },
                 },
                 "additionalProperties": False,
             },

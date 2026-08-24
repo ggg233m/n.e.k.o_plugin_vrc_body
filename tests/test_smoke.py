@@ -72,7 +72,11 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("selector", goal_properties)
         self.assertIn("constraints", goal_properties)
         self.assertIn("approach_observe", goal_properties["kind"]["enum"])
+        self.assertIn("depart", goal_properties["kind"]["enum"])
+        self.assertIn("wander", goal_properties["kind"]["enum"])
         self.assertIn("observe_seconds", goal_properties["constraints"]["properties"])
+        self.assertIn("turn_deg", goal_properties["constraints"]["properties"])
+        self.assertIn("导航器不会自行选择", tool_defs.VRC_AUTONOMY_GOAL["description"])
         self.assertIn("based_on_revision", goal_properties)
         declared_gestures = tool_defs.BODY_GESTURE["parameters"]["properties"]["name"]["enum"]
         self.assertEqual(set(declared_gestures), set(GESTURE_NAMES))

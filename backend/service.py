@@ -707,6 +707,7 @@ class BackendService:
                     "action": pending.get("action"),
                     "text": pending.get("text"),
                     "selector": dict(pending.get("selector") or {}),
+                    "route_planning": pending.get("route_planning") is True,
                 }
                 if isinstance(pending, Mapping)
                 else None
@@ -992,12 +993,12 @@ class BackendService:
                 ),
                 "instruction": "请让用户手动带路到可见位置，再观察新鲜画面。",
             }
-        if normalized_action not in {"find", "approach", "follow"}:
+        if normalized_action not in {"find", "approach", "follow", "depart", "wander"}:
             return {
                 **self.autonomy.snapshot(),
                 "accepted": False,
                 "reason_code": "invalid_action",
-                "reason": "action must be find, approach, follow, stop or status",
+                "reason": "action must be find, approach, follow, depart, wander, stop or status",
             }
 
         autonomy = self.autonomy.snapshot()
@@ -1008,6 +1009,109 @@ class BackendService:
                 "reason_code": "manual_arm_required",
                 "reason": "VRChat autonomy is not manually armed",
                 "instruction": "请先在 AnyaDance 身体调试台点击“启用自主控制”，再重试移动命令。",
+            }
+        if constraints is not None and not isinstance(constraints, Mapping):
+            return {
+                **autonomy,
+                "accepted": False,
+                "reason_code": "invalid_constraints",
+                "reason": "constraints must be an object",
+            }
+
+        # 离开当前位置和 LLM 规划的闲逛路段都不是“选一个人”，不能为了复用
+        # 目标导航而伪造 person selector。wander 的 constraints.turn_deg 必须由
+        # LLM 看当前画面后明确给出；后台 Agent 没有带上方向时，把最新配对画面
+        # 交回主多模态 LLM 规划，绝不能由导航器本地猜一条路线。
+        if normalized_action in {"depart", "wander"}:
+            world = self.vision.snapshot()
+            self.autonomy.update_world(world)
+            status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+            revision = int(status.get("revision", 0) or 0)
+            normalized_text = str(text or "").replace("\x00", "").strip()[:256]
+            has_wander_direction = (
+                normalized_action != "wander"
+                or (
+                    isinstance(constraints, Mapping)
+                    and constraints.get("turn_deg") is not None
+                )
+            )
+            if not has_wander_direction:
+                # 旧目标必须先停稳；只保留手动 arm，等待主模型基于这张图提交
+                # 一条最多三秒的短路段。该请求只驻留内存，不写原图到磁盘。
+                self.autonomy.complete_goal("wander_intent_waiting_for_route")
+                self.vision.clear_main_llm_semantic_request(
+                    "wander_intent_replaces_semantic_request"
+                )
+                route_request = self.vision.request_main_llm_semantics(
+                    {
+                        "semantic_type": "object",
+                        "label": "safe visible walkable direction",
+                        "min_confidence": 0.0,
+                    },
+                    reason="agent_wander_direction_unresolved",
+                    force=True,
+                )
+                if route_request.get("accepted"):
+                    request_id = str(route_request.get("request_id") or "")[:128]
+                    with self._lock:
+                        self._pending_semantic_intent = {
+                            "request_id": request_id,
+                            "action": "wander",
+                            "text": normalized_text or "在附近随便逛逛",
+                            "selector": {},
+                            "constraints": (
+                                dict(constraints) if isinstance(constraints, Mapping) else {}
+                            ),
+                            "route_planning": True,
+                        }
+                    return {
+                        **self.autonomy.snapshot(),
+                        "accepted": False,
+                        "route_request_accepted": True,
+                        "completed": False,
+                        "action": "wander",
+                        "reason_code": "wander_direction_pending",
+                        "reason": "the main multimodal LLM must choose a direction from the paired frame",
+                        "pending_route": True,
+                        "movement_started": False,
+                        "route_request": route_request,
+                        "instruction": (
+                            "最新画面已交给主多模态模型选择单段路线；当前尚未移动。"
+                            "不要声称已经出发，也不要重复提交闲逛；主模型会根据画面提交 turn_deg。"
+                        ),
+                    }
+                return {
+                    **self.autonomy.snapshot(),
+                    "accepted": False,
+                    "route_request_accepted": False,
+                    "completed": False,
+                    "action": "wander",
+                    "reason_code": "wander_direction_frame_unavailable",
+                    "reason": "no fresh paired frame is available for main-LLM route planning",
+                    "pending_route": False,
+                    "movement_started": False,
+                    "route_request": route_request,
+                    "instruction": "没有可供主模型规划路线的新鲜画面，动作没有开始。",
+                }
+            result = self.autonomy_goal(
+                normalized_text or (
+                    "离开当前位置" if normalized_action == "depart" else "在附近随便逛逛"
+                ),
+                normalized_action,
+                None,
+                None,
+                constraints,
+                revision,
+            )
+            return {
+                "action": normalized_action,
+                "movement_started": bool(result.get("accepted")),
+                "resolved_by": (
+                    "llm_planned_local_step"
+                    if normalized_action == "wander"
+                    else "bounded_local_behavior"
+                ),
+                **result,
             }
 
         normalized_type = str(target_type or "").replace("\x00", "").strip().lower()[:32]
@@ -1055,6 +1159,29 @@ class BackendService:
             return {"action": "find", "resolved_by": "semantic_selector", **result}
 
         normalized_target_id = str(target_id or "").replace("\x00", "").strip()[:96]
+        if normalized_action == "approach" and not normalized_target_id and not normalized_text:
+            navigation = self.navigator.snapshot()
+            behavior = navigation.get("behavior") if isinstance(navigation.get("behavior"), Mapping) else {}
+            outcome = behavior.get("last_outcome") if isinstance(behavior.get("last_outcome"), Mapping) else {}
+            try:
+                outcome_age_s = time.monotonic() - float(outcome.get("occurred_at_monotonic"))
+            except (TypeError, ValueError, OverflowError):
+                outcome_age_s = math.inf
+            if (
+                outcome.get("reason") == "approach_observe_complete"
+                and 0.0 <= outcome_age_s <= 15.0
+            ):
+                return {
+                    **self.autonomy.snapshot(),
+                    "accepted": True,
+                    "completed": True,
+                    "action": normalized_action,
+                    "movement_started": False,
+                    "reason_code": "recent_approach_already_completed",
+                    "reason": "the same unqualified background approach arrived after a recent completion",
+                    "navigation": navigation,
+                    "instruction": "最近一次接近观察已经完成；不要重复移动或创建语义任务。",
+                }
         candidates = self._semantic_navigation_candidates(world, selector)
         if not normalized_target_id:
             if not candidates:
@@ -1084,7 +1211,12 @@ class BackendService:
                         }
                     return {
                         **self.autonomy.snapshot(),
-                        "accepted": True,
+                        # accepted 只表示“移动目标已经进入执行态”。语义图片虽然已
+                        # 成功排队，但角色尚未移动，不能复用 accepted=true 让上层
+                        # 把两件事混为一谈。
+                        "accepted": False,
+                        "semantic_request_accepted": True,
+                        "completed": False,
                         "action": normalized_action,
                         "reason_code": "semantic_target_pending",
                         "reason": "target semantics must be confirmed from the paired frame",
@@ -1625,6 +1757,50 @@ class BackendService:
         result = dict(
             self.vision.main_llm_semantic_request(after_request_id=normalized_after)
         )
+        if result.get("available"):
+            request_id = str(result.get("request_id") or "")[:128]
+            with self._lock:
+                pending = self._pending_semantic_intent
+                if (
+                    isinstance(pending, Mapping)
+                    and pending.get("route_planning") is True
+                    and str(pending.get("request_id") or "") == request_id
+                ):
+                    result["route_planning"] = {
+                        "action": "wander",
+                        "text": str(pending.get("text") or "在附近随便逛逛")[:256],
+                        "constraints": dict(pending.get("constraints") or {}),
+                    }
+        if result.get("reason") == "request_cancelled":
+            cancelled_id = str(result.get("request_id") or "")[:128]
+            with self._lock:
+                pending = self._pending_semantic_intent
+                if (
+                    isinstance(pending, Mapping)
+                    and str(pending.get("request_id") or "") == cancelled_id
+                ):
+                    route_planning = pending.get("route_planning") is True
+                    result["pending_navigation"] = {
+                        "accepted": False,
+                        "completed": False,
+                        "action": str(pending.get("action") or "")[:32],
+                        "movement_started": False,
+                        "reason_code": (
+                            "wander_direction_expired"
+                            if route_planning else "semantic_confirmation_expired"
+                        ),
+                        "reason": (
+                            "route planning expired before the main LLM chose a wander direction"
+                            if route_planning else
+                            "semantic confirmation expired before the navigation target could be resolved"
+                        ),
+                        "instruction": (
+                            "这次闲逛没有开始；必须如实告诉用户尚未移动，不能描述已经出发。"
+                            if route_planning else
+                            "这次导航没有开始；必须如实告诉用户尚未移动，不能描述正在接近。"
+                        ),
+                    }
+                    self._pending_semantic_intent = None
         data = result.pop("data", None)
         if isinstance(data, bytes):
             import base64
@@ -1637,6 +1813,24 @@ class BackendService:
         frame_revision: Any,
         entities: Any,
     ) -> dict[str, Any]:
+        normalized_request_id = str(request_id or "").replace("\x00", "").strip()[:128]
+        with self._lock:
+            pending = self._pending_semantic_intent
+            if (
+                isinstance(pending, Mapping)
+                and pending.get("route_planning") is True
+                and str(pending.get("request_id") or "") == normalized_request_id
+            ):
+                return {
+                    "accepted": False,
+                    "reason_code": "wander_goal_commit_required",
+                    "reason": "this request requires a wander goal, not a semantic classification",
+                    "movement_started": False,
+                    "instruction": (
+                        "查看配对画面后调用 vrc_autonomy_goal(kind='wander')，"
+                        "并在 constraints.turn_deg 填入 -45 到 45 度；不要调用 vrc_semantic_commit。"
+                    ),
+                }
         result = self.vision.commit_main_llm_semantics(
             request_id,
             frame_revision,

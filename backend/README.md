@@ -167,13 +167,21 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 自主目标被接受后，`LocalNavigator` 以约 10 Hz 运行在后端本地。它只接受新鲜、可见、
 置信度足够且带方位提示的世界实体；每次只发送 220 ms 左右的受限摇杆脉冲。单帧低置信
 或漏检最多复用最后可靠观测 300 ms，宽限到期、观测过期、世界不确定、会话解除或后端
-停止时释放输入。它不会调用 LLM、
-等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
+停止时释放输入。它不会调用 LLM 或等待 VLM；面向实体的目标绝不会在没有目标方位时
+盲目向前走。只有用户明确提交的 `depart`/`wander` 可以不绑定实体：前者短时后退；
+后者必须带上多模态 LLM 根据最新画面选择的 `constraints.turn_deg`，并且只执行最多
+3 秒的一条短路段。后台 Agent 若漏传角度，后端只建立 `pending_route` 内存单槽，把配对
+画面主动交回主多模态 LLM 调用 `vrc_autonomy_goal`；在该调用返回 `accepted=true` 前不会
+发送移动输入。导航器负责转向落地、避撞和停车，但绝不自行选择下一条闲逛路线。
+单段结束后宿主只推送一次终态和最新画面，由 LLM 决定下一段、改为接近可见目标或停止。
+`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
 普通 Agent 的一次 `approach` 会在后端转换为有限的 `approach_observe`：本地依次完成
 获取、朝向、接近、停稳和约 1.8 秒观察，循环内不调用 LLM。只有到达并观察完成、持续
 丢失目标或绕行预算耗尽时才增加 `navigation.behavior.outcome_sequence`；宿主据此只推送
 一次终态和一张新鲜画面，不会把 10 Hz 控制状态写盘或持续塞进模型上下文。
+主 LLM 已完成接近后，若后台 Agent 在 15 秒内又晚到一条无文本、无目标的相同 approach，
+后端只返回 `recent_approach_already_completed`，不会创建第二个语义任务或重复移动。
 任何朝视觉实体移动的目标都必须由 LLM 从最新叠框画面中明确选择。LLM只提交
 `target_ref`（例如 `T2`）与 `frame_revision`，后端把它解析为精确 `target_id`；无目标的
 探索请求只停留在观察/规划阶段。本地导航不按 goal 文本、实体标签或
@@ -477,8 +485,11 @@ N.E.K.O 普通插件执行器可通过 `POST /autonomy/intent` 一次提交 `fin
 `manual_arm_required`。其中 `approach` 会转换为一次有限的“接近并观察”，`follow`
 才是持续目标。`approach/follow` 省略精确 ID 时，当前画面恰好存在一个
 匹配且 `semantic_verified=true` 的目标会直接绑定；只有未确认的本地 `person`
-轨迹时返回 `semantic_target_pending`，把配对画面交给宿主主多模态模型。模型提交
-唯一匹配分类后，后端自动续接原意图，不需要第二次移动调用。多人场景仍返回
+轨迹时返回 `semantic_target_pending`，把配对画面交给宿主主多模态模型；此时外层
+`accepted=false`、`semantic_request_accepted=true`、`movement_started=false`，避免宿主
+把“图片任务已创建”误读成“角色已移动”。模型提交唯一匹配分类后，后端自动续接原意图，
+不需要第二次移动调用；只有 `pending_navigation.accepted=true` 才表示移动真正开始。语义
+请求超时会产生一次 `movement_not_started` 结果，不再静默取消。多人场景仍返回
 `target_choice_required`，禁止本地代码擅自替 LLM 选人。
 
 运行时层面 `max_age_ms <= 0` 表示不限龄，这是留给内部调用方的逃生口；`BackendService`

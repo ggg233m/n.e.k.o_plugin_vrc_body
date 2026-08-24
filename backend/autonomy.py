@@ -14,7 +14,8 @@ from .world_state import blocking_uncertainties
 
 
 ALLOWED_GOAL_KINDS = frozenset({
-    "explore", "approach", "approach_observe", "follow", "interact", "socialize",
+    "explore", "wander", "depart",
+    "approach", "approach_observe", "follow", "interact", "socialize",
 })
 TARGETED_GOAL_KINDS = frozenset({
     "approach", "approach_observe", "follow", "interact", "socialize",
@@ -23,7 +24,7 @@ ALLOWED_SELECTOR_TYPES = frozenset({"npc", "player", "avatar", "person", "humano
 _SELECTOR_KEYS = frozenset({"semantic_type", "label", "min_confidence"})
 _CONSTRAINT_KEYS = frozenset({
     "max_duration_s", "max_scan_turns", "max_forward_axis",
-    "settle_seconds", "observe_seconds",
+    "settle_seconds", "observe_seconds", "turn_deg",
 })
 
 
@@ -115,6 +116,13 @@ def _normalize_constraints(value: Any) -> dict[str, Any] | None:
             "constraints.observe_seconds",
             0.5,
             10.0,
+        )
+    if value.get("turn_deg") is not None:
+        result["turn_deg"] = _finite_number(
+            value.get("turn_deg"),
+            "constraints.turn_deg",
+            -45.0,
+            45.0,
         )
     return result or None
 
@@ -236,6 +244,22 @@ class AutonomyRuntime:
                 **self.snapshot(),
                 "reason": "unsupported autonomy goal kind",
             }
+        if normalized_kind == "wander":
+            # 闲逛的路线选择属于 LLM。后端只接受一条明确的相对方向，并把每条
+            # 路段限制在 3 秒内；缺少方向时绝不自行随机或按固定模式选路。
+            if normalized_constraints is None or "turn_deg" not in normalized_constraints:
+                return {
+                    "accepted": False,
+                    **self.snapshot(),
+                    "reason": "constraints.turn_deg is required for an LLM-planned wander step",
+                }
+            wander_duration = float(normalized_constraints.get("max_duration_s", 2.0))
+            if wander_duration > 3.0:
+                return {
+                    "accepted": False,
+                    **self.snapshot(),
+                    "reason": "wander max_duration_s must not exceed 3 seconds",
+                }
         # 接近、跟随和交互会驱动 avatar，不能靠“person”等标签模糊选择。
         # 调用方必须从最新世界快照里显式锁定一个实体，避免海报、镜像或旁人被
         # 高置信度检测框误选后触发移动。
@@ -318,14 +342,18 @@ class AutonomyRuntime:
                         self._goal.kind == "explore"
                         and self._goal.selector is not None
                     )
-                    or self._goal.kind == "approach_observe"
+                    or self._goal.kind in {"approach_observe", "wander"}
                 )
                 if fresh_empty_goal:
                     self._state = "armed"
                     self._reason = (
                         "goal_waiting_for_explorer"
                         if self._goal.kind == "explore"
-                        else "goal_reacquiring_target"
+                        else (
+                            "goal_waiting_for_wander"
+                            if self._goal.kind == "wander"
+                            else "goal_reacquiring_target"
+                        )
                     )
                     return
                 self._state = "degraded"
