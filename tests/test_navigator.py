@@ -423,6 +423,32 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(len(self.turns), 1)
         self.assertEqual(self.navigator.snapshot()["explorer"]["scan_turns"], 1)
 
+    def test_explore_duration_notifies_goal_completion_once(self) -> None:
+        completed: list[str] = []
+        self.goal["goal"] = {
+            "kind": "explore",
+            "text": "寻找 NPC",
+            "selector": {"semantic_type": "npc"},
+            "constraints": {"max_duration_s": 30},
+            "age_seconds": 31.0,
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            complete_goal=completed.append,
+            clock=lambda: self.now[0],
+        )
+
+        first = navigator.tick()
+        second = navigator.tick()
+
+        self.assertEqual(first.reason, "explore_duration_exhausted")
+        self.assertEqual(second.reason, "explore_duration_exhausted")
+        self.assertEqual(completed, ["explore_duration_exhausted"])
+
     def test_explorer_advances_after_one_full_scan_and_respects_axis_constraint(self) -> None:
         self.goal["goal"] = {
             "kind": "explore",

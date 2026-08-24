@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -662,6 +663,36 @@ class RemoteAutonomy:
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}
 
+    def intent(
+        self,
+        action: str,
+        *,
+        text: str | None = None,
+        target_id: str | None = None,
+        target_type: str = "npc",
+        target_label: str | None = None,
+        min_confidence: float = 0.25,
+        constraints: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """供普通插件 Agent 使用的单步安全入口；不会绕过手动 arm。"""
+        try:
+            payload: dict[str, Any] = {
+                "action": str(action),
+                "target_type": str(target_type),
+                "min_confidence": float(min_confidence),
+            }
+            if text:
+                payload["text"] = str(text)
+            if target_id:
+                payload["target_id"] = str(target_id)
+            if target_label:
+                payload["target_label"] = str(target_label)
+            if constraints is not None:
+                payload["constraints"] = dict(constraints)
+            return _control_request(self.client, "POST", "/autonomy/intent", payload)
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
     def stop(self, reason: str = "autonomy_stop") -> dict[str, Any]:
         try:
             return _control_request(self.client, "POST", "/autonomy/stop", {"reason": reason})
@@ -800,6 +831,40 @@ class RemoteVision:
                 "reason": "backend_unavailable",
                 "error": str(exc),
             }
+
+    def semantic_request(self, after_request_id: str | None = None) -> dict[str, Any]:
+        """读取主 LLM 尚未消费的被动语义任务，不触发模型推理。"""
+        try:
+            query = "/semantic/request"
+            if after_request_id:
+                query += f"?after_request_id={quote(str(after_request_id)[:128], safe='')}"
+            return self.client.request("GET", query)
+        except BackendUnavailable as exc:
+            return {
+                "available": False,
+                "reason": "backend_unavailable",
+                "error": str(exc),
+            }
+
+    def semantic_commit(
+        self,
+        request_id: str,
+        frame_revision: int,
+        entities: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """把当前宿主多模态 LLM 的分类提交给精确 revision。"""
+        try:
+            return self.client.request(
+                "POST",
+                "/semantic/commit",
+                {
+                    "request_id": str(request_id),
+                    "frame_revision": int(frame_revision),
+                    "entities": [dict(item) for item in entities],
+                },
+            )
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc)}
 
     def ingest(
         self,

@@ -45,6 +45,7 @@ _EDITABLE_FIELDS = {
         "identity_reid_margin", "identity_reid_retention_s",
         "identity_reid_max_identities", "semantic_backend",
         "semantic_endpoint", "semantic_model", "semantic_max_per_minute",
+        "semantic_main_llm_min_interval_s",
         "frame_cache_interval_s", "frame_max_width", "frame_jpeg_quality",
         "frame_max_per_minute", "monitor_index", "dxcam_device_idx",
         "dxcam_output_idx", "dxcam_backend", "interval_ms", "queue_size",

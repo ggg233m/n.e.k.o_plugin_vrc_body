@@ -179,6 +179,16 @@ class AutonomyRuntime:
                 self._disarm_locked(str(reason)[:160])
         return self.snapshot()
 
+    def complete_goal(self, reason: str = "goal_complete") -> dict[str, Any]:
+        """结束当前目标但保留手动 arm，会话可继续接收下一条明确目标。"""
+        with self._lock:
+            self._goal = None
+            if self._state in {"armed", "degraded"}:
+                self._state = "armed"
+                self._reason = str(reason or "goal_complete")[:160]
+        self._release_inputs()
+        return self.snapshot()
+
     def submit_goal(
         self,
         text: Any,

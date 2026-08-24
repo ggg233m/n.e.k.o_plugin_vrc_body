@@ -1,10 +1,10 @@
 [plugin]
 id = "neko_anyadance_body"
 name = "N.E.K.O AnyaDance Body"
-description = "让 N.E.K.O 通过 AnyaDance 与 VRChat OSC 控制虚拟身体姿态、Avatar 参数和握持输入"
-short_description = "控制 AnyaDance 姿态与 VRChat OSC 动作"
-keywords = ["anyadance", "steamvr", "vrchat", "osc", "body", "pose", "gesture", "姿态", "举手", "握持"]
-version = "0.13.9"
+description = "让 N.E.K.O 感知当前 VRChat 画面，以稳定实体 ID 搜索、接近或跟随 NPC/玩家，并通过 AnyaDance 与 OSC 控制虚拟身体"
+short_description = "VRChat 视觉感知、本地导航与 AnyaDance 身体控制"
+keywords = ["anyadance", "steamvr", "vrchat", "vision", "navigation", "npc", "follow", "osc", "body", "视觉", "感知", "导航", "移动", "跟随"]
+version = "0.13.11"
 type = "plugin"
 entry = "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 
@@ -173,12 +173,18 @@ identity_reid_similarity = 0.90
 identity_reid_margin = 0.04
 identity_reid_retention_s = 1800.0
 identity_reid_max_identities = 128
-semantic_backend = "openai_compatible"
-# 独立后端配置面板可以把下面两项写到 backend.settings.json；环境变量
-# VRC_VLM_ENDPOINT / OPENAI_BASE_URL 与 VRC_VLM_MODEL / OPENAI_VLM_MODEL 优先。
+# main_llm 把语义任务作为被动图片上下文并入宿主已有对话，不另起一次模型调用。
+# 独立运行且没有 N.E.K.O 宿主时，可在配置面板切换为 openai_compatible。
+semantic_backend = "main_llm"
+# openai_compatible 模式下，独立后端配置面板可以把下面两项写到
+# backend.settings.json；环境变量 VRC_VLM_ENDPOINT / OPENAI_BASE_URL 与
+# VRC_VLM_MODEL / OPENAI_VLM_MODEL 优先。
 semantic_endpoint = ""
 semantic_model = "gpt-4o-mini"
 semantic_max_per_minute = 30
+# selector 未解决时，下一张主 LLM 语义图的最小间隔。pending 单槽不会重复注入，
+# 所以 12 秒是兜底重试而不是固定截图频率。
+semantic_main_llm_min_interval_s = 12.0
 # 给 agent 看的单槽内存帧缓存。这条路径与 world_state 完全无关：帧只喂理解，不
 # 产生实体也不产生事件，更不能用来满足 body_reach_and_grab 的 preconditions。
 # 检测完成后 JPEG、同帧实体和 revision 一起覆盖内存单槽；不写临时图片、不保留

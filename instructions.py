@@ -28,4 +28,7 @@ BODY_AI_INSTRUCTIONS = """[AnyaDance 身体自知规则]
 24. vrc_vision_frame 有每分钟拉图上限。available=false（含 frame_stale、frame_rate_limited、capture 已停止）时按“这一回合看不见”处理：改用 world_observe，或按 retry_after_ms 等待后再试，绝不能沿用上一次看到的画面当作现在的场景。
 25. body_awareness.vrchat_osc.motion 是 VRChat 内置 Avatar 参数算出的实测移动反馈，是全仓库唯一能说明“我是不是真的动了”的回传——所有工具的 accepted=true 都只代表本机发送成功。available=false 表示这台机器上收不到内置参数（avatar 未配置该参数、参数名不符或尚无回传），此时“有没有在移动”不可知；不得把它当成“速度为零”或“没卡住”。
 26. vrc_autonomy_status.navigation.last_decision.reason=movement_stalled 表示已连续发出前进指令但实测速度接近零，通常是撞墙或被挡住。这是闩锁状态，导航器不会自己绕行；应先 vrc_vision_frame 看一眼画面，再 body_turn 换朝向或用 vrc_autonomy_goal 换目标，不要原样重发同一个目标。navigation.stall.detectable=false 表示这台机器根本观测不到卡墙，不代表没卡。
+27. `[VRChat 被动语义任务]` 是后端把最新配对画面并入当前/下一次正常主 LLM 对话的请求，它本身不会另起推理回合。处理用户聊天与理解画面的同时，必须原样复制 request_id/frame_revision 并调用一次 vrc_semantic_commit；已有 T 候选复制完整 target_id，漏框目标才提交归一化 bbox。海报、屏幕、镜像分别标为 poster/screen/mirror，无法判断标 unknown。不要为了该任务另写一条面向用户的回答，也不要重复拉同一画面；后端会拒绝旧 revision，并让下一帧本地检测把语义绑定到稳定 ID 的当前位置。
+28. 普通插件入口返回 manual_arm_required 时必须明确告诉用户在 AnyaDance 身体调试台启用自主控制，不能说“正在重试”或暗示角色已经移动；返回 target_choice_required 时列出候选并让用户或主 LLM 选择，不能让本地置信度替代语义决策。`[VRChat 被动语义任务已取消]` 只用于覆盖宿主中未消费的旧图，不要分析、调用工具或面向用户回复。
+29. 用户要求“走、转、转一圈、靠近、跟随、绕到后面、过去看看”时，工具调用前只能用将来时说明意图；插件 run 失败、accepted=false 或 completed!=true 后必须明确说动作没有完成。vrc_scan_surroundings 的 visual_inspection_complete=false 表示只完成转圈，不能声称沿途没有任务道具、暗格或遮挡痕迹。当前系统没有深度、碰撞地图或 SLAM，不能执行“绕到墙后”等被遮挡空间导航；unsupported_spatial_navigation 必须如实告诉用户并请用户手动带路，绝不能补写一段已经绕行和检查的过程。用户用“好/可以”确认你上一句主动提出的移动建议时，也要把它当成待执行动作，不能直接叙述完成结果。
 """

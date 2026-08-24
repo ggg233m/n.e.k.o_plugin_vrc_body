@@ -279,6 +279,8 @@ class BackendService:
             self.world_state,
             detector=vision_detector,
             semantic=vision_semantic,
+            main_llm_semantic=(self.config.vision.semantic_backend == "main_llm"),
+            main_llm_min_interval_s=self.config.vision.semantic_main_llm_min_interval_s,
             observation_callback=self._on_vision_observation,
             detect_interval_s=effective_detector_interval_ms / 1000.0,
             frame_cache_interval_s=self.config.vision.frame_cache_interval_s,
@@ -323,6 +325,7 @@ class BackendService:
             release_inputs=self._navigator_release_inputs,
             motion_provider=self._navigator_motion_feedback,
             turn_state_provider=self._navigator_turn_state,
+            complete_goal=self._navigator_complete_goal,
             turn_retarget_supported=True,
         )
         self._control_metrics_lock = threading.Lock()
@@ -564,6 +567,11 @@ class BackendService:
                 self.stop()
                 raise
 
+    def _navigator_complete_goal(self, reason: str) -> None:
+        """导航总时限到期时同时撤销语义单槽，避免后台继续刷新图片。"""
+        self.vision.clear_main_llm_semantic_request(reason)
+        self.autonomy.complete_goal(reason)
+
     def _start_vmc_calibration(self) -> None:
         host_vmc = self.host_vmc
         relay = self.vmc_idle
@@ -691,7 +699,9 @@ class BackendService:
         return {"accepted": True, **self.autonomy.arm(ttl_s=normalized)}
 
     def autonomy_disarm(self, reason: Any = "manual_disarm") -> dict[str, Any]:
-        return {"accepted": True, **self.autonomy.disarm(str(reason or "manual_disarm"))}
+        normalized_reason = str(reason or "manual_disarm")
+        self.vision.clear_main_llm_semantic_request(normalized_reason)
+        return {"accepted": True, **self.autonomy.disarm(normalized_reason)}
 
     def autonomy_goal(
         self,
@@ -712,7 +722,7 @@ class BackendService:
                     "reason": "semantic vision is degraded; only safe exploration is allowed",
                     **self.autonomy.snapshot(),
                 }
-        return self.autonomy.submit_goal(
+        result = self.autonomy.submit_goal(
             text,
             kind,
             target_id,
@@ -720,9 +730,195 @@ class BackendService:
             constraints,
             based_on_revision,
         )
+        if result.get("accepted"):
+            goal = result.get("goal") if isinstance(result.get("goal"), Mapping) else {}
+            normalized_selector = goal.get("selector") if isinstance(goal.get("selector"), Mapping) else None
+            if normalized_selector is not None:
+                # 建立被动任务，不在这里调用模型。插件会把这张图并入当前/下一次
+                # 主 LLM 对话，LocalNavigator 在此期间继续自己的高频循环。
+                result["semantic_request"] = self.vision.request_main_llm_semantics(
+                    normalized_selector,
+                    reason="autonomy_selector_submitted",
+                    force=True,
+                )
+            else:
+                self.vision.clear_main_llm_semantic_request("goal_replaced_without_selector")
+        return result
+
+    def autonomy_intent(
+        self,
+        action: Any,
+        text: Any = None,
+        target_id: Any = None,
+        target_type: Any = "npc",
+        target_label: Any = None,
+        min_confidence: Any = 0.25,
+        constraints: Any = None,
+    ) -> dict[str, Any]:
+        """把 Agent 的单步自然语言意图收紧为安全的本地导航目标。
+
+        普通插件执行器一次通常只调用一个 entry，无法可靠地先观察、再复制 ID、
+        最后提交目标。这里仅在当前画面恰好有一个经语义确认的匹配实体时替它完成
+        这段机械绑定；多个候选仍交还主 LLM 选择，绝不按置信度偷偷挑人。
+        """
+        normalized_action = str(action or "").replace("\x00", "").strip().lower()
+        if normalized_action == "status":
+            return {"accepted": True, "action": "status", **self.autonomy_snapshot()}
+        if normalized_action == "stop":
+            return {"action": "stop", **self.autonomy_stop("agent_navigation_stop")}
+        if normalized_action == "inspect_occluded_area":
+            return {
+                **self.autonomy.snapshot(),
+                "accepted": False,
+                "action": normalized_action,
+                "reason_code": "unsupported_spatial_navigation",
+                "reason": (
+                    "current perception has no depth, collision map or SLAM; "
+                    "it cannot route to or verify an occluded area"
+                ),
+                "instruction": "请让用户手动带路到可见位置，再观察新鲜画面。",
+            }
+        if normalized_action not in {"find", "approach", "follow"}:
+            return {
+                **self.autonomy.snapshot(),
+                "accepted": False,
+                "reason_code": "invalid_action",
+                "reason": "action must be find, approach, follow, stop or status",
+            }
+
+        autonomy = self.autonomy.snapshot()
+        if not autonomy.get("armed"):
+            return {
+                **autonomy,
+                "accepted": False,
+                "reason_code": "manual_arm_required",
+                "reason": "VRChat autonomy is not manually armed",
+                "instruction": "请先在 AnyaDance 身体调试台点击“启用自主控制”，再重试移动命令。",
+            }
+
+        normalized_type = str(target_type or "").replace("\x00", "").strip().lower()[:32]
+        normalized_label = str(target_label or "").replace("\x00", "").strip()[:64]
+        try:
+            normalized_confidence = float(min_confidence)
+        except (TypeError, ValueError, OverflowError):
+            normalized_confidence = math.nan
+        if not math.isfinite(normalized_confidence) or not 0.0 <= normalized_confidence <= 1.0:
+            return {
+                **autonomy,
+                "accepted": False,
+                "reason_code": "invalid_min_confidence",
+                "reason": "min_confidence must be between 0 and 1",
+            }
+        selector: dict[str, Any] = {"min_confidence": normalized_confidence}
+        if normalized_type:
+            selector["semantic_type"] = normalized_type
+        if normalized_label:
+            selector["label"] = normalized_label
+        if len(selector) == 1:
+            return {
+                **autonomy,
+                "accepted": False,
+                "reason_code": "selector_required",
+                "reason": "target_type or target_label is required",
+            }
+
+        world = self.vision.snapshot()
+        # 普通 Agent entry 可能正好落在 detector 回调之间；用本次精确快照同步
+        # revision，避免把自己刚读到的 revision 误判成“来自未来”。
+        self.autonomy.update_world(world)
+        status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+        revision = int(status.get("revision", 0) or 0)
+        normalized_text = str(text or "").replace("\x00", "").strip()[:256]
+        if normalized_action == "find":
+            result = self.autonomy_goal(
+                normalized_text or f"寻找 {normalized_label or normalized_type}",
+                "explore",
+                None,
+                selector,
+                constraints,
+                revision,
+            )
+            return {"action": "find", "resolved_by": "semantic_selector", **result}
+
+        normalized_target_id = str(target_id or "").replace("\x00", "").strip()[:96]
+        candidates = self._semantic_navigation_candidates(world, selector)
+        if not normalized_target_id:
+            if len(candidates) != 1:
+                return {
+                    **autonomy,
+                    "accepted": False,
+                    "action": normalized_action,
+                    "reason_code": (
+                        "semantic_target_not_found" if not candidates else "target_choice_required"
+                    ),
+                    "reason": (
+                        "no currently visible semantic target matches the selector"
+                        if not candidates else
+                        "multiple semantic targets match; the main LLM must choose an exact target_id"
+                    ),
+                    "candidates": candidates,
+                }
+            normalized_target_id = str(candidates[0]["target_id"])
+            resolved_by = "unique_semantic_target"
+        else:
+            resolved_by = "exact_target_id"
+        result = self.autonomy_goal(
+            normalized_text or f"{normalized_action} {normalized_label or normalized_type}",
+            normalized_action,
+            normalized_target_id,
+            None,
+            constraints,
+            revision,
+        )
+        return {
+            "action": normalized_action,
+            "resolved_by": resolved_by,
+            "resolved_target_id": normalized_target_id,
+            **result,
+        }
+
+    @staticmethod
+    def _semantic_navigation_candidates(
+        world: Mapping[str, Any],
+        selector: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """返回当前可见且经语义确认的候选；负类别永远不能进入导航。"""
+        expected_type = str(selector.get("semantic_type") or "").strip().lower()
+        expected_label = str(selector.get("label") or "").strip().casefold()
+        minimum = float(selector.get("min_confidence", 0.0) or 0.0)
+        candidates: list[dict[str, Any]] = []
+        entities = world.get("entities") if isinstance(world.get("entities"), list) else []
+        for entity in entities:
+            if not isinstance(entity, Mapping) or not entity.get("visible"):
+                continue
+            attributes = entity.get("attributes") if isinstance(entity.get("attributes"), Mapping) else {}
+            semantic_type = str(attributes.get("semantic_type") or "").strip().lower()
+            if not attributes.get("semantic_verified") or semantic_type in {
+                "", "poster", "screen", "mirror", "unknown",
+            }:
+                continue
+            label = str(entity.get("label") or "")
+            confidence = float(entity.get("confidence", 0.0) or 0.0)
+            if expected_type and semantic_type != expected_type:
+                continue
+            if expected_label and expected_label not in label.casefold():
+                continue
+            if confidence < minimum:
+                continue
+            candidates.append({
+                "target_id": str(entity.get("id") or "")[:96],
+                "label": label[:64],
+                "semantic_type": semantic_type,
+                "confidence": round(confidence, 4),
+                "bearing_deg": attributes.get("bearing_deg"),
+                "apparent_height": attributes.get("apparent_height"),
+            })
+        return candidates
 
     def autonomy_stop(self, reason: Any = "autonomy_stop") -> dict[str, Any]:
-        return {"accepted": True, **self.autonomy.stop(str(reason or "autonomy_stop"))}
+        normalized_reason = str(reason or "autonomy_stop")
+        self.vision.clear_main_llm_semantic_request(normalized_reason)
+        return {"accepted": True, **self.autonomy.stop(normalized_reason)}
 
     def attach_vision(self, source: FrameSource, detector: FrameDetector) -> dict[str, Any]:
         """注入外部 detector；模型包和采集实现由调用方负责。"""
@@ -1155,6 +1351,30 @@ class BackendService:
             import base64
             result["data_base64"] = base64.b64encode(data).decode("ascii")
         return result
+
+    def main_llm_semantic_request(self, after_request_id: Any = None) -> dict[str, Any]:
+        """取一次被动语义任务；JPEG 仍只来自运行时的内存单槽。"""
+        normalized_after = str(after_request_id or "").replace("\x00", "").strip()[:128] or None
+        result = dict(
+            self.vision.main_llm_semantic_request(after_request_id=normalized_after)
+        )
+        data = result.pop("data", None)
+        if isinstance(data, bytes):
+            import base64
+            result["data_base64"] = base64.b64encode(data).decode("ascii")
+        return result
+
+    def main_llm_semantic_commit(
+        self,
+        request_id: Any,
+        frame_revision: Any,
+        entities: Any,
+    ) -> dict[str, Any]:
+        return self.vision.commit_main_llm_semantics(
+            request_id,
+            frame_revision,
+            entities,
+        )
 
     def _navigator_send_axes(self, side: str, x: float, y: float, duration_ms: int) -> bool:
         """只发送主 AnyaDance 命令，绝不回退到 OSC。"""
@@ -1619,6 +1839,51 @@ class BackendService:
             frame_id=observation.frame_id,
         )
         self.autonomy.update_world(self.vision.snapshot())
+        if self.config.vision.semantic_backend == "main_llm":
+            autonomy = self.autonomy.snapshot()
+            goal = autonomy.get("goal") if isinstance(autonomy.get("goal"), Mapping) else {}
+            selector = goal.get("selector") if isinstance(goal.get("selector"), Mapping) else None
+            if selector is not None:
+                if self._semantic_selector_is_satisfied(selector, normalized_entities):
+                    # 结果已在当前本地帧重新绑定，尚未被宿主消费的旧任务没有价值。
+                    self.vision.clear_main_llm_semantic_request()
+                else:
+                    # 本地 detector 每帧都可到这里，但运行时有 pending 单槽与最小间隔；
+                    # 因而这里只表达“仍未解决”，不会按帧生成主 LLM 图片。
+                    self.vision.request_main_llm_semantics(
+                        selector,
+                        reason="autonomy_selector_unresolved",
+                    )
+
+    @staticmethod
+    def _semantic_selector_is_satisfied(
+        selector: Mapping[str, Any],
+        entities: list[Mapping[str, Any]],
+    ) -> bool:
+        expected_type = str(selector.get("semantic_type") or "").strip().lower()
+        expected_label = str(selector.get("label") or "").strip().casefold()
+        try:
+            minimum = float(selector.get("min_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            minimum = 0.0
+        for entity in entities:
+            attributes = entity.get("attributes") if isinstance(entity.get("attributes"), Mapping) else {}
+            if not bool(attributes.get("semantic_verified")):
+                continue
+            semantic_type = str(attributes.get("semantic_type") or "").strip().lower()
+            label = str(entity.get("label") or "").casefold()
+            try:
+                confidence = float(entity.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                confidence = 0.0
+            if expected_type and semantic_type != expected_type:
+                continue
+            if expected_label and expected_label not in label:
+                continue
+            if confidence < minimum:
+                continue
+            return True
+        return False
 
     def ingest_world(
         self,

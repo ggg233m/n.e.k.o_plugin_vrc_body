@@ -77,6 +77,7 @@ function renderOverview() {
   const vision = get(world, "backends.vision_runtime", {});
   const detector = vision.detector || {};
   const semantic = vision.semantic || {};
+  const mainLlmSemantic = vision.main_llm_semantic || {};
   const navigation = perception.navigation || snapshot.navigation || {};
   const autonomy = snapshot.autonomy || {};
   const worker = perception.worker || snapshot.vision_worker || {};
@@ -104,7 +105,12 @@ function renderOverview() {
 
   text("captureFact", `${boolLabel(worker.running, "运行中", "已停止")} · ${worker.frames_processed ?? 0} 帧`);
   text("deviceFact", `${detector.runtime || "none"} / ${detector.resolved_device || detector.device || "—"}`);
-  text("semanticQueueFact", `${get(vision, "semantic_worker.queue_depth", 0)} / ${get(vision, "semantic_worker.queue_size", 1)} · 已处理 ${get(vision, "semantic_worker.processed", 0)}`);
+  text(
+    "semanticQueueFact",
+    mainLlmSemantic.enabled
+      ? `${mainLlmSemantic.request_state || "none"} · revision ${mainLlmSemantic.request_revision ?? "—"} · 已提交 ${mainLlmSemantic.requests_committed ?? 0}`
+      : `${get(vision, "semantic_worker.queue_depth", 0)} / ${get(vision, "semantic_worker.queue_size", 1)} · 已处理 ${get(vision, "semantic_worker.processed", 0)}`,
+  );
   text("candidateFact", `${get(vision, "semantic_candidates.candidate_count", 0)} / ${get(vision, "semantic_candidates.max_candidates", 32)} · 仅内存`);
 
   const lines = [
@@ -181,10 +187,11 @@ function populateConfig() {
   byId("cfgInterval").value = vision.interval_ms ?? 100;
   byId("cfgDetectorInterval").value = vision.detector_interval_ms ?? 500;
   byId("cfgAcceleratorInterval").value = vision.detector_accelerator_interval_ms ?? 100;
-  byId("cfgSemanticBackend").value = vision.semantic_backend || "openai_compatible";
+  byId("cfgSemanticBackend").value = vision.semantic_backend || "main_llm";
   byId("cfgSemanticEndpoint").value = vision.semantic_endpoint || "";
   byId("cfgSemanticModel").value = vision.semantic_model || "gpt-4o-mini";
   byId("cfgSemanticRate").value = vision.semantic_max_per_minute ?? 30;
+  byId("cfgMainLlmInterval").value = vision.semantic_main_llm_min_interval_s ?? 12;
   byId("cfgAnyaHost").value = anya.host || "127.0.0.1";
   byId("cfgAnyaPort").value = anya.port ?? 39570;
   byId("cfgOscEnabled").checked = Boolean(osc.enabled);
@@ -199,8 +206,13 @@ function populateConfig() {
   byId("saveSettings").disabled = !state.config.editable;
   const hasKey = Boolean(get(state.config, "secrets.vlm_api_key", false));
   const keyBadge = byId("apiKeyBadge");
-  keyBadge.textContent = hasKey ? "API Key 已配置" : "API Key 未配置";
-  keyBadge.className = `badge ${hasKey ? "ok" : "bad"}`;
+  if ((vision.semantic_backend || "main_llm") === "main_llm") {
+    keyBadge.textContent = "需要 N.E.K.O 宿主桥接";
+    keyBadge.className = "badge muted";
+  } else {
+    keyBadge.textContent = hasKey ? "API Key 已配置" : "API Key 未配置";
+    keyBadge.className = `badge ${hasKey ? "ok" : "bad"}`;
+  }
   state.configInitialized = true;
 }
 
@@ -233,10 +245,11 @@ function collectConfig() {
       interval_ms: numericValue("cfgInterval"),
       detector_interval_ms: numericValue("cfgDetectorInterval"),
       detector_accelerator_interval_ms: numericValue("cfgAcceleratorInterval"),
-      semantic_backend: value("cfgSemanticBackend", "openai_compatible"),
+      semantic_backend: value("cfgSemanticBackend", "main_llm"),
       semantic_endpoint: value("cfgSemanticEndpoint") || null,
       semantic_model: value("cfgSemanticModel", "gpt-4o-mini"),
       semantic_max_per_minute: numericValue("cfgSemanticRate"),
+      semantic_main_llm_min_interval_s: numericValue("cfgMainLlmInterval"),
     },
   };
 }

@@ -370,6 +370,59 @@ VRC_AUTONOMY_STOP = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+VRC_SEMANTIC_COMMIT = {
+    "name": "vrc_semantic_commit",
+    "description": (
+        "提交当前主多模态 LLM 对被动 VRChat 语义任务的结构化分类。"
+        "必须原样使用任务消息中的 request_id 和 frame_revision，并且每个任务只调用一次；"
+        "这是和当前用户聊天同一回合内的附带工作，不要为它另起回答。"
+        "已有检测框优先复制 candidates 中的完整 target_id；只有检测器漏框时才填写归一化 bbox。"
+        "海报、屏幕和镜像要明确标为 poster/screen/mirror，避免被自主搜索当成 NPC。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "frame_revision": {"type": "integer", "minimum": 0},
+            "entities": {
+                "type": "array",
+                "maxItems": 32,
+                "description": "画面中的语义分类；确认没有可分类候选时提交空数组。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 96,
+                            "description": "本次任务 candidates 中的完整稳定 ID。",
+                        },
+                        "bbox": {
+                            "type": "array",
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "items": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "description": "仅漏检目标使用：[left, top, right, bottom] 归一化坐标。",
+                        },
+                        "semantic_type": {
+                            "type": "string",
+                            "enum": [
+                                "npc", "player", "avatar", "person", "humanoid", "object",
+                                "poster", "screen", "mirror", "unknown"
+                            ],
+                        },
+                        "label": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    },
+                    "required": ["semantic_type", "label", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["request_id", "frame_revision", "entities"],
+    },
+}
+
 BODY_STOP = {
     "name": "body_stop",
     "description": "最高优先级急停：冻结当前合法姿态、释放所有输入、清空队列并锁定后续动作。",
@@ -492,6 +545,28 @@ BODY_TURN = {
             "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 500, "description": "持续时间；超时后自动归零"},
         },
         "required": ["horizontal"],
+    },
+}
+
+VRC_SCAN_SURROUNDINGS = {
+    "name": "vrc_scan_surroundings",
+    "description": (
+        "按用户明确要求让 VRChat 视角原地完整转一圈，并等待本地转向调度结束。"
+        "completed=true 只证明一整圈转向在本地调度器中完成，不证明已经看清沿途物体；"
+        "visual_inspection_complete=false 时不得声称没有任务道具、暗格或遮挡痕迹。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "direction": {
+                "type": "string",
+                "enum": ["left", "right"],
+                "default": "right",
+                "description": "转圈方向。",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
     },
 }
 

@@ -19,6 +19,7 @@ TurnSender = Callable[[float], bool]
 ReleaseSender = Callable[[str], None]
 SnapshotProvider = Callable[[], Mapping[str, Any]]
 TurnStateProvider = Callable[[], Mapping[str, Any]]
+GoalCompleter = Callable[[str], None]
 
 # 目标贴到画面上下边时表观高度会饱和，无法再作为距离的单调函数。此时按一个
 # 更低的比例判定「已到达」，避免因为读数封顶而一直前进撞上对方。安全边界留在
@@ -340,6 +341,7 @@ class LocalNavigator:
         release_inputs: ReleaseSender,
         motion_provider: SnapshotProvider | None = None,
         turn_state_provider: TurnStateProvider | None = None,
+        complete_goal: GoalCompleter | None = None,
         turn_retarget_supported: bool = False,
         config: NavigatorConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -356,6 +358,7 @@ class LocalNavigator:
         # 可选：scheduler 的 heading 状态。没有该回传时仍用本地冷却限速，
         # 保持独立测试和第三方适配器可用。
         self._turn_state_provider = turn_state_provider
+        self._complete_goal = complete_goal
         # true 表示发送器会把每次相对修正换算成「基于当前朝向的绝对目标」。这种
         # 发送器可以在上一段平滑转向仍在执行时安全重定向，不会把相对角度累加超调。
         self._turn_retarget_supported = bool(turn_retarget_supported)
@@ -374,6 +377,7 @@ class LocalNavigator:
         self._stalled = False
         self._stall_goal_key: tuple[str, str, str] | None = None
         self._stall_goal_age: float | None = None
+        self._completion_notified_goal_key: tuple[str, str, str] | None = None
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
@@ -449,6 +453,7 @@ class LocalNavigator:
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
+            self._notify_goal_complete(decision)
             return decision
         except Exception as exc:
             self._safe_release()
@@ -487,6 +492,7 @@ class LocalNavigator:
                 # 绕行预算随闩锁一起归零：LLM 换了目标就是新的一次尝试，不该
                 # 背着上一个目标用掉的次数。
                 self._recover_attempts = 0
+                self._completion_notified_goal_key = None
                 # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
                 # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
@@ -495,6 +501,22 @@ class LocalNavigator:
                     self._target_observation = None
             self._stall_goal_key = goal_key
             self._stall_goal_age = goal_age
+
+    def _notify_goal_complete(self, decision: NavigationDecision) -> None:
+        """总时限是语义等待的最终边界；到期后只通知一次并释放上层目标。"""
+        if decision.reason != "explore_duration_exhausted" or self._complete_goal is None:
+            return
+        with self._lock:
+            goal_key = self._stall_goal_key
+            if goal_key is None or goal_key == self._completion_notified_goal_key:
+                return
+            self._completion_notified_goal_key = goal_key
+        try:
+            self._complete_goal(decision.reason)
+        except Exception as exc:
+            # 完成回调失败不能把已经停车的决策改成导航器故障；状态里保留诊断。
+            with self._lock:
+                self._last_error = f"goal_complete_callback:{type(exc).__name__}: {exc}"[:240]
 
     def _stall_guard(
         self,

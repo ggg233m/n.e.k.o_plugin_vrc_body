@@ -26,6 +26,8 @@
 - 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
 - 用 `vrc_controller_input`、`vrc_menu_navigate` 和 `vrc_jump` 发送有限时长的虚拟 Index 摇杆、按钮和跳跃脉冲。
 - 用 `vrc_autonomy_status`、`vrc_autonomy_goal`、`vrc_autonomy_stop` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
+- 向 N.E.K.O 后台 Agent 暴露正式的“观察当前 VRChat 世界”和“寻找或走向 VRChat 目标”入口；自然语言里的“找 NPC / 走过去 / 跟着它”会进入同一个安全导航接口，而不是被误判成仅有身体姿态能力。唯一语义目标可自动绑定稳定 ID，多个候选仍必须交回主 LLM 选择。
+- 用 `vrc_scan_surroundings` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。当前没有深度、碰撞地图或 SLAM，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
 - 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status` 与 `body_awareness`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
 - 单一发送线程以配置的 120 Hz（默认）向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
@@ -151,6 +153,20 @@ base64——所以两条路都通过 `push_message` 的 image part 交给宿主�
 拉图有每分钟上限（`frame_max_per_minute` 默认 10，滑动窗口）。一张 960 px 的 JPEG 进
 上下文是十万字符量级的 base64，agent 在循环里每回合拉一张足以把会话挤爆。唤醒配的图
 不占这个预算，它自己受 12 s 的最小唤醒间隔约束。
+
+`semantic_backend="main_llm"` 时，后端不会再为语义识别另起一次模型请求。带 selector
+的目标尚未解析时，它把同帧 JPEG、检测候选和 revision 放入一个内存单槽；插件用
+`ai_behavior="read"` 将这项被动任务并入当前或下一次正常用户对话。主多模态 LLM 在完成
+聊天和画面理解的同一回合调用 `vrc_semantic_commit`，后端校验 request ID/revision 后只
+缓存分类，下一帧本地检测再把分类附到稳定 ID 的当前位置。pending 任务不重复注入，默认
+至少间隔 `semantic_main_llm_min_interval_s=12` 秒才允许产生下一张，并且新任务覆盖宿主
+尚未消费的旧图；因此锁定后的导航阶段不再消耗图片 token。
+
+这条桥接不会让主 LLM 逐帧观看：普通位置变化仍只进入内存 revision 账本，重要社交事件
+沿用原有的限速主动唤醒，用户明确询问当前画面时仍可调用 `vrc_vision_frame`。海报、屏幕
+和镜像可以分别提交为 `poster`、`screen`、`mirror`，作为负语义缓存避免反复把同一干扰物
+当作 NPC。独立后端脱离 N.E.K.O 运行时没有“当前主 LLM”，应在面板中切换到
+`openai_compatible`。
 
 视觉捕获也可以独立于身体控制链路启停：调用后端 `POST /vision/stop` 会释放当前
 DXcam/WinRT/MSS 句柄并解除自主导航，`POST /vision/start` 会创建全新的

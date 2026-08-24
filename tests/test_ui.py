@@ -13,7 +13,7 @@ class HostedUiTests(unittest.TestCase):
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         with (ROOT / "plugin.toml").open("rb") as handle:
             manifest = tomllib.load(handle)
-        self.assertEqual(manifest["plugin"]["version"], "0.13.9")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.11")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -41,6 +41,9 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("body_turn", commands)
         self.assertIn("body_stop_movement", commands)
         self.assertIn("body_chatbox", commands)
+        self.assertIn("observe_vrchat_world", commands)
+        self.assertIn("navigate_vrchat_world", commands)
+        self.assertIn("vrc_scan_surroundings", commands)
 
         plugin_class = next(
             node for node in tree.body
@@ -55,11 +58,36 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("ui.context", context_decorators)
         self.assertIn("ui.action", action_source)
         self.assertIn("plugin_entry", action_source)
+        self.assertIn("观察与导航", action_source)
+        self.assertIn("manual_arm_required", action_source)
         self.assertIn(".catalog()", context_source)
         self.assertIn("driver_log", context_source)
+        self.assertIn("world_bridge", context_source)
+        self.assertIn("semantic_push_rejected", context_source)
+        self.assertIn("_world_bridge_thread", context_source)
         self.assertNotIn(".list()", context_source)
         self.assertIn("asyncio.to_thread", list_source)
         self.assertIn("asyncio.to_thread", play_source)
+
+        observe_source = ast.unparse(methods["observe_vrchat_world"])
+        navigate_source = ast.unparse(methods["navigate_vrchat_world"])
+        cancel_source = ast.unparse(methods["_replace_cancelled_semantic_push"])
+        self.assertIn("plugin_entry", observe_source)
+        self.assertIn("当前 VRChat 视觉检测", observe_source)
+        self.assertIn("plugin_entry", navigate_source)
+        self.assertIn("manual_arm_required", navigate_source)
+        self.assertIn("autonomy.intent", navigate_source)
+        self.assertIn("unsupported_spatial_navigation", navigate_source)
+        self.assertIn("_execution_result", action_source)
+        execution_result_source = ast.unparse(methods["_execution_result"])
+        self.assertIn("Err", execution_result_source)
+        startup_source = ast.unparse(methods["on_startup"])
+        self.assertIn("_register_agent_entries", startup_source)
+        register_source = ast.unparse(methods["_register_agent_entries"])
+        self.assertIn("agent_scan_vrchat_surroundings", register_source)
+        self.assertIn("register_dynamic_entry", register_source)
+        self.assertIn("neko_anyadance_body.semantic.latest", cancel_source)
+        self.assertIn("被动语义任务已取消", cancel_source)
 
     def test_panel_uses_only_hosted_ui_runtime_and_covers_controls(self) -> None:
         source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")

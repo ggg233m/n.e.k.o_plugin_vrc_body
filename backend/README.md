@@ -357,8 +357,9 @@ max_detections = 64
 min_box_ratio = 0.02
 min_box_width_ratio = 0.008
 min_box_height_ratio = 0.02
-semantic_backend = "openai_compatible"
+semantic_backend = "main_llm" # main_llm / openai_compatible / none / external
 semantic_max_per_minute = 30
+semantic_main_llm_min_interval_s = 12.0
 # 给 agent 看的单槽帧缓存；与 world_state 无关，不产生实体也不产生事件。
 frame_cache_interval_s = 1.0
 frame_max_width = 960 # 降采样宽度；0 表示不缩放
@@ -426,6 +427,51 @@ endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行
 （`capture_stopped` / `no_frame_cached` / `frame_stale`），不会退而求其次给旧画面。
 编码失败只记进 `frame_cache.last_error` 并让这次拉取报不可用，绝不打断采集——看不到
 图是降级，掉帧才是故障。
+
+### 合并到当前对话的主 LLM 语义任务
+
+`semantic_backend="main_llm"` 不调用外部 endpoint。selector 尚未解决时，运行时从
+最新帧/检测配对建立一个有 TTL 的内存单槽。插件通过
+`GET /semantic/request?after_request_id=...` 取走任务并以被动 `read` 消息注入宿主已有
+对话，因此取图本身不会触发额外模型回合。响应包含 `request_id`、`revision`、叠框候选
+和 `data_base64`；同一 pending ID 不会按帧重复返回给同一插件游标。
+
+目标停止、解除武装或达到总时限时，后端立即释放图片单槽并为最后一个 request ID
+保留一条轻量内存取消标记。插件用相同 `coalesce_key` 发送无图片取消消息，覆盖宿主中
+尚未消费的旧回调；因此晚到的下一次聊天不会看到十几分钟前的 VRChat 画面，也不会
+继续调用已失效的 `vrc_semantic_commit`。取消标记和图片都不写磁盘。
+
+主多模态 LLM 在正常聊天回合内调用 `vrc_semantic_commit`，插件转发到
+`POST /semantic/commit`：
+
+```json
+{
+  "request_id": "semantic-request:abcd:1",
+  "frame_revision": 42,
+  "entities": [
+    {
+      "target_id": "avatar:session:abcd:3",
+      "semantic_type": "npc",
+      "label": "白衣 NPC",
+      "confidence": 0.92
+    }
+  ]
+}
+```
+
+已有检测框必须使用本任务中的完整 `target_id`；本地 detector 漏框时才允许提交归一化
+`bbox`。后端拒绝错 request ID、错 revision、超时结果和不属于该帧的 target ID。提交只
+更新会话级语义候选缓存，不把十秒前的位置直接写回世界；下一帧本地检测重新看到同一
+稳定 ID 后才附加 `semantic_type`。图片、裁剪和候选均有界驻留内存，不写临时文件。
+
+独立后端脱离 N.E.K.O 时没有宿主主 LLM，应从 Web UI 把后端切换为
+`openai_compatible`。该模式继续使用 endpoint/model/API key 与独立异步 worker。
+
+N.E.K.O 普通插件执行器可通过 `POST /autonomy/intent` 一次提交 `find`、`approach`、
+`follow`、`stop` 或 `status`。该高层入口不会绕过手动 arm：未授权时明确返回
+`manual_arm_required`。`approach/follow` 省略精确 ID 时，只有当前画面恰好存在一个
+匹配且 `semantic_verified=true` 的目标才会绑定；多人场景返回
+`target_choice_required`，禁止本地代码擅自替 LLM 选人。
 
 运行时层面 `max_age_ms <= 0` 表示不限龄，这是留给内部调用方的逃生口；`BackendService`
 和 LLM 工具都把下限抬到 250 ms，否则「要最新的画面」写成 0 反而会拿到最旧的一张。

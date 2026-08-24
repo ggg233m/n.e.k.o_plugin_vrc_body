@@ -213,12 +213,17 @@ class VisionConfig:
     identity_reid_margin: float = 0.04
     identity_reid_retention_s: float = 1800.0
     identity_reid_max_identities: int = 128
-    semantic_backend: str = "openai_compatible"
+    # main_llm 不另起独立模型请求：它把一次有界语义任务作为被动上下文并入
+    # 当前/下一次宿主多模态对话，分类结果再通过工具回填到本地稳定 ID 缓存。
+    semantic_backend: str = "main_llm"
     # 独立后端可以直接从配置面板保存 endpoint/model；API key 仍只从环境变量
     # 读取，避免把凭据混入可导出、可提交的普通 JSON/TOML 配置。
     semantic_endpoint: str | None = None
     semantic_model: str = "gpt-4o-mini"
     semantic_max_per_minute: int = 30
+    # 主 LLM 看图会占用对话 token。未解决的 selector 至少间隔这么久才允许
+    # 产生下一张候选图；请求本身不唤醒模型，普通用户回合可以顺便消费它。
+    semantic_main_llm_min_interval_s: float = 12.0
     # 给 agent 看的单槽内存帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
     # 不产生实体也不产生事件。检测完成后把 JPEG 与同帧实体原子配对，编码按间隔
     # 做一次；不创建临时图片、不保留历史，也不增加世界持久化写入。
@@ -444,9 +449,11 @@ class PluginConfig:
         fallback_backend = str(vision.get("fallback_backend", "none")).strip().lower() or "none"
         if fallback_backend not in {"none", "opencv_hog"}:
             raise ValueError("vision.fallback_backend must be none or opencv_hog")
-        semantic_backend = str(vision.get("semantic_backend", "openai_compatible")).strip().lower() or "openai_compatible"
-        if semantic_backend not in {"openai_compatible", "none", "external"}:
-            raise ValueError("vision.semantic_backend must be openai_compatible, none, or external")
+        semantic_backend = str(vision.get("semantic_backend", "main_llm")).strip().lower() or "main_llm"
+        if semantic_backend not in {"main_llm", "openai_compatible", "none", "external"}:
+            raise ValueError(
+                "vision.semantic_backend must be main_llm, openai_compatible, none, or external"
+            )
         semantic_endpoint = optional_path("semantic_endpoint")
         if semantic_endpoint is not None and not semantic_endpoint.lower().startswith(("http://", "https://")):
             raise ValueError("vision.semantic_endpoint must be an http(s) URL")
@@ -577,6 +584,13 @@ class PluginConfig:
                 minimum=1,
                 maximum=30,
                 name="vision.semantic_max_per_minute",
+            ),
+            semantic_main_llm_min_interval_s=_finite_float(
+                vision.get("semantic_main_llm_min_interval_s"),
+                12.0,
+                minimum=5.0,
+                maximum=120.0,
+                name="vision.semantic_main_llm_min_interval_s",
             ),
             frame_cache_interval_s=_finite_float(
                 vision.get("frame_cache_interval_s"),

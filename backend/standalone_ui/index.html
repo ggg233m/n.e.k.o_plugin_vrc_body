@@ -171,12 +171,13 @@
           <article class="panel">
             <div class="panel-heading"><div><p class="eyebrow">SEMANTIC</p><h2>VLM 语义识别</h2></div><span id="apiKeyBadge" class="badge muted">API Key 未配置</span></div>
             <div class="form-grid">
-              <label class="field"><span>语义后端</span><select id="cfgSemanticBackend"><option value="openai_compatible">OpenAI Compatible</option><option value="none">关闭</option><option value="external">外部注入</option></select></label>
+              <label class="field"><span>语义后端</span><select id="cfgSemanticBackend"><option value="main_llm">当前主多模态 LLM</option><option value="openai_compatible">OpenAI Compatible</option><option value="none">关闭</option><option value="external">外部注入</option></select></label>
               <label class="field"><span>每分钟上限</span><input id="cfgSemanticRate" type="number" min="1" max="30"></label>
+              <label class="field"><span>主 LLM 最小间隔（秒）</span><input id="cfgMainLlmInterval" type="number" min="5" max="120" step="1"></label>
               <label class="field span-2"><span>Endpoint</span><input id="cfgSemanticEndpoint" placeholder="http://127.0.0.1:8000/v1/chat/completions"></label>
               <label class="field span-2"><span>模型</span><input id="cfgSemanticModel" placeholder="gpt-4o-mini"></label>
             </div>
-            <p class="help">API Key 不写入配置文件。启动前设置 <code>VRC_VLM_API_KEY</code> 或 <code>OPENAI_API_KEY</code>；环境变量会覆盖面板中的 endpoint/model。</p>
+            <p class="help">main_llm 需要 N.E.K.O 插件外壳连接，任务会并入已有聊天回合；独立运行请选 OpenAI Compatible。API Key 不写入配置文件。</p>
           </article>
 
           <article class="panel">

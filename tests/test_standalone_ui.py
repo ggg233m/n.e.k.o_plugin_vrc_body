@@ -163,6 +163,51 @@ class StandaloneHttpUiTests(unittest.TestCase):
             "https://example.invalid/v1/chat/completions",
         )
 
+    def test_main_llm_semantic_http_bridge_requires_token_and_forwards_revision(self) -> None:
+        calls = []
+
+        class Service:
+            def main_llm_semantic_request(self, after_request_id=None):
+                calls.append(("request", after_request_id))
+                return {"available": True, "request_id": "semantic-request:test:2"}
+
+            def main_llm_semantic_commit(self, request_id, frame_revision, entities):
+                calls.append(("commit", request_id, frame_revision, entities))
+                return {"accepted": True}
+
+            def record_control_dispatch(self, operation, started_at):
+                return 0.1
+
+        self.server.service = Service()
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(self.base + "/semantic/request", timeout=2.0)
+        self.assertEqual(raised.exception.code, 401)
+
+        get_request = Request(
+            self.base + "/semantic/request?after_request_id=semantic-request%3Atest%3A1",
+            headers={"X-Neko-Backend-Token": "test-token"},
+        )
+        payload = json.loads(urlopen(get_request, timeout=2.0).read())
+        self.assertTrue(payload["available"])
+
+        post_request = Request(
+            self.base + "/semantic/commit",
+            method="POST",
+            headers={
+                "X-Neko-Backend-Token": "test-token",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps({
+                "request_id": "semantic-request:test:2",
+                "frame_revision": 42,
+                "entities": [],
+            }).encode("utf-8"),
+        )
+        committed = json.loads(urlopen(post_request, timeout=2.0).read())
+        self.assertTrue(committed["accepted"])
+        self.assertEqual(calls[0], ("request", "semantic-request:test:1"))
+        self.assertEqual(calls[1], ("commit", "semantic-request:test:2", 42, []))
+
 
 if __name__ == "__main__":
     unittest.main()

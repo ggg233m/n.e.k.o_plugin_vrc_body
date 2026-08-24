@@ -1040,6 +1040,166 @@ class VisionRuntimeTests(unittest.TestCase):
             semantic.release.set()
             runtime.close()
 
+    def test_main_llm_semantic_request_is_single_slot_and_commits_to_next_local_frame(self) -> None:
+        class BoxDetector:
+            name = "box_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "avatar:session:test:1",
+                        "label": "person",
+                        "confidence": 0.96,
+                        "bbox": [0.2, 0.2, 0.5, 0.9],
+                        "attributes": {"bearing_deg": -13.5, "apparent_height": 0.7},
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                    frame_id=f"frame-{now}",
+                )
+
+        now = [1.0]
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            detector=BoxDetector(),
+            main_llm_semantic=True,
+            main_llm_min_interval_s=12.0,
+            frame_cache_interval_s=0.0,
+            clock=lambda: now[0],
+        )
+        try:
+            runtime.process_frame(b"jpeg", observed_at=1.0)
+            created = runtime.request_main_llm_semantics(
+                {"semantic_type": "npc", "min_confidence": 0.7},
+            )
+            self.assertTrue(created["accepted"])
+            self.assertTrue(created["created"])
+
+            # detector 连续报告未解决也只能复用一个 pending 槽，不能按帧刷图。
+            duplicate = runtime.request_main_llm_semantics({"semantic_type": "npc"})
+            self.assertTrue(duplicate["accepted"])
+            self.assertFalse(duplicate["created"])
+            self.assertEqual(duplicate["request_id"], created["request_id"])
+
+            request = runtime.main_llm_semantic_request()
+            self.assertTrue(request["available"])
+            self.assertEqual(request["request_id"], created["request_id"])
+            self.assertIsInstance(request["data"], bytes)
+            repeated = runtime.main_llm_semantic_request(
+                after_request_id=request["request_id"]
+            )
+            self.assertFalse(repeated["available"])
+            self.assertEqual(repeated["reason"], "no_new_request")
+
+            stale = runtime.commit_main_llm_semantics(
+                request["request_id"],
+                request["revision"] + 1,
+                [],
+            )
+            self.assertFalse(stale["accepted"])
+            self.assertEqual(stale["reason"], "frame_revision_mismatch")
+
+            committed = runtime.commit_main_llm_semantics(
+                request["request_id"],
+                request["revision"],
+                [{
+                    "target_id": "avatar:session:test:1",
+                    "semantic_type": "npc",
+                    "label": "white seated npc",
+                    "confidence": 0.93,
+                }],
+            )
+            self.assertTrue(committed["accepted"])
+            self.assertEqual(committed["classified"], 1)
+            self.assertEqual(
+                committed["position_update"],
+                "deferred_to_next_local_detection",
+            )
+
+            # 主 LLM 的旧帧不直接更新位置；下一帧 detector 才带上语义缓存。
+            now[0] = 2.0
+            current = runtime.process_frame(b"jpeg", observed_at=2.0)
+            entity = current["entities"][0]
+            self.assertEqual(entity["id"], "avatar:session:test:1")
+            self.assertEqual(entity["attributes"]["semantic_type"], "npc")
+            self.assertTrue(entity["attributes"]["semantic_verified"])
+            self.assertIn("main_llm_vlm", entity["source"])
+            status = runtime.status()["main_llm_semantic"]
+            self.assertEqual(status["requests_created"], 1)
+            self.assertEqual(status["requests_committed"], 1)
+            self.assertEqual(status["results_rejected"], 1)
+        finally:
+            runtime.close()
+
+    def test_main_llm_can_seed_open_category_candidate_without_local_box(self) -> None:
+        now = [3.0]
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            main_llm_semantic=True,
+            frame_cache_interval_s=0.0,
+            clock=lambda: now[0],
+        )
+        try:
+            runtime.process_frame(b"jpeg", observed_at=3.0)
+            created = runtime.request_main_llm_semantics({"semantic_type": "object"})
+            self.assertTrue(created["accepted"])
+            request = runtime.main_llm_semantic_request()
+            self.assertTrue(request["available"])
+            self.assertEqual((request.get("overlay") or {}).get("entities_available"), 0)
+
+            committed = runtime.commit_main_llm_semantics(
+                request["request_id"],
+                request["revision"],
+                [{
+                    "bbox": [0.55, 0.25, 0.82, 0.88],
+                    "semantic_type": "npc",
+                    "label": "map npc",
+                    "confidence": 0.81,
+                }],
+            )
+            self.assertTrue(committed["accepted"])
+            self.assertTrue(
+                committed["bindings"][0]["target_id"].startswith("semantic:session:")
+            )
+            self.assertEqual(
+                runtime.status()["semantic_candidates"]["candidates"][0]["semantic_type"],
+                "npc",
+            )
+        finally:
+            runtime.close()
+
+    def test_cancelled_main_llm_request_exposes_lightweight_tombstone(self) -> None:
+        now = [5.0]
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            main_llm_semantic=True,
+            frame_cache_interval_s=0.0,
+            clock=lambda: now[0],
+        )
+        try:
+            runtime.process_frame(b"jpeg", observed_at=5.0)
+            created = runtime.request_main_llm_semantics({"semantic_type": "npc"})
+            request_id = created["request_id"]
+            runtime.clear_main_llm_semantic_request("explore_duration_exhausted")
+
+            cancelled = runtime.main_llm_semantic_request(after_request_id=request_id)
+            self.assertFalse(cancelled["available"])
+            self.assertEqual(cancelled["reason"], "request_cancelled")
+            self.assertEqual(cancelled["request_id"], request_id)
+            self.assertEqual(cancelled["cancellation_reason"], "explore_duration_exhausted")
+            status = runtime.status()["main_llm_semantic"]
+            self.assertEqual(status["requests_cancelled"], 1)
+            self.assertEqual(status["last_cancelled_request_id"], request_id)
+
+            stale = runtime.commit_main_llm_semantics(request_id, created["revision"], [])
+            self.assertFalse(stale["accepted"])
+            self.assertEqual(stale["reason"], "request_cancelled")
+        finally:
+            runtime.close()
+
     def test_detect_interval_throttles_inference_without_erasing_the_world(self) -> None:
         """检测占空比是 CPU 上限的第二个轴，但跳帧不能变成"看到了空场景"。
 

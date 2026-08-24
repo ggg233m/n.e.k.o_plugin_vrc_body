@@ -68,6 +68,26 @@ class ControllerInputTests(unittest.TestCase):
 
 
 class AutonomyAndWorldTests(unittest.TestCase):
+    def test_complete_goal_keeps_arm_but_clears_goal_and_releases_inputs(self) -> None:
+        released: list[str] = []
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: released.append("release"),
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        self.assertTrue(runtime.submit_goal(
+            "find the npc", "explore", selector={"semantic_type": "npc"}
+        )["accepted"])
+
+        completed = runtime.complete_goal("explore_duration_exhausted")
+
+        self.assertTrue(completed["armed"])
+        self.assertEqual(completed["state"], "armed")
+        self.assertIsNone(completed["goal"])
+        self.assertEqual(completed["reason"], "explore_duration_exhausted")
+        self.assertEqual(released, ["release"])
+
     def test_autonomy_requires_arm_and_ttl_releases(self) -> None:
         now = [0.0]
         released: list[str] = []

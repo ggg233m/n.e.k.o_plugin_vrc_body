@@ -59,6 +59,89 @@ class BackendClientTests(unittest.TestCase):
         self.assertEqual(semantic.model, "local-vlm")
         self.assertEqual(semantic.api_key, "session-secret")
 
+    def test_main_llm_semantic_goal_reuses_existing_conversation_bridge(self) -> None:
+        class Detector:
+            name = "test_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "avatar:session:test:1",
+                        "label": "person",
+                        "confidence": 0.95,
+                        "bbox": [0.2, 0.2, 0.5, 0.9],
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                    frame_id="paired-frame",
+                )
+
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_backends(detector=Detector())
+            service.vision.set_capture_state(True, "test")
+            world = service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+            goal = service.autonomy_goal(
+                "寻找地图 NPC",
+                "explore",
+                selector={"semantic_type": "npc", "min_confidence": 0.7},
+                based_on_revision=world["status"]["revision"],
+            )
+            self.assertTrue(goal["accepted"])
+            self.assertTrue(goal["semantic_request"]["accepted"])
+
+            request = service.main_llm_semantic_request()
+            self.assertTrue(request["available"])
+            self.assertIn("data_base64", request)
+            committed = service.main_llm_semantic_commit(
+                request["request_id"],
+                request["revision"],
+                [{
+                    "target_id": "avatar:session:test:1",
+                    "semantic_type": "npc",
+                    "label": "地图 NPC",
+                    "confidence": 0.9,
+                }],
+            )
+            self.assertTrue(committed["accepted"])
+            self.assertEqual(committed["bindings"][0]["target_id"], "avatar:session:test:1")
+
+            # 导航总时限是被动语义请求的最终边界：超时后仍保持手动 arm，
+            # 但目标和内存中的图片单槽都必须立刻释放，不能每 30 秒重新送图。
+            renewed = service.autonomy_goal(
+                "继续寻找地图 NPC",
+                "explore",
+                selector={"semantic_type": "npc", "min_confidence": 0.7},
+                based_on_revision=world["status"]["revision"],
+            )
+            self.assertTrue(renewed["semantic_request"]["accepted"])
+            self.assertTrue(service.main_llm_semantic_request()["available"])
+            service._navigator_complete_goal("explore_duration_exhausted")
+            completed = service.autonomy_snapshot()
+            self.assertTrue(completed["armed"])
+            self.assertIsNone(completed["goal"])
+            self.assertEqual(
+                service.main_llm_semantic_request()["reason"],
+                "no_pending_request",
+            )
+        finally:
+            service.vision.close()
+
     def test_remote_autonomy_forwards_exact_target_id(self) -> None:
         calls = []
 
@@ -88,6 +171,114 @@ class BackendClientTests(unittest.TestCase):
                 "based_on_revision": 41,
             },
         )])
+
+    def test_remote_autonomy_intent_uses_single_high_level_endpoint(self) -> None:
+        calls = []
+
+        class RecordingClient:
+            def fast_request(self, method, path, payload):
+                calls.append((method, path, payload))
+                return {"accepted": True, "resolved_target_id": "avatar:session:test:1"}
+
+        result = RemoteAutonomy(RecordingClient()).intent(
+            "approach",
+            text="走向地图 NPC",
+            target_type="npc",
+            min_confidence=0.25,
+            constraints={"max_duration_s": 30},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(calls[0][0:2], ("POST", "/autonomy/intent"))
+        self.assertEqual(calls[0][2]["target_type"], "npc")
+        self.assertEqual(calls[0][2]["constraints"], {"max_duration_s": 30})
+
+    def test_autonomy_intent_requires_manual_arm_and_only_resolves_unique_semantic_target(self) -> None:
+        service = BackendService({}, Path.cwd())
+        unarmed = service.autonomy_intent("approach", target_type="npc")
+        self.assertFalse(unarmed["accepted"])
+        self.assertEqual(unarmed["reason_code"], "manual_arm_required")
+
+        service.autonomy_arm()
+        service.vision.set_capture_state(True, "test")
+        service.world_state.ingest(
+            entities=[{
+                "id": "avatar:session:test:1",
+                "label": "地图 NPC",
+                "confidence": 0.88,
+                "bbox": [0.55, 0.2, 0.8, 0.9],
+                "attributes": {
+                    "semantic_type": "npc",
+                    "semantic_verified": True,
+                    "bearing_deg": 18.0,
+                    "apparent_height": 0.7,
+                },
+            }],
+            source="main_llm_vlm",
+        )
+        approached = service.autonomy_intent(
+            "approach",
+            text="走过去看看",
+            target_type="npc",
+        )
+        self.assertTrue(approached["accepted"])
+        self.assertEqual(approached["resolved_by"], "unique_semantic_target")
+        self.assertEqual(approached["resolved_target_id"], "avatar:session:test:1")
+
+        service.world_state.ingest(
+            entities=[{
+                "id": "avatar:session:test:2",
+                "label": "另一个 NPC",
+                "confidence": 0.91,
+                "bbox": [0.1, 0.2, 0.3, 0.85],
+                "attributes": {
+                    "semantic_type": "npc",
+                    "semantic_verified": True,
+                    "bearing_deg": -22.0,
+                    "apparent_height": 0.65,
+                },
+            }],
+            source="main_llm_vlm",
+        )
+        ambiguous = service.autonomy_intent("follow", target_type="npc")
+        self.assertFalse(ambiguous["accepted"])
+        self.assertEqual(ambiguous["reason_code"], "target_choice_required")
+        self.assertEqual(len(ambiguous["candidates"]), 2)
+
+    def test_remote_vision_transports_main_llm_semantic_request_and_commit(self) -> None:
+        calls = []
+
+        class RecordingClient:
+            def request(self, method, path, payload=None):
+                calls.append((method, path, payload))
+                return {"available": True} if method == "GET" else {"accepted": True}
+
+        vision = RemoteVision(RecordingClient())
+        request = vision.semantic_request("semantic-request:test:1")
+        committed = vision.semantic_commit(
+            "semantic-request:test:2",
+            42,
+            [{
+                "target_id": "avatar:1",
+                "semantic_type": "npc",
+                "label": "NPC",
+                "confidence": 0.9,
+            }],
+        )
+
+        self.assertTrue(request["available"])
+        self.assertTrue(committed["accepted"])
+        self.assertEqual(
+            calls[0],
+            (
+                "GET",
+                "/semantic/request?after_request_id=semantic-request%3Atest%3A1",
+                None,
+            ),
+        )
+        self.assertEqual(calls[1][0:2], ("POST", "/semantic/commit"))
+        self.assertEqual(calls[1][2]["frame_revision"], 42)
+        self.assertEqual(calls[1][2]["entities"][0]["semantic_type"], "npc")
 
     def test_detector_interval_uses_override_only_for_resolved_accelerators(self) -> None:
         config = SimpleNamespace(

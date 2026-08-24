@@ -173,6 +173,15 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 self.server.service.vision_frame(max_age_ms=max_age_ms, overlay=overlay),
             )
             return
+        if path == "/semantic/request":
+            from urllib.parse import parse_qs
+            semantic_query = parse_qs(urlsplit(self.path).query)
+            after_request_id = semantic_query.get("after_request_id", [None])[0]
+            self._json(
+                200,
+                self.server.service.main_llm_semantic_request(after_request_id),
+            )
+            return
         self._json(404, {"error": "unknown endpoint"})
 
     def do_POST(self) -> None:
@@ -260,6 +269,16 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("constraints"),
                     value.get("based_on_revision"),
                 )
+            elif self.path == "/autonomy/intent":
+                result = self.server.service.autonomy_intent(
+                    value.get("action"),
+                    value.get("text"),
+                    value.get("target_id"),
+                    value.get("target_type", "npc"),
+                    value.get("target_label"),
+                    value.get("min_confidence", 0.25),
+                    value.get("constraints"),
+                )
             elif self.path == "/autonomy/stop":
                 result = self.server.service.autonomy_stop(value.get("reason"))
             elif self.path == "/vision/start":
@@ -270,6 +289,12 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.list_clips()
             elif self.path == "/semantic_express":
                 result = self.server.service.semantic_express(value)
+            elif self.path == "/semantic/commit":
+                result = self.server.service.main_llm_semantic_commit(
+                    value.get("request_id"),
+                    value.get("frame_revision"),
+                    value.get("entities"),
+                )
             elif self.path == "/world/ingest":
                 result = self.server.service.ingest_world(
                     value,

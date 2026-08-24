@@ -1509,7 +1509,10 @@ def _semantic_type(value: Mapping[str, Any]) -> str:
     }
     normalized = aliases.get(normalized, normalized)
     return normalized if normalized in {
-        "npc", "player", "avatar", "person", "humanoid", "object", "unknown"
+        "npc", "player", "avatar", "person", "humanoid", "object",
+        # 这些负类别不能作为自主 selector，但主 LLM 必须能明确标出干扰物，
+        # 否则海报/镜子只能被压成 unknown，下一轮还会反复消耗图片 token。
+        "poster", "screen", "mirror", "unknown",
     } else "unknown"
 
 
@@ -1568,6 +1571,7 @@ class SemanticJob:
     frame_id: str
     revision: int
     world: Mapping[str, Any]
+    source: str = "openai_vlm"
 
 
 class SemanticCandidateCache:
@@ -1677,6 +1681,7 @@ class SemanticCandidateCache:
                     dict(raw.get("attributes") or {})
                     if isinstance(raw.get("attributes"), Mapping) else {}
                 ),
+                "source": job.source,
                 "crop": crop if crop is not None else previous.get("crop"),
                 "descriptor": descriptor if descriptor is not None else previous.get("descriptor"),
             }
@@ -1707,7 +1712,7 @@ class SemanticCandidateCache:
             "bbox": bbox,
             "state": str(raw.get("state") or "visible")[:64],
             "attributes": attributes,
-            "source": ["openai_vlm"],
+            "source": [job.source],
             "observed_at": job.captured_at,
             "ttl_s": min(5.0, max(0.5, float(raw.get("ttl_s") or 2.0))),
         })
@@ -1796,7 +1801,7 @@ class SemanticCandidateCache:
                 source_values = [str(item) for item in sources]
             else:
                 source_values = []
-            source_values.append("openai_vlm")
+            source_values.append(str(candidate.get("source") or "openai_vlm"))
             local_confidence = min(1.0, max(0.0, float(raw.get("confidence") or 0.0)))
             semantic_confidence = min(1.0, max(0.0, float(candidate.get("confidence") or 0.0)))
             raw.update({
@@ -2194,6 +2199,8 @@ class VisionRuntime:
         detector: FrameDetector | None = None,
         semantic: SemanticBackend | None = None,
         semantic_cooldown_s: float = 0.75,
+        main_llm_semantic: bool = False,
+        main_llm_min_interval_s: float = 12.0,
         detect_interval_s: float = 0.0,
         clock: Any = time.monotonic,
         observation_callback: Callable[[VisionObservation, Mapping[str, Any]], None] | None = None,
@@ -2211,6 +2218,21 @@ class VisionRuntime:
         self._last_semantic_at: float | None = None
         self._semantic_candidates = SemanticCandidateCache(clock=clock)
         self._semantic_worker = SemanticWorker(self, clock=clock)
+        # 主 LLM 语义桥只有一个待处理槽位。它保存与 revision 原子配对的一张
+        # JPEG，插件取走后作为被动上下文并入已有对话；不会在后端另起模型调用。
+        self._main_llm_semantic_enabled = bool(main_llm_semantic)
+        self._main_llm_min_interval_s = max(5.0, float(main_llm_min_interval_s))
+        self._main_llm_request_ttl_s = max(30.0, self._main_llm_min_interval_s * 2.0)
+        self._main_llm_request: dict[str, Any] | None = None
+        self._main_llm_request_counter = 0
+        self._main_llm_last_requested_at: float | None = None
+        self._main_llm_last_committed_at: float | None = None
+        self._main_llm_requests_created = 0
+        self._main_llm_requests_committed = 0
+        self._main_llm_requests_cancelled = 0
+        self._main_llm_results_rejected = 0
+        self._main_llm_last_cancelled_request_id: str | None = None
+        self._main_llm_last_cancel_reason: str | None = None
         # 检测最小间隔。线程上限管的是「一次推理占几个核」，这个管的是「一秒里
         # 推几次」——两者相乘才是实际 CPU 占用，少任何一个都收不住。0 表示每帧
         # 都检测（保持既有行为，也是所有现存测试的假设）。
@@ -2235,6 +2257,24 @@ class VisionRuntime:
         self._capture_reason = "active"
         self.store.set_backend_status("vision_runtime", self.status())
 
+    def _cancel_main_llm_request_locked(self, reason: str) -> str | None:
+        """在持锁状态下取消单槽，并留下供宿主覆盖旧回调的轻量墓碑。"""
+        request = self._main_llm_request
+        request_id = (
+            str(request.get("request_id") or "")[:128]
+            if isinstance(request, Mapping) else ""
+        )
+        self._main_llm_request = None
+        if not request_id:
+            return None
+        self._main_llm_last_cancelled_request_id = request_id
+        self._main_llm_last_cancel_reason = (
+            str(reason or "request_cancelled").replace("\x00", "").strip()[:96]
+            or "request_cancelled"
+        )
+        self._main_llm_requests_cancelled += 1
+        return request_id
+
     def set_capture_state(self, active: bool, reason: str | None = None) -> None:
         """发布世界消费者是否可以使用新鲜帧。
 
@@ -2251,6 +2291,7 @@ class VisionRuntime:
                 # 而 agent 无法区分「刚才」和「现在」。
                 self._frame_cache = None
                 self._frame_cache_at = None
+                self._cancel_main_llm_request_locked(self._capture_reason)
         if not active:
             # 尚未开始的旧语义任务必须丢掉；已经在推理的任务返回后也会经过
             # captured_at/采集门控，最多进入候选记忆，不能伪装成当前可见实体。
@@ -2267,6 +2308,8 @@ class VisionRuntime:
     def close(self) -> None:
         """停止仅属于运行时的异步语义线程。"""
         self._semantic_worker.stop()
+        with self._lock:
+            self._cancel_main_llm_request_locked("vision_runtime_closed")
 
     def _build_semantic_job(self, frame: Any, captured_at: float) -> SemanticJob:
         data: bytes | None = None
@@ -2303,6 +2346,334 @@ class VisionRuntime:
             revision=revision,
             world=world,
         )
+
+    @staticmethod
+    def _normalize_main_llm_selector(value: Any) -> dict[str, Any]:
+        """收紧发给主 LLM 的 selector，避免把任意目标文本重复塞进上下文。"""
+        if not isinstance(value, Mapping):
+            return {}
+        result: dict[str, Any] = {}
+        semantic_type = str(value.get("semantic_type") or "").replace("\x00", "").strip().lower()[:32]
+        if semantic_type:
+            result["semantic_type"] = semantic_type
+        label = str(value.get("label") or "").replace("\x00", "").strip()[:64]
+        if label:
+            result["label"] = label
+        try:
+            confidence = float(value.get("min_confidence"))
+        except (TypeError, ValueError, OverflowError):
+            confidence = None
+        if confidence is not None and math.isfinite(confidence):
+            result["min_confidence"] = min(1.0, max(0.0, confidence))
+        return result
+
+    def request_main_llm_semantics(
+        self,
+        selector: Mapping[str, Any] | None,
+        *,
+        reason: str = "semantic_target_unresolved",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """为宿主主 LLM 建立一个最新帧语义任务，但不触发任何模型推理。"""
+        now = self._clock()
+        normalized_selector = self._normalize_main_llm_selector(selector)
+        with self._lock:
+            if not self._main_llm_semantic_enabled:
+                return {"accepted": False, "reason": "main_llm_semantic_not_configured"}
+            if not self._capture_active:
+                return {"accepted": False, "reason": self._capture_reason or "capture_stopped"}
+            current = self._main_llm_request
+            if isinstance(current, Mapping):
+                age_s = max(0.0, now - float(current.get("created_at", now)))
+                if current.get("state") in {"pending", "processing"} and age_s <= self._main_llm_request_ttl_s:
+                    return {
+                        "accepted": True,
+                        "created": False,
+                        "reason": "request_already_pending",
+                        "request_id": current.get("request_id"),
+                        "revision": current.get("revision"),
+                    }
+            if (
+                not force
+                and self._main_llm_last_requested_at is not None
+                and now - self._main_llm_last_requested_at < self._main_llm_min_interval_s
+            ):
+                retry_s = self._main_llm_min_interval_s - (now - self._main_llm_last_requested_at)
+                return {
+                    "accepted": False,
+                    "reason": "main_llm_semantic_rate_limited",
+                    "retry_after_ms": round(max(0.0, retry_s) * 1000.0),
+                }
+            cached = self._frame_cache
+            cached_at = self._frame_cache_at
+            if not isinstance(cached, Mapping) or cached_at is None or not isinstance(cached.get("data"), bytes):
+                return {"accepted": False, "reason": "no_frame_cached"}
+            frame_age_s = max(0.0, now - float(cached_at))
+            if frame_age_s > 3.0:
+                return {
+                    "accepted": False,
+                    "reason": "frame_stale",
+                    "age_ms": round(frame_age_s * 1000.0, 1),
+                }
+            pair = cached.get("detection_pair")
+            if not isinstance(pair, Mapping):
+                # 没有本地 detector 时仍允许主 LLM 做第一阶段开放类别检测；它
+                # 必须返回 bbox，不能伪造 target_id。合成空配对只锚定像素时间，
+                # 不会把当前 world 的旧实体画到这张图上。
+                world = self.store.snapshot(now=now)
+                world_status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+                pair = {
+                    "frame_id": f"main-llm-source-{int(cached_at * 1000)}",
+                    "revision": int(world_status.get("revision", 0) or 0),
+                    "captured_at": float(cached_at),
+                    "observed_at": float(cached_at),
+                    "entities": [],
+                }
+            try:
+                revision = int(pair.get("revision", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                revision = 0
+            captured_at = float(pair.get("captured_at", cached_at) or cached_at)
+            self._main_llm_request_counter += 1
+            request_id = (
+                f"semantic-request:{self._semantic_candidates.session_token}:"
+                f"{self._main_llm_request_counter}"
+            )
+            # bytes 是不可变对象，这里只持有同一引用；没有第二份 JPEG，也没有队列。
+            self._main_llm_request = {
+                "request_id": request_id,
+                "state": "pending",
+                "created_at": now,
+                "captured_at": captured_at,
+                "reason": str(reason or "semantic_target_unresolved").replace("\x00", "").strip()[:96],
+                "selector": normalized_selector,
+                "frame_id": str(pair.get("frame_id") or "")[:128] or None,
+                "revision": revision,
+                "data": cached["data"],
+                "mime": str(cached.get("mime") or "image/jpeg"),
+                "width": int(cached.get("width", 0) or 0),
+                "height": int(cached.get("height", 0) or 0),
+                "detection_pair": dict(pair),
+            }
+            self._main_llm_last_requested_at = now
+            self._main_llm_requests_created += 1
+            return {
+                "accepted": True,
+                "created": True,
+                "reason": None,
+                "request_id": request_id,
+                "revision": revision,
+            }
+
+    def main_llm_semantic_request(
+        self,
+        *,
+        after_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """读取精确配对的待处理任务；同 ID 只返回轻量 no_new_request。"""
+        now = self._clock()
+        with self._lock:
+            if not self._main_llm_semantic_enabled:
+                return {"available": False, "reason": "main_llm_semantic_not_configured"}
+            request = self._main_llm_request
+            if not isinstance(request, Mapping):
+                cancelled_id = self._main_llm_last_cancelled_request_id
+                if after_request_id and str(after_request_id) == cancelled_id:
+                    return {
+                        "available": False,
+                        "reason": "request_cancelled",
+                        "request_id": cancelled_id,
+                        "cancellation_reason": self._main_llm_last_cancel_reason,
+                    }
+                return {"available": False, "reason": "no_pending_request"}
+            request_id = str(request.get("request_id") or "")
+            age_s = max(0.0, now - float(request.get("created_at", now)))
+            if age_s > self._main_llm_request_ttl_s:
+                cancelled_id = self._cancel_main_llm_request_locked("request_expired")
+                return {
+                    "available": False,
+                    "reason": "request_cancelled",
+                    "request_id": cancelled_id,
+                    "cancellation_reason": "request_expired",
+                }
+            if request.get("state") != "pending":
+                return {"available": False, "reason": f"request_{request.get('state', 'unavailable')}"}
+            if after_request_id and str(after_request_id) == request_id:
+                return {
+                    "available": False,
+                    "reason": "no_new_request",
+                    "request_id": request_id,
+                }
+            data = request.get("data")
+            pair = request.get("detection_pair")
+            frame = {
+                "available": True,
+                "capture_active": True,
+                "age_ms": round(max(0.0, now - float(request.get("captured_at", now))) * 1000.0, 1),
+                "mime": str(request.get("mime") or "image/jpeg"),
+                "width": int(request.get("width", 0) or 0),
+                "height": int(request.get("height", 0) or 0),
+                "bytes": len(data) if isinstance(data, bytes) else 0,
+                "data": data,
+                "frame_id": request.get("frame_id"),
+                "revision": int(request.get("revision", 0) or 0),
+            }
+            metadata = {
+                "request_id": request_id,
+                "request_state": "pending",
+                "request_age_ms": round(age_s * 1000.0, 1),
+                "request_ttl_ms": round(self._main_llm_request_ttl_s * 1000.0),
+                "reason": request.get("reason"),
+                "selector": dict(request.get("selector") or {}),
+            }
+        if not isinstance(frame.get("data"), bytes):
+            return {"available": False, "reason": "request_frame_unavailable"}
+        result = self._apply_overlay(
+            frame,
+            frame_age_ms=float(frame["age_ms"]),
+            detection_pair=pair,
+        )
+        result.update(metadata)
+        return result
+
+    def commit_main_llm_semantics(
+        self,
+        request_id: Any,
+        frame_revision: Any,
+        entities: Any,
+    ) -> dict[str, Any]:
+        """校验并缓存主 LLM 分类；旧帧位置绝不直接回放到当前世界。"""
+        normalized_request_id = str(request_id or "").replace("\x00", "").strip()[:128]
+        try:
+            normalized_revision = int(frame_revision)
+        except (TypeError, ValueError, OverflowError):
+            return {"accepted": False, "reason": "frame_revision must be an integer"}
+        if not isinstance(entities, (list, tuple)) or len(entities) > 32:
+            return {"accepted": False, "reason": "entities must be an array with at most 32 items"}
+        now = self._clock()
+        with self._lock:
+            request = self._main_llm_request
+            if not self._main_llm_semantic_enabled or not isinstance(request, Mapping):
+                self._main_llm_results_rejected += 1
+                reason = (
+                    "request_cancelled"
+                    if normalized_request_id
+                    and normalized_request_id == self._main_llm_last_cancelled_request_id
+                    else "no_pending_request"
+                )
+                return {"accepted": False, "reason": reason}
+            if request.get("state") != "pending":
+                self._main_llm_results_rejected += 1
+                return {"accepted": False, "reason": "request_not_pending"}
+            if normalized_request_id != str(request.get("request_id") or ""):
+                self._main_llm_results_rejected += 1
+                return {"accepted": False, "reason": "request_id_mismatch"}
+            if normalized_revision != int(request.get("revision", 0) or 0):
+                self._main_llm_results_rejected += 1
+                return {"accepted": False, "reason": "frame_revision_mismatch"}
+            if now - float(request.get("created_at", now)) > self._main_llm_request_ttl_s:
+                self._cancel_main_llm_request_locked("request_expired")
+                self._main_llm_results_rejected += 1
+                return {"accepted": False, "reason": "request_expired"}
+            self._main_llm_request["state"] = "processing"
+            frozen = dict(request)
+
+        pair = frozen.get("detection_pair") if isinstance(frozen.get("detection_pair"), Mapping) else {}
+        paired_entities = {
+            str(item.get("id") or "")[:96]: dict(item)
+            for item in (pair.get("entities") or ())
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip()
+        }
+        raw_entities: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for index, value in enumerate(entities):
+            if not isinstance(value, Mapping):
+                rejected.append({"index": index, "reason": "entity_must_be_object"})
+                continue
+            target_id = str(value.get("target_id") or "").replace("\x00", "").strip()[:96]
+            paired = paired_entities.get(target_id) if target_id else None
+            bbox = _semantic_bbox((paired or {}).get("bbox")) if paired is not None else _semantic_bbox(value.get("bbox"))
+            if target_id and paired is None:
+                rejected.append({"index": index, "reason": "target_id_not_in_request"})
+                continue
+            if bbox is None:
+                rejected.append({"index": index, "reason": "bbox_required_for_unpaired_entity"})
+                continue
+            try:
+                confidence = float(value.get("confidence"))
+            except (TypeError, ValueError, OverflowError):
+                confidence = math.nan
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                rejected.append({"index": index, "reason": "confidence_out_of_range"})
+                continue
+            semantic_type = _semantic_type(value)
+            label = str(value.get("label") or (paired or {}).get("label") or semantic_type)
+            label = label.replace("\x00", "").strip()[:64] or semantic_type
+            raw_entities.append({
+                "id": target_id or None,
+                "label": label,
+                "semantic_type": semantic_type,
+                "confidence": confidence,
+                "bbox": bbox,
+                "state": "visible",
+                "attributes": {"classified_by_current_main_llm": True},
+                "ttl_s": 2.0,
+            })
+
+        job = SemanticJob(
+            data=bytes(frozen.get("data") or b""),
+            captured_at=float(frozen.get("captured_at", now) or now),
+            frame_id=str(frozen.get("frame_id") or f"main-llm-{normalized_revision}"),
+            revision=normalized_revision,
+            world={"entities": list(paired_entities.values())},
+            source="main_llm_vlm",
+        )
+        try:
+            normalized = self._normalize_semantic_observation(
+                VisionObservation(
+                    entities=tuple(raw_entities),
+                    source="main_llm_vlm",
+                    observed_at=job.captured_at,
+                    frame_id=job.frame_id,
+                ),
+                job,
+            )
+        except Exception as exc:
+            with self._lock:
+                if self._main_llm_request is not None:
+                    self._main_llm_request["state"] = "pending"
+                self._main_llm_results_rejected += 1
+            return {"accepted": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+        bindings = [
+            {
+                "target_id": str(item.get("id") or ""),
+                "semantic_type": _semantic_type(item),
+                "label": str(item.get("label") or "")[:64],
+            }
+            for item in normalized.entities
+            if isinstance(item, Mapping)
+        ]
+        with self._lock:
+            self._main_llm_request = None
+            self._main_llm_last_committed_at = now
+            self._main_llm_requests_committed += 1
+        # 不 ingest 旧帧：下一次本地检测会用稳定 ID/外观把这些属性附到当前位置。
+        self.store.set_backend_status("vision_runtime", self.status())
+        return {
+            "accepted": True,
+            "request_id": normalized_request_id,
+            "frame_revision": normalized_revision,
+            "bindings": bindings,
+            "classified": len(bindings),
+            "rejected": rejected,
+            "position_update": "deferred_to_next_local_detection",
+        }
+
+    def clear_main_llm_semantic_request(self, reason: str = "goal_cleared") -> None:
+        """目标结束时释放单槽图片，避免下一次对话消费已经无关的任务。"""
+        with self._lock:
+            self._cancel_main_llm_request_locked(reason)
 
     def _normalize_semantic_observation(
         self,
@@ -2341,14 +2712,14 @@ class VisionRuntime:
             old_target = str(raw_event.get("target_id") or "")
             if old_target in id_map:
                 raw_event["target_id"] = id_map[old_target]
-            raw_event["source"] = ["openai_vlm"]
+            raw_event["source"] = [job.source]
             raw_event["observed_at"] = job.captured_at
             events.append(raw_event)
 
         return VisionObservation(
             entities=tuple(entities),
             events=tuple(events),
-            source="openai_vlm",
+            source=job.source,
             observed_at=job.captured_at,
             frame_id=job.frame_id,
             uncertainties=tuple(observation.uncertainties),
@@ -2693,6 +3064,7 @@ class VisionRuntime:
         return result
 
     def status(self) -> dict[str, Any]:
+        status_now = self._clock()
         with self._lock:
             detector = self.detector
             semantic = self.semantic
@@ -2712,6 +3084,41 @@ class VisionRuntime:
             detect_skipped = self._detect_skipped
             obscured_frames = self._obscured_frames
             last_detect_at = self._last_detect_at
+            main_llm_enabled = self._main_llm_semantic_enabled
+            main_llm_request = self._main_llm_request
+            main_llm_status = {
+                "enabled": main_llm_enabled,
+                "mode": "merged_conversation",
+                "storage": "memory_single_slot",
+                "persistent": False,
+                "min_interval_s": self._main_llm_min_interval_s,
+                "request_id": (
+                    str(main_llm_request.get("request_id") or "") or None
+                    if isinstance(main_llm_request, Mapping) else None
+                ),
+                "request_state": (
+                    str(main_llm_request.get("state") or "none")
+                    if isinstance(main_llm_request, Mapping) else "none"
+                ),
+                "request_revision": (
+                    int(main_llm_request.get("revision", 0) or 0)
+                    if isinstance(main_llm_request, Mapping) else None
+                ),
+                "request_age_ms": (
+                    round(max(0.0, status_now - float(main_llm_request.get("created_at", status_now))) * 1000.0, 1)
+                    if isinstance(main_llm_request, Mapping) else None
+                ),
+                "requests_created": self._main_llm_requests_created,
+                "requests_committed": self._main_llm_requests_committed,
+                "requests_cancelled": self._main_llm_requests_cancelled,
+                "last_cancelled_request_id": self._main_llm_last_cancelled_request_id,
+                "last_cancel_reason": self._main_llm_last_cancel_reason,
+                "results_rejected": self._main_llm_results_rejected,
+                "last_commit_age_ms": (
+                    None if self._main_llm_last_committed_at is None
+                    else round(max(0.0, status_now - self._main_llm_last_committed_at) * 1000.0, 1)
+                ),
+            }
         def backend_status(backend: Any, *, label: str) -> Mapping[str, Any]:
             if backend is None:
                 return {"available": False, "reason": "not_configured"}
@@ -2726,12 +3133,21 @@ class VisionRuntime:
                     "available": False,
                     "reason": f"{type(exc).__name__}: {exc}"[:256],
                 }
+        semantic_status = backend_status(semantic, label="semantic")
+        if main_llm_enabled:
+            semantic_status = {
+                "available": True,
+                "backend": "main_llm",
+                "model": "current_host_multimodal_llm",
+                **main_llm_status,
+            }
         return {
-            "enabled": detector is not None or semantic is not None,
+            "enabled": detector is not None or semantic is not None or main_llm_enabled,
             "capture_active": capture_active,
             "capture_reason": capture_reason,
             "detector": backend_status(detector, label="detector"),
-            "semantic": backend_status(semantic, label="semantic"),
+            "semantic": semantic_status,
+            "main_llm_semantic": main_llm_status,
             "semantic_worker": self._semantic_worker.status(),
             "semantic_candidates": self._semantic_candidates.snapshot(),
             "optional_dependencies": optional_dependency_status(),
