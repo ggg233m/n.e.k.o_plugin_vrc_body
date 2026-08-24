@@ -268,6 +268,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("selector"),
                     value.get("constraints"),
                     value.get("based_on_revision"),
+                    value.get("target_ref"),
+                    value.get("frame_revision"),
                 )
             elif self.path == "/autonomy/intent":
                 result = self.server.service.autonomy_intent(

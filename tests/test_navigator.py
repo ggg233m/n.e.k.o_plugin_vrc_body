@@ -449,6 +449,81 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(second.reason, "explore_duration_exhausted")
         self.assertEqual(completed, ["explore_duration_exhausted"])
 
+    def test_approach_observe_runs_locally_and_completes_once(self) -> None:
+        """主 LLM 只给一次目标，本地完成停稳、观察和结束。"""
+        completed: list[str] = []
+        self.goal["goal"] = {
+            "kind": "approach_observe",
+            "text": "过去看看",
+            "target_id": "vision:door:1",
+            "constraints": {"settle_seconds": 0.2, "observe_seconds": 0.5},
+            "age_seconds": 1.0,
+        }
+        self.world["entities"][0]["attributes"]["distance_m"] = 1.0
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
+            release_inputs=lambda side: self.released.append(side),
+            complete_goal=completed.append,
+            clock=lambda: self.now[0],
+        )
+
+        self.assertEqual(navigator.tick().reason, "behavior_settling")
+        self.now[0] += 0.21
+        self.assertEqual(navigator.tick().reason, "behavior_observing")
+        # 观察时目标偏 15° 仍在自然注视死区内，不会被死锁到绝对中央。
+        self.world["entities"][0]["attributes"]["bearing_deg"] = 15.0
+        self.world["status"]["revision"] += 1
+        self.now[0] += 0.51
+        finished = navigator.tick()
+
+        self.assertEqual(finished.state, "complete")
+        self.assertEqual(finished.reason, "approach_observe_complete")
+        self.assertEqual(completed, ["approach_observe_complete"])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.turns, [])
+        behavior = navigator.snapshot()["behavior"]
+        self.assertEqual(behavior["outcome_sequence"], 1)
+        self.assertEqual(behavior["last_outcome"]["reason"], "approach_observe_complete")
+        self.assertEqual(behavior["llm_calls_in_loop"], 0)
+
+    def test_approach_observe_waits_before_reporting_target_lost(self) -> None:
+        completed: list[str] = []
+        self.goal["goal"] = {
+            "kind": "approach_observe",
+            "text": "过去看看",
+            "target_id": "vision:door:1",
+            "age_seconds": 1.0,
+        }
+        self.world.update({
+            "available": False,
+            "capture_active": True,
+            "entities": [],
+            "uncertainties": ["no_recent_visual_observation"],
+        })
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            complete_goal=completed.append,
+            config=NavigatorConfig(behavior_reacquire_s=0.5),
+            clock=lambda: self.now[0],
+        )
+
+        waiting = navigator.tick()
+        self.assertEqual(waiting.state, "acquire")
+        self.assertEqual(waiting.reason, "behavior_reacquiring_target")
+        self.now[0] += 0.51
+        lost = navigator.tick()
+
+        self.assertEqual(lost.state, "complete")
+        self.assertEqual(lost.reason, "approach_observe_target_lost")
+        self.assertEqual(completed, ["approach_observe_target_lost"])
+
     def test_explorer_advances_after_one_full_scan_and_respects_axis_constraint(self) -> None:
         self.goal["goal"] = {
             "kind": "explore",

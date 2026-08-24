@@ -648,6 +648,8 @@ class RemoteAutonomy:
         selector: Mapping[str, Any] | None = None,
         constraints: Mapping[str, Any] | None = None,
         based_on_revision: int | None = None,
+        target_ref: str | None = None,
+        frame_revision: int | None = None,
     ) -> dict[str, Any]:
         try:
             payload = {"text": text, "kind": kind}
@@ -659,6 +661,10 @@ class RemoteAutonomy:
                 payload["constraints"] = dict(constraints)
             if based_on_revision is not None:
                 payload["based_on_revision"] = int(based_on_revision)
+            if target_ref:
+                payload["target_ref"] = str(target_ref)
+            if frame_revision is not None:
+                payload["frame_revision"] = int(frame_revision)
             return _control_request(self.client, "POST", "/autonomy/goal", payload)
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}

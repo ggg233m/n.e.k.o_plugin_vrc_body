@@ -133,8 +133,10 @@
             <div class="panel-heading"><div><p class="eyebrow">NEW GOAL</p><h2>提交目标</h2></div></div>
             <div class="form-grid">
               <label class="field span-2"><span>目标描述</span><input id="goalText" value="寻找 NPC"></label>
-              <label class="field"><span>类型</span><select id="goalKind"><option value="explore">探索</option><option value="approach">接近</option><option value="follow">跟随</option><option value="interact">交互</option></select></label>
-              <label class="field"><span>目标 ID（可选）</span><input id="targetId" placeholder="avatar:session:…"></label>
+              <label class="field"><span>类型</span><select id="goalKind"><option value="explore">探索</option><option value="approach_observe">接近并观察</option><option value="approach">持续接近（兼容）</option><option value="follow">跟随</option><option value="interact">交互</option></select></label>
+              <label class="field"><span>画面编号（推荐）</span><input id="targetRef" placeholder="先读取叠框画面，再填 T1/T2"></label>
+              <label class="field"><span>画面 revision</span><input id="frameRevision" readonly placeholder="读取画面后自动填写"></label>
+              <label class="field span-2"><span>稳定 ID（兼容高级调用）</span><input id="targetId" placeholder="通常留空，由 T 编号在后端解析"></label>
               <label class="field"><span>语义选择器</span><select id="selectorType"><option value="npc">NPC</option><option value="player">玩家</option><option value="person">人物</option><option value="object">物体</option></select></label>
               <label class="field"><span>最低置信度</span><input id="selectorConfidence" type="number" min="0" max="1" step="0.05" value="0.7"></label>
               <label class="field"><span>最大时长（秒）</span><input id="goalDuration" type="number" min="1" max="600" value="90"></label>
@@ -142,7 +144,7 @@
               <label class="field"><span>最大前进轴</span><input id="goalForward" type="number" min="0.05" max="1" step="0.05" value="0.3"></label>
             </div>
             <button id="submitGoal" class="button primary wide">提交给本地执行器</button>
-            <small class="muted">提交时自动携带当前世界 revision；之后导航循环不等待 LLM。</small>
+            <small class="muted">T 编号与画面 revision 成对提交，后端解析稳定 ID；之后导航循环不等待 LLM。</small>
           </article>
         </div>
       </section>

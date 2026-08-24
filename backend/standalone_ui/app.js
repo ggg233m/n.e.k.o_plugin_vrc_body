@@ -6,6 +6,7 @@ const state = {
   perception: null,
   config: null,
   configInitialized: false,
+  frameRevision: null,
   timer: null,
 };
 
@@ -159,11 +160,12 @@ function renderEntities(entities) {
 
 function renderAutonomy(autonomy, navigation) {
   const explorer = navigation.explorer || {};
+  const behavior = navigation.behavior || {};
   text("autonomySummary", `${autonomy.state || "disarmed"} · ${autonomy.reason || "—"} · 剩余 ${number(autonomy.remaining_seconds, 0)} 秒`);
   text("goalFact", get(autonomy, "goal.text", "无"));
-  text("decisionFact", `${get(navigation, "last_decision.state", "idle")} / ${get(navigation, "last_decision.reason", "—")}`);
+  text("decisionFact", `${get(navigation, "last_decision.state", "idle")} / ${get(navigation, "last_decision.reason", "—")} · 阶段 ${behavior.phase || "idle"}`);
   text("scanFact", explorer.scan_turns ?? 0);
-  text("llmLoopFact", explorer.llm_calls_in_loop ?? 0);
+  text("llmLoopFact", Math.max(explorer.llm_calls_in_loop ?? 0, behavior.llm_calls_in_loop ?? 0));
 }
 
 function value(id, fallback = "") { return byId(id).value.trim() || fallback; }
@@ -300,6 +302,7 @@ function bind() {
   byId("disarmAutonomy").addEventListener("click", () => command("解除自主授权", "/autonomy/disarm", { reason: "standalone_ui" }));
   byId("submitGoal").addEventListener("click", async () => {
     const targetId = value("targetId");
+    const targetRef = value("targetRef").toUpperCase();
     const payload = {
       text: value("goalText", "寻找目标"),
       kind: value("goalKind", "explore"),
@@ -315,6 +318,10 @@ function bind() {
       based_on_revision: Number(get(state.perception, "world.status.revision", 0)),
     };
     if (targetId) payload.target_id = targetId;
+    if (targetRef) {
+      payload.target_ref = targetRef;
+      payload.frame_revision = state.frameRevision;
+    }
     await command("提交目标", "/autonomy/goal", payload);
   });
   byId("loadFrame").addEventListener("click", async () => {
@@ -324,7 +331,9 @@ function bind() {
       const image = byId("frameImage");
       image.src = `data:${frame.mime_type || "image/jpeg"};base64,${frame.data_base64}`;
       image.classList.add("loaded");
-      text("frameMeta", `${frame.frame_id || "frame"} · revision ${frame.revision ?? "—"} · ${number(frame.age_ms, 0)} ms`);
+      state.frameRevision = get(frame, "overlay.revision", frame.revision ?? null);
+      byId("frameRevision").value = state.frameRevision == null ? "" : String(state.frameRevision);
+      text("frameMeta", `${frame.frame_id || "frame"} · revision ${state.frameRevision ?? "—"} · ${number(frame.age_ms, 0)} ms`);
     } catch (error) {
       toast(`读取画面：${error.message || error}`, true);
     }

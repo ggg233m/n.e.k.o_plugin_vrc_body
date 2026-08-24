@@ -4,7 +4,7 @@ name = "N.E.K.O AnyaDance Body"
 description = "让 N.E.K.O 感知当前 VRChat 画面，以稳定实体 ID 搜索、接近或跟随 NPC/玩家，并通过 AnyaDance 与 OSC 控制虚拟身体"
 short_description = "VRChat 视觉感知、本地导航与 AnyaDance 身体控制"
 keywords = ["anyadance", "steamvr", "vrchat", "vision", "navigation", "npc", "follow", "osc", "body", "视觉", "感知", "导航", "移动", "跟随"]
-version = "0.13.11"
+version = "0.13.14"
 type = "plugin"
 entry = "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 

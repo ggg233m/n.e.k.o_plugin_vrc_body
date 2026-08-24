@@ -289,7 +289,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         </ToolbarGroup>
       </Toolbar>
 
-      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.11。</Alert> : null}
+      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.14。</Alert> : null}
       {osc.last_error ? <Alert tone="warning">OSC：{String(osc.last_error)}</Alert> : null}
       {idleRelay.last_error ? <Alert tone="warning">VMC 待机中转：{String(idleRelay.last_error)}</Alert> : null}
       {idleRelay.frame_error ? <Alert tone="warning">VMC 待机帧：{String(idleRelay.frame_error)}</Alert> : null}
@@ -356,6 +356,8 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               { key: "revision", label: "世界 revision", value: autonomy.world_revision ?? 0 },
               { key: "goal", label: "当前目标", value: autonomy.goal?.text || "无" },
               { key: "navReason", label: "导航决策", value: navigation.last_decision?.reason || "—" },
+              { key: "behaviorPhase", label: "本地行为阶段", value: navigation.behavior?.phase || "idle" },
+              { key: "behaviorOutcome", label: "最近行为结果", value: navigation.behavior?.last_outcome?.reason || "—" },
               {
                 key: "speed",
                 label: "实测水平速度",

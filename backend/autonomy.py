@@ -13,11 +13,18 @@ from typing import Any, Callable, Mapping
 from .world_state import blocking_uncertainties
 
 
-ALLOWED_GOAL_KINDS = frozenset({"explore", "approach", "follow", "interact", "socialize"})
-TARGETED_GOAL_KINDS = frozenset({"approach", "follow", "interact", "socialize"})
+ALLOWED_GOAL_KINDS = frozenset({
+    "explore", "approach", "approach_observe", "follow", "interact", "socialize",
+})
+TARGETED_GOAL_KINDS = frozenset({
+    "approach", "approach_observe", "follow", "interact", "socialize",
+})
 ALLOWED_SELECTOR_TYPES = frozenset({"npc", "player", "avatar", "person", "humanoid", "object"})
 _SELECTOR_KEYS = frozenset({"semantic_type", "label", "min_confidence"})
-_CONSTRAINT_KEYS = frozenset({"max_duration_s", "max_scan_turns", "max_forward_axis"})
+_CONSTRAINT_KEYS = frozenset({
+    "max_duration_s", "max_scan_turns", "max_forward_axis",
+    "settle_seconds", "observe_seconds",
+})
 
 
 def _finite_number(value: Any, name: str, minimum: float, maximum: float) -> float:
@@ -94,6 +101,20 @@ def _normalize_constraints(value: Any) -> dict[str, Any] | None:
             "constraints.max_forward_axis",
             0.05,
             1.0,
+        )
+    if value.get("settle_seconds") is not None:
+        result["settle_seconds"] = _finite_number(
+            value.get("settle_seconds"),
+            "constraints.settle_seconds",
+            0.2,
+            3.0,
+        )
+    if value.get("observe_seconds") is not None:
+        result["observe_seconds"] = _finite_number(
+            value.get("observe_seconds"),
+            "constraints.observe_seconds",
+            0.5,
+            10.0,
         )
     return result or None
 
@@ -286,17 +307,26 @@ class AutonomyRuntime:
                 except (TypeError, ValueError, OverflowError):
                     pass
                 uncertainties = set(blocking_uncertainties(world.get("uncertainties")))
-                fresh_empty_explore = (
-                    self._goal.kind == "explore"
-                    and self._goal.selector is not None
-                    and world.get("capture_active") is not False
+                fresh_empty_observation = (
+                    world.get("capture_active") is not False
                     and status_age is not None
                     and status_age <= 2500.0
                     and not (uncertainties - {"no_recent_visual_observation"})
                 )
-                if fresh_empty_explore:
+                fresh_empty_goal = fresh_empty_observation and (
+                    (
+                        self._goal.kind == "explore"
+                        and self._goal.selector is not None
+                    )
+                    or self._goal.kind == "approach_observe"
+                )
+                if fresh_empty_goal:
                     self._state = "armed"
-                    self._reason = "goal_waiting_for_explorer"
+                    self._reason = (
+                        "goal_waiting_for_explorer"
+                        if self._goal.kind == "explore"
+                        else "goal_reacquiring_target"
+                    )
                     return
                 self._state = "degraded"
                 self._reason = "world_observation_unknown"

@@ -97,9 +97,10 @@ class DeltaSignatureTests(unittest.TestCase):
 
 
 class ClassifyTests(unittest.TestCase):
-    def test_person_appearing_in_conversation_range_wakes_the_agent(self) -> None:
+    def test_person_appearing_in_conversation_range_is_context_only(self) -> None:
         result = classify({"entities": [_person("p1", height=0.30, bearing=-20.0)]}, {})
-        self.assertTrue(result["wake"])
+        self.assertFalse(result["wake"])
+        self.assertIn("出现", result["reasons"][0])
         self.assertEqual(result["entity_states"]["p1"], ("close", "front_slight_left"))
 
     def test_person_appearing_far_away_does_not_wake(self) -> None:
@@ -109,10 +110,10 @@ class ClassifyTests(unittest.TestCase):
         # 但状态仍要记录，后续靠近才有得比。
         self.assertEqual(result["entity_states"]["p1"], ("far", "front_slight_left"))
 
-    def test_approaching_from_far_to_close_wakes_the_agent(self) -> None:
+    def test_approaching_from_far_to_close_is_context_only(self) -> None:
         history = {"p1": ("far", "front")}
         result = classify({"entities": [_person("p1", height=0.35, bearing=2.0)]}, history)
-        self.assertTrue(result["wake"])
+        self.assertFalse(result["wake"])
         self.assertIn("靠近", result["reasons"][0])
 
     def test_walking_away_does_not_wake(self) -> None:
@@ -149,12 +150,13 @@ class ClassifyTests(unittest.TestCase):
         result = classify({"events": [{"kind": "frame_decoded"}]}, {})
         self.assertFalse(result["wake"])
 
-    def test_nearby_person_leaving_wakes_but_distant_one_does_not(self) -> None:
+    def test_nearby_person_leaving_is_context_only(self) -> None:
         near_gone = classify(
             {"removed_entity_ids": ["p1"]},
             {"p1": ("close", "front")},
         )
-        self.assertTrue(near_gone["wake"])
+        self.assertFalse(near_gone["wake"])
+        self.assertIn("离开", near_gone["reasons"][0])
         far_gone = classify(
             {"removed_entity_ids": ["p1"]},
             {"p1": ("far", "front")},

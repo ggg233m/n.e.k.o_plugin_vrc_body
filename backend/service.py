@@ -59,6 +59,10 @@ _OSC_HOLD_MAX_MS = 1000
 # horizontal=1.0 保持 500ms 就是 90°。调度器还会按 safety.max_angular_speed_dps
 # 再限一次速，这个常数只决定「一条指令要转多少」。
 TURN_SPEED_DPS = 180.0
+# 叠框编号只供人和多模态模型在单帧内选择。映射短期留在内存，让主 LLM
+# 思考数秒后仍能提交 T1/T2；真正执行前还会重新确认稳定 ID 当前可见。
+_TARGET_REF_CACHE_TTL_S = 60.0
+_TARGET_REF_CACHE_LIMIT = 16
 
 
 def _effective_detector_interval_ms(config: Any, detector: Any | None) -> int:
@@ -306,6 +310,10 @@ class BackendService:
         self._vmc_calibration_stop = threading.Event()
         self._vmc_calibration_thread: threading.Thread | None = None
         self._lock = threading.RLock()
+        self._target_ref_cache: dict[int, dict[str, Any]] = {}
+        # 主 LLM 只负责一次语义选择；选择完成后由后端自动接续本地导航，避免
+        # 让模型再复制稳定 ID、再发一次“走过去”，从而把行为做成遥控器。
+        self._pending_semantic_intent: dict[str, Any] | None = None
         self._started = False
         self._last_error: str | None = None
         self._expression_side_count = 0
@@ -569,6 +577,7 @@ class BackendService:
 
     def _navigator_complete_goal(self, reason: str) -> None:
         """导航总时限到期时同时撤销语义单槽，避免后台继续刷新图片。"""
+        self._clear_pending_semantic_intent()
         self.vision.clear_main_llm_semantic_request(reason)
         self.autonomy.complete_goal(reason)
 
@@ -643,6 +652,7 @@ class BackendService:
         with self._lock:
             # 先解除授权，释放虚拟控制器叠加层和 OSC 回退，再拆除 worker/套接字。
             try:
+                self._pending_semantic_intent = None
                 self.autonomy.disarm("backend_stopped")
             except Exception:
                 pass
@@ -689,7 +699,23 @@ class BackendService:
     def autonomy_snapshot(self) -> dict[str, Any]:
         result = self.autonomy.snapshot()
         result["navigation"] = self.navigator.snapshot()
+        with self._lock:
+            pending = self._pending_semantic_intent
+            result["pending_semantic_intent"] = (
+                {
+                    "request_id": pending.get("request_id"),
+                    "action": pending.get("action"),
+                    "text": pending.get("text"),
+                    "selector": dict(pending.get("selector") or {}),
+                }
+                if isinstance(pending, Mapping)
+                else None
+            )
         return result
+
+    def _clear_pending_semantic_intent(self) -> None:
+        with self._lock:
+            self._pending_semantic_intent = None
 
     def autonomy_arm(self, ttl_s: Any = None) -> dict[str, Any]:
         try:
@@ -700,6 +726,7 @@ class BackendService:
 
     def autonomy_disarm(self, reason: Any = "manual_disarm") -> dict[str, Any]:
         normalized_reason = str(reason or "manual_disarm")
+        self._clear_pending_semantic_intent()
         self.vision.clear_main_llm_semantic_request(normalized_reason)
         return {"accepted": True, **self.autonomy.disarm(normalized_reason)}
 
@@ -711,10 +738,64 @@ class BackendService:
         selector: Any = None,
         constraints: Any = None,
         based_on_revision: Any = None,
+        target_ref: Any = None,
+        frame_revision: Any = None,
     ) -> dict[str, Any]:
         normalized_kind = str(kind or "explore").strip().lower()
-        if normalized_kind in {"approach", "follow", "interact", "socialize"}:
-            vision = self.vision.snapshot().get("vision") or {}
+        raw_target_id = str(target_id or "").replace("\x00", "").strip()
+        raw_target_ref = str(target_ref or "").replace("\x00", "").strip().upper()
+        if len(raw_target_id) > 96:
+            return {
+                **self.autonomy.snapshot(),
+                "accepted": False,
+                "reason_code": "invalid_target_id",
+                "reason": "target_id must not exceed 96 characters",
+            }
+        if len(raw_target_ref) > 8:
+            return {
+                **self.autonomy.snapshot(),
+                "accepted": False,
+                "reason_code": "invalid_target_ref",
+                "reason": "target_ref must not exceed 8 characters",
+            }
+        normalized_target_id = raw_target_id or None
+        normalized_target_ref = raw_target_ref or None
+        world = self.vision.snapshot()
+        # 用提交瞬间的世界同步 revision；target_ref 可以来自十秒前的画面，但执行
+        # 只能锁定此刻仍在视野中的同一个稳定实体。
+        self.autonomy.update_world(world)
+        autonomy = self.autonomy.snapshot()
+        targeted_kinds = {"approach", "approach_observe", "follow", "interact", "socialize"}
+        if normalized_kind in targeted_kinds and not autonomy.get("armed"):
+            return {
+                **autonomy,
+                "accepted": False,
+                "reason_code": "manual_arm_required",
+                "reason": "VRChat autonomy is not manually armed",
+            }
+        resolved_by: str | None = None
+        if normalized_target_ref:
+            if normalized_kind not in targeted_kinds:
+                return {
+                    **autonomy,
+                    "accepted": False,
+                    "reason_code": "target_ref_unsupported_for_goal",
+                    "reason": "target_ref is only supported for targeted autonomy goals",
+                }
+            if normalized_target_id:
+                return {
+                    **autonomy,
+                    "accepted": False,
+                    "reason_code": "target_selector_conflict",
+                    "reason": "target_ref and target_id cannot be used together",
+                }
+            resolved = self._resolve_target_ref(normalized_target_ref, frame_revision)
+            if not resolved.get("accepted"):
+                return {**autonomy, **resolved}
+            normalized_target_id = str(resolved["target_id"])
+            resolved_by = "frame_target_ref"
+        if normalized_kind in targeted_kinds:
+            vision = world.get("vision") or {}
             semantic = vision.get("semantic") if isinstance(vision, Mapping) else {}
             if isinstance(semantic, Mapping) and semantic.get("last_error"):
                 return {
@@ -722,15 +803,40 @@ class BackendService:
                     "reason": "semantic vision is degraded; only safe exploration is allowed",
                     **self.autonomy.snapshot(),
                 }
+            if normalized_target_id is None:
+                return {
+                    **autonomy,
+                    "accepted": False,
+                    "reason_code": "target_id_required",
+                    "reason": "target_ref and frame_revision are required for a visual target",
+                    "instruction": "调用 vrc_vision_frame(overlay=true)，选择 T 编号后重试。",
+                }
+            visible_entity = self._visible_entity_by_id(world, normalized_target_id)
+            if visible_entity is None:
+                return {
+                    **autonomy,
+                    "accepted": False,
+                    "reason_code": "target_id_not_visible",
+                    "reason": "selected target is not currently visible in the latest world snapshot",
+                    "target_ref": normalized_target_ref,
+                    "instruction": "重新调用 vrc_vision_frame(overlay=true) 并选择当前画面中的 T 编号。",
+                }
         result = self.autonomy.submit_goal(
             text,
             kind,
-            target_id,
+            normalized_target_id,
             selector,
             constraints,
             based_on_revision,
         )
+        if resolved_by:
+            result["resolved_by"] = resolved_by
+            result["resolved_target_ref"] = normalized_target_ref
+            result["resolved_target_id"] = normalized_target_id
         if result.get("accepted"):
+            # 任何显式新目标都会替换尚未完成的“识别后继续”意图。自动续接路径
+            # 会在调用本方法前先取出并清空待决项，因此不会误删自己的数据。
+            self._clear_pending_semantic_intent()
             goal = result.get("goal") if isinstance(result.get("goal"), Mapping) else {}
             normalized_selector = goal.get("selector") if isinstance(goal.get("selector"), Mapping) else None
             if normalized_selector is not None:
@@ -744,6 +850,114 @@ class BackendService:
             else:
                 self.vision.clear_main_llm_semantic_request("goal_replaced_without_selector")
         return result
+
+    @staticmethod
+    def _visible_entity_by_id(
+        world: Mapping[str, Any], target_id: str | None,
+    ) -> Mapping[str, Any] | None:
+        """只按精确稳定 ID 取当前可见实体，不按标签或置信度猜目标。"""
+        if not target_id:
+            return None
+        entities = world.get("entities") if isinstance(world.get("entities"), list) else []
+        for entity in entities:
+            if not isinstance(entity, Mapping):
+                continue
+            if str(entity.get("id") or "") == target_id and entity.get("visible") is True:
+                return entity
+        return None
+
+    def _remember_target_refs(self, frame: Mapping[str, Any]) -> None:
+        """缓存一次真正画进 JPEG 的 T 编号映射；不写磁盘、不保存像素。"""
+        overlay = frame.get("overlay") if isinstance(frame.get("overlay"), Mapping) else {}
+        if overlay.get("paired") is not True or overlay.get("drawn") is not True:
+            return
+        try:
+            revision = int(overlay.get("revision"))
+        except (TypeError, ValueError, OverflowError):
+            return
+        candidates = overlay.get("candidates") if isinstance(overlay.get("candidates"), list) else []
+        refs: dict[str, str] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            ref = str(candidate.get("ref") or "").strip().upper()[:8]
+            stable_id = str(candidate.get("target_id") or "").strip()[:96]
+            if ref.startswith("T") and ref[1:].isdigit() and stable_id:
+                refs[ref] = stable_id
+        if not refs:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._prune_target_refs_locked(now)
+            self._target_ref_cache[revision] = {
+                "stored_at": now,
+                "frame_id": str(overlay.get("frame_id") or "")[:128] or None,
+                "refs": refs,
+            }
+            while len(self._target_ref_cache) > _TARGET_REF_CACHE_LIMIT:
+                oldest = next(iter(self._target_ref_cache))
+                self._target_ref_cache.pop(oldest, None)
+
+    def _prune_target_refs_locked(self, now: float) -> None:
+        expired = [
+            revision
+            for revision, entry in self._target_ref_cache.items()
+            if now - float(entry.get("stored_at", 0.0) or 0.0) > _TARGET_REF_CACHE_TTL_S
+        ]
+        for revision in expired:
+            self._target_ref_cache.pop(revision, None)
+
+    def _resolve_target_ref(self, target_ref: str, frame_revision: Any) -> dict[str, Any]:
+        """把 T 编号和帧版本原子解析为稳定 ID；任何歧义都拒绝。"""
+        if not target_ref.startswith("T") or not target_ref[1:].isdigit() or int(target_ref[1:]) < 1:
+            return {
+                "accepted": False,
+                "reason_code": "invalid_target_ref",
+                "reason": "target_ref must look like T1 or T2",
+            }
+        if isinstance(frame_revision, bool):
+            normalized_revision = None
+        else:
+            try:
+                numeric_revision = float(frame_revision)
+                normalized_revision = int(numeric_revision) if math.isfinite(numeric_revision) and numeric_revision.is_integer() else None
+            except (TypeError, ValueError, OverflowError):
+                normalized_revision = None
+        if normalized_revision is None or normalized_revision < 0:
+            return {
+                "accepted": False,
+                "reason_code": "frame_revision_required",
+                "reason": "a non-negative frame_revision is required with target_ref",
+            }
+        now = time.monotonic()
+        with self._lock:
+            self._prune_target_refs_locked(now)
+            entry = self._target_ref_cache.get(normalized_revision)
+            if entry is None:
+                return {
+                    "accepted": False,
+                    "reason_code": "target_ref_revision_unavailable",
+                    "reason": "the selected overlay revision is unavailable or expired",
+                    "frame_revision": normalized_revision,
+                    "instruction": "重新调用 vrc_vision_frame(overlay=true) 获取当前 T 编号。",
+                }
+            refs = entry.get("refs") if isinstance(entry.get("refs"), Mapping) else {}
+            stable_id = str(refs.get(target_ref) or "")[:96]
+            if not stable_id:
+                return {
+                    "accepted": False,
+                    "reason_code": "target_ref_not_found",
+                    "reason": "target_ref was not present in the selected overlay revision",
+                    "target_ref": target_ref,
+                    "frame_revision": normalized_revision,
+                    "available_refs": sorted(str(item) for item in refs),
+                }
+        return {
+            "accepted": True,
+            "target_id": stable_id,
+            "target_ref": target_ref,
+            "frame_revision": normalized_revision,
+        }
 
     def autonomy_intent(
         self,
@@ -843,28 +1057,75 @@ class BackendService:
         normalized_target_id = str(target_id or "").replace("\x00", "").strip()[:96]
         candidates = self._semantic_navigation_candidates(world, selector)
         if not normalized_target_id:
+            if not candidates:
+                # 本地 person 检测只能给出稳定轨迹，无法断言它是 NPC、玩家还是
+                # 海报。建立一次与当前画面配对的主多模态任务，并暂停旧目标；
+                # commit 后若只得到一个匹配且仍可见的目标，后端会自动续接。
+                # 这里只暂停旧目标，不撤销用户的手动 arm；语义任务完成后还要在
+                # 同一授权会话里自动续接。complete_goal 会释放所有控制输入。
+                self.autonomy.complete_goal("navigation_intent_waiting_for_semantics")
+                self.vision.clear_main_llm_semantic_request(
+                    "navigation_intent_replaces_semantic_request"
+                )
+                semantic_request = self.vision.request_main_llm_semantics(
+                    selector,
+                    reason="agent_navigation_target_unresolved",
+                    force=True,
+                )
+                if semantic_request.get("accepted"):
+                    request_id = str(semantic_request.get("request_id") or "")[:128]
+                    with self._lock:
+                        self._pending_semantic_intent = {
+                            "request_id": request_id,
+                            "action": normalized_action,
+                            "text": normalized_text,
+                            "selector": dict(selector),
+                            "constraints": dict(constraints) if isinstance(constraints, Mapping) else constraints,
+                        }
+                    return {
+                        **self.autonomy.snapshot(),
+                        "accepted": True,
+                        "action": normalized_action,
+                        "reason_code": "semantic_target_pending",
+                        "reason": "target semantics must be confirmed from the paired frame",
+                        "pending_semantic": True,
+                        "movement_started": False,
+                        "semantic_request": semantic_request,
+                        "instruction": (
+                            "目标画面已交给主多模态模型确认；当前尚未移动。"
+                            "不要重复提交移动，也不要声称已经到达；分类提交后后端会自动续接。"
+                        ),
+                    }
+                return {
+                    **self.autonomy.snapshot(),
+                    "accepted": False,
+                    "action": normalized_action,
+                    "reason_code": "semantic_target_not_found",
+                    "reason": "no verified target is visible and no paired semantic frame is available",
+                    "pending_semantic": False,
+                    "movement_started": False,
+                    "semantic_request": semantic_request,
+                    "instruction": "当前没有可确认的配对画面，动作没有开始。",
+                }
             if len(candidates) != 1:
                 return {
                     **autonomy,
                     "accepted": False,
                     "action": normalized_action,
-                    "reason_code": (
-                        "semantic_target_not_found" if not candidates else "target_choice_required"
-                    ),
-                    "reason": (
-                        "no currently visible semantic target matches the selector"
-                        if not candidates else
-                        "multiple semantic targets match; the main LLM must choose an exact target_id"
-                    ),
+                    "reason_code": "target_choice_required",
+                    "reason": "multiple semantic targets match; the main LLM must choose an exact target_id",
                     "candidates": candidates,
                 }
             normalized_target_id = str(candidates[0]["target_id"])
             resolved_by = "unique_semantic_target"
         else:
             resolved_by = "exact_target_id"
+        # 高层的“走过去”默认是有限行为：到达后停稳并观察，而不是把永久目标
+        # 留给主 LLM 一步步遥控。低层显式 follow 仍保持持续跟随语义。
+        goal_kind = "approach_observe" if normalized_action == "approach" else normalized_action
         result = self.autonomy_goal(
             normalized_text or f"{normalized_action} {normalized_label or normalized_type}",
-            normalized_action,
+            goal_kind,
             normalized_target_id,
             None,
             constraints,
@@ -917,6 +1178,7 @@ class BackendService:
 
     def autonomy_stop(self, reason: Any = "autonomy_stop") -> dict[str, Any]:
         normalized_reason = str(reason or "autonomy_stop")
+        self._clear_pending_semantic_intent()
         self.vision.clear_main_llm_semantic_request(normalized_reason)
         return {"accepted": True, **self.autonomy.stop(normalized_reason)}
 
@@ -1319,6 +1581,9 @@ class BackendService:
         """长轮询世界存储，不进入身体控制路径。"""
         result = self.vision.delta(after_revision, wait_ms=wait_ms, limit=limit)
         self.autonomy.update_world(result.get("world"))
+        # 导航结果是离散内存状态，不进入视觉 revision 账本、不落盘。宿主可据此
+        # 只在完成/受阻/丢失时通知主 LLM，而不用注入每个控制 tick。
+        result["navigation"] = self.navigator.snapshot()
         return result
 
     def perception(self) -> dict[str, Any]:
@@ -1346,6 +1611,8 @@ class BackendService:
         # 「我要最新的」写成 0 会拿到最旧的一张——正好反了。
         limit_ms = min(30000, max(250, limit_ms))
         result = dict(self.vision.latest_frame(max_age_ms=limit_ms, overlay=bool(overlay)))
+        if overlay and result.get("available"):
+            self._remember_target_refs(result)
         data = result.pop("data", None)
         if isinstance(data, bytes):
             import base64
@@ -1370,11 +1637,112 @@ class BackendService:
         frame_revision: Any,
         entities: Any,
     ) -> dict[str, Any]:
-        return self.vision.commit_main_llm_semantics(
+        result = self.vision.commit_main_llm_semantics(
             request_id,
             frame_revision,
             entities,
         )
+        if not result.get("accepted"):
+            return result
+
+        normalized_request_id = str(result.get("request_id") or "")[:128]
+        with self._lock:
+            pending = self._pending_semantic_intent
+            if (
+                not isinstance(pending, Mapping)
+                or str(pending.get("request_id") or "") != normalized_request_id
+            ):
+                return result
+            pending = dict(pending)
+            self._pending_semantic_intent = None
+
+        action = str(pending.get("action") or "").strip().lower()
+        selector = pending.get("selector") if isinstance(pending.get("selector"), Mapping) else {}
+        bindings = [
+            dict(item)
+            for item in (result.get("bindings") or ())
+            if isinstance(item, Mapping) and self._semantic_binding_matches(item, selector)
+        ]
+        if len(bindings) != 1:
+            result["pending_navigation"] = {
+                "accepted": False,
+                "action": action,
+                "movement_started": False,
+                "reason_code": (
+                    "semantic_target_not_found" if not bindings else "target_choice_required"
+                ),
+                "reason": (
+                    "the paired frame contains no matching semantic target"
+                    if not bindings else
+                    "the paired frame contains multiple matching semantic targets"
+                ),
+                "candidates": bindings,
+            }
+            return result
+
+        target_id = str(bindings[0].get("target_id") or "")[:96]
+        world = self.vision.snapshot()
+        self.autonomy.update_world(world)
+        if not self.autonomy.snapshot().get("armed"):
+            result["pending_navigation"] = {
+                "accepted": False,
+                "action": action,
+                "movement_started": False,
+                "reason_code": "manual_arm_required",
+                "reason": "VRChat autonomy was disarmed before semantic confirmation completed",
+            }
+            return result
+        if self._visible_entity_by_id(world, target_id) is None:
+            result["pending_navigation"] = {
+                "accepted": False,
+                "action": action,
+                "movement_started": False,
+                "reason_code": "target_id_not_visible",
+                "reason": "the classified target is no longer visible in the latest world snapshot",
+            }
+            return result
+
+        status = world.get("status") if isinstance(world.get("status"), Mapping) else {}
+        revision = int(status.get("revision", 0) or 0)
+        goal_kind = "approach_observe" if action == "approach" else action
+        resumed = self.autonomy_goal(
+            pending.get("text") or f"{action} {bindings[0].get('label') or selector.get('semantic_type') or 'target'}",
+            goal_kind,
+            target_id,
+            None,
+            pending.get("constraints"),
+            revision,
+        )
+        result["pending_navigation"] = {
+            "action": action,
+            "movement_started": bool(resumed.get("accepted")),
+            "resolved_by": "main_llm_semantic_commit",
+            "resolved_target_id": target_id,
+            **resumed,
+        }
+        return result
+
+    @staticmethod
+    def _semantic_binding_matches(
+        binding: Mapping[str, Any], selector: Mapping[str, Any],
+    ) -> bool:
+        """只允许主 LLM 明确分类且满足原选择器的候选自动续接。"""
+        semantic_type = str(binding.get("semantic_type") or "").strip().lower()
+        if semantic_type in {"", "poster", "screen", "mirror", "unknown"}:
+            return False
+        expected_type = str(selector.get("semantic_type") or "").strip().lower()
+        if expected_type and semantic_type != expected_type:
+            return False
+        expected_label = str(selector.get("label") or "").strip().casefold()
+        label = str(binding.get("label") or "")
+        if expected_label and expected_label not in label.casefold():
+            return False
+        try:
+            confidence = float(binding.get("confidence", 0.0) or 0.0)
+            minimum = float(selector.get("min_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(confidence) and confidence >= minimum
 
     def _navigator_send_axes(self, side: str, x: float, y: float, duration_ms: int) -> bool:
         """只发送主 AnyaDance 命令，绝不回退到 OSC。"""

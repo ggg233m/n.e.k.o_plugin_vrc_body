@@ -170,8 +170,13 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 停止时释放输入。它不会调用 LLM、
 等待 VLM，也不会在没有目标方位时盲目向前走。`GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
-任何朝视觉实体移动的目标都必须提供由 LLM 从最新世界快照中选出的精确
-`target_id`；无 ID 的探索请求只停留在观察/规划阶段。本地导航不按 goal 文本、实体标签或
+普通 Agent 的一次 `approach` 会在后端转换为有限的 `approach_observe`：本地依次完成
+获取、朝向、接近、停稳和约 1.8 秒观察，循环内不调用 LLM。只有到达并观察完成、持续
+丢失目标或绕行预算耗尽时才增加 `navigation.behavior.outcome_sequence`；宿主据此只推送
+一次终态和一张新鲜画面，不会把 10 Hz 控制状态写盘或持续塞进模型上下文。
+任何朝视觉实体移动的目标都必须由 LLM 从最新叠框画面中明确选择。LLM只提交
+`target_ref`（例如 `T2`）与 `frame_revision`，后端把它解析为精确 `target_id`；无目标的
+探索请求只停留在观察/规划阶段。本地导航不按 goal 文本、实体标签或
 置信度自动选目标，实体暂时消失时也不会回退到同标签目标。目标方位在同侧做 EMA 平滑，明显跨过
 中心时立即采用新方向。生产转向发送器把每个新 revision 的比例修正换成“当前 yaw + 修正”
 的绝对目标，上一段尚未结束也能安全重定向；同一 revision 仍只发送一次。
@@ -184,11 +189,11 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 `usr_`/`avtr_`，相同 Avatar、镜像和大幅换装/视角仍可能产生歧义。
 
 多人场景下，先读取 `world_observe`，再调用 `vrc_vision_frame` 并设置
-`overlay=true`。图上的 `T1/T2` 是单帧临时编号，同次工具结果会在
-`overlay.candidates` 中返回它们到完整 `target_id` 的映射。多模态 LLM 只负责从本次
-候选中排除看起来像海报、屏幕、镜像或无法判断的目标；提交 `vrc_autonomy_goal` 时必须
-使用映射中的完整 ID，不能提交 T 编号。JPEG、同帧检测实体和 revision 只在内存中的
-单槽对象保存，下一组直接覆盖；不写临时图片、不保留历史、不增加世界持久化次数。
+`overlay=true`。图上的 `T1/T2` 是单帧临时编号；多模态 LLM 只负责从本次候选中排除
+看起来像海报、屏幕、镜像或无法判断的目标，再把选中的 `target_ref` 与同次
+`frame_revision` 交给 `vrc_autonomy_goal`。后端在有界内存中短期保存 T 编号到稳定 ID
+的映射，并在执行前确认该稳定实体当前仍可见；映射过期、revision 不符或目标消失都会
+拒绝执行。JPEG 不写临时图片，编号映射不写磁盘，也不增加世界持久化次数。
 `overlay.paired!=true`、`drawn=false`、候选为空或 `skew_warning=true` 时保持停止并重新观察。
 
 ### 卡墙判据（movement_stalled）
@@ -469,8 +474,11 @@ endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行
 
 N.E.K.O 普通插件执行器可通过 `POST /autonomy/intent` 一次提交 `find`、`approach`、
 `follow`、`stop` 或 `status`。该高层入口不会绕过手动 arm：未授权时明确返回
-`manual_arm_required`。`approach/follow` 省略精确 ID 时，只有当前画面恰好存在一个
-匹配且 `semantic_verified=true` 的目标才会绑定；多人场景返回
+`manual_arm_required`。其中 `approach` 会转换为一次有限的“接近并观察”，`follow`
+才是持续目标。`approach/follow` 省略精确 ID 时，当前画面恰好存在一个
+匹配且 `semantic_verified=true` 的目标会直接绑定；只有未确认的本地 `person`
+轨迹时返回 `semantic_target_pending`，把配对画面交给宿主主多模态模型。模型提交
+唯一匹配分类后，后端自动续接原意图，不需要第二次移动调用。多人场景仍返回
 `target_choice_required`，禁止本地代码擅自替 LLM 选人。
 
 运行时层面 `max_age_ms <= 0` 表示不限龄，这是留给内部调用方的逃生口；`BackendService`

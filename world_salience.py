@@ -9,9 +9,9 @@
    恒定写成 ``visible``、``events`` 恒定为空，于是「有人径直朝我走来」这种
    全程 id/label/state 都不变的过程产生**零次**推送——距离、方位这些真正在
    变的量一个都不在签名里。
-2. 原来所有推送都用 ``ai_behavior="read"``，宿主把它映射成 ``passive``，只
-   装饰下一次由用户触发的回合。也就是说没有任何观测能让 agent 主动开口，
-   「注意到有人挥手并回应」在架构上不可达。
+2. 只有明确的挥手、说话等离散社交事件才应主动叫醒 agent。人物检测框的
+   出现、靠近和横移仍会写入下一回合上下文，但不能各自启动一次推理；否则
+   检测抖动会造成连续讲话和虚构动作完成。
 
 两者的共同前提是：先能把「场面变了多少」量化出来。
 """
@@ -168,11 +168,12 @@ def classify(
     由调用方保存；没有历史时只能判断「出现了新的人」。
 
     返回 ``{"wake": bool, "reasons": [...], "entity_states": {...}}``。
-    刻意保守：只有社交上确实需要反应的变化才置 ``wake``，其余继续走 ``read``
-    进上下文。误报的代价是 agent 无缘无故开口，比漏报更难忍受。
+    人物位置变化会进入 ``reasons`` 供下一轮理解，但不置 ``wake``；只有明确的
+    离散社交事件主动开口。误报的代价是 agent 无缘无故开口，比漏报更难忍受。
     """
     history = dict(previous or {})
     reasons: list[str] = []
+    wake_reasons: list[str] = []
     entity_states: dict[str, tuple[str, str]] = {}
 
     for item in changes.get("entities") or ():
@@ -208,7 +209,9 @@ def classify(
             continue
         kind = str(item.get("type") or item.get("kind") or "").lower()
         if kind in _SOCIAL_EVENT_KINDS:
-            reasons.append(f"事件：{kind}")
+            reason = f"事件：{kind}"
+            reasons.append(reason)
+            wake_reasons.append(reason)
 
     for entity_id in list(changes.get("removed_entity_ids") or ())[:8]:
         previous_state = history.get(str(entity_id))
@@ -217,7 +220,10 @@ def classify(
             reasons.append("身边有人离开了视野")
 
     return {
-        "wake": bool(reasons),
+        # 普通人物出现、靠近、横移或离开只更新下一回合的上下文。只有离散的
+        # 社交事件才值得主动起一个主 LLM 回合；否则检测抖动会让模型连续讲话，
+        # 甚至把画面变化误叙述成自己已经完成了移动。
+        "wake": bool(wake_reasons),
         "reasons": reasons[:6],
         "entity_states": entity_states,
     }

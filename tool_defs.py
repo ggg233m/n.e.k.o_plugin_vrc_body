@@ -314,7 +314,8 @@ VRC_AUTONOMY_GOAL = {
     "name": "vrc_autonomy_goal",
     "description": (
         "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。"
-        "approach/follow/interact/socialize 必须提供最新世界快照中的精确 target_id；"
+        "approach/approach_observe/follow/interact/socialize 优先提交同一次叠框画面中的 target_ref（T1/T2）"
+        "和 frame_revision，由后端解析并锁定稳定 ID；不要复制长 target_id。"
         "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
         "explore 可以不提供 target_id，改用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
         "本地 Explorer 找到目标后只会将其保持在视野中央，不会自动接近。"
@@ -324,12 +325,32 @@ VRC_AUTONOMY_GOAL = {
         "type": "object",
         "properties": {
             "goal": {"type": "string", "minLength": 1, "maxLength": 256},
-            "kind": {"type": "string", "enum": ["explore", "approach", "follow", "interact", "socialize"]},
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "explore", "approach", "approach_observe", "follow", "interact", "socialize",
+                ],
+                "description": (
+                    "用户说“过去看看”时使用 approach_observe：后端一次完成朝向、接近、"
+                    "停稳和观察；不要拆成多个 approach/观察调用。"
+                ),
+            },
             "target_id": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 96,
-                "description": "目标实体在最新世界快照中的精确 id；不能填写临时 T1/T2 编号。",
+                "description": "兼容内部调用的稳定实体 ID；主 LLM不要复制它，优先使用 target_ref。",
+            },
+            "target_ref": {
+                "type": "string",
+                "pattern": "^T[1-9][0-9]*$",
+                "maxLength": 8,
+                "description": "从同次 vrc_vision_frame(overlay=true) 画面中选出的短编号，例如 T2。",
+            },
+            "frame_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "产生 target_ref 的同次叠框画面 revision；必须和 target_ref 一起原样提交。",
             },
             "selector": {
                 "type": "object",
@@ -346,11 +367,13 @@ VRC_AUTONOMY_GOAL = {
             },
             "constraints": {
                 "type": "object",
-                "description": "本地执行器必须兑现的有界搜索约束。",
+                "description": "本地执行器必须兑现的有界搜索或有限行为约束。",
                 "properties": {
                     "max_duration_s": {"type": "number", "minimum": 1.0, "maximum": 600.0},
                     "max_scan_turns": {"type": "integer", "minimum": 1, "maximum": 32},
                     "max_forward_axis": {"type": "number", "minimum": 0.05, "maximum": 1.0},
+                    "settle_seconds": {"type": "number", "minimum": 0.2, "maximum": 3.0},
+                    "observe_seconds": {"type": "number", "minimum": 0.5, "maximum": 10.0},
                 },
                 "additionalProperties": False,
             },
@@ -378,6 +401,9 @@ VRC_SEMANTIC_COMMIT = {
         "这是和当前用户聊天同一回合内的附带工作，不要为它另起回答。"
         "已有检测框优先复制 candidates 中的完整 target_id；只有检测器漏框时才填写归一化 bbox。"
         "海报、屏幕和镜像要明确标为 poster/screen/mirror，避免被自主搜索当成 NPC。"
+        "任务 reason=agent_navigation_target_unresolved 时，只提交用户所指的唯一真实目标；"
+        "提交后端会自动续接一次有限导航，不要再发第二次移动命令。"
+        "只有返回 pending_navigation.accepted=true 才代表移动已经开始。"
     ),
     "parameters": {
         "type": "object",
@@ -492,7 +518,8 @@ VRC_VISION_FRAME = {
         "不能写进 world_state，也不能拿来满足 body_reach_and_grab 的 preconditions——"
         "那条路必须用 world_observe 给出的 entity_id 与置信度。画面过期或采集已停止时"
         "返回 available=false，此时按看不见处理，不要沿用上一次看到的内容。overlay=true"
-        "时图中 T1/T2 与结果 overlay.candidates 的 target_id 一一对应，只对本次画面有效。"
+        "时图中 T1/T2 与结果 overlay.candidates 一一对应；选择后把短 target_ref 和同次"
+        "frame_revision 交给 vrc_autonomy_goal，稳定 ID 由后端解析。"
     ),
     "parameters": {
         "type": "object",
@@ -513,7 +540,7 @@ VRC_VISION_FRAME = {
                     "本地检测，并以单槽内存对象配对；overlay.paired=true 才能使用。没有"
                     "同帧配对时返回 drawn=false，不会拿旧图叠最新世界。叠了框也不改变"
                     "性质：画面结论仍然只是低置信视觉猜测，不能写进 world_state。成功时"
-                    "结果还会返回 overlay.candidates，将临时 T 编号映射到完整 target_id。"
+                    "结果返回不含长稳定 ID 的 overlay.candidates 和 frame_revision。"
                 ),
             },
         },

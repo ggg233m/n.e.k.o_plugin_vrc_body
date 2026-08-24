@@ -13,7 +13,7 @@ class HostedUiTests(unittest.TestCase):
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         with (ROOT / "plugin.toml").open("rb") as handle:
             manifest = tomllib.load(handle)
-        self.assertEqual(manifest["plugin"]["version"], "0.13.11")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.14")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -72,6 +72,8 @@ class HostedUiTests(unittest.TestCase):
         observe_source = ast.unparse(methods["observe_vrchat_world"])
         navigate_source = ast.unparse(methods["navigate_vrchat_world"])
         cancel_source = ast.unparse(methods["_replace_cancelled_semantic_push"])
+        navigation_outcome_source = ast.unparse(methods["_push_navigation_outcome"])
+        world_loop_source = ast.unparse(methods["_world_context_loop_run"])
         self.assertIn("plugin_entry", observe_source)
         self.assertIn("当前 VRChat 视觉检测", observe_source)
         self.assertIn("plugin_entry", navigate_source)
@@ -88,6 +90,10 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("register_dynamic_entry", register_source)
         self.assertIn("neko_anyadance_body.semantic.latest", cancel_source)
         self.assertIn("被动语义任务已取消", cancel_source)
+        self.assertIn("outcome_sequence", navigation_outcome_source)
+        self.assertIn("ai_behavior='respond'", navigation_outcome_source)
+        self.assertIn("_fetch_frame_image_part", navigation_outcome_source)
+        self.assertIn("_push_navigation_outcome", world_loop_source)
 
     def test_panel_uses_only_hosted_ui_runtime_and_covers_controls(self) -> None:
         source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")

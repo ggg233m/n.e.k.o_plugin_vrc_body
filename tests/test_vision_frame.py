@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
@@ -741,12 +742,16 @@ class VisionFrameServiceTests(unittest.TestCase):
 
         def __init__(self, runtime: VisionRuntime) -> None:
             self.vision = runtime
+            self._lock = threading.RLock()
+            self._target_ref_cache = {}
 
     def _service(self, runtime: VisionRuntime):
         from neko_anyadance_body.backend.service import BackendService
 
         stub = self._StubService(runtime)
         stub.vision_frame = BackendService.vision_frame.__get__(stub, type(stub))
+        stub._remember_target_refs = BackendService._remember_target_refs.__get__(stub, type(stub))
+        stub._prune_target_refs_locked = BackendService._prune_target_refs_locked.__get__(stub, type(stub))
         return stub
 
     def test_frame_is_returned_as_base64_not_raw_bytes(self) -> None:
@@ -793,7 +798,8 @@ class VisionFrameServiceTests(unittest.TestCase):
             world=world,
         )
 
-        result = self._service(runtime).vision_frame(overlay=True)
+        service = self._service(runtime)
+        result = service.vision_frame(overlay=True)
 
         self.assertTrue(result["available"])
         self.assertIn("data_base64", result)
@@ -809,6 +815,10 @@ class VisionFrameServiceTests(unittest.TestCase):
                 "bearing_deg": None,
                 "clipped": False,
             }],
+        )
+        self.assertEqual(
+            service._target_ref_cache[result["overlay"]["revision"]]["refs"]["T1"],
+            "avatar:session:test:4",
         )
 
     def test_unavailable_frames_carry_no_payload(self) -> None:

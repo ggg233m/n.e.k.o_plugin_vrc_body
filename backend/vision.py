@@ -2650,6 +2650,7 @@ class VisionRuntime:
                 "target_id": str(item.get("id") or ""),
                 "semantic_type": _semantic_type(item),
                 "label": str(item.get("label") or "")[:64],
+                "confidence": round(float(item.get("confidence", 0.0) or 0.0), 4),
             }
             for item in normalized.entities
             if isinstance(item, Mapping)

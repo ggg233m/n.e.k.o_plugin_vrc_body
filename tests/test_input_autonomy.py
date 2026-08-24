@@ -142,6 +142,31 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertTrue(recovered["armed"])
         self.assertIsNotNone(recovered["goal"])
 
+    def test_finite_approach_stays_armed_on_a_fresh_empty_frame(self) -> None:
+        """目标离开画面时要让本地重捕获计时，而不是先把整个会话降级。"""
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+        )
+        runtime.arm()
+        self.assertTrue(runtime.submit_goal(
+            "过去看看", "approach_observe", "vision:person:1"
+        )["accepted"])
+
+        runtime.update_world({
+            "available": False,
+            "capture_active": True,
+            "entities": [],
+            "events": [],
+            "uncertainties": ["no_recent_visual_observation"],
+            "status": {"revision": 1, "last_observation_age_ms": 80},
+        })
+
+        state = runtime.snapshot()
+        self.assertEqual(state["state"], "armed")
+        self.assertEqual(state["reason"], "goal_reacquiring_target")
+
     def test_targeted_goal_requires_and_preserves_exact_entity_id(self) -> None:
         runtime = AutonomyRuntime(
             world_provider=lambda: {},
@@ -164,6 +189,16 @@ class AutonomyAndWorldTests(unittest.TestCase):
         )
         self.assertTrue(accepted["accepted"])
         self.assertEqual(accepted["goal"]["target_id"], "vision:person:7")
+
+        finite = runtime.submit_goal(
+            "walk over and look",
+            "approach_observe",
+            "vision:person:7",
+            constraints={"settle_seconds": 0.4, "observe_seconds": 1.2},
+        )
+        self.assertTrue(finite["accepted"])
+        self.assertEqual(finite["goal"]["kind"], "approach_observe")
+        self.assertEqual(finite["goal"]["constraints"]["observe_seconds"], 1.2)
 
     def test_explore_goal_preserves_selector_constraints_and_revision(self) -> None:
         runtime = AutonomyRuntime(

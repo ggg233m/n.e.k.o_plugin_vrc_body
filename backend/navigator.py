@@ -59,6 +59,13 @@ class NavigatorConfig:
     # 变化」的直觉；而按固定身高反算的米制距离对矮/高 avatar 会差出数倍。
     target_apparent_height: float = 0.55
     max_goal_age_s: float = 60.0
+    # 「过去看看」不是永久跟随。到达后先停稳，再在较宽的注视死区内观察一小段
+    # 时间，随后自动完成目标。整个过程只用本地视觉闭环，不调用模型。
+    behavior_settle_s: float = 0.6
+    behavior_observe_s: float = 1.8
+    behavior_observe_deadband_deg: float = 18.0
+    # 短暂漏检继续用 target_grace_s；持续看不见才把有限行为判为目标丢失。
+    behavior_reacquire_s: float = 2.5
     # 顶着墙推摇杆的判据。检测器只看画面，永远不会告诉你「前面有堵墙」；
     # VRChat 内置 Velocity 参数是唯一能说明「命令发了但人没动」的回传。
     #
@@ -155,6 +162,16 @@ class NavigatorConfig:
             raise ValueError("navigator.target_apparent_height must be between 0.05 and 0.95")
         if not 5.0 <= float(self.max_goal_age_s) <= 600.0:
             raise ValueError("navigator.max_goal_age_s must be between 5 and 600")
+        if not 0.2 <= float(self.behavior_settle_s) <= 3.0:
+            raise ValueError("navigator.behavior_settle_s must be between 0.2 and 3")
+        if not 0.5 <= float(self.behavior_observe_s) <= 10.0:
+            raise ValueError("navigator.behavior_observe_s must be between 0.5 and 10")
+        if not float(self.bearing_deadband_deg) <= float(self.behavior_observe_deadband_deg) <= 30.0:
+            raise ValueError(
+                "navigator.behavior_observe_deadband_deg must be between bearing_deadband_deg and 30"
+            )
+        if not 0.5 <= float(self.behavior_reacquire_s) <= 10.0:
+            raise ValueError("navigator.behavior_reacquire_s must be between 0.5 and 10")
         if not 0.01 <= float(self.stall_speed_mps) <= 1.0:
             raise ValueError("navigator.stall_speed_mps must be between 0.01 and 1")
         if not 2 <= int(self.stall_ticks) <= 100:
@@ -378,6 +395,14 @@ class LocalNavigator:
         self._stall_goal_key: tuple[str, str, str] | None = None
         self._stall_goal_age: float | None = None
         self._completion_notified_goal_key: tuple[str, str, str] | None = None
+        # 有限行为导演只保存极小的内存状态，不写逐帧日志：主 LLM 给一次意图，
+        # 本地依次完成获取、朝向、接近、停稳和观察。
+        self._behavior_phase = "idle"
+        self._behavior_phase_started_at: float | None = None
+        self._behavior_target_lost_at: float | None = None
+        self._behavior_outcome_sequence = 0
+        self._behavior_last_outcome: dict[str, Any] | None = None
+        self._behavior_outcome_notified: tuple[tuple[str, str, str], str] | None = None
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
@@ -447,12 +472,15 @@ class LocalNavigator:
             goal_state = self._goal_provider()
             world = self._world_provider()
             self._pre_tick_goal_check(goal_state)
-            decision = self._stall_guard(self._decide(goal_state, world, now), goal_state, now)
+            base_decision = self._decide(goal_state, world, now)
+            directed_decision = self._direct_behavior(base_decision, goal_state, now)
+            decision = self._stall_guard(directed_decision, goal_state, now)
             applied = self._apply(decision, now)
             self._explorer.record_applied(decision.reason, applied)
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
+            self._record_behavior_outcome(decision, now)
             self._notify_goal_complete(decision)
             return decision
         except Exception as exc:
@@ -493,6 +521,11 @@ class LocalNavigator:
                 # 背着上一个目标用掉的次数。
                 self._recover_attempts = 0
                 self._completion_notified_goal_key = None
+                self._behavior_target_lost_at = None
+                self._behavior_outcome_notified = None
+                next_kind = goal_key[0].strip().lower()
+                self._behavior_phase = "acquire" if next_kind == "approach_observe" else "idle"
+                self._behavior_phase_started_at = None
                 # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
                 # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
@@ -503,8 +536,14 @@ class LocalNavigator:
             self._stall_goal_age = goal_age
 
     def _notify_goal_complete(self, decision: NavigationDecision) -> None:
-        """总时限是语义等待的最终边界；到期后只通知一次并释放上层目标。"""
-        if decision.reason != "explore_duration_exhausted" or self._complete_goal is None:
+        """有限行为完成或到期后只通知一次，并释放上层目标。"""
+        terminal_reasons = {
+            "approach_observe_complete",
+            "approach_observe_target_lost",
+            "explore_duration_exhausted",
+            "goal_expired",
+        }
+        if decision.reason not in terminal_reasons or self._complete_goal is None:
             return
         with self._lock:
             goal_key = self._stall_goal_key
@@ -517,6 +556,144 @@ class LocalNavigator:
             # 完成回调失败不能把已经停车的决策改成导航器故障；状态里保留诊断。
             with self._lock:
                 self._last_error = f"goal_complete_callback:{type(exc).__name__}: {exc}"[:240]
+
+    @staticmethod
+    def _stationary_decision(
+        source: NavigationDecision,
+        state: str,
+        reason: str,
+    ) -> NavigationDecision:
+        """保留产生决定的观测证据，但明确清零所有控制器输出。"""
+        return NavigationDecision(
+            state,
+            reason,
+            source.target_id,
+            source.bearing_deg,
+            source.distance_m,
+            revision=source.revision,
+            observed_age_ms=source.observed_age_ms,
+            observation_mode=source.observation_mode,
+        )
+
+    def _set_behavior_phase(self, phase: str, now: float) -> None:
+        with self._lock:
+            if self._behavior_phase != phase or self._behavior_phase_started_at is None:
+                self._behavior_phase = phase
+                self._behavior_phase_started_at = now
+
+    @staticmethod
+    def _behavior_seconds(
+        goal: Mapping[str, Any],
+        name: str,
+        default: float,
+    ) -> float:
+        constraints = _mapping(goal.get("constraints")) or {}
+        value = _finite(constraints.get(name))
+        return default if value is None else value
+
+    def _direct_behavior(
+        self,
+        decision: NavigationDecision,
+        goal_state: Mapping[str, Any] | None,
+        now: float,
+    ) -> NavigationDecision:
+        """把一次高层意图导演成有限的本地行为，不把逐步决策退回给 LLM。"""
+        goal = _mapping((goal_state or {}).get("goal")) or {}
+        if str(goal.get("kind") or "").strip().lower() != "approach_observe":
+            return decision
+
+        missing_reasons = {
+            "target_not_visible", "target_low_confidence", "target_bearing_unknown",
+        }
+        if decision.reason in missing_reasons:
+            with self._lock:
+                if self._behavior_target_lost_at is None:
+                    self._behavior_target_lost_at = now
+                lost_for = now - self._behavior_target_lost_at
+            self._set_behavior_phase("acquire", now)
+            if lost_for < self.config.behavior_reacquire_s:
+                return self._stationary_decision(
+                    decision, "acquire", "behavior_reacquiring_target"
+                )
+            self._set_behavior_phase("failed", now)
+            return self._stationary_decision(
+                decision, "complete", "approach_observe_target_lost"
+            )
+
+        # 只要重新拿到目标观测，就取消丢失计时；世界未知等安全停车不伪装成
+        # “目标丢失”，仍沿用原决定等待感知恢复。
+        if decision.target_id:
+            with self._lock:
+                self._behavior_target_lost_at = None
+
+        if decision.state == "turn":
+            self._set_behavior_phase("orient", now)
+            return decision
+        if decision.state == "advance":
+            self._set_behavior_phase("approach", now)
+            return decision
+        if decision.state != "reached":
+            return decision
+
+        with self._lock:
+            phase = self._behavior_phase
+            phase_started_at = self._behavior_phase_started_at
+        if phase == "complete":
+            return self._stationary_decision(
+                decision, "complete", "approach_observe_complete"
+            )
+        if phase not in {"settle", "observe"}:
+            self._set_behavior_phase("settle", now)
+            phase = "settle"
+            phase_started_at = now
+
+        if phase == "settle":
+            settle_s = self._behavior_seconds(
+                goal, "settle_seconds", self.config.behavior_settle_s
+            )
+            if phase_started_at is None or now - phase_started_at < settle_s:
+                return self._stationary_decision(decision, "settle", "behavior_settling")
+            self._set_behavior_phase("observe", now)
+            phase_started_at = now
+
+        observe_s = self._behavior_seconds(
+            goal, "observe_seconds", self.config.behavior_observe_s
+        )
+        if phase_started_at is None or now - phase_started_at < observe_s:
+            return self._stationary_decision(decision, "observe", "behavior_observing")
+        self._set_behavior_phase("complete", now)
+        return self._stationary_decision(
+            decision, "complete", "approach_observe_complete"
+        )
+
+    def _record_behavior_outcome(self, decision: NavigationDecision, now: float) -> None:
+        """只记录离散结果，供宿主低频通知；不会把逐帧运动写入硬盘或 LLM。"""
+        outcome_reasons = {
+            "approach_observe_complete",
+            "approach_observe_target_lost",
+            "movement_stalled",
+            "target_unreachable",
+        }
+        if decision.reason not in outcome_reasons:
+            return
+        with self._lock:
+            goal_key = self._stall_goal_key
+            if goal_key is None:
+                return
+            outcome_key = (goal_key, decision.reason)
+            if outcome_key == self._behavior_outcome_notified:
+                return
+            self._behavior_outcome_notified = outcome_key
+            self._behavior_outcome_sequence += 1
+            self._behavior_last_outcome = {
+                "sequence": self._behavior_outcome_sequence,
+                "reason": decision.reason,
+                "state": decision.state,
+                "target_id": decision.target_id,
+                "revision": decision.revision,
+                "observed_age_ms": decision.observed_age_ms,
+                "occurred_at_monotonic": now,
+            }
 
     def _stall_guard(
         self,
@@ -778,6 +955,22 @@ class LocalNavigator:
                 "active_side": self._active_side,
                 "last_decision": decision,
                 "last_error": self._last_error,
+                "behavior": {
+                    "policy": "acquire_orient_approach_settle_observe",
+                    "phase": self._behavior_phase,
+                    "phase_age_ms": (
+                        None
+                        if self._behavior_phase_started_at is None
+                        else round(max(0.0, now - self._behavior_phase_started_at) * 1000.0, 1)
+                    ),
+                    "llm_calls_in_loop": 0,
+                    "outcome_sequence": self._behavior_outcome_sequence,
+                    "last_outcome": (
+                        None
+                        if self._behavior_last_outcome is None
+                        else dict(self._behavior_last_outcome)
+                    ),
+                },
                 "turn": {
                     # 转向是相对位移，同一次观测重发会累加。suppressed 高于
                     # sent 是正常的（tick 频率本就高于出帧频率）；两者相等则说明
@@ -1023,7 +1216,31 @@ class LocalNavigator:
                 revision=revision,
                 observed_age_ms=observed_age,
             )
-        if not isinstance(world, Mapping) or not bool(world.get("available")):
+        if not isinstance(world, Mapping):
+            return NavigationDecision("stop", "world_unknown")
+        if not bool(world.get("available")):
+            status = _mapping(world.get("status")) or {}
+            revision = int(_finite(status.get("revision")) or 0)
+            observed_age = _finite(status.get("last_observation_age_ms"))
+            uncertainties = set(blocking_uncertainties(world.get("uncertainties")))
+            # 一张新鲜空画面是“这次没看到锁定目标”，不是“世界未知”。有限行为
+            # 需要靠它累计重捕获窗口；否则目标一离开画面，available=false 会先把
+            # 导航器卡在 world_unknown，永远产不出 target_lost 终态。
+            fresh_empty_target = (
+                str(goal.get("kind") or "").strip().lower() == "approach_observe"
+                and world.get("capture_active") is not False
+                and observed_age is not None
+                and observed_age <= self.config.max_observation_age_ms
+                and not (uncertainties - {"no_recent_visual_observation"})
+            )
+            if fresh_empty_target:
+                return NavigationDecision(
+                    "stop",
+                    "target_not_visible",
+                    target_id=str(goal.get("target_id") or "")[:96] or None,
+                    revision=revision,
+                    observed_age_ms=observed_age,
+                )
             return NavigationDecision("stop", "world_unknown")
         uncertainties = blocking_uncertainties(world.get("uncertainties"))
         if uncertainties:
@@ -1087,7 +1304,15 @@ class LocalNavigator:
         distance = observation.distance_m
         apparent = observation.apparent_height
         apparent_clipped = observation.apparent_clipped
-        if abs(bearing) > self.config.bearing_deadband_deg:
+        # 观察阶段不用把人钉死在视野正中央。较宽的注视死区更像自然地站在旁边
+        # 看一会儿；目标真正走远时，后面的距离判断仍会重新进入接近阶段。
+        bearing_deadband = self.config.bearing_deadband_deg
+        if (
+            str(goal.get("kind") or "").strip().lower() == "approach_observe"
+            and self._behavior_phase == "observe"
+        ):
+            bearing_deadband = self.config.behavior_observe_deadband_deg
+        if abs(bearing) > bearing_deadband:
             # 转向直接给角度，不再经摇杆。bearing 本身就是「要转多少度才能把目标
             # 转到画面中央」，压成摇杆量再靠脉冲时长积分只会丢精度；而且 VR 模式
             # 下右摇杆根本不产生转向。

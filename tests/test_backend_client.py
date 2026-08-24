@@ -172,6 +172,136 @@ class BackendClientTests(unittest.TestCase):
             },
         )])
 
+    def test_remote_autonomy_forwards_short_frame_reference(self) -> None:
+        calls = []
+
+        class RecordingClient:
+            def fast_request(self, method, path, payload):
+                calls.append((method, path, payload))
+                return {"accepted": True}
+
+        result = RemoteAutonomy(RecordingClient()).goal(
+            "follow T2",
+            "follow",
+            based_on_revision=42,
+            target_ref="T2",
+            frame_revision=42,
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(calls, [(
+            "POST",
+            "/autonomy/goal",
+            {
+                "text": "follow T2",
+                "kind": "follow",
+                "based_on_revision": 42,
+                "target_ref": "T2",
+                "frame_revision": 42,
+            },
+        )])
+
+    def test_autonomy_goal_resolves_frame_ref_and_rejects_fake_target_id(self) -> None:
+        """LLM只选 T 编号；后端解析稳定 ID，并拒绝描述文本冒充 ID。"""
+        try:
+            from PIL import Image
+        except Exception:  # pragma: no cover - 取决于可选视觉依赖
+            self.skipTest("Pillow is not installed")
+
+        class Detector:
+            name = "test_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=(
+                        {
+                            "id": "avatar:session:test:1",
+                            "label": "person",
+                            "confidence": 0.91,
+                            "bbox": [0.05, 0.1, 0.45, 0.9],
+                        },
+                        {
+                            "id": "avatar:session:test:2",
+                            "label": "person",
+                            "confidence": 0.94,
+                            "bbox": [0.55, 0.1, 0.95, 0.9],
+                        },
+                    ),
+                    source=self.name,
+                    observed_at=now,
+                    frame_id="selection-frame",
+                )
+
+        buffer = BytesIO()
+        Image.new("RGB", (160, 100), (10, 10, 10)).save(buffer, format="JPEG", quality=80)
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "local_backend": "none",
+                    "semantic_backend": "none",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_backends(detector=Detector())
+            service.vision.set_capture_state(True, "test")
+            world = service.vision.process_frame(buffer.getvalue())
+            frame = service.vision_frame(max_age_ms=3000, overlay=True)
+            revision = frame["overlay"]["revision"]
+            mapping = {
+                item["ref"]: item["target_id"]
+                for item in frame["overlay"]["candidates"]
+            }
+            self.assertEqual(
+                set(mapping.values()),
+                {"avatar:session:test:1", "avatar:session:test:2"},
+            )
+            selected_ref = next(
+                ref for ref, target in mapping.items()
+                if target == "avatar:session:test:2"
+            )
+
+            service.autonomy_arm()
+            fake = service.autonomy_goal(
+                "走过去看看",
+                "approach",
+                target_id="person[visible](front/unknown, conf=0.94)",
+                based_on_revision=world["status"]["revision"],
+            )
+            self.assertFalse(fake["accepted"])
+            self.assertEqual(fake["reason_code"], "target_id_not_visible")
+
+            selected = service.autonomy_goal(
+                "走向右边的人",
+                "approach",
+                target_ref=selected_ref.lower(),
+                frame_revision=revision,
+                based_on_revision=world["status"]["revision"],
+            )
+            self.assertTrue(selected["accepted"], selected)
+            self.assertEqual(selected["resolved_by"], "frame_target_ref")
+            self.assertEqual(selected["resolved_target_ref"], selected_ref)
+            self.assertEqual(selected["resolved_target_id"], "avatar:session:test:2")
+            self.assertEqual(selected["goal"]["target_id"], "avatar:session:test:2")
+
+            expired = service.autonomy_goal(
+                "跟随右边的人",
+                "follow",
+                target_ref=selected_ref,
+                frame_revision=revision + 999,
+            )
+            self.assertFalse(expired["accepted"])
+            self.assertEqual(expired["reason_code"], "target_ref_revision_unavailable")
+        finally:
+            service.vision.close()
+
     def test_remote_autonomy_intent_uses_single_high_level_endpoint(self) -> None:
         calls = []
 
@@ -224,6 +354,7 @@ class BackendClientTests(unittest.TestCase):
         self.assertTrue(approached["accepted"])
         self.assertEqual(approached["resolved_by"], "unique_semantic_target")
         self.assertEqual(approached["resolved_target_id"], "avatar:session:test:1")
+        self.assertEqual(approached["goal"]["kind"], "approach_observe")
 
         service.world_state.ingest(
             entities=[{
@@ -244,6 +375,87 @@ class BackendClientTests(unittest.TestCase):
         self.assertFalse(ambiguous["accepted"])
         self.assertEqual(ambiguous["reason_code"], "target_choice_required")
         self.assertEqual(len(ambiguous["candidates"]), 2)
+
+    def test_autonomy_intent_resumes_after_one_main_llm_semantic_commit(self) -> None:
+        """未分类 person 只触发一次看图；分类后不需要 LLM 再发移动命令。"""
+        class Detector:
+            name = "test_detector"
+
+            def status(self):
+                return {"available": True}
+
+            def observe(self, frame, *, now):
+                return VisionObservation(
+                    entities=({
+                        "id": "avatar:session:test:pending",
+                        "label": "person",
+                        "confidence": 0.95,
+                        "bbox": [0.2, 0.2, 0.5, 0.9],
+                        "attributes": {
+                            "bearing_deg": 12.0,
+                            "apparent_height": 0.32,
+                        },
+                    },),
+                    source=self.name,
+                    observed_at=now,
+                    frame_id="pending-navigation-frame",
+                )
+
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_backends(detector=Detector())
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+
+            pending = service.autonomy_intent(
+                "approach",
+                text="走过去看看",
+                target_type="npc",
+            )
+            self.assertTrue(pending["accepted"], pending)
+            self.assertTrue(pending["pending_semantic"])
+            self.assertFalse(pending["movement_started"])
+            self.assertEqual(pending["reason_code"], "semantic_target_pending")
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+
+            request = service.main_llm_semantic_request()
+            self.assertTrue(request["available"])
+            self.assertEqual(request["reason"], "agent_navigation_target_unresolved")
+            committed = service.main_llm_semantic_commit(
+                request["request_id"],
+                request["revision"],
+                [{
+                    "target_id": "avatar:session:test:pending",
+                    "semantic_type": "npc",
+                    "label": "地图 NPC",
+                    "confidence": 0.91,
+                }],
+            )
+
+            resumed = committed["pending_navigation"]
+            self.assertTrue(resumed["accepted"], committed)
+            self.assertTrue(resumed["movement_started"])
+            self.assertEqual(resumed["resolved_by"], "main_llm_semantic_commit")
+            self.assertEqual(resumed["goal"]["kind"], "approach_observe")
+            self.assertEqual(
+                resumed["goal"]["target_id"],
+                "avatar:session:test:pending",
+            )
+            self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+        finally:
+            service.vision.close()
 
     def test_remote_vision_transports_main_llm_semantic_request_and_commit(self) -> None:
         calls = []
