@@ -93,6 +93,16 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 身体运行时采用一个粗粒度的本机后端进程，而不是把每个动作拆成独立服务。Hosted 插件只保留 LLM 工具参数校验、UI 和 IPC 适配；后端进程统一持有 `BodyScheduler`、AnyaDance UDP 输出、VMC idle 中转、VRChat OSC、驱动遥测、动作加载和世界状态。两者通过带随机令牌的 loopback HTTP 通信，后端不可用时插件进入安全的 `backend_unavailable` 状态。
 
+后端现在也自带 Web 控制台，不依赖 N.E.K.O 宿主即可查看状态和配置视觉/VLM、
+授权自治并提交目标：
+
+```powershell
+.\.venv\Scripts\python.exe backend\process.py --standalone --open-ui
+```
+
+普通配置保存在被 Git 忽略的 `backend.settings.json`，只有点击保存时才写一次；
+API key 只从环境变量读取。完整说明见 [独立后端](backend/README.md#脱离-neko-运行)。
+
 ## 视觉世界状态（第一阶段）
 
 插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable；启用采集但没有模型时只运行 capture-only 诊断，不发布猜测实体。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。

@@ -9,4 +9,5 @@ tmp/
 .venv/
 .trae/
 world_memory.json
+backend.settings.json
 memory/

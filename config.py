@@ -214,6 +214,10 @@ class VisionConfig:
     identity_reid_retention_s: float = 1800.0
     identity_reid_max_identities: int = 128
     semantic_backend: str = "openai_compatible"
+    # 独立后端可以直接从配置面板保存 endpoint/model；API key 仍只从环境变量
+    # 读取，避免把凭据混入可导出、可提交的普通 JSON/TOML 配置。
+    semantic_endpoint: str | None = None
+    semantic_model: str = "gpt-4o-mini"
     semantic_max_per_minute: int = 30
     # 给 agent 看的单槽内存帧缓存。这条路径与 world_state 完全无关：帧只喂理解，
     # 不产生实体也不产生事件。检测完成后把 JPEG 与同帧实体原子配对，编码按间隔
@@ -443,6 +447,12 @@ class PluginConfig:
         semantic_backend = str(vision.get("semantic_backend", "openai_compatible")).strip().lower() or "openai_compatible"
         if semantic_backend not in {"openai_compatible", "none", "external"}:
             raise ValueError("vision.semantic_backend must be openai_compatible, none, or external")
+        semantic_endpoint = optional_path("semantic_endpoint")
+        if semantic_endpoint is not None and not semantic_endpoint.lower().startswith(("http://", "https://")):
+            raise ValueError("vision.semantic_endpoint must be an http(s) URL")
+        semantic_model = str(vision.get("semantic_model", "gpt-4o-mini")).strip()
+        if not semantic_model or len(semantic_model) > 256 or "\x00" in semantic_model:
+            raise ValueError("vision.semantic_model must be a short non-empty string")
         dxcam_backend = str(vision.get("dxcam_backend", "auto")).strip().lower() or "auto"
         if dxcam_backend not in {"auto", "dxgi", "winrt"}:
             raise ValueError("vision.dxcam_backend must be auto, dxgi, or winrt")
@@ -559,6 +569,8 @@ class PluginConfig:
                 name="vision.identity_reid_max_identities",
             ),
             semantic_backend=semantic_backend,
+            semantic_endpoint=semantic_endpoint,
+            semantic_model=semantic_model,
             semantic_max_per_minute=_bounded_int(
                 vision.get("semantic_max_per_minute"),
                 30,

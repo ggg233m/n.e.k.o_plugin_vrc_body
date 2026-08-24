@@ -102,6 +102,8 @@ class PluginSmokeTests(unittest.TestCase):
                 "detector_accelerator_interval_ms": 100,
                 "onnxruntime_cuda": "disabled",
                 "onnxruntime_cuda_device_id": 2,
+                "semantic_endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+                "semantic_model": "local-vlm",
             }
         })
         self.assertTrue(configured.vision.enabled)
@@ -111,6 +113,11 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(configured.vision.detector_accelerator_interval_ms, 100)
         self.assertEqual(configured.vision.onnxruntime_cuda, "disabled")
         self.assertEqual(configured.vision.onnxruntime_cuda_device_id, 2)
+        self.assertEqual(
+            configured.vision.semantic_endpoint,
+            "http://127.0.0.1:8000/v1/chat/completions",
+        )
+        self.assertEqual(configured.vision.semantic_model, "local-vlm")
         self.assertEqual(configured.vision.lifecycle_watermark_limit, 4096)
         self.assertEqual(configured.vision.monitor_index, -1)
         self.assertEqual(configured.vision.dxcam_device_idx, -1)
@@ -148,6 +155,8 @@ class PluginSmokeTests(unittest.TestCase):
             PluginConfig.from_mapping({"vision": {"interval_ms": 5}})
         with self.assertRaisesRegex(ValueError, "vision.lifecycle_watermark_limit"):
             PluginConfig.from_mapping({"vision": {"lifecycle_watermark_limit": 128}})
+        with self.assertRaisesRegex(ValueError, "semantic_endpoint"):
+            PluginConfig.from_mapping({"vision": {"semantic_endpoint": "file:///tmp/model"}})
 
     def test_integer_config_values_are_not_silently_truncated(self) -> None:
         with self.assertRaisesRegex(ValueError, "anyadance.port"):

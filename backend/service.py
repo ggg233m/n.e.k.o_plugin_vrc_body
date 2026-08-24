@@ -244,12 +244,23 @@ class BackendService:
             )
         vision_semantic: Any | None = None
         if self.config.vision.enabled and self.config.vision.semantic_backend == "openai_compatible":
-            endpoint = os.getenv("VRC_VLM_ENDPOINT") or os.getenv("OPENAI_BASE_URL")
-            model = os.getenv("VRC_VLM_MODEL") or os.getenv("OPENAI_VLM_MODEL") or "gpt-4o-mini"
+            endpoint = (
+                os.getenv("VRC_VLM_ENDPOINT")
+                or os.getenv("OPENAI_BASE_URL")
+                or self.config.vision.semantic_endpoint
+            )
+            model = (
+                os.getenv("VRC_VLM_MODEL")
+                or os.getenv("OPENAI_VLM_MODEL")
+                or self.config.vision.semantic_model
+                or "gpt-4o-mini"
+            )
+            api_key = os.getenv("VRC_VLM_API_KEY") or os.getenv("OPENAI_API_KEY")
             if endpoint:
                 vision_semantic = OpenAICompatibleSemanticBackend(
                     endpoint=endpoint,
                     model=model,
+                    api_key=api_key,
                     max_per_minute=self.config.vision.semantic_max_per_minute,
                 )
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)

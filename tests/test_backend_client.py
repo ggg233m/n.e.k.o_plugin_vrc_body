@@ -28,6 +28,37 @@ from neko_anyadance_body.backend.vision import VisionObservation
 
 
 class BackendClientTests(unittest.TestCase):
+    def test_semantic_backend_can_be_configured_without_neko_host(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VRC_VLM_ENDPOINT": "",
+                "OPENAI_BASE_URL": "",
+                "VRC_VLM_MODEL": "",
+                "OPENAI_VLM_MODEL": "",
+                "VRC_VLM_API_KEY": "session-secret",
+            },
+            clear=False,
+        ):
+            service = BackendService(
+                {
+                    "vision": {
+                        "enabled": True,
+                        "source": "none",
+                        "local_backend": "none",
+                        "semantic_backend": "openai_compatible",
+                        "semantic_endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+                        "semantic_model": "local-vlm",
+                    }
+                },
+                Path.cwd(),
+            )
+        semantic = service.vision.semantic
+        self.assertIsNotNone(semantic)
+        self.assertEqual(semantic.endpoint, "http://127.0.0.1:8000/v1/chat/completions")
+        self.assertEqual(semantic.model, "local-vlm")
+        self.assertEqual(semantic.api_key, "session-secret")
+
     def test_remote_autonomy_forwards_exact_target_id(self) -> None:
         calls = []
 

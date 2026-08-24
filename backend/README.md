@@ -10,6 +10,8 @@
 - `process.py` 通过带认证的本机回环 HTTP 暴露服务。它支持 JSON/TOML 配置文件，
   可用 `--offline`/`--dry-run` 关闭 VMC、VRChat OSC、驱动遥测和 AnyaDance UDP，
   直接启动开发后端；完全省略配置时也默认使用该安全模式。
+- `standalone_ui/` 是后端自己托管的零构建 Web 控制台。它不依赖 N.E.K.O UI，
+  可以查看视觉/稳定 ID/导航状态、手动授权与提交目标，并保存独立运行覆盖配置。
 - `client.py` 是插件侧的轻量 IPC 客户端和兼容代理层。
 - `debug_cli.py` 是不依赖 SDK 的实时调试命令行，可以读取状态、注入世界观测、
   提交动作、创建高层计划、注入反馈和停止后端。
@@ -66,6 +68,43 @@ OSC 和遥测映射，并保持进程协议与世界状态模块不变。进程�
 项目包，不会导入 N.E.K.O SDK。
 
 ## 实时开发
+
+### 脱离 N.E.K.O 运行
+
+使用项目虚拟环境启动完整独立后端；它会读取 `plugin.toml`，再叠加面板生成的
+`backend.settings.json`：
+
+```powershell
+$env:VRC_VLM_API_KEY="你的接口密钥" # 也可使用 OPENAI_API_KEY
+.\.venv\Scripts\python.exe backend\process.py --standalone --open-ui
+```
+
+启动日志会输出形如 `http://127.0.0.1:48912/#token=...` 的控制台地址。token 放在
+URL fragment 中，不会作为 HTTP 请求参数发送；页面只把它保存在当前浏览器会话，
+所有状态和控制 API 仍要求 `X-Neko-Backend-Token`。
+
+控制台分为总览、视觉与语义、自主控制和配置四页，支持：
+
+- 显示 OpenVINO 实际设备、语义 worker、内存候选缓存和 revision journal；
+- 手动读取最新一张带框画面，不自动轮询图片；
+- 启停视觉、启停身体输出、手动授权、停止和提交带 selector/constraints 的目标；
+- 配置模型路径、采集窗口、推理间隔、VLM endpoint/model、OSC 和授权时长。
+
+配置面板只在点击保存时原子写一次 `backend.settings.json`，不会写视觉帧、候选或
+revision 历史。模型、端口和 VLM 改动经过 `PluginConfig` 校验，保存后明确显示
+“需要重启”；它不会热拆正在运行的驱动或采集句柄。API key 不进入 JSON，也不通过
+`GET /config` 回显，只读取 `VRC_VLM_API_KEY` / `OPENAI_API_KEY`。环境变量中的
+endpoint/model 同样优先于面板设置。由 N.E.K.O 通过 `--config-json` 管理的后端也会
+提供状态页面，但配置页只读，避免两个宿主争抢配置所有权。
+
+可指定其他覆盖文件或固定 token：
+
+```powershell
+.\.venv\Scripts\python.exe backend\process.py --standalone `
+  --settings-file .\my-backend.settings.json --port 48912 --token dev
+```
+
+### 离线开发
 
 从项目根目录启动一个不连接宿主的开发后端。动作仍会进入调度器，但 UDP 只会
 进入 dry-run 计数器，不会发到网络：

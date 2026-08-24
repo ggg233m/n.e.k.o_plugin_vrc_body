@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>N.E.K.O VRChat 独立后端</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+  <script defer src="/ui/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">N.E.K.O / ANYADANCE</p>
+        <h1>VRChat 独立后端</h1>
+      </div>
+      <div class="top-actions">
+        <span id="connectionBadge" class="badge muted">未连接</span>
+        <button id="refreshButton" class="button secondary">刷新</button>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="控制台页面">
+      <button class="tab active" data-tab="overview">总览</button>
+      <button class="tab" data-tab="perception">视觉与语义</button>
+      <button class="tab" data-tab="autonomy">自主控制</button>
+      <button class="tab" data-tab="settings">配置</button>
+    </nav>
+
+    <main>
+      <section id="overview" class="page active">
+        <div class="status-grid">
+          <article class="metric"><span>身体输出</span><strong id="bodyStatus">—</strong><small id="bodyDetail">—</small></article>
+          <article class="metric"><span>本地检测</span><strong id="detectorStatus">—</strong><small id="detectorDetail">—</small></article>
+          <article class="metric"><span>语义后端</span><strong id="semanticStatus">—</strong><small id="semanticDetail">—</small></article>
+          <article class="metric"><span>自主导航</span><strong id="navigationStatus">—</strong><small id="navigationDetail">—</small></article>
+        </div>
+
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">RUNTIME</p><h2>运行控制</h2></div></div>
+            <div class="button-row">
+              <button id="enableBody" class="button primary">启用身体输出</button>
+              <button id="disableBody" class="button secondary">平滑禁用</button>
+              <button id="emergencyStop" class="button danger">立即急停</button>
+            </div>
+            <dl class="facts">
+              <div><dt>AnyaDance</dt><dd id="anyadanceFact">—</dd></div>
+              <div><dt>VRChat OSC</dt><dd id="oscFact">—</dd></div>
+              <div><dt>控制延迟</dt><dd id="latencyFact">—</dd></div>
+              <div><dt>磁盘写入</dt><dd id="diskFact">—</dd></div>
+            </dl>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">WORLD</p><h2>世界状态</h2></div></div>
+            <dl class="facts">
+              <div><dt>Revision</dt><dd id="revisionFact">—</dd></div>
+              <div><dt>可见实体</dt><dd id="entityCountFact">—</dd></div>
+              <div><dt>观测龄期</dt><dd id="observationAgeFact">—</dd></div>
+              <div><dt>内存账本</dt><dd id="journalFact">—</dd></div>
+            </dl>
+            <div id="uncertainties" class="notice muted">等待观测。</div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">EVENTS</p><h2>最近状态</h2></div></div>
+          <pre id="runtimeLog" class="log">正在连接本地后端……</pre>
+        </article>
+      </section>
+
+      <section id="perception" class="page">
+        <div class="two-column perception-layout">
+          <article class="panel frame-panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">LATEST FRAME</p><h2>当前视觉帧</h2></div>
+              <button id="loadFrame" class="button secondary">手动读取一帧</button>
+            </div>
+            <div class="frame-wrap">
+              <img id="frameImage" alt="尚未读取 VRChat 画面">
+              <p id="framePlaceholder">图片不会自动轮询，避免占用带宽和上下文。</p>
+            </div>
+            <small id="frameMeta" class="muted">—</small>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">PIPELINE</p><h2>感知管线</h2></div></div>
+            <dl class="facts">
+              <div><dt>采集</dt><dd id="captureFact">—</dd></div>
+              <div><dt>设备</dt><dd id="deviceFact">—</dd></div>
+              <div><dt>语义队列</dt><dd id="semanticQueueFact">—</dd></div>
+              <div><dt>候选缓存</dt><dd id="candidateFact">—</dd></div>
+            </dl>
+            <div class="button-row">
+              <button id="startVision" class="button primary">启动视觉</button>
+              <button id="stopVision" class="button secondary">停止视觉</button>
+            </div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">ENTITIES</p><h2>当前实体与稳定 ID</h2></div></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ID</th><th>标签</th><th>语义</th><th>置信度</th><th>方位</th><th>身份方法</th></tr></thead>
+              <tbody id="entityRows"><tr><td colspan="6" class="empty">暂无实体</td></tr></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="autonomy" class="page">
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">AUTHORIZATION</p><h2>自主授权</h2></div></div>
+            <div id="autonomySummary" class="notice">—</div>
+            <div class="button-row">
+              <button id="armAutonomy" class="button primary">手动授权</button>
+              <button id="stopAutonomy" class="button secondary">停止目标</button>
+              <button id="disarmAutonomy" class="button danger">解除授权</button>
+            </div>
+            <dl class="facts">
+              <div><dt>当前目标</dt><dd id="goalFact">—</dd></div>
+              <div><dt>本地决策</dt><dd id="decisionFact">—</dd></div>
+              <div><dt>扫描次数</dt><dd id="scanFact">—</dd></div>
+              <div><dt>循环 LLM 调用</dt><dd id="llmLoopFact">—</dd></div>
+            </dl>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">NEW GOAL</p><h2>提交目标</h2></div></div>
+            <div class="form-grid">
+              <label class="field span-2"><span>目标描述</span><input id="goalText" value="寻找 NPC"></label>
+              <label class="field"><span>类型</span><select id="goalKind"><option value="explore">探索</option><option value="approach">接近</option><option value="follow">跟随</option><option value="interact">交互</option></select></label>
+              <label class="field"><span>目标 ID（可选）</span><input id="targetId" placeholder="avatar:session:…"></label>
+              <label class="field"><span>语义选择器</span><select id="selectorType"><option value="npc">NPC</option><option value="player">玩家</option><option value="person">人物</option><option value="object">物体</option></select></label>
+              <label class="field"><span>最低置信度</span><input id="selectorConfidence" type="number" min="0" max="1" step="0.05" value="0.7"></label>
+              <label class="field"><span>最大时长（秒）</span><input id="goalDuration" type="number" min="1" max="600" value="90"></label>
+              <label class="field"><span>最大扫描次数</span><input id="goalScans" type="number" min="1" max="32" value="16"></label>
+              <label class="field"><span>最大前进轴</span><input id="goalForward" type="number" min="0.05" max="1" step="0.05" value="0.3"></label>
+            </div>
+            <button id="submitGoal" class="button primary wide">提交给本地执行器</button>
+            <small class="muted">提交时自动携带当前世界 revision；之后导航循环不等待 LLM。</small>
+          </article>
+        </div>
+      </section>
+
+      <section id="settings" class="page">
+        <div id="restartBanner" class="notice warning hidden">配置已保存，需要重启独立后端后生效。</div>
+        <div id="managedBanner" class="notice muted hidden">当前由 N.E.K.O 宿主管理配置；请用 <code>--standalone</code> 启动后再编辑。</div>
+
+        <form id="settingsForm">
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">VISION</p><h2>视觉检测</h2></div></div>
+            <div class="form-grid">
+              <label class="switch-field"><input id="cfgVisionEnabled" type="checkbox"><span>启用视觉</span></label>
+              <label class="field"><span>采集后端</span><select id="cfgCapture"><option value="desktop_mirror">Desktop Mirror</option><option value="dxcam">DXcam</option><option value="mss">MSS</option></select></label>
+              <label class="field"><span>窗口标题</span><input id="cfgWindowTitle" placeholder="VRChat"></label>
+              <label class="field"><span>推理设备</span><input id="cfgDevice" placeholder="AUTO / GPU / CPU"></label>
+              <label class="field span-2"><span>模型路径</span><input id="cfgModelPath"></label>
+              <label class="field span-2"><span>标签路径</span><input id="cfgLabelsPath"></label>
+              <label class="field"><span>置信度阈值</span><input id="cfgConfidence" type="number" min="0" max="1" step="0.01"></label>
+              <label class="field"><span>采集间隔 ms</span><input id="cfgInterval" type="number" min="10" max="2000"></label>
+              <label class="field"><span>CPU 检测间隔 ms</span><input id="cfgDetectorInterval" type="number" min="0" max="10000"></label>
+              <label class="field"><span>加速器检测间隔 ms</span><input id="cfgAcceleratorInterval" type="number" min="0" max="10000"></label>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">SEMANTIC</p><h2>VLM 语义识别</h2></div><span id="apiKeyBadge" class="badge muted">API Key 未配置</span></div>
+            <div class="form-grid">
+              <label class="field"><span>语义后端</span><select id="cfgSemanticBackend"><option value="openai_compatible">OpenAI Compatible</option><option value="none">关闭</option><option value="external">外部注入</option></select></label>
+              <label class="field"><span>每分钟上限</span><input id="cfgSemanticRate" type="number" min="1" max="30"></label>
+              <label class="field span-2"><span>Endpoint</span><input id="cfgSemanticEndpoint" placeholder="http://127.0.0.1:8000/v1/chat/completions"></label>
+              <label class="field span-2"><span>模型</span><input id="cfgSemanticModel" placeholder="gpt-4o-mini"></label>
+            </div>
+            <p class="help">API Key 不写入配置文件。启动前设置 <code>VRC_VLM_API_KEY</code> 或 <code>OPENAI_API_KEY</code>；环境变量会覆盖面板中的 endpoint/model。</p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">CONTROL</p><h2>连接与自治</h2></div></div>
+            <div class="form-grid">
+              <label class="field"><span>AnyaDance Host</span><input id="cfgAnyaHost"></label>
+              <label class="field"><span>AnyaDance Port</span><input id="cfgAnyaPort" type="number" min="1" max="65535"></label>
+              <label class="switch-field"><input id="cfgOscEnabled" type="checkbox"><span>启用 VRChat OSC</span></label>
+              <label class="field"><span>OSC 发送端口</span><input id="cfgOscSendPort" type="number" min="1" max="65535"></label>
+              <label class="field"><span>OSC 监听端口</span><input id="cfgOscListenPort" type="number" min="1" max="65535"></label>
+              <label class="field"><span>授权时长（分钟）</span><input id="cfgAutonomyTtl" type="number" min="1" max="240"></label>
+              <label class="switch-field"><input id="cfgPersistWorld" type="checkbox"><span>持久化世界事实</span></label>
+              <label class="switch-field"><input id="cfgPersistPlayers" type="checkbox"><span>持久化玩家信息</span></label>
+            </div>
+          </article>
+
+          <div class="save-bar">
+            <div><strong id="settingsPath">—</strong><small>只在点击保存时写一次 JSON；视觉帧和候选仍只在内存中。</small></div>
+            <button id="saveSettings" type="submit" class="button primary">校验并保存配置</button>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <section id="authGate" class="auth-gate hidden">
+    <form id="authForm" class="auth-card">
+      <p class="eyebrow">LOCAL AUTHENTICATION</p>
+      <h2>连接独立后端</h2>
+      <p>输入启动日志中的本机 token。它只保存在当前浏览器会话。</p>
+      <label class="field"><span>Backend Token</span><input id="tokenInput" type="password" autocomplete="off"></label>
+      <button class="button primary wide" type="submit">连接</button>
+    </form>
+  </section>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>
