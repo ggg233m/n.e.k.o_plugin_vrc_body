@@ -387,6 +387,19 @@ VRC_AUTONOMY_GOAL = {
                         "maximum": 45.0,
                         "description": "wander 必填：LLM 选择的相对转角；正数左转、负数右转，0 为直行。",
                     },
+                    "direction_scores": {
+                        "type": "object",
+                        "description": (
+                            "可选的方向偏好，不是通行概率；键可用 left/forward/right "
+                            "或角度字符串，分数范围 0~1。后端只记录并回报，不替 LLM 选路。"
+                        ),
+                        "maxProperties": 16,
+                        "additionalProperties": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                    },
                 },
                 "additionalProperties": False,
             },

@@ -23,6 +23,7 @@ from neko_anyadance_body.backend.client import (
     RemoteScheduler,
     RemoteVision,
 )
+from neko_anyadance_body.backend.direction_memory import SegmentOutcome
 from neko_anyadance_body.backend.service import BackendService, _effective_detector_interval_ms
 from neko_anyadance_body.backend.vision import VisionObservation
 
@@ -706,6 +707,193 @@ class BackendClientTests(unittest.TestCase):
             self.assertFalse(refused["movement_started"])
             self.assertIsNone(service.autonomy_snapshot()["goal"])
             self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
+        finally:
+            service.vision.close()
+
+    def test_wander_step_refuses_confirmed_blocked_bearing_and_keeps_route_task(self) -> None:
+        """确认封死的方向要拒绝，但路线任务必须留着让主 LLM 重选，不能自动改方向。"""
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+            pending = service.autonomy_intent(
+                "wander",
+                text="随便逛逛",
+                constraints={"max_duration_s": 2.0},
+            )
+            request_id = pending["route_request"]["request_id"]
+            # 用真实证据而不是打桩：朝这个方向撞两次才升级为 confident_block。
+            # 锚点取导航器当前朝向，和 should_refuse_bearing 查询时用的是同一个。
+            heading = service.navigator._current_heading_deg()
+            now = service.navigator._clock()
+            for offset in (0.0, 1.0):
+                service.navigator._direction_memory.record(
+                    SegmentOutcome(
+                        bearing_deg=-25.0, blocked=True, heading_deg=heading
+                    ),
+                    now + offset,
+                )
+
+            refused = service.autonomy_wander_step("right", request_id)
+            self.assertFalse(refused["accepted"])
+            self.assertEqual(refused["reason_code"], "recent_direction_blocked")
+            self.assertEqual(refused["blocked_bearing_deg"], -25.0)
+            self.assertEqual(refused["route_choice_owner"], "main_llm")
+            # 拒绝不是取消：请求还在，主 LLM 可以换个方向再提一次。
+            self.assertIsNotNone(
+                service.autonomy_snapshot()["pending_semantic_intent"]
+            )
+            self.assertEqual(
+                service.vision.main_llm_semantic_request()["request_id"],
+                request_id,
+            )
+        finally:
+            service.vision.close()
+
+    def test_direct_wander_goal_cannot_bypass_the_direction_refusal(self) -> None:
+        """两个 wander 入口共用同一道闸：绕过工具层不该能重提刚撞死的方向。"""
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+            heading = service.navigator._current_heading_deg()
+            now = service.navigator._clock()
+            for offset in (0.0, 1.0):
+                service.navigator._direction_memory.record(
+                    SegmentOutcome(
+                        bearing_deg=25.0, blocked=True, heading_deg=heading
+                    ),
+                    now + offset,
+                )
+
+            refused = service.autonomy_goal(
+                "往左走",
+                "wander",
+                constraints={"turn_deg": 25.0, "max_duration_s": 2.0},
+            )
+            self.assertFalse(refused["accepted"])
+            self.assertEqual(refused["reason_code"], "recent_direction_blocked")
+            self.assertEqual(refused["blocked_bearing_deg"], 25.0)
+            self.assertEqual(refused["route_choice_owner"], "main_llm")
+            # 拒绝不能顺手把目标换掉：这次提交整体没有发生。
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+
+            # 别的方向照旧放行，拒绝不扩散成「四周都不能走」。
+            allowed = service.autonomy_goal(
+                "往右走",
+                "wander",
+                constraints={"turn_deg": -25.0, "max_duration_s": 2.0},
+            )
+            self.assertTrue(allowed["accepted"])
+        finally:
+            service.vision.close()
+
+    def test_wander_direction_scores_reach_prediction_memory(self) -> None:
+        """主 LLM 的方向偏好进入预测记忆，但不触发本地选路。"""
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+            accepted = service.autonomy_goal(
+                "按当前画面逛逛",
+                "wander",
+                constraints={
+                    "turn_deg": 0.0,
+                    "max_duration_s": 2.0,
+                    "direction_scores": {
+                        "left": 0.8,
+                        "forward": 0.3,
+                        "right": 0.6,
+                    },
+                },
+            )
+            self.assertTrue(accepted["accepted"], accepted)
+            advice = service.navigator.direction_advice()
+            by_bearing = {
+                item["bearing_deg"]: item["predicted_score"]
+                for item in advice["records"]
+            }
+            self.assertAlmostEqual(by_bearing[45.0], 0.8)
+            self.assertAlmostEqual(by_bearing[0.0], 0.3)
+            self.assertAlmostEqual(by_bearing[-45.0], 0.6)
+            self.assertEqual(advice["route_choice_owner"], "main_llm")
+        finally:
+            service.vision.close()
+
+    def test_world_change_clears_direction_memory_through_the_service(self) -> None:
+        """跨对象的回调必须真的接上：换世界后旧世界的墙不能继续拒绝方向。"""
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.autonomy_arm()
+            heading = service.navigator._current_heading_deg()
+            now = service.navigator._clock()
+            for offset in (0.0, 1.0):
+                service.navigator._direction_memory.record(
+                    SegmentOutcome(
+                        bearing_deg=25.0, blocked=True, heading_deg=heading
+                    ),
+                    now + offset,
+                )
+            self.assertTrue(service.navigator.should_refuse_bearing(25.0))
+
+            service.autonomy.update_world({
+                "available": True,
+                "entities": [],
+                "events": [{"type": "world_changed"}],
+                "status": {"revision": 1},
+            })
+            self.assertFalse(service.navigator.should_refuse_bearing(25.0))
         finally:
             service.vision.close()
 

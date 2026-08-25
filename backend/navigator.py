@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from .direction_memory import DirectionMemory, SegmentOutcome, integrate_progress
 from .explorer import ExplorerStateMachine
 from .world_state import blocking_uncertainties
 
@@ -40,6 +41,14 @@ _DEPART_MAX_FORWARD_AXIS = 0.35
 # 已经用正负样本校准过的全局 0.55 阈值。
 _WANDER_SLIP_FORWARD_RATIO = 0.85
 _WANDER_SLIP_TICKS = 3
+
+# 门控积分丢弃转向拍的判据。AngularY 只在移动期间回传，量级未标定，所以只用它
+# 判「有没有在转」，不参与任何角度积分。
+#
+# 年龄门槛比一拍略宽：10Hz 下一拍 100ms，250ms 允许错开一两个包，又不至于让上
+# 一次转向的旧包把整段直行都标成转弯。
+_ANGULAR_RESTING = 0.05
+_ANGULAR_FRESH_MS = 250.0
 
 
 @dataclass(frozen=True)
@@ -374,6 +383,7 @@ class LocalNavigator:
         motion_provider: SnapshotProvider | None = None,
         turn_state_provider: TurnStateProvider | None = None,
         complete_goal: GoalCompleter | None = None,
+        direction_memory: "DirectionMemory | None" = None,
         turn_retarget_supported: bool = False,
         config: NavigatorConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -427,6 +437,17 @@ class LocalNavigator:
         # 世界实测朝向，终态字段会明确标注来源。不会保存逐帧图片或写硬盘。
         self._wander_trace_sequence = 0
         self._wander_trace: dict[str, Any] | None = None
+        # 方向记忆：只记「刚朝哪个方向试过、撞没撞」，短 TTL 自然过期。扇区锚在
+        # 调度器虚拟 HMD yaw 上，所以换世界必须 reset()——见 _reset_direction_memory。
+        self._direction_memory = direction_memory or DirectionMemory()
+        # 每条 wander 轨迹只允许记账一次。movement_stalled 会先经 _record_behavior_outcome
+        # 产生终态，紧接着 goal_expired 或下一次失速判定还会再来——重复 record()
+        # 会把一次撞墙攒成 confident_block，凭一段轨迹就把方向永久封死。
+        #
+        # 用 dict 当有序集合：裁剪必须按插入顺序丢最老的。set 没有顺序，
+        # list(set)[-32:] 可能正好把刚加进去的 segment_id 丢掉，于是同一次碰撞
+        # 会被第二次记账——正是这个守卫要防的事。
+        self._direction_recorded_segments: dict[str, None] = {}
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
@@ -707,6 +728,9 @@ class LocalNavigator:
             "output_heading_delta_deg": 0.0,
             "output_heading_last_yaw_deg": None if yaw is None else yaw % 360.0,
             "output_heading_sample_count": 0 if yaw is None else 1,
+            # 方向记忆的锚点：这一段**起始**时的虚拟 HMD yaw。绕行会改变朝向，
+            # 用终点 yaw 反算会把证据记到隔壁扇区，所以必须在这里就固定下来。
+            "anchor_yaw_deg": yaw,
             "turn_commands_start": None if commands is None else int(commands),
             "turn_commands_end": None if commands is None else int(commands),
             "motion_feedback_observed": False,
@@ -715,6 +739,14 @@ class LocalNavigator:
             "speed_sample_count": 0,
             "last_horizontal_speed_mps": None,
             "last_forward_ratio": None,
+            # 门控积分的输入。每拍一条，上限 240（4Hz 下约 60 秒），够覆盖一段
+            # wander 又不会无界增长。
+            "progress_samples": [],
+            "progress_last_sample_at": None,
+            # 只允许本段真正发送成功之后的速度样本进入里程积分。否则 body
+            # 未 enable 时，上一段缓存的速度也可能被误算成当前段的推进。
+            "forward_command_started_at": None,
+            "last_angular_age_ms": None,
         }
 
     def _record_wander_output_heading(
@@ -801,13 +833,35 @@ class LocalNavigator:
                     trace["segment_timer_reset_count"] = int(
                         trace.get("segment_timer_reset_count", 0)
                     ) + 1
+                    # recover 会改变朝向；下一次前进要从新的命令起点重新验收速度，
+                    # 不能把绕行前缓存的速度当成绕行后的推进。
+                    trace["forward_command_started_at"] = None
+                    trace["progress_last_sample_at"] = now
             elif decision.reason == "wander_forward" and applied:
                 trace["forward_command_count"] = int(
                     trace.get("forward_command_count", 0)
                 ) + 1
+                if trace.get("forward_command_started_at") is None:
+                    trace["forward_command_started_at"] = now
 
             motion = self._last_motion
-            if isinstance(motion, Mapping) and decision.state in {"advance", "recover"}:
+            if (
+                isinstance(motion, Mapping)
+                and decision.state in {"advance", "recover"}
+                and applied
+            ):
+                # ``motion_feedback`` 返回的是带年龄的最新缓存值；本段刚开始时
+                # 这里很可能仍是上一段的包。它不能证明本段已移动，也不能进入
+                # progress_samples。没有年龄字段的第三方 provider 保持兼容，
+                # 交给原有的 evidence/progress 门槛处理。
+                sample_age_ms = _finite(motion.get("value_age_ms"))
+                segment_start = _finite(trace.get("forward_command_started_at"))
+                if (
+                    sample_age_ms is not None
+                    and segment_start is not None
+                    and now - sample_age_ms / 1000.0 < segment_start - 0.01
+                ):
+                    return
                 if motion.get("available"):
                     trace["motion_feedback_observed"] = True
                 speed = _finite(motion.get("horizontal_speed_mps"))
@@ -819,8 +873,62 @@ class LocalNavigator:
                     trace["last_horizontal_speed_mps"] = speed
                 if ratio is not None:
                     trace["last_forward_ratio"] = ratio
+                self._append_progress_sample_locked(
+                    trace,
+                    now,
+                    motion=motion,
+                    speed=speed,
+                    ratio=ratio,
+                    turning=bool(decision.state == "recover"),
+                )
             if decision.reason == "movement_stalled":
                 trace["stall_detected"] = True
+
+    def _append_progress_sample_locked(
+        self,
+        trace: dict[str, Any],
+        now: float,
+        *,
+        motion: Mapping[str, Any],
+        speed: float | None,
+        ratio: float | None,
+        turning: bool,
+    ) -> None:
+        """给门控积分攒一拍样本；调用方必须持有 ``_lock``。
+
+        ``dt`` 用相邻两拍的实际间隔，不是标称 tick 周期：导航循环会被视觉和锁拖慢，
+        用标称值积出来的距离会系统性偏大，而这个距离正是 verified_free 的门槛。
+
+        ``turned`` 有两个来源，任一为真就丢弃这拍：绕行决策（我们自己发的转向），
+        以及新鲜的 ``AngularY``（VRChat 说人在转）。角速度必须看年龄——它和
+        VelocityX/Z 各有各的回传时机，旧包会把整段都标成「一直在转」。
+        """
+        samples = trace.get("progress_samples")
+        if not isinstance(samples, list):
+            samples = []
+            trace["progress_samples"] = samples
+        previous_at = _finite(trace.get("progress_last_sample_at"))
+        trace["progress_last_sample_at"] = now
+        if previous_at is None:
+            # 第一拍没有区间可积。只记时间戳，让下一拍有 dt 可用。
+            return
+        dt = max(0.0, now - previous_at)
+        angular_age_ms = _finite(motion.get("angular_age_ms"))
+        angular_speed = _finite(motion.get("angular_speed"))
+        trace["last_angular_age_ms"] = angular_age_ms
+        fresh_angular = (
+            angular_speed is not None
+            and abs(angular_speed) > _ANGULAR_RESTING
+            and angular_age_ms is not None
+            and angular_age_ms <= _ANGULAR_FRESH_MS
+        )
+        if len(samples) < 240:
+            samples.append({
+                "speed": speed,
+                "forward_ratio": ratio,
+                "dt": dt,
+                "turned": bool(turning or fresh_angular),
+            })
 
     def _wander_execution_summary_locked(
         self,
@@ -903,6 +1011,11 @@ class LocalNavigator:
                 "forward_command_count": int(trace.get("forward_command_count", 0)),
             },
             "recoveries": recoveries,
+            "direction_memory": self._record_direction_memory_locked(
+                trace,
+                completion=completion,
+                now=now,
+            ),
             "motion_evidence": {
                 "velocity_feedback_observed": bool(
                     trace.get("motion_feedback_observed")
@@ -920,9 +1033,142 @@ class LocalNavigator:
                     if _finite(trace.get("last_forward_ratio")) is None
                     else round(float(trace["last_forward_ratio"]), 4)
                 ),
+                # 门控积分出的推进距离下界：转向拍和贴墙拍都已丢弃。它是
+                # verified_free 的门槛，所以必须和摘要一起回报，让主 LLM 能自己
+                # 判断「记成走通」这个结论有多少证据支撑。
+                "gated_progress_m": round(
+                    integrate_progress(trace.get("progress_samples") or ())[0], 2
+                ),
+                "progress_sample_count": len(trace.get("progress_samples") or ()),
+                "angular_age_ms": _finite(trace.get("last_angular_age_ms")),
             },
             "turn_sign_convention": "positive_left_negative_right",
         }
+
+    def _record_direction_memory_locked(
+        self,
+        trace: Mapping[str, Any],
+        *,
+        completion: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """把这一段的实测结果记进方向记忆，并回传给主 LLM 的建议摘要。
+
+        调用方必须持有 ``_lock``。每个 ``segment_id`` 只记一次：``movement_stalled``
+        产生终态后，``goal_expired`` 或下一 tick 的失速判定还会再进来一次，重复
+        record() 会把一次撞墙攒成 ``confident_block``，凭一段轨迹就把整个扇区封死。
+
+        bearing 用 LLM 请求的 ``turn_deg``，不是绕行后的实际朝向：被记住、之后可能
+        被拒绝的是「主模型选的那个方向」。绕行净转角另存在 recoveries 里。锚点用
+        这一段**起始**时的虚拟 HMD yaw，绕行改变的朝向不该把证据挪到隔壁扇区。
+        """
+        segment_id = str(trace.get("segment_id") or "wander:unknown")[:64]
+        bearing = float(trace.get("requested_turn_deg", 0.0))
+        anchor = _finite(trace.get("anchor_yaw_deg"))
+        already_recorded = segment_id in self._direction_recorded_segments
+        progress_m, turned = integrate_progress(
+            trace.get("progress_samples") or ()
+        )
+        if not already_recorded:
+            blocked = completion in ("blocked", "blocked_after_recovery") or bool(
+                trace.get("stall_detected")
+            ) or bool(trace.get("wall_slide_detected"))
+            # 速度证据只认真的取到过样本。velocity_feedback_observed 为假时，
+            # 「没撞上」和「压根没动」无法区分，只能记 unknown。
+            #
+            # 但有样本也不等于走通了：顶着墙时 VRChat 照样回传速度包，值可能就是
+            # 0.0。真正的门槛是 progress_m——SegmentOutcome.cleared 会检查它。
+            evidence = int(trace.get("speed_sample_count", 0)) > 0 and bool(
+                trace.get("motion_feedback_observed")
+            )
+            self._direction_memory.record(
+                SegmentOutcome(
+                    bearing_deg=bearing,
+                    blocked=blocked,
+                    heading_deg=0.0 if anchor is None else anchor,
+                    progress_m=progress_m,
+                    turned=turned,
+                    evidence_available=evidence,
+                ),
+                now,
+            )
+            self._direction_recorded_segments[segment_id] = None
+            while len(self._direction_recorded_segments) > 64:
+                # dict 保序，popitem(last=False) 的等价写法：丢最早插入的那条。
+                # 顺序在这里是正确性问题，不是整洁问题——丢掉刚加进去的 id 就等于
+                # 允许同一次碰撞被第二次记账。
+                self._direction_recorded_segments.pop(
+                    next(iter(self._direction_recorded_segments))
+                )
+        # 记录必须用路段起始锚点，否则 recover 改变朝向后会把这段证据记到
+        # 邻近扇区；但给主 LLM 的终态摘要必须按**当前**虚拟 yaw 汇报，才能让
+        # 下一次 turn_deg 直接复用这些相对角度。两者不能共用一个 heading。
+        record_heading = 0.0 if anchor is None else anchor
+        report_heading = self._current_heading_deg()
+        advice = self._direction_memory.advice(now, heading_deg=report_heading)
+        advice["recorded_bearing_deg"] = round(bearing, 2)
+        advice["recorded_state"] = self._direction_memory.state_of(
+            bearing, now, heading_deg=record_heading
+        )
+        # 同一段被重复问到时明确标出来，避免上层把它当成第二次独立实测。
+        advice["recorded_this_segment"] = not already_recorded
+        advice["recorded_progress_m"] = round(progress_m, 2)
+        advice["recorded_turned_during_segment"] = turned
+        advice["heading_anchor_deg"] = None if anchor is None else round(anchor, 2)
+        advice["heading_report_deg"] = round(report_heading, 2)
+        return advice
+
+    def _current_heading_deg(self) -> float:
+        """当前虚拟 HMD yaw，读不到时退回 0。
+
+        退回 0 会让记忆退化成「相对会话起点」，仍然自相一致（写入和查询用同一个
+        锚点），只是转身之后精度下降。这比让方向记忆整体失效要好。
+        """
+        state = self._sample_turn_output_state()
+        if not isinstance(state, Mapping):
+            return 0.0
+        yaw = _finite(state.get("yaw_deg"))
+        return 0.0 if yaw is None else yaw
+
+    def direction_advice(self) -> dict[str, Any]:
+        """当前方向记忆摘要，供宿主在非终态场合查询。"""
+        return self._direction_memory.advice(
+            self._clock(), heading_deg=self._current_heading_deg()
+        )
+
+    def update_direction_scores(
+        self, scores: Mapping[Any, Any]
+    ) -> dict[str, Any]:
+        """记录主 LLM 对当前画面方向的偏好；绝不在这里选择执行方向。"""
+        heading = self._current_heading_deg()
+        now = self._clock()
+        with self._lock:
+            # 新一帧的偏好替换旧预测，但保留 empirical_state 和撞墙历史。
+            self._direction_memory.clear_predictions()
+            self._direction_memory.predict(scores, now, heading_deg=heading)
+            advice = self._direction_memory.advice(now, heading_deg=heading)
+        advice["prediction_heading_deg"] = round(heading, 2)
+        return advice
+
+    def should_refuse_bearing(self, bearing_deg: float) -> bool:
+        """这个方向是否已确认封死。真值表示应当拒绝并把选择权还给主 LLM。
+
+        ``bearing_deg`` 是相对**当前**朝向的转角，和 wander 的 turn_deg 同源；这里
+        用当前 yaw 换算到记忆系，所以转身之后同一个 +25° 不会再命中旧扇区。
+        """
+        return self._direction_memory.should_refuse(
+            bearing_deg, self._clock(), heading_deg=self._current_heading_deg()
+        )
+
+    def reset_direction_memory(self, reason: str = "world_changed") -> None:
+        """换世界时清空方向记忆。
+
+        锚点是虚拟 HMD yaw，只在一个世界里连续。换了世界之后所有扇区指向的都是
+        上个世界里的墙，留着只会拒绝本来能走的方向。
+        """
+        with self._lock:
+            self._direction_memory.reset()
+            self._direction_recorded_segments.clear()
 
     def _notify_goal_complete(self, decision: NavigationDecision) -> None:
         """有限行为完成或到期后只通知一次，并释放上层目标。"""

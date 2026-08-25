@@ -329,6 +329,10 @@ class BackendService:
             world_provider=lambda: self.vision.snapshot(),
             release_inputs=self._release_all_inputs,
             session_ttl_s=self.config.autonomy.session_ttl_minutes * 60.0,
+            # 延迟解析 self.navigator：它在下面才构造，这个回调只会在运行期触发。
+            on_world_changed=lambda: self.navigator.reset_direction_memory(
+                "world_changed"
+            ),
         )
         # 导航器是本地有界控制环，刻意与 LLM 和视觉 worker 分离；只有观察到
         # 新鲜且可见的目标后，才发送短时 AnyaDance 轴更新。
@@ -829,6 +833,12 @@ class BackendService:
                     "target_ref": normalized_target_ref,
                     "instruction": "重新调用 vrc_vision_frame(overlay=true) 并选择当前画面中的 T 编号。",
                 }
+        # 方向记忆拒绝收口在这里：autonomy_wander_step 会先自己查一次（它必须在
+        # 消费路线任务之前拒绝），但直接调 autonomy_goal(kind="wander") 的路径也
+        # 必须走同一道闸，否则绕过工具层就能把刚撞过两次的方向再提一遍。
+        refusal = self._refuse_blocked_bearing(normalized_kind, constraints)
+        if refusal is not None:
+            return refusal
         result = self.autonomy.submit_goal(
             text,
             kind,
@@ -846,6 +856,17 @@ class BackendService:
             # 会在调用本方法前先取出并清空待决项，因此不会误删自己的数据。
             self._clear_pending_semantic_intent()
             goal = result.get("goal") if isinstance(result.get("goal"), Mapping) else {}
+            if normalized_kind == "wander":
+                # 方向分数来自主 LLM 当前画面，只写入短期预测记忆；导航器不能依据
+                # 分数替 LLM 选择下一段路线。实测状态和撞墙历史由 DirectionMemory 保留。
+                goal_constraints = (
+                    goal.get("constraints")
+                    if isinstance(goal.get("constraints"), Mapping)
+                    else {}
+                )
+                direction_scores = goal_constraints.get("direction_scores")
+                if isinstance(direction_scores, Mapping):
+                    self.navigator.update_direction_scores(direction_scores)
             normalized_selector = goal.get("selector") if isinstance(goal.get("selector"), Mapping) else None
             if normalized_selector is not None:
                 # 建立被动任务，不在这里调用模型。插件会把这张图并入当前/下一次
@@ -858,6 +879,40 @@ class BackendService:
             else:
                 self.vision.clear_main_llm_semantic_request("goal_replaced_without_selector")
         return result
+
+    def _refuse_blocked_bearing(
+        self,
+        kind: str,
+        constraints: Any,
+    ) -> dict[str, Any] | None:
+        """已确认封死的方向一律拒绝；返回 None 表示放行。
+
+        只管 wander：它是唯一由主 LLM 自选方向的行为。人物绑定的 approach/follow
+        有具体目标，方向由目标决定，不该被扇区记忆挡下来。
+
+        拒绝载荷刻意只有四个键，不带 autonomy 快照：这不是一次执行结果，多余的
+        字段会让主 LLM 以为动作已经发生。也刻意**不**替它换一个方向——选路权在主
+        LLM，本地静默换向会让它以为自己选的方向可走。
+        """
+        if kind != "wander" or not isinstance(constraints, Mapping):
+            return None
+        raw = constraints.get("turn_deg")
+        if raw is None:
+            return None
+        try:
+            bearing = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(bearing):
+            return None
+        if not self.navigator.should_refuse_bearing(bearing):
+            return None
+        return {
+            "accepted": False,
+            "reason_code": "recent_direction_blocked",
+            "blocked_bearing_deg": bearing,
+            "route_choice_owner": "main_llm",
+        }
 
     def autonomy_wander_step(
         self,
@@ -907,6 +962,15 @@ class BackendService:
                     "reason_code": "wander_route_request_mismatch",
                     "reason": "the injected route request was replaced before execution",
                 }
+            # 方向记忆拒绝必须在消费配对任务之前：拒绝不是执行结果，路线任务要原样
+            # 留着让主 LLM 看着同一张画面重选。autonomy_goal 里还有同一道闸兜住直接
+            # 提交的路径，但那道闸在消费之后才生效，所以这里必须先自己查一次。
+            blocked_bearing = _WANDER_DIRECTION_TURN_DEG[normalized_direction]
+            refusal = self._refuse_blocked_bearing(
+                "wander", {"turn_deg": blocked_bearing}
+            )
+            if refusal is not None:
+                return refusal
             claimed = self.vision.consume_main_llm_route_request(
                 normalized_request_id
             )

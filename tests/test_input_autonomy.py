@@ -142,6 +142,45 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertTrue(recovered["armed"])
         self.assertIsNotNone(recovered["goal"])
 
+    def test_world_change_notifies_the_host_to_drop_world_bound_state(self) -> None:
+        """换世界要通知宿主清方向记忆：扇区锚在虚拟 HMD yaw 上，跨世界不连续。"""
+        notified: list[str] = []
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+            on_world_changed=lambda: notified.append("reset"),
+        )
+        runtime.arm()
+        runtime.update_world({
+            "available": True,
+            "entities": [],
+            "events": [{"type": "world_changed"}],
+            "status": {"revision": 1},
+        })
+        self.assertEqual(notified, ["reset"])
+        self.assertEqual(runtime.snapshot()["reason"], "world_changed")
+
+    def test_world_change_callback_failure_does_not_block_disarm(self) -> None:
+        """清理回调炸了也必须先把授权解除——安全动作不能被附属状态拖住。"""
+        def boom() -> None:
+            raise RuntimeError("navigator gone")
+
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+            session_ttl_s=600.0,
+            on_world_changed=boom,
+        )
+        runtime.arm()
+        runtime.update_world({
+            "available": True,
+            "entities": [],
+            "events": [{"type": "world_changed"}],
+            "status": {"revision": 1},
+        })
+        self.assertFalse(runtime.snapshot()["armed"])
+
     def test_finite_approach_stays_armed_on_a_fresh_empty_frame(self) -> None:
         """目标离开画面时要让本地重捕获计时，而不是先把整个会话降级。"""
         runtime = AutonomyRuntime(
@@ -265,6 +304,34 @@ class AutonomyAndWorldTests(unittest.TestCase):
         self.assertTrue(wander["accepted"], wander)
         self.assertIsNone(wander["goal"]["selector"])
         self.assertEqual(wander["goal"]["constraints"]["turn_deg"], -30.0)
+
+    def test_wander_direction_scores_are_clamped_and_bad_entries_skipped(self) -> None:
+        runtime = AutonomyRuntime(
+            world_provider=lambda: {},
+            release_inputs=lambda: None,
+        )
+        runtime.arm()
+
+        result = runtime.submit_goal(
+            "按画面偏好逛逛",
+            "wander",
+            constraints={
+                "turn_deg": 0.0,
+                "max_duration_s": 2.0,
+                "direction_scores": {
+                    "left": 1.5,
+                    "forward": 0.4,
+                    "right": -0.2,
+                    "not-a-direction": "bad",
+                },
+            },
+        )
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(
+            result["goal"]["constraints"]["direction_scores"],
+            {"left": 1.0, "forward": 0.4, "right": 0.0},
+        )
 
     def test_fresh_empty_observation_keeps_selector_explore_armed(self) -> None:
         runtime = AutonomyRuntime(

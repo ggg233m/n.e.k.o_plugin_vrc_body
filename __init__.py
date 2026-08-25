@@ -471,21 +471,20 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         if not isinstance(value, Mapping):
             return result
         rejected = value.get("accepted") is False
-        deferred = rejected and (
-            value.get("semantic_request_accepted") is True
-            or value.get("route_request_accepted") is True
-        )
         incomplete = require_completed and value.get("completed") is not True
-        # “等待主模型看图”已经成功建立异步任务，但移动尚未开始。它不是插件
-        # 故障；保留 accepted=false 给上层，防止 Agent 把排队误说成已经执行。
-        if deferred or (not rejected and not incomplete):
+        # 异步任务排队成功也不是动作成功：如果把它作为 Ok 返回，宿主/主 LLM
+        # 很容易把“已经建立路线任务”压缩成“已经出发”。统一走 Err 让工具层把
+        # movement_started=false 显式暴露为失败，并迫使下一步先消费配对路线。
+        # 这不会取消 pending_semantic/pending_route；它们仍由世界桥接注入主 LLM。
+        if not rejected and not incomplete:
             return result
         reason_code = str(value.get("reason_code") or "action_not_completed")
         reason = str(value.get("reason") or "动作未完成")
         instruction = str(value.get("instruction") or "").strip()
         suffix = f"；{instruction}" if instruction else ""
         return Err(
-            f"{reason_code}: {reason}{suffix}；accepted=false，不能声称动作已执行或检查已完成。"
+            f"{reason_code}: {reason}{suffix}；accepted=false，movement_started=false；"
+            "动作没有开始，不能声称已经出发、正在移动或已经完成。"
         )
 
     async def _agent_observe_vrchat_world(self, **kwargs: Any):
@@ -1750,7 +1749,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             min_confidence=normalized_confidence,
             constraints=None if constraints is None else dict(constraints),
         )
-        return Ok(result)
+        # 直接暴露给主 LLM 的入口也必须经过动作结果闸门；否则它会把
+        # route_request_accepted/semantic_request_accepted 当成已经开始移动。
+        return self._execution_result(Ok(result))
 
     @plugin_entry(
         id="scan_vrchat_surroundings",
@@ -2868,7 +2869,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 self._llm_consumed_revision,
                 min(normalized_revision, self._llm_pending_revision),
             )
-        return Ok(result)
+        # 直接暴露给主 LLM 的工具也必须遵守同一动作闸门；异步路线/语义任务
+        # 只代表排队，不能以 Ok 结果让模型把它叙述成已开始移动。
+        return self._execution_result(Ok(result))
 
     @llm_tool(**VRC_WANDER_STEP)
     async def vrc_wander_step(
@@ -2883,22 +2886,22 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             ("left", "forward", "right"),
         )
         if not self._backend_client:
-            return Ok({
+            return self._execution_result(Ok({
                 "accepted": False,
                 "movement_started": False,
                 "reason_code": "backend_unavailable",
                 "reason": "backend is not initialized",
-            })
+            }))
         # request_id 不暴露给模型填写：它来自插件刚刚实际注入本会话的配对任务。
         # 因而迟到输出只能消费自己的任务，不能误命中新生成的路线或任何人物。
         bound_request_id = self._semantic_request_id
         if not bound_request_id:
-            return Ok({
+            return self._execution_result(Ok({
                 "accepted": False,
                 "movement_started": False,
                 "reason_code": "no_injected_wander_route",
                 "reason": "there is no injected main-LLM wander route",
-            })
+            }))
         result = await asyncio.to_thread(
             self._backend_client.autonomy.wander_step,
             normalized_direction,
@@ -2910,7 +2913,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             and self._semantic_request_id == bound_request_id
         ):
             self._semantic_request_id = None
-        return Ok(result)
+        return self._execution_result(Ok(result))
 
     @llm_tool(**VRC_AUTONOMY_STOP)
     async def vrc_autonomy_stop(self, *, reason: Any = "autonomy_stop", **_: Any):

@@ -903,6 +903,10 @@ class VrchatOscBridge:
             "forward_ratio": None,
             "slip_ratio": None,
             "angular_speed": None,
+            # AngularY 和 VelocityX/Z 各有各的回传时机，共用一个 value_age_ms 会让
+            # 「这一拍转过没有」误判成「这一段一直在转」。单独给它一个年龄，读的人
+            # 才能判断手里这个角速度是不是本次采样窗口里的新包。
+            "angular_age_ms": None,
             "grounded": None,
             "upright": None,
         }
@@ -975,9 +979,21 @@ class VrchatOscBridge:
         if horizontal > _RESTING_SPEED_MPS:
             result["forward_ratio"] = round(vz / horizontal, 4)
             result["slip_ratio"] = round(vx / horizontal, 4)
-        angular = _numeric((records.get("AngularY") or {}).get("value"))
+        angular_record = records.get("AngularY") or {}
+        angular = _numeric(angular_record.get("value"))
         if angular is not None:
             result["angular_speed"] = round(angular, 4)
+            angular_mono = _numeric(angular_record.get("received_at_monotonic"))
+            if angular_mono is not None:
+                result["angular_age_ms"] = round(
+                    max(0.0, (now_mono - angular_mono) * 1000.0), 1
+                )
+            else:
+                angular_wall = _numeric(angular_record.get("received_at_unix"))
+                if angular_wall is not None:
+                    result["angular_age_ms"] = round(
+                        max(0.0, (now_wall - angular_wall) * 1000.0), 1
+                    )
         upright = _numeric((records.get("Upright") or {}).get("value"))
         if upright is not None:
             result["upright"] = round(upright, 4)

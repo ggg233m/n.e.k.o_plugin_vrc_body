@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from tests import _bootstrap  # noqa: F401
+from neko_anyadance_body.backend.direction_memory import SegmentOutcome
 from neko_anyadance_body.backend.navigator import LocalNavigator, NavigatorConfig
 
 
@@ -199,6 +200,398 @@ class NavigatorTests(unittest.TestCase):
         self.assertFalse(summary["execution"]["initial_turn_submitted"])
         self.assertEqual(summary["execution"]["submitted_turn_delta_deg"], 0.0)
         self.assertEqual(summary["execution"]["submitted_deviation_from_request_deg"], 20.0)
+
+    def test_terminal_summary_reports_direction_memory_advice(self) -> None:
+        self.navigator._complete_goal = lambda reason: None
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向左走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 45.0, "max_duration_s": 1.0},
+            },
+        }
+
+        self.assertEqual(self.navigator.tick().reason, "wander_llm_turn")
+        self.now[0] += 0.4
+        self.assertEqual(self.navigator.tick().reason, "wander_forward")
+        self.now[0] += 1.1
+        self.goal["goal"]["age_seconds"] = 1.5
+        self.assertEqual(self.navigator.tick().reason, "wander_step_complete")
+
+        memory = self.navigator.snapshot()["behavior"]["last_outcome"][
+            "execution_summary"
+        ]["direction_memory"]
+        self.assertEqual(memory["recorded_bearing_deg"], 45.0)
+        self.assertTrue(memory["recorded_this_segment"])
+        # 这套桩没有速度反馈，所以「没撞上」和「压根没动」不可区分，只能是 unknown。
+        self.assertEqual(memory["recorded_state"], "unknown")
+
+    def test_each_wander_segment_is_recorded_at_most_once(self) -> None:
+        self.navigator._complete_goal = lambda reason: None
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向左走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 45.0, "max_duration_s": 1.0},
+            },
+        }
+        self.assertEqual(self.navigator.tick().reason, "wander_llm_turn")
+        self.now[0] += 0.4
+        self.assertEqual(self.navigator.tick().reason, "wander_forward")
+        self.now[0] += 1.1
+        self.goal["goal"]["age_seconds"] = 1.5
+        self.assertEqual(self.navigator.tick().reason, "wander_step_complete")
+
+        recorded: list[Any] = []
+        self.navigator._direction_memory.record = (
+            lambda outcome, now: recorded.append(outcome)
+        )
+        # 同一段轨迹再次产生终态（goal_expired 紧随失速）不能第二次记账，否则
+        # 一次撞墙会被攒成 confident_block。
+        self.goal["goal"]["age_seconds"] = self.navigator.config.max_goal_age_s + 1.0
+        self.now[0] += 0.1
+        self.navigator.tick()
+        self.assertEqual(recorded, [])
+
+    def test_direction_memory_anchors_sectors_to_scheduler_yaw(self) -> None:
+        """记账用这一段**起始**时的 yaw 当锚点，绕行改变的朝向不该挪动证据。"""
+        self.navigator._complete_goal = lambda reason: None
+        self.turn_state.update({"yaw_deg": 90.0})
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向左走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 45.0, "max_duration_s": 1.0},
+            },
+        }
+        self.assertEqual(self.navigator.tick().reason, "wander_llm_turn")
+        self.now[0] += 0.4
+        self.assertEqual(self.navigator.tick().reason, "wander_forward")
+        # 走到一半人被转开了。终态摘要必须仍然把证据记在起始朝向上。
+        self.turn_state.update({"yaw_deg": 200.0})
+        self.now[0] += 1.1
+        self.goal["goal"]["age_seconds"] = 1.5
+        self.assertEqual(self.navigator.tick().reason, "wander_step_complete")
+
+        memory = self.navigator.snapshot()["behavior"]["last_outcome"][
+            "execution_summary"
+        ]["direction_memory"]
+        self.assertEqual(memory["heading_anchor_deg"], 90.0)
+        self.assertEqual(memory["heading_anchor_source"], "scheduler_virtual_hmd")
+        self.assertEqual(memory["position_reference"], "relative_to_current_heading")
+        # 证据写在 90° 的起始锚点，但终态回报要按当前 200° 汇报；否则主 LLM
+        # 下一次提交的相对 turn_deg 会把旧朝向下的角度再用一遍。
+        self.assertEqual(memory["heading_report_deg"], 200.0)
+        self.assertEqual(memory["records"][0]["bearing_deg"], -65.0)
+
+    def test_turning_away_stops_refusing_the_old_bearing(self) -> None:
+        """转身之后同一个 turn_deg 指向别处，不能再命中旧扇区。"""
+        self.turn_state.update({"yaw_deg": 0.0})
+        now = self.now[0]
+        for offset in (0.0, 1.0):
+            self.navigator._direction_memory.record(
+                SegmentOutcome(bearing_deg=25.0, blocked=True, heading_deg=0.0),
+                now + offset,
+            )
+        self.assertTrue(self.navigator.should_refuse_bearing(25.0))
+        # 人转过 90°：向左 25° 现在是另一个方向，旧记录不该封死它。
+        self.turn_state.update({"yaw_deg": 90.0})
+        self.assertFalse(self.navigator.should_refuse_bearing(25.0))
+        # 那堵墙现在在相对 -65° 处，记忆没丢，只是换算了。
+        self.assertTrue(self.navigator.should_refuse_bearing(-65.0))
+
+    def test_zero_speed_feedback_is_not_recorded_as_verified_free(self) -> None:
+        """顶着墙时 VRChat 照样回传速度包，0.0 不是「走通了」。"""
+        motion = {
+            "available": True,
+            "horizontal_feedback_confirmed": True,
+            "horizontal_speed_mps": 0.0,
+            "forward_ratio": None,
+            "value_age_ms": 10.0,
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            motion_provider=lambda: motion,
+            turn_state_provider=lambda: self.turn_state,
+            complete_goal=lambda reason: None,
+            clock=lambda: self.now[0],
+        )
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+        for _ in range(4):
+            navigator.tick()
+            self.now[0] += 0.25
+            self.goal["goal"]["age_seconds"] += 0.25
+        navigator.tick()
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        # 收到过速度样本，但一米都没推进——不能记成 verified_free。
+        self.assertGreater(summary["motion_evidence"]["speed_sample_count"], 0)
+        self.assertEqual(summary["motion_evidence"]["gated_progress_m"], 0.0)
+        self.assertNotEqual(
+            summary["direction_memory"]["recorded_state"], "verified_free"
+        )
+
+    def test_cruising_progress_is_integrated_into_the_terminal_summary(self) -> None:
+        """progress_m 必须真的接上实机速度流，而不是永远 null。"""
+        motion = {
+            "available": True,
+            "horizontal_feedback_confirmed": True,
+            # 实机 px_open2 巡航值。
+            "horizontal_speed_mps": 1.05,
+            "forward_ratio": 1.0,
+            "value_age_ms": 10.0,
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            motion_provider=lambda: motion,
+            turn_state_provider=lambda: self.turn_state,
+            complete_goal=lambda reason: None,
+            clock=lambda: self.now[0],
+        )
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+        for _ in range(6):
+            navigator.tick()
+            self.now[0] += 0.25
+            self.goal["goal"]["age_seconds"] += 0.25
+        navigator.tick()
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        progress = summary["motion_evidence"]["gated_progress_m"]
+        self.assertGreater(progress, 0.35)
+        self.assertEqual(summary["direction_memory"]["recorded_progress_m"], progress)
+        self.assertEqual(
+            summary["direction_memory"]["recorded_state"], "verified_free"
+        )
+
+    def test_rejected_forward_command_does_not_reuse_old_motion_as_progress(self) -> None:
+        """body 未 enable 时，旧速度包不能证明当前 wander 段已经走通。"""
+        motion = {
+            "available": True,
+            "horizontal_feedback_confirmed": True,
+            "horizontal_speed_mps": 1.05,
+            "forward_ratio": 1.0,
+            # 这是命令被拒前留下的速度缓存。
+            "value_age_ms": 10.0,
+        }
+        goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: goal,
+            send_axes=lambda side, x, y, pulse: False,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            motion_provider=lambda: motion,
+            turn_state_provider=lambda: self.turn_state,
+            complete_goal=lambda reason: None,
+            clock=lambda: self.now[0],
+        )
+
+        for _ in range(3):
+            navigator.tick()
+            self.now[0] += 0.25
+            goal["goal"]["age_seconds"] += 0.25
+        goal["goal"]["age_seconds"] = navigator.config.max_goal_age_s + 1.0
+        self.now[0] += 0.1
+        self.assertEqual(navigator.tick().reason, "goal_expired")
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"][
+            "execution_summary"
+        ]
+        self.assertEqual(summary["motion_evidence"]["speed_sample_count"], 0)
+        self.assertEqual(summary["motion_evidence"]["gated_progress_m"], 0.0)
+        self.assertNotEqual(
+            summary["direction_memory"]["recorded_state"], "verified_free"
+        )
+
+    def test_fresh_angular_samples_are_excluded_from_straight_line_mileage(self) -> None:
+        """AngularY 在移动期间更新时，那一拍的位移属于转弯，不能算进直行里程。"""
+        motion = {
+            "available": True,
+            "horizontal_feedback_confirmed": True,
+            "horizontal_speed_mps": 1.05,
+            "forward_ratio": 1.0,
+            "value_age_ms": 10.0,
+            # 新鲜的角速度包：VRChat 说人在转。
+            "angular_speed": 0.8,
+            "angular_age_ms": 20.0,
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            motion_provider=lambda: motion,
+            turn_state_provider=lambda: self.turn_state,
+            complete_goal=lambda reason: None,
+            clock=lambda: self.now[0],
+        )
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+        for _ in range(6):
+            navigator.tick()
+            self.now[0] += 0.25
+            self.goal["goal"]["age_seconds"] += 0.25
+        navigator.tick()
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertEqual(summary["motion_evidence"]["gated_progress_m"], 0.0)
+        self.assertTrue(
+            summary["direction_memory"]["recorded_turned_during_segment"]
+        )
+        # 一直在转就没有直行证据，不能记成走通。
+        self.assertNotEqual(
+            summary["direction_memory"]["recorded_state"], "verified_free"
+        )
+
+    def test_stale_angular_packet_does_not_veto_a_whole_straight_segment(self) -> None:
+        """AngularY 和 VelocityX/Z 回传时机不同；旧角速度包不能把整段标成转弯。"""
+        motion = {
+            "available": True,
+            "horizontal_feedback_confirmed": True,
+            "horizontal_speed_mps": 1.05,
+            "forward_ratio": 1.0,
+            "value_age_ms": 10.0,
+            # 上一次转向留下的包，早就过期了。
+            "angular_speed": 0.8,
+            "angular_age_ms": 4000.0,
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: True,
+            release_inputs=lambda side: None,
+            motion_provider=lambda: motion,
+            turn_state_provider=lambda: self.turn_state,
+            complete_goal=lambda reason: None,
+            clock=lambda: self.now[0],
+        )
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+            },
+        }
+        for _ in range(6):
+            navigator.tick()
+            self.now[0] += 0.25
+            self.goal["goal"]["age_seconds"] += 0.25
+        navigator.tick()
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertGreater(summary["motion_evidence"]["gated_progress_m"], 0.35)
+        self.assertFalse(
+            summary["direction_memory"]["recorded_turned_during_segment"]
+        )
+
+    def test_segment_dedupe_trim_drops_the_oldest_not_the_newest(self) -> None:
+        """裁剪必须按插入顺序：丢掉刚加进去的 id 等于允许同一次碰撞再记一次。
+
+        走真实的 ``_record_direction_memory_locked``，不在测试里重写一遍淘汰逻辑——
+        重写的版本会跟着测试自己走，实现改坏了也照样通过。
+        """
+        def feed(segment_id: str) -> None:
+            with self.navigator._lock:
+                self.navigator._record_direction_memory_locked(
+                    {
+                        "segment_id": segment_id,
+                        "requested_turn_deg": 0.0,
+                        "anchor_yaw_deg": 0.0,
+                        "stall_detected": True,
+                    },
+                    completion="blocked",
+                    now=self.now[0],
+                )
+
+        for index in range(70):
+            feed(f"wander:{index}")
+        recorded = self.navigator._direction_recorded_segments
+        self.assertEqual(len(recorded), 64)
+        # 最近的一定还在；最老的一定已经被丢掉。
+        self.assertIn("wander:69", recorded)
+        self.assertIn("wander:6", recorded)
+        self.assertNotIn("wander:0", recorded)
+        self.assertNotIn("wander:5", recorded)
+
+        # 淘汰之后重放最近的 id 仍要被当成同一段，不能再记一次账。
+        blocked_before = self.navigator.direction_advice()["records"][0][
+            "blocked_count"
+        ]
+        feed("wander:69")
+        self.assertEqual(
+            self.navigator.direction_advice()["records"][0]["blocked_count"],
+            blocked_before,
+        )
+
+    def test_world_change_resets_direction_memory(self) -> None:
+        """锚点只在一个世界里连续，换世界后旧扇区指向的是上个世界的墙。"""
+        now = self.now[0]
+        for offset in (0.0, 1.0):
+            self.navigator._direction_memory.record(
+                SegmentOutcome(bearing_deg=0.0, blocked=True, heading_deg=0.0),
+                now + offset,
+            )
+        self.assertTrue(self.navigator.should_refuse_bearing(0.0))
+        self.navigator.reset_direction_memory("world_changed")
+        self.assertFalse(self.navigator.should_refuse_bearing(0.0))
+        self.assertEqual(self.navigator.direction_advice()["records"], [])
 
     def test_wander_zero_turn_means_llm_explicitly_chose_straight(self) -> None:
         self.goal = {

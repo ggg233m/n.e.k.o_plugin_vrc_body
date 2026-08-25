@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -24,7 +25,7 @@ ALLOWED_SELECTOR_TYPES = frozenset({"npc", "player", "avatar", "person", "humano
 _SELECTOR_KEYS = frozenset({"semantic_type", "label", "min_confidence"})
 _CONSTRAINT_KEYS = frozenset({
     "max_duration_s", "max_scan_turns", "max_forward_axis",
-    "settle_seconds", "observe_seconds", "turn_deg",
+    "settle_seconds", "observe_seconds", "turn_deg", "direction_scores",
 })
 
 
@@ -67,6 +68,30 @@ def _normalize_selector(value: Any) -> dict[str, Any] | None:
     if not result:
         raise ValueError("selector must contain semantic_type or label")
     return result
+
+
+def _normalize_direction_scores(value: Any) -> dict[str, float] | None:
+    """归一化主 LLM 的方向偏好；坏键/坏值不应让整段 wander 失败。"""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("constraints.direction_scores must be an object")
+    result: dict[str, float] = {}
+    for raw_key, raw_score in list(value.items())[:16]:
+        key = str(raw_key or "").replace("\x00", "").strip()[:32]
+        if not key:
+            continue
+        if isinstance(raw_score, bool):
+            continue
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(score):
+            continue
+        # 这是偏好分，不是概率；夹断异常输出比拒绝整条移动目标更安全。
+        result[key] = min(1.0, max(0.0, score))
+    return result or None
 
 
 def _normalize_constraints(value: Any) -> dict[str, Any] | None:
@@ -124,6 +149,9 @@ def _normalize_constraints(value: Any) -> dict[str, Any] | None:
             -45.0,
             45.0,
         )
+    direction_scores = _normalize_direction_scores(value.get("direction_scores"))
+    if direction_scores is not None:
+        result["direction_scores"] = direction_scores
     return result or None
 
 
@@ -162,9 +190,13 @@ class AutonomyRuntime:
         release_inputs: Callable[[], None],
         clock: Callable[[], float] = time.monotonic,
         session_ttl_s: float = 1800.0,
+        on_world_changed: Callable[[], None] | None = None,
     ) -> None:
         self._world_provider = world_provider
         self._release_inputs = release_inputs
+        # 换世界时通知宿主丢弃与旧世界绑定的本地状态（方向记忆的朝向锚点等）。
+        # 不做成通用事件总线：只有这一个事件需要跨出授权层。
+        self._on_world_changed = on_world_changed
         self._clock = clock
         self._session_ttl_s = min(3600.0, max(60.0, float(session_ttl_s)))
         self._lock = threading.RLock()
@@ -321,6 +353,13 @@ class AutonomyRuntime:
             ):
                 self._disarm_locked("world_changed")
                 self._release_inputs()
+                if self._on_world_changed is not None:
+                    # 换世界后方向记忆里的扇区指向的都是上个世界的墙，留着只会
+                    # 拒绝本来能走的方向。回调失败不能连带影响解除授权。
+                    try:
+                        self._on_world_changed()
+                    except Exception:
+                        pass
                 return
             if self._goal is None:
                 return

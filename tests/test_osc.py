@@ -378,6 +378,22 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.assertIsNone(motion["upright"])
         self.assertIsNone(motion["angular_speed"])
 
+    def test_angular_sample_carries_its_own_age(self) -> None:
+        """AngularY 和 VelocityX/Z 各有各的回传时机，不能共用 value_age_ms。
+
+        共用会让「这一拍转过没有」误判成「这一段一直在转」，而门控积分正是靠这个
+        判据丢弃转向拍——判错就等于把整段直行里程扔掉。
+        """
+        self._feed("AngularY", 0.8)
+        self.now[0] += 3.0
+        self._feed("VelocityX", 0.0)
+        self._feed("VelocityZ", 1.05)
+        motion = self.bridge.motion_feedback(max_age_ms=2000)
+        self.assertTrue(motion["available"], motion["reason"])
+        # 速度是刚收到的，角速度是三秒前的旧包。
+        self.assertLess(motion["value_age_ms"], 100.0)
+        self.assertGreaterEqual(motion["angular_age_ms"], 3000.0)
+
     def test_awareness_surfaces_motion_and_keeps_action_summary_readable(self) -> None:
         self._feed("NEKO_Action", 2)
         self._feed("VelocityX", 0.0)

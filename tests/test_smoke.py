@@ -76,6 +76,7 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("wander", goal_properties["kind"]["enum"])
         self.assertIn("observe_seconds", goal_properties["constraints"]["properties"])
         self.assertIn("turn_deg", goal_properties["constraints"]["properties"])
+        self.assertIn("direction_scores", goal_properties["constraints"]["properties"])
         self.assertIn("导航器不会自行选择", tool_defs.VRC_AUTONOMY_GOAL["description"])
         self.assertIn("based_on_revision", goal_properties)
         wander_step = tool_defs.VRC_WANDER_STEP
