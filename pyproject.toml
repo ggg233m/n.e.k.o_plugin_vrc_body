@@ -1,6 +1,6 @@
 [project]
 name = "neko_anyadance_body"
-version = "0.13.19"
+version = "0.13.21"
 requires-python = ">=3.11"
 dependencies = []
 

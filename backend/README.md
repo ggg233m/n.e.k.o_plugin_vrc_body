@@ -171,9 +171,16 @@ Hosted 插件的动作、移动和 OSC 调用使用后端的持久 HTTP/1.1 控�
 盲目向前走。只有用户明确提交的 `depart`/`wander` 可以不绑定实体：前者短时后退；
 后者必须带上多模态 LLM 根据最新画面选择的 `constraints.turn_deg`，并且只执行最多
 3 秒的一条短路段。后台 Agent 若漏传角度，后端只建立 `pending_route` 内存单槽，把配对
-画面主动交回主多模态 LLM 调用 `vrc_autonomy_goal`；在该调用返回 `accepted=true` 前不会
-发送移动输入。导航器负责转向落地、避撞和停车，但绝不自行选择下一条闲逛路线。
+画面主动交回主多模态 LLM 调用 `vrc_wander_step(direction=left|forward|right)`；插件会
+把调用自动绑定到自己刚注入的精确请求 ID，模型不复制 revision。该协议没有 target_id、
+target_ref 或 selector，后端也会显式以 `target_binding=none` 提交 wander，因此不会把
+空间方向误绑定成某个角色。任务被替换、取消、超过画面执行期限或请求不匹配时直接拒绝；
+在工具返回 `accepted=true` 前不会发送移动输入。导航器负责转向落地、避撞和停车，但绝不
+自行选择下一条闲逛路线。
 单段结束后宿主只推送一次终态和最新画面，由 LLM 决定下一段、改为接近可见目标或停止。
+终态同时附带纯内存 `execution_summary`：分别记录 LLM 请求角度、成功提交的命令累计、
+每次 recover 的触发原因/方向/是否提交、计时器重置次数，以及调度器虚拟 HMD 的输出朝向
+变化。后者明确标为 `world_observation_verified=false`，不得冒充 VRChat 世界实测朝向。
 `GET /snapshot`、`GET /perception`
 和 `GET /autonomy` 的 `navigation` 字段会报告当前决策、脉冲计数和停止原因。
 普通 Agent 的一次 `approach` 会在后端转换为有限的 `approach_observe`：本地依次完成
@@ -253,6 +260,7 @@ AnyaDance 虚拟 Index 输入使用 `POST /input/axes`、`POST /input/button` �
 `POST /input/release`；同一 UDP 发送线程将控制器叠加到 VMC/动作帧，旧输入采用
 latest-wins，轴和按钮到期自动释放。`GET /autonomy`、`POST /autonomy/arm`、
 `POST /autonomy/disarm`、`POST /autonomy/goal`、`POST /autonomy/stop` 管理手动授权；
+`POST /autonomy/wander-step` 只供宿主把当前配对路线任务原子转换为单段闲逛，不接受人物；
 `GET /world/delta?after_revision=N&wait_ms=250` 用 revision 长轮询世界变化。
 
 视觉采集可以在后端运行期间独立启停，不需要重启 AnyaDance/OSC 控制链路：

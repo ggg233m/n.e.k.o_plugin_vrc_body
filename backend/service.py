@@ -63,6 +63,13 @@ TURN_SPEED_DPS = 180.0
 # 思考数秒后仍能提交 T1/T2；真正执行前还会重新确认稳定 ID 当前可见。
 _TARGET_REF_CACHE_TTL_S = 60.0
 _TARGET_REF_CACHE_LIMIT = 16
+# 这只是把主 LLM 的离散空间选择映射为一条短转向；它不是人物选择器，不能
+# 携带或推导 target_id。
+_WANDER_DIRECTION_TURN_DEG = {
+    "left": 25.0,
+    "forward": 0.0,
+    "right": -25.0,
+}
 
 
 def _effective_detector_interval_ms(config: Any, detector: Any | None) -> int:
@@ -851,6 +858,121 @@ class BackendService:
             else:
                 self.vision.clear_main_llm_semantic_request("goal_replaced_without_selector")
         return result
+
+    def autonomy_wander_step(
+        self,
+        direction: Any,
+        route_request_id: Any,
+    ) -> dict[str, Any]:
+        """消费主 LLM 当前路线任务并提交一段不绑定人物的短闲逛。"""
+        normalized_direction = str(direction or "").replace("\x00", "").strip().lower()
+        if normalized_direction not in _WANDER_DIRECTION_TURN_DEG:
+            return {
+                **self.autonomy_snapshot(),
+                "accepted": False,
+                "movement_started": False,
+                "reason_code": "invalid_wander_direction",
+                "reason": "direction must be left, forward or right",
+            }
+        normalized_request_id = (
+            str(route_request_id or "").replace("\x00", "").strip()[:128]
+        )
+        if not normalized_request_id:
+            return {
+                **self.autonomy_snapshot(),
+                "accepted": False,
+                "movement_started": False,
+                "reason_code": "route_request_id_required",
+                "reason": "no injected main-LLM wander route is bound to this call",
+            }
+
+        # 用服务锁把“核对待决意图 → 消费精确图片请求 → 提交目标”串成一个原子
+        # 控制事务，避免迟到工具调用覆盖用户刚提交的新目标。
+        with self._lock:
+            pending = self._pending_semantic_intent
+            if not isinstance(pending, Mapping) or pending.get("route_planning") is not True:
+                return {
+                    **self.autonomy_snapshot(),
+                    "accepted": False,
+                    "movement_started": False,
+                    "reason_code": "no_pending_wander_route",
+                    "reason": "there is no pending main-LLM wander route",
+                }
+            expected_request_id = str(pending.get("request_id") or "")[:128]
+            if normalized_request_id != expected_request_id:
+                return {
+                    **self.autonomy_snapshot(),
+                    "accepted": False,
+                    "movement_started": False,
+                    "reason_code": "wander_route_request_mismatch",
+                    "reason": "the injected route request was replaced before execution",
+                }
+            claimed = self.vision.consume_main_llm_route_request(
+                normalized_request_id
+            )
+            if not claimed.get("accepted"):
+                reason_code = str(claimed.get("reason_code") or "route_request_rejected")
+                if reason_code not in {
+                    "route_request_id_mismatch",
+                    "request_is_not_wander_route",
+                }:
+                    self._pending_semantic_intent = None
+                return {
+                    **self.autonomy_snapshot(),
+                    "accepted": False,
+                    "movement_started": False,
+                    "reason_code": reason_code,
+                    "reason": "the paired wander-route frame is no longer executable",
+                    "route_request": dict(claimed),
+                }
+
+            pending = dict(pending)
+            self._pending_semantic_intent = None
+            raw_constraints = (
+                dict(pending.get("constraints") or {})
+                if isinstance(pending.get("constraints"), Mapping) else {}
+            )
+            try:
+                requested_duration = float(raw_constraints.get("max_duration_s", 2.0))
+            except (TypeError, ValueError, OverflowError):
+                requested_duration = 2.0
+            if not math.isfinite(requested_duration):
+                requested_duration = 2.0
+            constraints: dict[str, Any] = {
+                "turn_deg": _WANDER_DIRECTION_TURN_DEG[normalized_direction],
+                "max_duration_s": min(3.0, max(1.0, requested_duration)),
+            }
+            try:
+                forward_axis = float(raw_constraints.get("max_forward_axis"))
+            except (TypeError, ValueError, OverflowError):
+                forward_axis = math.nan
+            if math.isfinite(forward_axis) and 0.05 <= forward_axis <= 1.0:
+                constraints["max_forward_axis"] = forward_axis
+
+            # 明确传入 target_id=None、selector=None。路线方向永远不能升级为人物
+            # 绑定；要接近或跟随人物必须重新走 T 编号与稳定 ID 流程。
+            result = self.autonomy_goal(
+                pending.get("text") or "在附近随便逛逛",
+                "wander",
+                None,
+                None,
+                constraints,
+                claimed.get("frame_revision"),
+            )
+            return {
+                "action": "wander",
+                "movement_started": bool(result.get("accepted")),
+                "resolved_by": "main_llm_wander_step",
+                "direction": normalized_direction,
+                "route_binding": {
+                    "request_id": normalized_request_id,
+                    "frame_revision": claimed.get("frame_revision"),
+                    "request_age_ms": claimed.get("request_age_ms"),
+                    "frame_age_ms": claimed.get("frame_age_ms"),
+                    "target_binding": "none",
+                },
+                **result,
+            }
 
     @staticmethod
     def _visible_entity_by_id(
@@ -1827,8 +1949,8 @@ class BackendService:
                     "reason": "this request requires a wander goal, not a semantic classification",
                     "movement_started": False,
                     "instruction": (
-                        "查看配对画面后调用 vrc_autonomy_goal(kind='wander')，"
-                        "并在 constraints.turn_deg 填入 -45 到 45 度；不要调用 vrc_semantic_commit。"
+                        "查看配对画面后调用 vrc_wander_step，只提交 left、forward 或 right；"
+                        "请求与 revision 由插件自动绑定，不要调用 vrc_semantic_commit。"
                     ),
                 }
         result = self.vision.commit_main_llm_semantics(

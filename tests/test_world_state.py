@@ -1200,6 +1200,48 @@ class VisionRuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_wander_route_request_requires_exact_id_and_fresh_frame(self) -> None:
+        """路线消费只认原请求，且不会让静态方向决定存活超过执行时限。"""
+        now = [1.0]
+        runtime = VisionRuntime(
+            WorldStateStore(clock=lambda: now[0]),
+            main_llm_semantic=True,
+            frame_cache_interval_s=0.0,
+            clock=lambda: now[0],
+        )
+        try:
+            runtime.process_frame(b"jpeg", observed_at=1.0)
+            created = runtime.request_main_llm_semantics(
+                {"semantic_type": "object"},
+                reason="agent_wander_direction_unresolved",
+                force=True,
+            )
+            mismatch = runtime.consume_main_llm_route_request(
+                created["request_id"] + ":old"
+            )
+            self.assertFalse(mismatch["accepted"])
+            self.assertEqual(mismatch["reason_code"], "route_request_id_mismatch")
+
+            now[0] = 22.0
+            expired = runtime.consume_main_llm_route_request(created["request_id"])
+            self.assertFalse(expired["accepted"])
+            self.assertEqual(expired["reason_code"], "wander_route_frame_expired")
+
+            runtime.process_frame(b"jpeg", observed_at=22.0)
+            renewed = runtime.request_main_llm_semantics(
+                {"semantic_type": "object"},
+                reason="agent_wander_direction_unresolved",
+                force=True,
+            )
+            consumed = runtime.consume_main_llm_route_request(renewed["request_id"])
+            self.assertTrue(consumed["accepted"])
+            self.assertEqual(consumed["target_binding"], "none")
+            status = runtime.status()["main_llm_semantic"]
+            self.assertEqual(status["route_requests_consumed"], 1)
+            self.assertIsNone(status["request_id"])
+        finally:
+            runtime.close()
+
     def test_detect_interval_throttles_inference_without_erasing_the_world(self) -> None:
         """检测占空比是 CPU 上限的第二个轴，但跳帧不能变成"看到了空场景"。
 

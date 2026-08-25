@@ -30,6 +30,11 @@ _CLIPPED_REACH_FACTOR = 0.6
 # 执行、避撞和停车；每段完成后由宿主带一张新画面唤醒 LLM 决定下一段。
 _WANDER_DEFAULT_STEP_S = 2.0
 _WANDER_MAX_STEP_S = 3.0
+# 自由移动的前进轴上限按行为分开：wander 是朝着可见空地巡航，depart 是背对观察点
+# 后退，看不见身后，所以更慢。两个值只在这里定义，执行侧和终态摘要共用同一份解析，
+# 避免回报给主 LLM 的 requested 与实际推的摇杆漂移。
+_WANDER_MAX_FORWARD_AXIS = 0.45
+_DEPART_MAX_FORWARD_AXIS = 0.35
 # 闲逛时没有“目标方向”可以容忍斜走；forward_ratio=0.738 的实机贴墙滑行对
 # 普通目标导航尚可接受，对自由巡航则应尽快绕开。这里只收紧 wander，不改变
 # 已经用正负样本校准过的全局 0.55 阈值。
@@ -417,6 +422,11 @@ class LocalNavigator:
         # 自己挑下一条路线。
         self._wander_turn_sent = False
         self._wander_segment_started_at: float | None = None
+        # 每条 wander 只保留一个有界的内存执行摘要。它记录主模型请求、实际提交
+        # 给调度器的转向，以及调度器虚拟 HMD 输出朝向的变化；后者仍不是 VRChat
+        # 世界实测朝向，终态字段会明确标注来源。不会保存逐帧图片或写硬盘。
+        self._wander_trace_sequence = 0
+        self._wander_trace: dict[str, Any] | None = None
         # target_id -> 记录到期的时刻。刻意不随换目标清空：「连续顶着它推摇杆
         # 一动不动」是关于那个实体的实测事实，换一句目标文本不会让墙消失。
         self._unreachable: dict[str, float] = {}
@@ -485,15 +495,26 @@ class LocalNavigator:
         try:
             goal_state = self._goal_provider()
             world = self._world_provider()
-            self._pre_tick_goal_check(goal_state)
+            goal = _mapping((goal_state or {}).get("goal")) or {}
+            goal_kind = str(goal.get("kind") or "").strip().lower()
+            with self._lock:
+                trace_active = self._wander_trace is not None
+            turn_state_before = (
+                self._sample_turn_output_state()
+                if goal_kind == "wander" or trace_active else None
+            )
+            self._pre_tick_goal_check(
+                goal_state,
+                now=now,
+                turn_state=turn_state_before,
+            )
+            self._record_wander_output_heading(turn_state_before)
             base_decision = self._decide(goal_state, world, now)
             directed_decision = self._direct_behavior(base_decision, goal_state, now)
             decision = self._stall_guard(directed_decision, goal_state, now)
             applied = self._apply(decision, now)
             self._explorer.record_applied(decision.reason, applied)
             if applied:
-                goal = _mapping((goal_state or {}).get("goal")) or {}
-                goal_kind = str(goal.get("kind") or "").strip().lower()
                 with self._lock:
                     if decision.reason == "wander_llm_turn":
                         self._wander_turn_sent = True
@@ -503,6 +524,17 @@ class LocalNavigator:
                         # 绕墙转向已经改变了路线；从转向完成后重新给这一段完整预算，
                         # 避免刚绕开墙就被旧路段计时器立刻要求再转一次。
                         self._wander_segment_started_at = now
+            turn_state_after = (
+                self._sample_turn_output_state()
+                if goal_kind == "wander" or trace_active else None
+            )
+            self._record_wander_execution(
+                decision,
+                applied,
+                now,
+                goal_kind=goal_kind,
+                turn_state=turn_state_after,
+            )
             with self._lock:
                 self._last_error = None
                 self._last_decision = decision
@@ -517,7 +549,13 @@ class LocalNavigator:
                 self._last_decision = decision
             return decision
 
-    def _pre_tick_goal_check(self, goal_state: Mapping[str, Any] | None) -> None:
+    def _pre_tick_goal_check(
+        self,
+        goal_state: Mapping[str, Any] | None,
+        *,
+        now: float | None = None,
+        turn_state: Mapping[str, Any] | None = None,
+    ) -> None:
         """在 _decide 之前处理目标切换，保证 _decide 拿到的 skip_ids 已经反映了
         当前目标的新鲜度。
 
@@ -546,6 +584,9 @@ class LocalNavigator:
                 # 绕行预算随闩锁一起归零：LLM 换了目标就是新的一次尝试，不该
                 # 背着上一个目标用掉的次数。
                 self._recover_attempts = 0
+                # 绕行方向在一个路段内锁定，但不跨路段：新目标面对的地形不同，
+                # 应重新由第一次滑行取样决定，而不是继承上一段的偏向。
+                self._recover_sign = 1.0
                 self._completion_notified_goal_key = None
                 self._behavior_target_lost_at = None
                 self._behavior_outcome_notified = None
@@ -557,6 +598,14 @@ class LocalNavigator:
                 # turn_deg=0 明确表示 LLM 选择直行，不需要伪造一条零度转向命令。
                 self._wander_turn_sent = bool(turn_deg is not None and abs(turn_deg) <= 0.5)
                 self._wander_segment_started_at = None
+                if next_kind == "wander":
+                    self._start_wander_trace_locked(
+                        goal,
+                        self._clock() if now is None else now,
+                        turn_state,
+                    )
+                else:
+                    self._wander_trace = None
                 # 目标文本真的变了才清空拉黑列表，给每个实体一次重试机会。
                 # 同一句目标重提（age 倒退）= 「再试一次」，地形没变，不重置；
                 # 镜面倒影之类的会在新目标文本后立刻再次触发失速并重新记账。
@@ -565,6 +614,315 @@ class LocalNavigator:
                     self._target_observation = None
             self._stall_goal_key = goal_key
             self._stall_goal_age = goal_age
+
+    @staticmethod
+    def _turn_direction_by_contract(turn_deg: float) -> str:
+        """按 wander 对外契约解释方向；这不是实测世界旋转方向。"""
+        if turn_deg > 0.5:
+            return "left"
+        if turn_deg < -0.5:
+            return "right"
+        return "straight"
+
+    def _sample_turn_output_state(self) -> dict[str, Any] | None:
+        """读取调度器虚拟 HMD 朝向；读取失败不影响导航，只让摘要降级。"""
+        provider = self._turn_state_provider
+        if provider is None:
+            return None
+        try:
+            state = provider()
+        except Exception:
+            return None
+        if not isinstance(state, Mapping) or state.get("available") is False:
+            return None
+        yaw = _finite(state.get("yaw_deg"))
+        if yaw is None:
+            return None
+        commands = _finite(state.get("turn_commands"))
+        return {
+            "yaw_deg": yaw % 360.0,
+            "turning": bool(state.get("turning")),
+            "turn_commands": None if commands is None else int(commands),
+        }
+
+    def _free_roam_params(
+        self,
+        goal: Mapping[str, Any],
+        kind: str,
+    ) -> dict[str, Any]:
+        """解析一次自由移动的请求参数。
+
+        执行侧和 wander 终态摘要都只能走这里。两边各自夹取过一次，任何一侧改了
+        上限都会让回报给主 LLM 的 requested 偏离实际推的摇杆，而这种偏差恰好是
+        execution_summary 想消除的东西。
+
+        ``duration`` 对 depart 保留原始请求值，因为 depart 用它和 age_seconds
+        直接比较判完成；wander 的时长在这里就夹进 [1, _WANDER_MAX_STEP_S]。
+        """
+        constraints = _mapping(goal.get("constraints")) or {}
+        is_depart = kind == "depart"
+        duration = _finite(constraints.get("max_duration_s"))
+        if duration is None:
+            duration = 2.0 if is_depart else _WANDER_DEFAULT_STEP_S
+        if not is_depart:
+            duration = min(_WANDER_MAX_STEP_S, max(1.0, duration))
+        max_axis = _finite(constraints.get("max_forward_axis"))
+        axis = min(
+            self.config.max_forward_axis,
+            _DEPART_MAX_FORWARD_AXIS if is_depart else _WANDER_MAX_FORWARD_AXIS,
+            self.config.max_forward_axis if max_axis is None else max_axis,
+        )
+        return {
+            "turn_deg": _finite(constraints.get("turn_deg")),
+            "duration_s": duration,
+            "forward_axis": axis,
+        }
+
+    def _start_wander_trace_locked(
+        self,
+        goal: Mapping[str, Any],
+        now: float,
+        turn_state: Mapping[str, Any] | None,
+    ) -> None:
+        """开始一条有界内存轨迹；调用方必须持有 ``_lock``。"""
+        params = self._free_roam_params(goal, "wander")
+        requested_turn = params["turn_deg"] or 0.0
+        requested_duration = params["duration_s"]
+        requested_axis = params["forward_axis"]
+        yaw = _finite((turn_state or {}).get("yaw_deg"))
+        commands = _finite((turn_state or {}).get("turn_commands"))
+        self._wander_trace_sequence += 1
+        self._wander_trace = {
+            "segment_id": f"wander:{self._wander_trace_sequence}",
+            "started_at_monotonic": now,
+            "requested_turn_deg": requested_turn,
+            "requested_duration_s": requested_duration,
+            "requested_forward_axis": requested_axis,
+            "initial_turn_required": abs(requested_turn) > 0.5,
+            "initial_turn_submitted": abs(requested_turn) <= 0.5,
+            "submitted_turn_delta_deg": 0.0,
+            "recoveries": [],
+            "segment_timer_reset_count": 0,
+            "forward_command_count": 0,
+            "output_heading_delta_deg": 0.0,
+            "output_heading_last_yaw_deg": None if yaw is None else yaw % 360.0,
+            "output_heading_sample_count": 0 if yaw is None else 1,
+            "turn_commands_start": None if commands is None else int(commands),
+            "turn_commands_end": None if commands is None else int(commands),
+            "motion_feedback_observed": False,
+            "wall_slide_detected": False,
+            "stall_detected": False,
+            "speed_sample_count": 0,
+            "last_horizontal_speed_mps": None,
+            "last_forward_ratio": None,
+        }
+
+    def _record_wander_output_heading(
+        self,
+        turn_state: Mapping[str, Any] | None,
+    ) -> None:
+        """累计调度器输出朝向变化；用最短圆周差处理 0/360 度回绕。"""
+        if not isinstance(turn_state, Mapping):
+            return
+        yaw = _finite(turn_state.get("yaw_deg"))
+        commands = _finite(turn_state.get("turn_commands"))
+        if yaw is None:
+            return
+        yaw %= 360.0
+        with self._lock:
+            trace = self._wander_trace
+            if trace is None:
+                return
+            previous = _finite(trace.get("output_heading_last_yaw_deg"))
+            if previous is not None:
+                delta = (yaw - previous + 180.0) % 360.0 - 180.0
+                trace["output_heading_delta_deg"] = (
+                    float(trace.get("output_heading_delta_deg", 0.0)) + delta
+                )
+            trace["output_heading_last_yaw_deg"] = yaw
+            trace["output_heading_sample_count"] = int(
+                trace.get("output_heading_sample_count", 0)
+            ) + 1
+            if commands is not None:
+                trace["turn_commands_end"] = int(commands)
+
+    def _record_wander_execution(
+        self,
+        decision: NavigationDecision,
+        applied: bool,
+        now: float,
+        *,
+        goal_kind: str,
+        turn_state: Mapping[str, Any] | None,
+    ) -> None:
+        """记录本段命令与恢复事件；所有列表都有固定上限且只驻留内存。"""
+        self._record_wander_output_heading(turn_state)
+        with self._lock:
+            trace = self._wander_trace
+            if trace is None or goal_kind != "wander":
+                return
+            if decision.reason == "wander_llm_turn":
+                trace["initial_turn_submitted"] = bool(applied)
+                if applied:
+                    trace["submitted_turn_delta_deg"] = (
+                        float(trace.get("submitted_turn_delta_deg", 0.0))
+                        + float(decision.turn_deg)
+                    )
+            elif decision.state == "recover":
+                recoveries = trace.get("recoveries")
+                if not isinstance(recoveries, list):
+                    recoveries = []
+                    trace["recoveries"] = recoveries
+                trigger = (
+                    "wall_slide"
+                    if decision.reason.startswith("auto_recover_slide")
+                    else "forward_stall"
+                )
+                if len(recoveries) < 20:
+                    recoveries.append({
+                        "sequence": len(recoveries) + 1,
+                        "trigger": trigger,
+                        "turn_deg": round(float(decision.turn_deg), 2),
+                        "direction_by_contract": self._turn_direction_by_contract(
+                            float(decision.turn_deg)
+                        ),
+                        "turn_submitted": bool(applied),
+                        "backed_up": bool(decision.y < -1e-6),
+                    })
+                if trigger == "wall_slide":
+                    trace["wall_slide_detected"] = True
+                else:
+                    trace["stall_detected"] = True
+                if applied:
+                    trace["submitted_turn_delta_deg"] = (
+                        float(trace.get("submitted_turn_delta_deg", 0.0))
+                        + float(decision.turn_deg)
+                    )
+                    trace["segment_timer_reset_count"] = int(
+                        trace.get("segment_timer_reset_count", 0)
+                    ) + 1
+            elif decision.reason == "wander_forward" and applied:
+                trace["forward_command_count"] = int(
+                    trace.get("forward_command_count", 0)
+                ) + 1
+
+            motion = self._last_motion
+            if isinstance(motion, Mapping) and decision.state in {"advance", "recover"}:
+                if motion.get("available"):
+                    trace["motion_feedback_observed"] = True
+                speed = _finite(motion.get("horizontal_speed_mps"))
+                ratio = _finite(motion.get("forward_ratio"))
+                if speed is not None:
+                    trace["speed_sample_count"] = int(
+                        trace.get("speed_sample_count", 0)
+                    ) + 1
+                    trace["last_horizontal_speed_mps"] = speed
+                if ratio is not None:
+                    trace["last_forward_ratio"] = ratio
+            if decision.reason == "movement_stalled":
+                trace["stall_detected"] = True
+
+    def _wander_execution_summary_locked(
+        self,
+        decision: NavigationDecision,
+        now: float,
+    ) -> dict[str, Any] | None:
+        """生成供主 LLM 消费的紧凑终态；调用方必须持有 ``_lock``。"""
+        trace = self._wander_trace
+        if trace is None:
+            return None
+        requested_turn = float(trace.get("requested_turn_deg", 0.0))
+        submitted_turn = float(trace.get("submitted_turn_delta_deg", 0.0))
+        recoveries = [
+            dict(item)
+            for item in (trace.get("recoveries") or ())[:20]
+            if isinstance(item, Mapping)
+        ]
+        submitted_recoveries = sum(
+            1 for item in recoveries if item.get("turn_submitted") is True
+        )
+        if decision.reason == "wander_step_complete":
+            completion = (
+                "completed_after_recovery" if submitted_recoveries else "completed_clean"
+            )
+        elif decision.reason == "movement_stalled":
+            completion = (
+                "blocked_after_recovery" if submitted_recoveries else "blocked"
+            )
+        elif decision.reason == "goal_expired":
+            completion = "expired"
+        else:
+            completion = "stopped"
+        start = _finite(trace.get("started_at_monotonic"))
+        if start is None:
+            start = now
+        final_leg_ms = (
+            None
+            if self._wander_segment_started_at is None
+            else round(max(0.0, now - self._wander_segment_started_at) * 1000.0, 1)
+        )
+        heading_samples = int(trace.get("output_heading_sample_count", 0))
+        heading_delta = (
+            round(float(trace.get("output_heading_delta_deg", 0.0)), 2)
+            if heading_samples >= 2 else None
+        )
+        start_commands = trace.get("turn_commands_start")
+        end_commands = trace.get("turn_commands_end")
+        command_count_delta = (
+            int(end_commands) - int(start_commands)
+            if isinstance(start_commands, int) and isinstance(end_commands, int)
+            else None
+        )
+        return {
+            "segment_id": str(trace.get("segment_id") or "wander:unknown")[:64],
+            "completion": completion,
+            "requested": {
+                "turn_deg": round(requested_turn, 2),
+                "duration_s": round(float(trace.get("requested_duration_s", 0.0)), 2),
+                "forward_axis": round(float(trace.get("requested_forward_axis", 0.0)), 3),
+            },
+            "execution": {
+                # submitted 是调用方返回成功的命令累计，不保证 VRChat 已呈现同样角度。
+                "submitted_turn_delta_deg": round(submitted_turn, 2),
+                "submitted_deviation_from_request_deg": round(
+                    submitted_turn - requested_turn, 2
+                ),
+                # output 来自调度器虚拟 HMD 内部 yaw，比 submit 更接近输出，但仍不是
+                # VRChat 世界回传；字段名和 verified 标志禁止上层把它当作实测真值。
+                "output_heading_delta_deg": heading_delta,
+                "output_heading_source": "scheduler_virtual_hmd",
+                "world_observation_verified": False,
+                "turn_command_count_delta": command_count_delta,
+                "initial_turn_required": bool(trace.get("initial_turn_required")),
+                "initial_turn_submitted": bool(trace.get("initial_turn_submitted")),
+                "total_elapsed_ms": round(max(0.0, now - start) * 1000.0, 1),
+                "final_leg_elapsed_ms": final_leg_ms,
+                "segment_timer_reset_count": int(
+                    trace.get("segment_timer_reset_count", 0)
+                ),
+                "forward_command_count": int(trace.get("forward_command_count", 0)),
+            },
+            "recoveries": recoveries,
+            "motion_evidence": {
+                "velocity_feedback_observed": bool(
+                    trace.get("motion_feedback_observed")
+                ),
+                "wall_slide_detected": bool(trace.get("wall_slide_detected")),
+                "stall_detected": bool(trace.get("stall_detected")),
+                "speed_sample_count": int(trace.get("speed_sample_count", 0)),
+                "last_horizontal_speed_mps": (
+                    None
+                    if _finite(trace.get("last_horizontal_speed_mps")) is None
+                    else round(float(trace["last_horizontal_speed_mps"]), 4)
+                ),
+                "last_forward_ratio": (
+                    None
+                    if _finite(trace.get("last_forward_ratio")) is None
+                    else round(float(trace["last_forward_ratio"]), 4)
+                ),
+            },
+            "turn_sign_convention": "positive_left_negative_right",
+        }
 
     def _notify_goal_complete(self, decision: NavigationDecision) -> None:
         """有限行为完成或到期后只通知一次，并释放上层目标。"""
@@ -708,6 +1066,7 @@ class LocalNavigator:
             "wander_step_complete",
             "movement_stalled",
             "target_unreachable",
+            "goal_expired",
         }
         if decision.reason not in outcome_reasons:
             return
@@ -720,7 +1079,7 @@ class LocalNavigator:
                 return
             self._behavior_outcome_notified = outcome_key
             self._behavior_outcome_sequence += 1
-            self._behavior_last_outcome = {
+            outcome = {
                 "sequence": self._behavior_outcome_sequence,
                 "reason": decision.reason,
                 "state": decision.state,
@@ -729,6 +1088,11 @@ class LocalNavigator:
                 "observed_age_ms": decision.observed_age_ms,
                 "occurred_at_monotonic": now,
             }
+            if goal_key[0].strip().lower() == "wander":
+                execution_summary = self._wander_execution_summary_locked(decision, now)
+                if execution_summary is not None:
+                    outcome["execution_summary"] = execution_summary
+            self._behavior_last_outcome = outcome
 
     def _stall_guard(
         self,
@@ -918,7 +1282,14 @@ class LocalNavigator:
                 attempt = self._recover_attempts
                 if slip_ratio is not None and abs(slip_ratio) > 1e-3:
                     # 正贴着墙滑，滑行方向就是几何上可通行的方向：跟着它转。
-                    self._recover_sign = 1.0 if slip_ratio > 0.0 else -1.0
+                    #
+                    # 但只有本路段的第一次绕行才允许由滑行方向定调。转开之后往往
+                    # 会蹭上邻墙，那一面的 slip_ratio 符号相反；若每次都重新取样，
+                    # 就会 -55/+55/-55 原地对撞，把绕行预算耗在摆动上而不是脱困
+                    # （实机复现：三次绕行净转向 -30°，最终仍 movement_stalled）。
+                    # 方向一旦选定就锁到路段结束，让连续几次绕行朝同一侧累积。
+                    if attempt <= 1:
+                        self._recover_sign = 1.0 if slip_ratio > 0.0 else -1.0
                     reason = "auto_recover_slide"
                     back_axis = 0.0
                 else:
@@ -1518,19 +1889,13 @@ class LocalNavigator:
     ) -> NavigationDecision:
         """执行有限后退或一条由 LLM 规划的闲逛路段，不伪造导航对象。"""
         kind = str(goal.get("kind") or "").strip().lower()
-        constraints = _mapping(goal.get("constraints")) or {}
         age_s = _finite(goal.get("age_seconds")) or 0.0
-        duration = _finite(constraints.get("max_duration_s"))
-        duration = (2.0 if kind == "depart" else _WANDER_DEFAULT_STEP_S) if duration is None else duration
+        params = self._free_roam_params(goal, kind)
+        duration = params["duration_s"]
+        axis = params["forward_axis"]
         if kind == "depart" and age_s >= duration:
             return NavigationDecision("stop", "depart_complete")
 
-        max_axis = _finite(constraints.get("max_forward_axis"))
-        axis = min(
-            self.config.max_forward_axis,
-            0.35 if kind == "depart" else 0.45,
-            self.config.max_forward_axis if max_axis is None else max_axis,
-        )
         if kind == "depart":
             # 短时后退只用于离开当前观察点，不依赖人物框，也不把倒退速度套进
             # “向前分量”失速判据。
@@ -1559,7 +1924,7 @@ class LocalNavigator:
             return NavigationDecision(
                 "stop", "world_uncertain", revision=revision, observed_age_ms=observed_age
             )
-        turn_deg = _finite(constraints.get("turn_deg"))
+        turn_deg = params["turn_deg"]
         if turn_deg is None:
             # 正常入口会在 AutonomyRuntime 拒绝这种目标；这里仍做最后一道防御，
             # 保证第三方 provider 不能让导航器自行决定路线。
@@ -1569,7 +1934,6 @@ class LocalNavigator:
                 revision=revision,
                 observed_age_ms=observed_age,
             )
-        duration = min(_WANDER_MAX_STEP_S, max(1.0, duration))
         with self._lock:
             turn_sent = self._wander_turn_sent
             segment_started_at = self._wander_segment_started_at

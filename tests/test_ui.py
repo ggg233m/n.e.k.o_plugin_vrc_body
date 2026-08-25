@@ -13,7 +13,7 @@ class HostedUiTests(unittest.TestCase):
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         with (ROOT / "plugin.toml").open("rb") as handle:
             manifest = tomllib.load(handle)
-        self.assertEqual(manifest["plugin"]["version"], "0.13.19")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.21")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -44,6 +44,7 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("observe_vrchat_world", commands)
         self.assertIn("navigate_vrchat_world", commands)
         self.assertIn("vrc_scan_surroundings", commands)
+        self.assertIn("vrc_wander_step", commands)
 
         plugin_class = next(
             node for node in tree.body
@@ -74,6 +75,7 @@ class HostedUiTests(unittest.TestCase):
         cancel_source = ast.unparse(methods["_replace_cancelled_semantic_push"])
         navigation_outcome_source = ast.unparse(methods["_push_navigation_outcome"])
         autonomy_goal_source = ast.unparse(methods["vrc_autonomy_goal"])
+        wander_step_source = ast.unparse(methods["vrc_wander_step"])
         world_loop_source = ast.unparse(methods["_world_context_loop_run"])
         semantic_text_source = ast.unparse(methods["_semantic_request_text"])
         semantic_push_source = ast.unparse(methods["_push_passive_semantic_parts"])
@@ -85,6 +87,9 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("unsupported_spatial_navigation", navigate_source)
         self.assertIn("'depart'", autonomy_goal_source)
         self.assertIn("'wander'", autonomy_goal_source)
+        self.assertIn("_semantic_request_id", wander_step_source)
+        self.assertIn("autonomy.wander_step", wander_step_source)
+        self.assertNotIn("target_id", wander_step_source)
         self.assertIn("_execution_result", action_source)
         execution_result_source = ast.unparse(methods["_execution_result"])
         self.assertIn("Err", execution_result_source)
@@ -100,9 +105,11 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("outcome_sequence", navigation_outcome_source)
         self.assertIn("ai_behavior='respond'", navigation_outcome_source)
         self.assertIn("_fetch_frame_image_part", navigation_outcome_source)
+        self.assertIn("execution_summary", navigation_outcome_source)
+        self.assertIn("world_observation_verified", navigation_outcome_source)
         self.assertIn("_push_navigation_outcome", world_loop_source)
         self.assertIn("agent_wander_direction_unresolved", semantic_text_source)
-        self.assertIn("vrc_autonomy_goal", semantic_text_source)
+        self.assertIn("vrc_wander_step", semantic_text_source)
         self.assertIn("semantic_wake", world_loop_source)
         self.assertIn("ai_behavior='respond' if wake else 'read'", semantic_push_source)
 

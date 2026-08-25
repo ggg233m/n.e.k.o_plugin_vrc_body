@@ -76,6 +76,9 @@ _OPTIONAL_STATUS_CACHE: dict[str, bool] | None = None
 _OPTIONAL_STATUS_AT = 0.0
 _OPTIONAL_STATUS_LOCK = threading.Lock()
 _OPTIONAL_STATUS_TTL_S = 5.0
+# 路线方向来自一张静态画面。即使通用语义任务仍在 30 秒单槽寿命内，也不能让
+# 更老的“左/前/右”决定直接驱动身体；超时后必须重新取图规划。
+_MAIN_LLM_ROUTE_DECISION_MAX_AGE_S = 20.0
 
 
 def optional_dependency_status(*, refresh: bool = False) -> dict[str, bool]:
@@ -2229,6 +2232,7 @@ class VisionRuntime:
         self._main_llm_last_committed_at: float | None = None
         self._main_llm_requests_created = 0
         self._main_llm_requests_committed = 0
+        self._main_llm_route_requests_consumed = 0
         self._main_llm_requests_cancelled = 0
         self._main_llm_results_rejected = 0
         self._main_llm_last_cancelled_request_id: str | None = None
@@ -2671,6 +2675,61 @@ class VisionRuntime:
             "position_update": "deferred_to_next_local_detection",
         }
 
+    def consume_main_llm_route_request(self, request_id: Any) -> dict[str, Any]:
+        """原子消费一次闲逛路线任务，不解析或绑定任何人物实体。"""
+        normalized_request_id = str(request_id or "").replace("\x00", "").strip()[:128]
+        if not normalized_request_id:
+            return {"accepted": False, "reason_code": "route_request_id_required"}
+        now = self._clock()
+        with self._lock:
+            request = self._main_llm_request
+            if not self._main_llm_semantic_enabled or not isinstance(request, Mapping):
+                reason_code = (
+                    "route_request_cancelled"
+                    if normalized_request_id == self._main_llm_last_cancelled_request_id
+                    else "no_pending_route_request"
+                )
+                return {"accepted": False, "reason_code": reason_code}
+            if request.get("state") != "pending":
+                return {"accepted": False, "reason_code": "route_request_not_pending"}
+            if normalized_request_id != str(request.get("request_id") or ""):
+                return {"accepted": False, "reason_code": "route_request_id_mismatch"}
+            if str(request.get("reason") or "") != "agent_wander_direction_unresolved":
+                return {"accepted": False, "reason_code": "request_is_not_wander_route"}
+            age_s = max(0.0, now - float(request.get("created_at", now)))
+            max_age_s = min(
+                self._main_llm_request_ttl_s,
+                _MAIN_LLM_ROUTE_DECISION_MAX_AGE_S,
+            )
+            if age_s > max_age_s:
+                self._cancel_main_llm_request_locked("wander_route_frame_expired")
+                return {
+                    "accepted": False,
+                    "reason_code": "wander_route_frame_expired",
+                    "request_age_ms": round(age_s * 1000.0, 1),
+                }
+            if not self._capture_active:
+                self._cancel_main_llm_request_locked(
+                    self._capture_reason or "capture_stopped"
+                )
+                return {"accepted": False, "reason_code": "route_capture_unavailable"}
+            revision = int(request.get("revision", 0) or 0)
+            frame_age_ms = round(
+                max(0.0, now - float(request.get("captured_at", now))) * 1000.0,
+                1,
+            )
+            self._main_llm_request = None
+            self._main_llm_last_committed_at = now
+            self._main_llm_route_requests_consumed += 1
+        return {
+            "accepted": True,
+            "request_id": normalized_request_id,
+            "frame_revision": revision,
+            "request_age_ms": round(age_s * 1000.0, 1),
+            "frame_age_ms": frame_age_ms,
+            "target_binding": "none",
+        }
+
     def clear_main_llm_semantic_request(self, reason: str = "goal_cleared") -> None:
         """目标结束时释放单槽图片，避免下一次对话消费已经无关的任务。"""
         with self._lock:
@@ -3111,6 +3170,7 @@ class VisionRuntime:
                 ),
                 "requests_created": self._main_llm_requests_created,
                 "requests_committed": self._main_llm_requests_committed,
+                "route_requests_consumed": self._main_llm_route_requests_consumed,
                 "requests_cancelled": self._main_llm_requests_cancelled,
                 "last_cancelled_request_id": self._main_llm_last_cancelled_request_id,
                 "last_cancel_reason": self._main_llm_last_cancel_reason,

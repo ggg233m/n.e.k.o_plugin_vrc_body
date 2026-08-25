@@ -45,6 +45,7 @@ class BackendClientTests(unittest.TestCase):
                     "vision": {
                         "enabled": True,
                         "source": "none",
+                        "capture": "external",
                         "local_backend": "none",
                         "semantic_backend": "openai_compatible",
                         "semantic_endpoint": "http://127.0.0.1:8000/v1/chat/completions",
@@ -84,6 +85,7 @@ class BackendClientTests(unittest.TestCase):
                 "vision": {
                     "enabled": True,
                     "source": "none",
+                    "capture": "external",
                     "local_backend": "none",
                     "semantic_backend": "main_llm",
                     "frame_cache_interval_s": 0,
@@ -201,6 +203,29 @@ class BackendClientTests(unittest.TestCase):
             },
         )])
 
+    def test_remote_autonomy_wander_step_forwards_only_direction_and_bound_request(self) -> None:
+        calls = []
+
+        class RecordingClient:
+            def fast_request(self, method, path, payload):
+                calls.append((method, path, payload))
+                return {"accepted": True}
+
+        result = RemoteAutonomy(RecordingClient()).wander_step(
+            "left",
+            "semantic-request:test:7",
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(calls, [(
+            "POST",
+            "/autonomy/wander-step",
+            {
+                "direction": "left",
+                "route_request_id": "semantic-request:test:7",
+            },
+        )])
+
     def test_autonomy_goal_resolves_frame_ref_and_rejects_fake_target_id(self) -> None:
         """LLM只选 T 编号；后端解析稳定 ID，并拒绝描述文本冒充 ID。"""
         try:
@@ -242,6 +267,7 @@ class BackendClientTests(unittest.TestCase):
                 "vision": {
                     "enabled": True,
                     "source": "none",
+                    "capture": "external",
                     "local_backend": "none",
                     "semantic_backend": "none",
                     "frame_cache_interval_s": 0,
@@ -406,6 +432,7 @@ class BackendClientTests(unittest.TestCase):
                 "vision": {
                     "enabled": True,
                     "source": "none",
+                    "capture": "external",
                     "local_backend": "none",
                     "semantic_backend": "main_llm",
                     "frame_cache_interval_s": 0,
@@ -566,6 +593,7 @@ class BackendClientTests(unittest.TestCase):
                 "vision": {
                     "enabled": True,
                     "source": "none",
+                    "capture": "external",
                     "local_backend": "none",
                     "semantic_backend": "main_llm",
                     "frame_cache_interval_s": 0,
@@ -609,19 +637,75 @@ class BackendClientTests(unittest.TestCase):
             self.assertEqual(wrong_commit["reason_code"], "wander_goal_commit_required")
             self.assertIsNone(service.autonomy_snapshot()["goal"])
 
-            started = service.autonomy_goal(
-                "去逛逛吧",
-                "wander",
-                constraints={"turn_deg": 0.0, "max_duration_s": 2.0},
-                based_on_revision=request["revision"],
+            mismatched = service.autonomy_wander_step(
+                "forward",
+                request["request_id"] + ":old",
+            )
+            self.assertFalse(mismatched["accepted"])
+            self.assertEqual(
+                mismatched["reason_code"],
+                "wander_route_request_mismatch",
+            )
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+
+            started = service.autonomy_wander_step(
+                "forward",
+                request["request_id"],
             )
             self.assertTrue(started["accepted"], started)
             self.assertEqual(started["goal"]["constraints"]["turn_deg"], 0.0)
+            self.assertIsNone(started["goal"]["target_id"])
+            self.assertIsNone(started["goal"]["selector"])
+            self.assertEqual(started["route_binding"]["target_binding"], "none")
+            self.assertEqual(started["resolved_by"], "main_llm_wander_step")
             self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
             self.assertEqual(
                 service.main_llm_semantic_request()["reason"],
                 "no_pending_request",
             )
+            repeated = service.autonomy_wander_step(
+                "left",
+                request["request_id"],
+            )
+            self.assertFalse(repeated["accepted"])
+            self.assertEqual(repeated["reason_code"], "no_pending_wander_route")
+        finally:
+            service.vision.close()
+
+    def test_wander_step_refuses_cancelled_route_without_binding_visible_avatar(self) -> None:
+        """世界/视觉取消后旧方向不能执行，更不能顺手绑定当前 person。"""
+        service = BackendService(
+            {
+                "vision": {
+                    "enabled": True,
+                    "source": "none",
+                    "capture": "external",
+                    "local_backend": "none",
+                    "semantic_backend": "main_llm",
+                    "frame_cache_interval_s": 0,
+                }
+            },
+            Path.cwd(),
+        )
+        try:
+            service.vision.set_capture_state(True, "test")
+            service.vision.process_frame(b"jpeg")
+            service.autonomy_arm()
+            pending = service.autonomy_intent(
+                "wander",
+                text="随便逛逛",
+                constraints={"max_duration_s": 2.0},
+            )
+            self.assertTrue(pending["route_request_accepted"], pending)
+            request_id = pending["route_request"]["request_id"]
+            service.vision.clear_main_llm_semantic_request("world_switched")
+
+            refused = service.autonomy_wander_step("right", request_id)
+            self.assertFalse(refused["accepted"])
+            self.assertEqual(refused["reason_code"], "route_request_cancelled")
+            self.assertFalse(refused["movement_started"])
+            self.assertIsNone(service.autonomy_snapshot()["goal"])
+            self.assertIsNone(service.autonomy_snapshot()["pending_semantic_intent"])
         finally:
             service.vision.close()
 

@@ -4,5 +4,5 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "neko-anyadance-body"
-version = "0.13.19"
+version = "0.13.21"
 source = { virtual = "." }

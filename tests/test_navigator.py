@@ -30,7 +30,12 @@ class NavigatorTests(unittest.TestCase):
             },
         }
         self.now = [100.0]
-        self.turn_state = {"available": True, "turning": False}
+        self.turn_state = {
+            "available": True,
+            "turning": False,
+            "yaw_deg": 0.0,
+            "turn_commands": 0,
+        }
         self.sent: list[tuple[str, float, float, int]] = []
         self.turns: list[float] = []
         self.released: list[str] = []
@@ -119,6 +124,81 @@ class NavigatorTests(unittest.TestCase):
         self.assertEqual(self.released[-1], "all")
         self.assertEqual(len(self.turns), 1)
         self.assertEqual(completed, ["wander_step_complete"])
+        summary = self.navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertEqual(summary["completion"], "completed_clean")
+        self.assertEqual(summary["requested"]["turn_deg"], -30.0)
+        self.assertEqual(summary["execution"]["submitted_turn_delta_deg"], -30.0)
+        self.assertEqual(summary["execution"]["submitted_deviation_from_request_deg"], 0.0)
+        self.assertFalse(summary["execution"]["world_observation_verified"])
+        self.assertEqual(summary["recoveries"], [])
+
+    def test_wander_summary_tracks_scheduler_heading_across_zero_without_calling_it_world_truth(self) -> None:
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向左前方走一段",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 30.0, "max_duration_s": 1.0},
+            },
+        }
+        self.turn_state.update({"yaw_deg": 350.0, "turn_commands": 0})
+
+        self.assertEqual(self.navigator.tick().reason, "wander_llm_turn")
+        self.turn_state.update({"yaw_deg": 355.0, "turn_commands": 1, "turning": True})
+        self.now[0] += 0.1
+        self.assertEqual(self.navigator.tick().reason, "wander_turn_settling")
+        self.turn_state.update({"yaw_deg": 10.0, "turning": False})
+        self.now[0] += 0.3
+        self.assertEqual(self.navigator.tick().reason, "wander_forward")
+        self.now[0] += 1.1
+        self.goal["goal"]["age_seconds"] = 1.5
+        self.assertEqual(self.navigator.tick().reason, "wander_step_complete")
+
+        summary = self.navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertEqual(summary["execution"]["output_heading_delta_deg"], 20.0)
+        self.assertEqual(summary["execution"]["output_heading_source"], "scheduler_virtual_hmd")
+        self.assertFalse(summary["execution"]["world_observation_verified"])
+        self.assertEqual(summary["execution"]["turn_command_count_delta"], 1)
+
+    def test_rejected_wander_turn_is_not_counted_as_submitted(self) -> None:
+        completed: list[str] = []
+        goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向右走",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": -20.0, "max_duration_s": 1.0},
+            },
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: goal,
+            send_axes=lambda side, x, y, pulse: True,
+            send_turn=lambda delta: False,
+            release_inputs=lambda side: None,
+            turn_state_provider=lambda: {
+                "available": True,
+                "turning": False,
+                "yaw_deg": 0.0,
+                "turn_commands": 0,
+            },
+            complete_goal=completed.append,
+            clock=lambda: self.now[0],
+        )
+
+        self.assertEqual(navigator.tick().reason, "wander_llm_turn")
+        goal["goal"]["age_seconds"] = navigator.config.max_goal_age_s + 1.0
+        self.now[0] += 0.1
+        self.assertEqual(navigator.tick().reason, "goal_expired")
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertEqual(summary["completion"], "expired")
+        self.assertFalse(summary["execution"]["initial_turn_submitted"])
+        self.assertEqual(summary["execution"]["submitted_turn_delta_deg"], 0.0)
+        self.assertEqual(summary["execution"]["submitted_deviation_from_request_deg"], 20.0)
 
     def test_wander_zero_turn_means_llm_explicitly_chose_straight(self) -> None:
         self.goal = {
@@ -1333,6 +1413,53 @@ class NavigatorAutoRecoverTests(unittest.TestCase):
             decision = navigator.tick()
         self.assertLess(decision.turn_deg, 0.0)
 
+    def test_slide_recovery_keeps_its_direction_when_the_next_wall_flips_the_slip(self) -> None:
+        # 转开第一面墙后常会蹭上邻墙，那一面的 slip_ratio 符号相反。若每次绕行都
+        # 重新取样，就会 -55/+55/-55 原地对撞，把预算耗光却没脱困（实机复现过）。
+        navigator = self._navigator(auto_recover_limit=3)
+        self._slide(-0.98)
+        for _ in range(3):
+            first = navigator.tick()
+        self.assertLess(first.turn_deg, 0.0)
+
+        # 邻墙把滑行方向翻了过来，但本路段的绕行方向必须保持不变。
+        self._slide(0.98)
+        for _ in range(3):
+            second = navigator.tick()
+        self.assertEqual(second.turn_deg, first.turn_deg)
+
+        self._slide(-0.98)
+        for _ in range(3):
+            third = navigator.tick()
+        self.assertEqual(third.turn_deg, first.turn_deg)
+        # 三次绕行同向累积，而不是互相抵消回原点。
+        self.assertAlmostEqual(
+            first.turn_deg + second.turn_deg + third.turn_deg,
+            3.0 * first.turn_deg,
+        )
+
+    def test_recovery_direction_is_resampled_for_a_new_goal(self) -> None:
+        # 锁定只在一个路段内有效：换目标后地形不同，应重新由滑行取样决定。
+        navigator = self._navigator(auto_recover_limit=3)
+        self._slide(-0.98)
+        for _ in range(3):
+            first = navigator.tick()
+        self.assertLess(first.turn_deg, 0.0)
+
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "approach",
+                "text": "walk to someone else",
+                "target_id": "vision:person:1",
+                "age_seconds": 1.0,
+            },
+        }
+        self._slide(0.98)
+        for _ in range(3):
+            after = navigator.tick()
+        self.assertGreater(after.turn_deg, 0.0)
+
     def test_slide_recovery_does_not_waste_a_backup_step(self) -> None:
         # 斜撞墙时人还在动，直接转就行，不需要先退。
         navigator = self._navigator()
@@ -1486,6 +1613,62 @@ class NavigatorAutoRecoverTests(unittest.TestCase):
         self.assertEqual(snapshot["stall"]["slip_threshold_ticks"], 3)
         self.assertEqual(snapshot["stall"]["slip_forward_ratio"], 0.85)
         self.assertEqual(NavigatorConfig().slip_forward_ratio, 0.55)
+
+    def test_wander_terminal_summary_exposes_recovery_route_rewrite(self) -> None:
+        """终态必须说明 recover 改写了路线和重置了分段计时器。"""
+        now = [100.0]
+        self.goal["goal"] = {
+            "kind": "wander",
+            "text": "直走看看",
+            "target_id": None,
+            "age_seconds": 0.0,
+            "constraints": {"turn_deg": 0.0, "max_duration_s": 1.0},
+        }
+        self._slide(-0.98)
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
+            release_inputs=lambda side: self.released.append(side),
+            motion_provider=lambda: self.motion,
+            config=NavigatorConfig(
+                slip_ticks=3,
+                auto_recover_limit=1,
+                turn_cooldown_s=0.0,
+            ),
+            clock=lambda: now[0],
+        )
+
+        self.assertEqual(navigator.tick().state, "advance")
+        self.assertEqual(navigator.tick().state, "advance")
+        recovered = navigator.tick()
+        self.assertEqual(recovered.state, "recover")
+        self.assertLess(recovered.turn_deg, 0.0)
+
+        self.motion.update({
+            "available": True,
+            "horizontal_speed_mps": 0.9,
+            "forward_ratio": 1.0,
+            "slip_ratio": 0.0,
+        })
+        now[0] += 0.1
+        self.assertEqual(navigator.tick().reason, "wander_forward")
+        now[0] += 1.1
+        self.goal["goal"]["age_seconds"] = 1.3
+        self.assertEqual(navigator.tick().reason, "wander_step_complete")
+
+        summary = navigator.snapshot()["behavior"]["last_outcome"]["execution_summary"]
+        self.assertEqual(summary["completion"], "completed_after_recovery")
+        self.assertEqual(summary["requested"]["turn_deg"], 0.0)
+        self.assertEqual(summary["execution"]["submitted_turn_delta_deg"], -55.0)
+        self.assertEqual(summary["execution"]["submitted_deviation_from_request_deg"], -55.0)
+        self.assertEqual(summary["execution"]["segment_timer_reset_count"], 1)
+        self.assertEqual(len(summary["recoveries"]), 1)
+        self.assertEqual(summary["recoveries"][0]["trigger"], "wall_slide")
+        self.assertEqual(summary["recoveries"][0]["direction_by_contract"], "right")
+        self.assertTrue(summary["recoveries"][0]["turn_submitted"])
+        self.assertTrue(summary["motion_evidence"]["wall_slide_detected"])
 
     def test_real_measured_head_on_wall_uses_the_speed_judgement(self) -> None:
         # 另一次实测：正面撞墙时速度直接塌到 0.062，低于失速阈值，

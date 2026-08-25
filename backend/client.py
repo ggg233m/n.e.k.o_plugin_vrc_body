@@ -669,6 +669,25 @@ class RemoteAutonomy:
         except BackendUnavailable as exc:
             return {"accepted": False, "reason": str(exc), **self.snapshot()}
 
+    def wander_step(
+        self,
+        direction: str,
+        route_request_id: str | None,
+    ) -> dict[str, Any]:
+        """提交主 LLM 已看图选择的单段方向；人物目标不在此协议中。"""
+        try:
+            return _control_request(
+                self.client,
+                "POST",
+                "/autonomy/wander-step",
+                {
+                    "direction": str(direction),
+                    "route_request_id": str(route_request_id or ""),
+                },
+            )
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), **self.snapshot()}
+
     def intent(
         self,
         action: str,

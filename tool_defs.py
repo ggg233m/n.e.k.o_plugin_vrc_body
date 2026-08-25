@@ -320,8 +320,9 @@ VRC_AUTONOMY_GOAL = {
         "explore 可以不提供 target_id，改用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
         "本地 Explorer 找到目标后只会将其保持在视野中央，不会自动接近。"
         "wander 只执行一条由多模态 LLM 根据最新画面规划的短路段，必须在 constraints.turn_deg"
-        "明确相对转角；收到主模型闲逛路线任务时直接用本工具提交 wander，不能改调用"
-        "vrc_semantic_commit。该路段停止后会带新画面再次唤醒 LLM，导航器不会自行选择下一方向。"
+        "明确相对转角。普通显式规划可以用本工具；收到主模型闲逛路线任务时改用"
+        "vrc_wander_step，只提交 left/forward/right，不能调用 vrc_semantic_commit。"
+        "该路段停止后会带新画面再次唤醒 LLM，导航器不会自行选择下一方向。"
         "应把 world_observe.decision_context.through_revision 原样写入 based_on_revision。"
     ),
     "parameters": {
@@ -396,6 +397,29 @@ VRC_AUTONOMY_GOAL = {
             },
         },
         "required": ["goal"],
+    },
+}
+
+VRC_WANDER_STEP = {
+    "name": "vrc_wander_step",
+    "description": (
+        "完成当前 `[VRChat 主模型闲逛路线任务]`：根据该任务附带的最新画面选择"
+        " left、forward 或 right，并启动一条最多三秒的短路段。工具只绑定插件刚注入"
+        "当前会话的待决路线请求，不接受 target_id、target_ref 或人物选择器，因此不会"
+        "把方向误绑定为某个角色。没有待决任务、任务已替换/过期或请求不匹配时会拒绝，"
+        "不能用它接近或跟随人物。只有 accepted=true 才代表路段已经开始。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "direction": {
+                "type": "string",
+                "enum": ["left", "forward", "right"],
+                "description": "主 LLM 从任务配对画面选择的短路线：左前、正前或右前。",
+            },
+        },
+        "required": ["direction"],
+        "additionalProperties": False,
     },
 }
 

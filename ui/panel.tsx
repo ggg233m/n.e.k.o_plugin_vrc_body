@@ -289,7 +289,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         </ToolbarGroup>
       </Toolbar>
 
-      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.19。</Alert> : null}
+      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.21。</Alert> : null}
       {osc.last_error ? <Alert tone="warning">OSC：{String(osc.last_error)}</Alert> : null}
       {idleRelay.last_error ? <Alert tone="warning">VMC 待机中转：{String(idleRelay.last_error)}</Alert> : null}
       {idleRelay.frame_error ? <Alert tone="warning">VMC 待机帧：{String(idleRelay.frame_error)}</Alert> : null}

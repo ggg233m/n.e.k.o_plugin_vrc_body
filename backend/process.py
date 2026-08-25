@@ -271,6 +271,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("target_ref"),
                     value.get("frame_revision"),
                 )
+            elif self.path == "/autonomy/wander-step":
+                result = self.server.service.autonomy_wander_step(
+                    value.get("direction"),
+                    value.get("route_request_id"),
+                )
             elif self.path == "/autonomy/intent":
                 result = self.server.service.autonomy_intent(
                     value.get("action"),
