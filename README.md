@@ -365,3 +365,11 @@ VMD 和 PMX/PMD 都是独立的第三方作品；导入前应确认各自授权�
   "loop_count": 1
 }
 ```
+
+## 致谢
+
+本项目的开发与完善离不开以下贡献者的支持：
+
+- [Kivo-bash](https://github.com/Kivo-bash) —— 提供 Token 赞助
+- [Neilzzw](https://github.com/Neilzzw) —— 参与模型与地图制作
+- [miaoluoxue](https://github.com/miaoluoxue) —— 提供初版参考实现
