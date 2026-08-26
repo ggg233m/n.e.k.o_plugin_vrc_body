@@ -70,6 +70,27 @@ _WANDER_DIRECTION_TURN_DEG = {
     "forward": 0.0,
     "right": -25.0,
 }
+# 本地检测器只产出人形轨迹，world.entities 里永远不会出现海报、屏幕、家具这类
+# 静态物体。主 LLM 可以在画面里看见它们并提交分类，但 SemanticCandidateCache
+# 的分类只能作为属性附着到本地检测已有的框上（见 vision.enrich_observation），
+# 造不出新实体——所以对这类目标建语义任务必然以 semantic_target_not_found 收场，
+# 白烧一张图还让模型误以为在等确认。这里提前识别出来，改走方位角闲逛。
+_HUMANOID_SELECTOR_TYPES = frozenset(
+    {"npc", "player", "avatar", "person", "humanoid"}
+)
+
+
+def _selector_is_locally_detectable(selector: Mapping[str, Any] | None) -> bool:
+    """selector 描述的目标本地检测器能否产出实体框。
+
+    只有人形类别能被确认。``object`` 和空类别都不行：前者明确指向非人物体，
+    后者只有标签没有类别，无法保证落在人形轨迹上。
+    """
+    if not isinstance(selector, Mapping):
+        return False
+    semantic_type = str(selector.get("semantic_type") or "").strip().lower()
+    return semantic_type in _HUMANOID_SELECTOR_TYPES
+
 
 
 def _effective_detector_interval_ms(config: Any, detector: Any | None) -> int:
@@ -1374,6 +1395,33 @@ class BackendService:
                 }
         candidates = self._semantic_navigation_candidates(world, selector)
         if not normalized_target_id:
+            if not candidates and not _selector_is_locally_detectable(selector):
+                # 非人形目标：直接附上当前画面让主 LLM 一步估算方位并提交 wander。
+                frame_result = self.vision.pull_frame(max_age_ms=2000)
+                frame_data = frame_result.pop("data", None) if isinstance(frame_result, dict) else None
+                return {
+                    **self.autonomy.snapshot(),
+                    "accepted": False,
+                    "completed": False,
+                    "action": normalized_action,
+                    "reason_code": "target_not_locally_detectable",
+                    "reason": (
+                        "local detection only tracks humanoids; this target cannot be"
+                        " resolved into a navigable entity"
+                    ),
+                    "pending_semantic": False,
+                    "movement_started": False,
+                    "frame": frame_result,
+                    "frame_data": frame_data,
+                    "instruction": (
+                        "本机视觉只能锁定人物,海报/屏幕/家具无法导航。已附当前画面,立即"
+                        "估算目标相对方位(正左负右)并调用 vrc_autonomy_goal(goal=\"朝目标"
+                        "方向走走看\",kind=\"wander\",constraints={\"turn_deg\":估算角度,"
+                        "\"max_duration_s\":2.0},based_on_revision=frame.revision)。"
+                        "turn_deg 限 ±45°,更偏先 body_turn。不提交 target_id/target_ref/"
+                        "selector。只朝那个方向走一段,不会在物体前停下,说朝那边走走看。"
+                    ),
+                }
             if not candidates:
                 # 本地 person 检测只能给出稳定轨迹，无法断言它是 NPC、玩家还是
                 # 海报。建立一次与当前画面配对的主多模态任务，并暂停旧目标；
@@ -2223,6 +2271,33 @@ class BackendService:
         if self.osc is None:
             return False, "AnyaDance controller input and VRChat OSC bridge are unavailable"
         return self.osc.pulse_input(normalized_action, normalized_side, normalized_hold)
+
+    def pulse_jump(self, hold_ms: Any) -> tuple[bool, str | None]:
+        """跳跃走 VRChat OSC ``/input/Jump``，不经 ``input.primary`` 路由。
+
+        之前这里接的是虚拟 Index 的 A 键，但 VRChat 的跳跃绑定是否落在 A 上完全取决于
+        用户的按键配置，实机无法确认——和 ``set_turn`` 里 ``/input/LookHorizontal``
+        那个坑同类。``/input/Jump`` 是语义地址，跟按键绑定无关，是唯一可靠的跳跃手段。
+
+        按下与释放之间必须有真实间隔：VRChat 只在按下沿触发起跳，同一拍内按下又释放
+        会被丢掉。这里用 ``send_button`` 的整数 1/0 通道，急停时 ``_BUTTON_ADDRESSES``
+        的统一释放兜底，按钮不会卡住。
+        """
+        if self.osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        try:
+            normalized_hold = _osc_hold_ms(hold_ms, self.config.vrchat_osc.input_pulse_ms)
+        except ValueError as exc:
+            return False, str(exc)
+        pressed, reason = self.osc.send_button("jump", True)
+        if not pressed:
+            return False, reason or "VRChat OSC jump press failed"
+        scheduled = self.osc.schedule_button_release("jump", delay_s=normalized_hold / 1000.0)
+        if not scheduled:
+            # 排不上释放就地同步松开：宁可跳得短，也不能留着按住的跳跃键。
+            self.osc.send_button("jump", False)
+            return False, "VRChat OSC jump release could not be scheduled"
+        return True, None
 
     def set_locomotion(self, vertical: Any, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
         """走位固定走 VRChat OSC，不经过 ``input.primary`` 路由。

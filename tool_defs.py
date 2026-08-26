@@ -296,7 +296,10 @@ VRC_MENU_NAVIGATE = {
 
 VRC_JUMP = {
     "name": "vrc_jump",
-    "description": "通过右侧虚拟 Index A 键发送一次跳跃脉冲。无法确认 VRChat 当前绑定是否使用 A 键跳跃。",
+    "description": (
+        "通过 VRChat OSC /input/Jump 发送一次跳跃脉冲；这是语义地址，与用户的按键绑定无关。"
+        "accepted=true 只代表本机发送成功，不代表角色真的离地（当前世界可能禁跳，或人卡在低天花板下）。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {"hold_ms": {"type": "integer", "minimum": 20, "maximum": 1000, "default": 100}},
@@ -314,14 +317,17 @@ VRC_AUTONOMY_GOAL = {
     "name": "vrc_autonomy_goal",
     "description": (
         "提交一个受安全策略约束的当前实例自主目标；必须先手动 arm。"
-        "approach/approach_observe/follow/interact/socialize 优先提交同一次叠框画面中的 target_ref（T1/T2）"
+        "approach/approach_observe/follow/interact/socialize 只能锁定人物：优先提交同一次叠框画面中的 target_ref（T1/T2）"
         "和 frame_revision，由后端解析并锁定稳定 ID；不要复制长 target_id。"
         "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
-        "explore 可以不提供 target_id，改用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
+        "本机视觉只追踪人形，海报、屏幕、家具这类静态物体无法作为导航目标。"
+        "用户要求接近这类物体时，改用 kind=\"wander\" 提交方位角闲逛：先看最新画面，"
+        "估计相对方位填入 constraints.turn_deg（正左负右，限 ±45°，更偏就先 body_turn 转过去），"
+        "不提交 target_id/target_ref/selector。这条路只朝那个方向走一段（不会在物体前自动停下），"
+        "所以不要说成走到它面前，要如实说朝那边走走看。"
+        "explore 可以用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
         "本地 Explorer 找到目标后只会将其保持在视野中央，不会自动接近。"
-        "wander 只执行一条由多模态 LLM 根据最新画面规划的短路段，必须在 constraints.turn_deg"
-        "明确相对转角。普通显式规划可以用本工具；收到主模型闲逛路线任务时改用"
-        "vrc_wander_step，只提交 left/forward/right，不能调用 vrc_semantic_commit。"
+        "收到主模型闲逛路线任务时改用 vrc_wander_step，只提交 left/forward/right，不能调用 vrc_semantic_commit。"
         "该路段停止后会带新画面再次唤醒 LLM，导航器不会自行选择下一方向。"
         "应把 world_observe.decision_context.through_revision 原样写入 based_on_revision。"
     ),
@@ -436,6 +442,35 @@ VRC_WANDER_STEP = {
     },
 }
 
+VRC_WANDER_ROUTE = {
+    "name": "vrc_wander_route",
+    "description": (
+        "在方向尚未决定时开始一次闲逛：把最新配对画面作为"
+        " `[VRChat 主模型闲逛路线任务]` 交回给你选路。"
+        "用户说“随便走走/去逛逛/往前走一小段”而你还没有看图决定方向时用它。"
+        "本次调用不会移动，返回 accepted=false 且 reason_code=wander_direction_pending"
+        "才是成功建立路线任务，此时不得声称已经出发；紧接着必须用 vrc_wander_step"
+        "选择 left/forward/right 才真正开始移动。"
+        "若你已经看过画面并确定了相对角度，可以直接用 vrc_autonomy_goal 提交 wander"
+        "并填 constraints.turn_deg，不需要本工具。"
+        "两条路都走本地闭环：会读取速度回传、检测撞墙、有限绕行并记录死路方向；"
+        "绝不能改用 body_locomotion 这类开环遥控代替。"
+        "需要用户先在插件面板手动启用自主控制。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "用户的原始意图描述，例如“往前走一小段”。",
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
 VRC_AUTONOMY_STOP = {
     "name": "vrc_autonomy_stop",
     "description": "停止自主目标并释放 AnyaDance 控制器输入。",
@@ -449,7 +484,9 @@ VRC_SEMANTIC_COMMIT = {
         "必须原样使用任务消息中的 request_id 和 frame_revision，并且每个任务只调用一次；"
         "这是和当前用户聊天同一回合内的附带工作，不要为它另起回答。"
         "已有检测框优先复制 candidates 中的完整 target_id；只有检测器漏框时才填写归一化 bbox。"
-        "海报、屏幕和镜像要明确标为 poster/screen/mirror，避免被自主搜索当成 NPC。"
+        "海报、屏幕和镜像要如实标为 poster/screen/mirror，不要为了让导航通过就谎报成人物。"
+        "这类静态物体默认被自主搜索当作干扰物过滤，但用户点名要去看它时是可以导航的："
+        "在 vrc_autonomy_goal 的 selector.semantic_type 里填同一个类别即可放行。"
         "任务 reason=agent_navigation_target_unresolved 时，只提交用户所指的唯一真实目标；"
         "提交后端会自动续接一次有限导航，不要再发第二次移动命令。"
         "只有返回 pending_navigation.accepted=true 才代表移动已经开始。"
@@ -603,7 +640,17 @@ VRC_VISION_FRAME = {
 
 BODY_LOCOMOTION = {
     "name": "body_locomotion",
-    "description": "优先通过 AnyaDance 虚拟 Index 左摇杆实现移动，没有可用驱动时回退到 VRChat OSC；直到超时或下一次调用。前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；可同时设置斜向移动。",
+    "description": (
+        "开环遥控摇杆：直接通过 VRChat OSC 推移动轴，保持到超时或下一次调用。"
+        "前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；"
+        "可同时设置斜向移动。移动方向相对角色当前朝向，不是世界方向。"
+        "它不读速度回传、不检测撞墙、不会绕行、也不记录死路方向，accepted=true 只代表"
+        "本机发送成功，不能证明角色真的移动了。因此只用于用户明确要求的一次性微调"
+        "（挪一点、退半步、对齐位置）。"
+        "凡是“走走/逛逛/往前走/过去/离开”这类导航意图一律改用闭环："
+        "已看图定好方向用 vrc_autonomy_goal(kind=\"wander\") 并填 constraints.turn_deg，"
+        "尚未定方向用 vrc_wander_route 取回路线任务后再 vrc_wander_step。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -617,7 +664,13 @@ BODY_LOCOMOTION = {
 
 BODY_TURN = {
     "name": "body_turn",
-    "description": "优先通过 AnyaDance 虚拟 Index 右摇杆水平轴实现转身，没有可用驱动时回退到 VRChat OSC；正值向右转，负值向左转。",
+    "description": (
+        "转身：直接旋转虚拟 HMD 的朝向，正值向右转，负值向左转。"
+        "不走摇杆——VR 模式下 VRChat 的右摇杆转向不可靠，照样会回 accepted=true 却不动。"
+        "转身同时就是转视角：转完之后画面朝向变了，body_locomotion 的前后左右也随之改变，"
+        "所以「先转向再前进」是改变行进方向的正确做法。"
+        "accepted=true 只代表本机发送成功，要确认真的转了得用 vrc_vision_frame 看画面。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {

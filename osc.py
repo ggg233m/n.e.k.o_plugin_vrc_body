@@ -247,6 +247,10 @@ class _ScheduledInput:
     pressed: bool = field(compare=False)
     guard: Callable[[], bool] | None = field(compare=False, default=None)
     pulse_id: int | None = field(compare=False, default=None)
+    # "input" 走 _INPUT_ADDRESSES 的 action/side 对；"button" 走 _BUTTON_ADDRESSES，
+    # 只用 action 存按钮名，side 留空。两者的 OSC 载荷类型不同（浮点 vs 整数），
+    # 必须在分派时就分开，不能让调用方误把一种当另一种发出去。
+    kind: str = field(compare=False, default="input")
 
 
 class VrchatOscBridge:
@@ -497,6 +501,41 @@ class VrchatOscBridge:
         )
         return True
 
+    def schedule_button_release(self, button: str, *, delay_s: float) -> bool:
+        """安排一次延迟的按钮释放（``/input/Jump`` 等整数按钮地址）。
+
+        跳跃这类按钮由调用方先同步按下、再由这里排释放，因为 VRChat 只在按下沿触发，
+        必须让按下与释放隔开真实时间。急停时 ``cancel_scheduled_inputs`` 会清队列并
+        统一释放所有按钮，所以这里排不上也不会留下卡住的键。
+        """
+        if not self.config.enabled or self._send_socket is None:
+            return False
+        if isinstance(delay_s, bool):
+            return False
+        try:
+            delay = float(delay_s)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(delay) or delay < 0.0:
+            return False
+        normalized = str(button).strip().lower().replace("-", "_")
+        if normalized not in _BUTTON_ADDRESSES:
+            return False
+        event = _ScheduledInput(
+            self._clock() + delay,
+            next(self._schedule_sequence),
+            normalized,
+            "",
+            False,
+            None,
+            None,
+            "button",
+        )
+        with self._lock:
+            heapq.heappush(self._scheduled, event)
+        self._wake_event.set()
+        return True
+
     def _schedule_input(
         self,
         action: str,
@@ -709,7 +748,10 @@ class VrchatOscBridge:
                 with self._lock:
                     if event.pulse_id not in self._started_pulses:
                         continue
-            sent, _ = self.send_input(event.action, event.side, event.pressed)
+            if event.kind == "button":
+                sent, _ = self.send_button(event.action, event.pressed)
+            else:
+                sent, _ = self.send_input(event.action, event.side, event.pressed)
             if event.pulse_id is not None:
                 with self._lock:
                     if event.pressed:

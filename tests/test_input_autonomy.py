@@ -470,5 +470,23 @@ class AutonomyAndWorldTests(unittest.TestCase):
             backend.observe(b"jpeg", world={}, now=1.1)
 
 
+class BearingWanderTests(unittest.TestCase):
+    def test_selector_is_locally_detectable_only_for_humanoid_types(self) -> None:
+        """只有人形类别能被本地检测器确认；object/空类别都不行。"""
+        from neko_anyadance_body.backend.service import _selector_is_locally_detectable
+
+        self.assertTrue(_selector_is_locally_detectable({"semantic_type": "npc"}))
+        self.assertTrue(_selector_is_locally_detectable({"semantic_type": "player"}))
+        self.assertTrue(_selector_is_locally_detectable({"semantic_type": "avatar"}))
+        self.assertTrue(_selector_is_locally_detectable({"semantic_type": "person"}))
+        self.assertTrue(_selector_is_locally_detectable({"semantic_type": "humanoid"}))
+
+        self.assertFalse(_selector_is_locally_detectable({"semantic_type": "object"}))
+        self.assertFalse(_selector_is_locally_detectable({"semantic_type": "poster"}))
+        self.assertFalse(_selector_is_locally_detectable({"semantic_type": ""}))
+        self.assertFalse(_selector_is_locally_detectable({"label": "desk"}))
+        self.assertFalse(_selector_is_locally_detectable(None))
+
+
 if __name__ == "__main__":
     unittest.main()
