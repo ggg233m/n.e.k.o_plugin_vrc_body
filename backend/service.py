@@ -1415,11 +1415,15 @@ class BackendService:
                     "frame_data": frame_data,
                     "instruction": (
                         "本机视觉只能锁定人物,海报/屏幕/家具无法导航。已附当前画面,立即"
-                        "估算目标相对方位(正左负右)并调用 vrc_autonomy_goal(goal=\"朝目标"
+                        "估算目标相对方位(正数左转、负数右转;目标在画面右侧填负值,"
+                        "例如右前方填 -20)并调用 vrc_autonomy_goal(goal=\"朝目标"
                         "方向走走看\",kind=\"wander\",constraints={\"turn_deg\":估算角度,"
-                        "\"max_duration_s\":2.0},based_on_revision=frame.revision)。"
-                        "turn_deg 限 ±45°,更偏先 body_turn。不提交 target_id/target_ref/"
-                        "selector。只朝那个方向走一段,不会在物体前停下,说朝那边走走看。"
+                        "\"max_duration_s\":3.0},based_on_revision=frame.revision)。"
+                        "turn_deg 限 ±45°,更偏先 body_turn;max_duration_s 上限 3.0,"
+                        "远处目标就填 3.0。不提交 target_id/target_ref/selector。"
+                        "一段最多走 3~4 米,通常到不了:这是多段任务的第一段。"
+                        "每段停下后你会收到新画面和 progress_m,那时再判断是继续提交下一段、"
+                        "修正方向还是已经够近了。到达之前只能说朝那边走走看,不要说已经到了。"
                     ),
                 }
             if not candidates:

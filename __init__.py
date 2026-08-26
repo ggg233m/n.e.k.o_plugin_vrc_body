@@ -771,6 +771,55 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "movement_stalled": "blocked",
             "target_unreachable": "unreachable",
         }.get(reason, "stopped")
+        # 定向闲逛一段只走 3~4 米，"到了没有"必须由 LLM 看新画面判断。把本段位移
+        # 单独提出来，否则它埋在 execution_summary 的 motion_evidence 里容易被忽略，
+        # 模型倾向于直接宣布到达。
+        progress_hint = ""
+        if reason == "wander_step_complete" and execution_summary is not None:
+            evidence = execution_summary.get("motion_evidence")
+            progress = (
+                evidence.get("gated_progress_m")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            if isinstance(progress, (int, float)):
+                progress_hint = (
+                    f"本段实测前进 {float(progress):.2f} 米。"
+                    "如果这次闲逛是为了靠近某个物体：对照新画面判断它是否明显变大、"
+                    "是否已经足够近。还不够就立刻再提交一段 wander（按画面重新估算 "
+                    "turn_deg，可继续用 max_duration_s=3.0）；只有画面显示确实到了"
+                    "近前才能说到达。不确定就说还在往那边走，绝不能凭走过一段就宣布到了。"
+                )
+        elif reason == "approach_observe_target_lost":
+            # 锁定的是人形实体，海报/屏幕之类根本进不了 world.entities。用户本来
+            # 要去的是静态物体时，这里必须点明改走方位角 wander，否则模型只会把
+            # target_lost 当成"人被挡住了"，接着重发同一条锁不住的 approach。
+            #
+            # 光给规则不够：目标丢了之后画面里往往已经没有它，让模型自己重估
+            # 角度会偏得更远。把丢失瞬间的方位直接算成可提交的 turn_deg 附上。
+            #
+            # bearing 与 turn_deg 符号相反，必须取负再给：bearing 由像素列算出
+            # （local_perception.py:1450，目标在画面右侧为正），而 turn_deg 是
+            # 正左负右，导航器内部也是按 -bearing 发转向（navigator.py:2054）。
+            # 原样透传会把模型送向目标的反方向。
+            bearing = outcome.get("last_known_bearing_deg")
+            bearing_hint = ""
+            if isinstance(bearing, (int, float)):
+                turn_deg = max(-45.0, min(45.0, -float(bearing)))
+                side = "右" if float(bearing) > 0 else "左"
+                bearing_hint = (
+                    f"目标丢失前在画面{side}侧（bearing={float(bearing):.1f}°），"
+                    f"对应 constraints.turn_deg={turn_deg:.1f}，直接照此提交"
+                    f"{'（已截到 ±45° 上限，更偏的部分先 body_turn 补）' if abs(float(bearing)) > 45.0 else ''}。"
+                )
+            progress_hint = (
+                "注意：approach/approach_observe 只能锁定人物。如果用户要去的其实是"
+                "海报、屏幕、家具这类静态物体，本机视觉永远锁不住它，重发 approach"
+                "只会再次 target_lost——哪怕它旁边站着人，锁那个人也不等于走到它跟前。"
+                "这种情况改用 vrc_autonomy_goal(kind=\"wander\")："
+                + (bearing_hint or "看新画面估算目标相对方位填 constraints.turn_deg（正左负右，限 ±45°），")
+                + "max_duration_s=3.0，不提交 target_id/target_ref/selector，一段一段走过去。"
+            )
         parts: list[dict[str, Any]] = [{
             "type": "text",
             "text": (
@@ -788,6 +837,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "下一段应比较 requested、submitted_deviation_from_request_deg 和 recoveries，"
                 "明确补偿本地绕行已经造成的路线改写。"
                 "这些结果都不代表检查过沿途环境；受阻或丢失时必须如实说明没有完成。"
+                + progress_hint
             )[:3200],
         }]
         frame_part = await self._fetch_frame_image_part(max_age_ms=_WAKE_FRAME_MAX_AGE_MS)
@@ -1692,7 +1742,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                             "type": "number",
                             "minimum": -45.0,
                             "maximum": 45.0,
-                            "description": "wander 必填：LLM 看图选择的相对方向；正左负右，0 直行。",
+                            "description": (
+                                "wander 必填：相对当前朝向的转角。正数左转、负数右转、0 直行——"
+                                "目标在画面右侧填负值（例：右前方填 -20），在左侧填正值。"
+                            ),
                         },
                     },
                     "additionalProperties": False,

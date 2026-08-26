@@ -1370,6 +1370,14 @@ class LocalNavigator:
                 "revision": decision.revision,
                 "observed_age_ms": decision.observed_age_ms,
                 "occurred_at_monotonic": now,
+                # 目标丢失时把最后已知方位一并带出：宿主据此给主 LLM 一个可直接
+                # 提交的 wander turn_deg，不必让它再从画面上重新估角度。人形目标
+                # 丢了之后画面里往往已经没有它，凭空重估会偏得更远。
+                "last_known_bearing_deg": (
+                    None
+                    if decision.bearing_deg is None
+                    else round(float(decision.bearing_deg), 2)
+                ),
             }
             if goal_key[0].strip().lower() == "wander":
                 execution_summary = self._wander_execution_summary_locked(decision, now)

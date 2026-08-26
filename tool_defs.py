@@ -322,7 +322,8 @@ VRC_AUTONOMY_GOAL = {
         "多个候选目标必须先用带 overlay 的 vrc_vision_frame 让多模态模型选择。"
         "本机视觉只追踪人形，海报、屏幕、家具这类静态物体无法作为导航目标。"
         "用户要求接近这类物体时，改用 kind=\"wander\" 提交方位角闲逛：先看最新画面，"
-        "估计相对方位填入 constraints.turn_deg（正左负右，限 ±45°，更偏就先 body_turn 转过去），"
+        "估计相对方位填入 constraints.turn_deg（正数左转、负数右转；目标在画面右侧填负值，"
+        "例如右前方填 -20，限 ±45°，更偏就先 body_turn 转过去），"
         "不提交 target_id/target_ref/selector。这条路只朝那个方向走一段（不会在物体前自动停下），"
         "所以不要说成走到它面前，要如实说朝那边走走看。"
         "explore 可以用 selector 描述要搜索的语义目标，并用 constraints 限制本地执行器；"
@@ -342,10 +343,13 @@ VRC_AUTONOMY_GOAL = {
                     "approach", "approach_observe", "follow", "interact", "socialize",
                 ],
                 "description": (
-                    "用户说“过去看看”时使用 approach_observe：后端一次完成朝向、接近、"
-                    "停稳和观察；不要拆成多个 approach/观察调用。用户要求离开当前观察点"
-                    "时使用 depart；用户说随便走走、逛逛，或用“走吧”确认刚提出的闲逛时，"
-                    "先看最新画面，再用 wander 提交一条带 turn_deg 的短路段。"
+                    "先分清目标是人还是物。用户说“过去看看”指的是人时使用 approach_observe："
+                    "后端一次完成朝向、接近、停稳和观察，不要拆成多个 approach/观察调用。"
+                    "目标是海报、屏幕、家具这类静态物体时绝不能用 approach/approach_observe——"
+                    "本机视觉只追踪人形，锁不住它们，提交了也只会走到一半报 target_lost；"
+                    "这种情况一律用 wander 带 turn_deg 一段一段走过去。"
+                    "用户要求离开当前观察点时使用 depart；用户说随便走走、逛逛，"
+                    "或用“走吧”确认刚提出的闲逛时，先看最新画面，再用 wander 提交一条带 turn_deg 的短路段。"
                 ),
             },
             "target_id": {
@@ -391,7 +395,10 @@ VRC_AUTONOMY_GOAL = {
                         "type": "number",
                         "minimum": -45.0,
                         "maximum": 45.0,
-                        "description": "wander 必填：LLM 选择的相对转角；正数左转、负数右转，0 为直行。",
+                        "description": (
+                            "wander 必填：相对当前朝向的转角。正数左转、负数右转、0 直行——"
+                            "目标在画面右侧就填负值（例：右前方填 -20），在左侧填正值。"
+                        ),
                     },
                     "direction_scores": {
                         "type": "object",
@@ -665,7 +672,8 @@ BODY_LOCOMOTION = {
 BODY_TURN = {
     "name": "body_turn",
     "description": (
-        "转身：直接旋转虚拟 HMD 的朝向，正值向右转，负值向左转。"
+        "转身：直接旋转虚拟 HMD 的朝向。符号与 wander 的 turn_deg 一致——"
+        "正值向左转，负值向右转（例：用户说“向右转”填 horizontal=-0.5）。"
         "不走摇杆——VR 模式下 VRChat 的右摇杆转向不可靠，照样会回 accepted=true 却不动。"
         "转身同时就是转视角：转完之后画面朝向变了，body_locomotion 的前后左右也随之改变，"
         "所以「先转向再前进」是改变行进方向的正确做法。"
@@ -674,7 +682,7 @@ BODY_TURN = {
     "parameters": {
         "type": "object",
         "properties": {
-            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "转身速度：-1.0=最快左转，1.0=最快右转"},
+            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "转身速度：1.0=最快左转，-1.0=最快右转（正左负右，与 turn_deg 同）"},
             "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 500, "description": "持续时间；超时后自动归零"},
         },
         "required": ["horizontal"],
