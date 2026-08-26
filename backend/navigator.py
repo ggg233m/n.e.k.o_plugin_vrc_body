@@ -39,16 +39,31 @@ _DEPART_MAX_FORWARD_AXIS = 0.35
 # 闲逛时没有“目标方向”可以容忍斜走；forward_ratio=0.738 的实机贴墙滑行对
 # 普通目标导航尚可接受，对自由巡航则应尽快绕开。这里只收紧 wander，不改变
 # 已经用正负样本校准过的全局 0.55 阈值。
+#
+# 2026-08-26 第二次实机贴墙实测 forward_ratio=0.628、水平速度 0.6976 m/s（巡航
+# 1.1111），持续约 1.3s 后撞停归零。两个正样本（0.738、0.628）都落在 0.85 之下、
+# 0.55 之上：wander 会判定滑行并绕开，普通导航按原阈值放过。这正是分场景取
+# max() 的意图，不是两个阈值在打架。
 _WANDER_SLIP_FORWARD_RATIO = 0.85
 _WANDER_SLIP_TICKS = 3
 
-# 门控积分丢弃转向拍的判据。AngularY 只在移动期间回传，量级未标定，所以只用它
-# 判「有没有在转」，不参与任何角度积分。
+# 门控积分丢弃转向拍的判据。AngularY 只在移动期间回传，仍然只用它判「有没有在
+# 转」，不参与任何角度积分——它的单位没有确认，数值也远超任何角度/弧度解读。
 #
-# 年龄门槛比一拍略宽：10Hz 下一拍 100ms，250ms 允许错开一两个包，又不至于让上
-# 一次转向的旧包把整段直行都标成转弯。
-_ANGULAR_RESTING = 0.05
-_ANGULAR_FRESH_MS = 250.0
+# 2026-08-26 实测（/osc/turn horizontal=0.6 叠加前进，10Hz 采样）：转向中 AngularY
+# 为 -544 ~ -816，停转后是精确的 0.0，中间没有过渡值。所以真实间隔是 0 与 544，
+# 不是「噪声底 vs 小信号」；阈值取 1.0 而不是 0.05，是因为它落在这个空档中央，
+# 对未来可能出现的小抖动更有余量，而不是贴着噪声下沿。
+_ANGULAR_RESTING = 1.0
+
+# 年龄门槛比一拍略宽：10Hz 下一拍 100ms。
+#
+# 实测下这道门是冗余的：yaw 停止变化的同一拍，VRChat 就主动发出 AngularY=0.0，
+# 不留非零尾包；停转后 angular_age_ms 从 78ms 单调爬升（1.7s 内到 1718ms），
+# 而此时 |0.0| 已经低于 _ANGULAR_RESTING，fresh_angular 靠速度项就是 False。
+# 保留它是为了防「转向刚停、非零包仍在缓存」这一未观测到的情形；放宽到 400ms
+# 是因为它既然不承担实际判定，就不该在采样被视觉拖慢时误判新鲜样本为过期。
+_ANGULAR_FRESH_MS = 400.0
 
 
 @dataclass(frozen=True)
@@ -739,7 +754,7 @@ class LocalNavigator:
             "speed_sample_count": 0,
             "last_horizontal_speed_mps": None,
             "last_forward_ratio": None,
-            # 门控积分的输入。每拍一条，上限 240（4Hz 下约 60 秒），够覆盖一段
+            # 门控积分的输入。每拍一条，上限 240（10Hz 下约 24 秒），够覆盖一段
             # wander 又不会无界增长。
             "progress_samples": [],
             "progress_last_sample_at": None,
@@ -950,9 +965,22 @@ class LocalNavigator:
             1 for item in recoveries if item.get("turn_submitted") is True
         )
         if decision.reason == "wander_step_complete":
-            completion = (
-                "completed_after_recovery" if submitted_recoveries else "completed_clean"
-            )
+            # 蹭着墙走到计时器到点，不能报成 completed_clean：斜撞墙时速度模长
+            # 过得了失速判据，分段计时器照样自然到点，这一段和真正的空旷直行
+            # 长得一模一样。而 direction_memory 那边（见
+            # _record_direction_memory_locked）已经把 wall_slide 记成 blocked，
+            # 不改这里两个字段就会自相矛盾。
+            #
+            # 只在**一次绕行都没发过**时才改判。发过绕行说明贴墙已经被处理过，
+            # 之后是真的走通了，completed_after_recovery 本身就带着「中途出过事」
+            # 的信息；一并改成 blocked 会让「绕行救回来了」和「绕行没救回来」
+            # 变成同一个值，丢掉的信息比修掉的多。
+            if submitted_recoveries:
+                completion = "completed_after_recovery"
+            elif trace.get("wall_slide_detected"):
+                completion = "blocked"
+            else:
+                completion = "completed_clean"
         elif decision.reason == "movement_stalled":
             completion = (
                 "blocked_after_recovery" if submitted_recoveries else "blocked"

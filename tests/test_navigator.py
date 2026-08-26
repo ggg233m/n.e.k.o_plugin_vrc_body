@@ -455,8 +455,9 @@ class NavigatorTests(unittest.TestCase):
             "horizontal_speed_mps": 1.05,
             "forward_ratio": 1.0,
             "value_age_ms": 10.0,
-            # 新鲜的角速度包：VRChat 说人在转。
-            "angular_speed": 0.8,
+            # 新鲜的角速度包：VRChat 说人在转。取值贴合 2026-08-26 实测量级
+            # （转向中 AngularY 为 -544 ~ -816，停转后精确 0.0）。
+            "angular_speed": -544.0,
             "angular_age_ms": 20.0,
         }
         navigator = LocalNavigator(
@@ -504,8 +505,9 @@ class NavigatorTests(unittest.TestCase):
             "horizontal_speed_mps": 1.05,
             "forward_ratio": 1.0,
             "value_age_ms": 10.0,
-            # 上一次转向留下的包，早就过期了。
-            "angular_speed": 0.8,
+            # 上一次转向留下的包，早就过期了。数值取实测转向量级；实机上停转会
+            # 立刻补一个 0.0，所以这个非零尾包是构造出来专门压年龄门的。
+            "angular_speed": -544.0,
             "angular_age_ms": 4000.0,
         }
         navigator = LocalNavigator(
