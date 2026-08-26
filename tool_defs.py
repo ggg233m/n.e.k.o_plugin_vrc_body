@@ -533,6 +533,10 @@ WORLD_OBSERVE = {
         "decision_context 会把重复位置更新压成每个实体的 first/latest 轨迹，并保留离散事件；"
         "生成自主目标时把 through_revision 写入 based_on_revision，只有目标被接受后才会确认消费。"
         "结果来自可选的 VRChat 画面检测器/VLM；没有新观测时必须按 unknown 处理，不能把空结果当成世界为空。"
+        "其中 traversability_prediction 是独立的连续帧光流几何预测，不是实体或地图；"
+        "只有 predicted_blocked 才可能触发当前路线的安全停车，unknown 不能当作畅通。"
+        "traversability_prediction.ground_extent 是单帧地面可见范围，advisory_only；"
+        "它只给方向之间的相对开阔度排序，不触发停车，extent_ratio 是画面跨度比例而非米制。"
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }

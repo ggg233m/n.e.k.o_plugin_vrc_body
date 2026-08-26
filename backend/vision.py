@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib.request import Request, urlopen
 
 from .world_state import WorldEntity, WorldEvent, WorldStateStore
+from .traversability import GroundExtentEstimator, OpticalFlowTraversability
 
 
 @dataclass(frozen=True)
@@ -712,6 +713,8 @@ class DxcamFrameSource:
         self._lock = threading.Lock()
         self._camera: Any = None
         self._region = None
+        self._requested_region: dict[str, int] | None = None
+        self._region_origin: tuple[int, int] | None = None
         self._closed = False
         # 分开计「尝试」与「真的拿到帧」。DXcam 的 ``new_frame_only=True`` 在没有
         # 新帧时合法返回 ``None``，把两者合成一个计数器会让「相机在线但一帧不产」
@@ -741,6 +744,7 @@ class DxcamFrameSource:
 
             self._dxcam = dxcam
             normalized = _normalize_region(region)
+            self._requested_region = normalized
             if normalized is not None:
                 self._region = tuple(normalized[key] for key in ("left", "top", "right", "bottom"))
             self._candidate_specs = self._build_candidates(dxcam)
@@ -833,6 +837,40 @@ class DxcamFrameSource:
         # dxgi 的向后兼容回退：去掉 backend 参数，兼容不支持该参数的旧版 DXcam。
         return self._dxcam.create(**base, processor_backend="numpy")
 
+    def _region_for_candidate(
+        self,
+        spec: tuple[int, int | None, str],
+    ) -> tuple[int, int, int, int] | None:
+        """把虚拟桌面区域转换为目标 DXcam 输出的局部坐标。
+
+        DXcam 的 ``grab(region=...)`` 以所选输出左上角为原点，而 Win32
+        ``GetWindowRect`` 返回的是虚拟桌面坐标。只有 candidate 对应的输出
+        包含目标窗口时才做转换；其它输出保留绝对坐标，让它自然失败并继续
+        探测，不能把第二屏窗口误抓成第一屏同位置的画面。
+        """
+        requested = getattr(self, "_requested_region", None)
+        if requested is None:
+            return None
+        original = tuple(requested[key] for key in ("left", "top", "right", "bottom"))
+        target_rect = _monitor_for_region(requested)
+        if target_rect is None:
+            return original
+        _device, output, _backend = spec
+        try:
+            output_index = 0 if output is None else int(output)
+        except (TypeError, ValueError, OverflowError):
+            return original
+        monitors = _display_monitor_rects()
+        if output_index < 0 or output_index >= len(monitors) or monitors[output_index] != target_rect:
+            return original
+        origin_x, origin_y = target_rect[:2]
+        return (
+            original[0] - origin_x,
+            original[1] - origin_y,
+            original[2] - origin_x,
+            original[3] - origin_y,
+        )
+
     def _activate_candidate_locked(self, position: int) -> bool:
         old_camera = self._camera
         self._camera = None
@@ -843,11 +881,23 @@ class DxcamFrameSource:
             candidate_pos = (int(position) + offset) % len(self._candidate_specs)
             spec = self._candidate_specs[candidate_pos]
             try:
+                candidate_region = self._region_for_candidate(spec)
                 camera = self._create_camera(spec)
                 if camera is None:
                     raise RuntimeError("DXcam returned no camera")
                 self._candidate_pos = candidate_pos
                 self._camera = camera
+                self._region = candidate_region
+                target_rect = _monitor_for_region(getattr(self, "_requested_region", None) or {})
+                self._region_origin = (
+                    target_rect[:2]
+                    if candidate_region is not None and target_rect is not None
+                    and candidate_region != tuple(
+                        getattr(self, "_requested_region", {})[key]
+                        for key in ("left", "top", "right", "bottom")
+                    )
+                    else None
+                )
                 self._selected_device_idx, self._selected_output_idx, self._selected_backend = spec
                 # 构造成功不等于能采集：越界区域下每个 candidate 都能建出相机，
                 # 却在 grab 时抛同一个 ValueError。轮换一圈后如果每个 candidate
@@ -895,6 +945,8 @@ class DxcamFrameSource:
                 "available": self._camera is not None and not self._closed and self._last_error is None,
                 "name": self.name,
                 "region": self._region,
+                "requested_region": dict(getattr(self, "_requested_region", None) or {}) or None,
+                "region_origin": getattr(self, "_region_origin", None),
                 "device_idx": self._selected_device_idx,
                 "output_idx": self._selected_output_idx,
                 "backend": self._selected_backend,
@@ -1544,6 +1596,69 @@ def _semantic_crop(data: bytes, bbox: tuple[float, float, float, float] | None) 
         return None
 
 
+def _display_monitor_rects() -> list[tuple[int, int, int, int]]:
+    """返回按 Win32 枚举顺序排列的物理显示器虚拟桌面矩形。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.RECT),
+            ctypes.c_long,
+        )
+        rects: list[tuple[int, int, int, int]] = []
+
+        @callback_type
+        def callback(handle: Any, _hdc: Any, _clip: Any, _data: int) -> int:
+            info = _MonitorInfo()
+            info.cbSize = ctypes.sizeof(_MonitorInfo)
+            if user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+                rect = info.rcMonitor
+                if rect.right > rect.left and rect.bottom > rect.top:
+                    rects.append((int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)))
+            return 1
+
+        if not user32.EnumDisplayMonitors(0, 0, callback, 0):
+            return []
+        return rects
+    except Exception:
+        # 非 Windows、权限受限或 API 不可用时不猜坐标，调用方会沿用原区域。
+        return []
+
+
+def _monitor_for_region(region: Mapping[str, Any]) -> tuple[int, int, int, int] | None:
+    """找到包含区域中心的显示器；区域坐标仍保持虚拟桌面绝对坐标。"""
+    try:
+        normalized = _normalize_region(region)
+        if normalized is None:
+            return None
+        center_x = (normalized["left"] + normalized["right"]) / 2.0
+        center_y = (normalized["top"] + normalized["bottom"]) / 2.0
+    except (TypeError, ValueError, KeyError):
+        return None
+    matches = [
+        rect
+        for rect in _display_monitor_rects()
+        if rect[0] <= center_x < rect[2] and rect[1] <= center_y < rect[3]
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+
+
 def _semantic_descriptor(data: bytes | None) -> tuple[float, ...] | None:
     if not data:
         return None
@@ -1989,6 +2104,10 @@ class VisionWorker:
         interval_s: float = 0.1,
         queue_size: int = 1,
         capture_only: bool = False,
+        traversability: OpticalFlowTraversability | None = None,
+        ground_extent: "GroundExtentEstimator | None" = None,
+        motion_provider: Callable[[], Mapping[str, Any]] | None = None,
+        turning_provider: Callable[[], Mapping[str, Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.runtime = runtime
@@ -1996,6 +2115,13 @@ class VisionWorker:
         self.interval_s = min(2.0, max(0.01, float(interval_s)))
         self.queue: Queue[CapturedFrame] = Queue(maxsize=max(1, min(4, int(queue_size))))
         self.capture_only = bool(capture_only)
+        # 几何预测与 YOLO/VLM 解耦：worker 每次消费最新帧时只保留一份小灰度图，
+        # 不把原始帧放入另一个队列，也不进入身体 120 Hz 调度线程。
+        self._traversability = traversability or OpticalFlowTraversability(clock=clock)
+        # 地面范围与光流并列但独立：它没有 moving 门控，站着不动也有输出。
+        self._ground_extent = ground_extent or GroundExtentEstimator(clock=clock)
+        self._motion_provider = motion_provider
+        self._turning_provider = turning_provider
         self._clock = clock
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -2082,6 +2208,7 @@ class VisionWorker:
             if not alive:
                 self._producer = None
                 self._consumer = None
+        self._traversability.reset()
 
     def _record_error(self, exc: Exception) -> None:
         with self._lock:
@@ -2146,10 +2273,30 @@ class VisionWorker:
             except Empty:
                 continue
             try:
+                source_obscured = self._obscured()
+                prediction = self._estimate_traversability(
+                    packet.frame,
+                    captured_at=packet.captured_at,
+                    source_obscured=source_obscured,
+                )
+                # 地面范围挂在同一份预测里，而不是另开一条通道：这样它自动
+                # 继承既有的 TTL、过期屏蔽和采集停止语义，不必再复制一套。
+                prediction["ground_extent"] = self._estimate_ground_extent(
+                    packet.frame,
+                    captured_at=packet.captured_at,
+                    source_obscured=source_obscured,
+                )
+                # 即使窗口被遮挡，也要把本次 unknown 写入易失摘要，避免上一帧
+                # 的几何结论在遮挡期间继续被导航器使用。
+                self.runtime.set_traversability_prediction(
+                    prediction,
+                    observed_at=packet.captured_at,
+                )
                 self.runtime.process_frame(
                     packet.frame,
                     observed_at=packet.captured_at,
-                    source_obscured=self._obscured(),
+                    source_obscured=source_obscured,
+                    traversability=prediction,
                 )
                 with self._lock:
                     self._processed += 1
@@ -2158,6 +2305,114 @@ class VisionWorker:
                 self._record_error(exc)
             finally:
                 _release_frame(packet.frame)
+
+    def _estimate_ground_extent(
+        self,
+        frame: Any,
+        *,
+        captured_at: float,
+        source_obscured: bool,
+    ) -> Mapping[str, Any]:
+        """单帧地面可见范围。刻意不接 motion/turning 门控。
+
+        光流需要 ``moving=True``，而主 LLM 选方向的那一刻恰好站着不动；这条
+        单帧判据填的就是那个空档，所以转向中和静止时都要照常输出。遮挡仍然
+        必须是 unknown——那时画面根本不是 VRChat。
+        """
+        if source_obscured:
+            return self._ground_extent.estimate(
+                None,
+                captured_at=captured_at,
+                now=self._clock(),
+            ) | {"reason": "window_obscured"}
+        try:
+            return self._ground_extent.estimate(
+                frame,
+                captured_at=captured_at,
+                now=self._clock(),
+            )
+        except Exception:
+            # 地面范围只是参考信号，不该让它的失败打断整帧处理。
+            return self._ground_extent.estimate(
+                None,
+                captured_at=captured_at,
+                now=self._clock(),
+            ) | {"reason": "ground_extent_error"}
+
+    def _estimate_traversability(
+        self,
+        frame: Any,
+        *,
+        captured_at: float,
+        source_obscured: bool,
+    ) -> Mapping[str, Any]:
+        """在释放原始帧前生成一份有界几何摘要。"""
+        if source_obscured:
+            self._traversability.reset()
+            prediction = self._traversability.estimate(
+                None,
+                captured_at=captured_at,
+                moving=None,
+                now=self._clock(),
+            )
+            # 窗口被遮挡是可辨识的 unknown 原因，避免被误读成普通预热。
+            prediction["reason"] = "window_obscured"
+            return prediction
+        motion: Mapping[str, Any] = {}
+        if self._motion_provider is not None:
+            try:
+                value = self._motion_provider()
+                if isinstance(value, Mapping):
+                    motion = value
+            except Exception:
+                motion = {}
+        turning_state: Mapping[str, Any] = {}
+        if self._turning_provider is not None:
+            try:
+                value = self._turning_provider()
+                if isinstance(value, Mapping):
+                    turning_state = value
+            except Exception:
+                turning_state = {}
+        speed = motion.get("horizontal_speed_mps")
+        try:
+            sample_age_ms = float(motion.get("value_age_ms"))
+            # 判据看**速度值**，不看包年龄。VRChat OSC 是变化驱动的：匀速直行时
+            # VelocityZ 不变就不再发包，于是 value_age_ms 会一路爬升，而缓存里的
+            # 速度值始终有效。2026-08-26 实测一段 3s 直行：hspeed 从 0.3s 到 5.6s
+            # 恒为 1.5556 一次未变，age_ms 却从 15 爬到 2016——按年龄判会把
+            # 26 拍里的 17 拍误判成「没在动」，也就是**走得越稳光流越用不了**。
+            #
+            # 年龄门槛保留但放宽到秒级，只兜「人早已停下而缓存还留着」这一种情形；
+            # 缓存真正过期由 osc.py 的 velocity_feedback_quiet 覆盖（那时
+            # available=false，速度值本就取不到）。
+            #
+            # 阈值仍用 0.15 m/s（与 navigator 的 stall_speed_mps 同值），不用
+            # osc.py 的 _RESTING_SPEED_MPS=0.05：实测顶墙推摇杆时速度是 0.08 m/s，
+            # 0.05 会把顶墙判成在动，而贴脸的墙面发散率近零恰好会被读成 clear。
+            moving = (
+                bool(motion.get("available"))
+                and sample_age_ms <= 3000.0
+                and float(speed) > 0.15
+            )
+        except (TypeError, ValueError, OverflowError):
+            moving = None
+        turning = bool(turning_state.get("turning"))
+        try:
+            angular = float(motion.get("angular_speed"))
+            angular_age = float(motion.get("angular_age_ms"))
+            # 这两个门控值与 navigator 的实测约定一致，但仅在这里用于丢弃
+            # 转向光流，绝不把 AngularY 当作角度积分来源。
+            turning = turning or (abs(angular) > 1.0 and angular_age <= 400.0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return self._traversability.estimate(
+            frame,
+            captured_at=captured_at,
+            moving=moving,
+            turning=turning,
+            now=self._clock(),
+        )
 
     def status(self) -> dict[str, Any]:
         now = self._clock()
@@ -2254,6 +2509,11 @@ class VisionRuntime:
         self._frame_cache: dict[str, Any] | None = None
         self._frame_cache_at: float | None = None
         self._frame_cache_error: str | None = None
+        # 局部几何预测是独立的易失传感器，不写入 WorldStateStore。保存的是
+        # 最新一份标量摘要，超过短 TTL 后自动变成 unknown。
+        self._traversability_prediction: dict[str, Any] | None = None
+        self._traversability_at: float | None = None
+        self._traversability_ttl_s = 0.75
         # 采集生命周期与检测器可用性分离。将门控放在运行时中，可让所有消费者
         # （HTTP、世界桥、自主控制和导航器）统一认定已停止的来源为未知，即使
         # 有界世界存储中仍保留最近一帧。
@@ -2295,6 +2555,8 @@ class VisionRuntime:
                 # 而 agent 无法区分「刚才」和「现在」。
                 self._frame_cache = None
                 self._frame_cache_at = None
+                self._traversability_prediction = None
+                self._traversability_at = None
                 self._cancel_main_llm_request_locked(self._capture_reason)
         if not active:
             # 尚未开始的旧语义任务必须丢掉；已经在推理的任务返回后也会经过
@@ -2308,6 +2570,60 @@ class VisionRuntime:
                 "active": self._capture_active,
                 "reason": self._capture_reason,
             }
+
+    def set_traversability_prediction(
+        self,
+        prediction: Mapping[str, Any] | None,
+        *,
+        observed_at: float | None = None,
+    ) -> None:
+        """更新独立的局部几何摘要，不触碰实体世界存储。"""
+        if not isinstance(prediction, Mapping):
+            return
+        captured_at = observed_at
+        try:
+            if captured_at is None:
+                captured_at = float(prediction.get("captured_at_monotonic"))
+        except (TypeError, ValueError, OverflowError):
+            captured_at = None
+        with self._lock:
+            self._traversability_prediction = dict(prediction)
+            self._traversability_at = captured_at
+
+    def traversability_prediction(self) -> dict[str, Any]:
+        """返回未过期的光流预测；过期或未采到时只返回 unknown。"""
+        now = self._clock()
+        with self._lock:
+            prediction = dict(self._traversability_prediction or {})
+            captured_at = self._traversability_at
+            active = self._capture_active
+        age_ms = (
+            None
+            if captured_at is None
+            else round(max(0.0, now - captured_at) * 1000.0, 1)
+        )
+        if not active or not prediction or captured_at is None or now - captured_at > self._traversability_ttl_s:
+            reason = "capture_stopped" if not active else "prediction_stale"
+            return {
+                "available": False,
+                "source": "optical_flow",
+                "state": "unknown",
+                "reason": reason,
+                "age_ms": age_ms,
+                "sectors": [],
+                # 地面范围与光流共用这份 TTL，过期时必须一起失效：否则一条
+                # 早已过期的地面读数会在光流被屏蔽之后继续留在快照里。
+                "ground_extent": {
+                    "available": False,
+                    "source": "ground_extent",
+                    "state": "unknown",
+                    "reason": reason,
+                    "age_ms": age_ms,
+                    "sectors": [],
+                },
+            }
+        prediction["age_ms"] = age_ms
+        return prediction
 
     def close(self) -> None:
         """停止仅属于运行时的异步语义线程。"""
@@ -3212,6 +3528,9 @@ class VisionRuntime:
             "semantic_worker": self._semantic_worker.status(),
             "semantic_candidates": self._semantic_candidates.snapshot(),
             "optional_dependencies": optional_dependency_status(),
+            # 几何预测是易失的、独立于实体的第二条感知通道；状态接口也要暴露
+            # unknown/过期原因，避免调用方把没有预测误读成空旷。
+            "traversability": self.traversability_prediction(),
             # 画面缓存独立于世界状态；这里只报告它是否可用，不把画面内容
             # 混进感知结论。
             "frame_cache": {
@@ -3388,6 +3707,7 @@ class VisionRuntime:
         self.store.set_backend_status("vision_runtime", self.status())
         result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
         result["vision"] = self.status()
+        result["traversability_prediction"] = self.traversability_prediction()
         return result
 
     def process_frame(
@@ -3397,6 +3717,7 @@ class VisionRuntime:
         force_semantic: bool = False,
         observed_at: float | None = None,
         source_obscured: bool = False,
+        traversability: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """处理一帧画面而不阻塞身体调度器。
 
@@ -3410,11 +3731,18 @@ class VisionRuntime:
         if not self.capture_state()["active"]:
             result = self._mask_stopped_snapshot(self.store.snapshot(now=processing_now))
             result["vision"] = self.status()
+            result["traversability_prediction"] = self.traversability_prediction()
             return result
         try:
             observation_now = min(processing_now, float(observed_at)) if observed_at is not None else processing_now
         except (TypeError, ValueError, OverflowError):
             observation_now = processing_now
+        if traversability is not None:
+            # 允许非 worker 调用方同步提交预测，避免快照漏掉这次结果。
+            self.set_traversability_prediction(
+                traversability,
+                observed_at=observation_now,
+            )
         if source_obscured:
             return self._observe_obscured(processing_now, observation_now)
         # attach_vision/set_backends 可能与采集线程并行；在锁内取得稳定引用，
@@ -3496,6 +3824,7 @@ class VisionRuntime:
     def snapshot(self) -> dict[str, Any]:
         result = self._mask_stopped_snapshot(self.store.snapshot())
         result["vision"] = self.status()
+        result["traversability_prediction"] = self.traversability_prediction()
         return result
 
     def delta(
@@ -3539,4 +3868,6 @@ __all__ = [
     "WindowTrackedFrameSource",
     "window_visibility",
     "optional_dependency_status",
+    "GroundExtentEstimator",
+    "OpticalFlowTraversability",
 ]

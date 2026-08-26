@@ -133,6 +133,147 @@ class NavigatorTests(unittest.TestCase):
         self.assertFalse(summary["execution"]["world_observation_verified"])
         self.assertEqual(summary["recoveries"], [])
 
+    def test_wander_stops_before_a_confirmed_optical_flow_block(self) -> None:
+        """几何预测只做安全停车，不替主 LLM 改选方向。"""
+        completed: list[str] = []
+        self.navigator._complete_goal = completed.append
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前探索",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": 0.0, "max_duration_s": 2.0},
+            },
+        }
+        self.world["traversability_prediction"] = {
+            "available": True,
+            "state": "predicted_blocked",
+            "captured_at_monotonic": 99.9,
+            "sectors": [
+                {
+                    "bearing_deg": 0.0,
+                    "state": "predicted_blocked",
+                    "confidence": 0.9,
+                }
+            ],
+        }
+
+        first = self.navigator.tick()
+        self.assertEqual(first.reason, "wander_forward")
+        # 采集约 6.5 帧/秒而 tick 是 10Hz：同一份预测被再读一次不算第二拍，
+        # 否则一帧光流尖峰就能停车。
+        self.now[0] += 0.1
+        self.assertEqual(self.navigator.tick().reason, "wander_forward")
+        self.now[0] += 0.1
+        self.world["traversability_prediction"]["captured_at_monotonic"] = 100.05
+        second = self.navigator.tick()
+        self.assertEqual(second.reason, "traversability_predicted_blocked")
+        self.assertEqual(completed, ["traversability_predicted_blocked"])
+        self.assertEqual(self.released[-1], "all")
+
+    def test_optical_flow_sectors_are_relative_to_the_post_turn_heading(self) -> None:
+        """扇区 bearing 是相对当前视线的偏角，不能拿 turn_deg 再减一次。
+
+        转向在门检查之前就已完成，所以「正前方」在预测里恒为 0°。以前用
+        ``bearing - turn_deg`` 时，任何非零转角都会让正前方的墙被放行，而
+        侧面并不存在的扇区反而触发停车。
+        """
+        for turn_deg in (0.0, 45.0, 90.0, -135.0):
+            with self.subTest(turn_deg=turn_deg):
+                navigator = self._build_wander_navigator(turn_deg)
+                ahead = {
+                    "available": True,
+                    "captured_at_monotonic": 99.9,
+                    "sectors": [
+                        {"bearing_deg": 0.0, "state": "predicted_blocked", "confidence": 0.9},
+                    ],
+                }
+                self.world["traversability_prediction"] = ahead
+                reasons = []
+                for index in range(6):
+                    reasons.append(navigator.tick().reason)
+                    self.now[0] += 0.2
+                    ahead["captured_at_monotonic"] = 99.9 + 0.2 * (index + 1)
+                self.assertIn("traversability_predicted_blocked", reasons)
+
+    def test_optical_flow_block_outside_the_travel_sector_does_not_stop(self) -> None:
+        """只有行进方向那一片扇区被判 blocked 才停车。"""
+        navigator = self._build_wander_navigator(90.0)
+        side = {
+            "available": True,
+            "captured_at_monotonic": 99.9,
+            "sectors": [
+                {"bearing_deg": -60.0, "state": "predicted_blocked", "confidence": 0.9},
+            ],
+        }
+        self.world["traversability_prediction"] = side
+        reasons = []
+        for index in range(6):
+            reasons.append(navigator.tick().reason)
+            self.now[0] += 0.2
+            side["captured_at_monotonic"] = 99.9 + 0.2 * (index + 1)
+        self.assertNotIn("traversability_predicted_blocked", reasons)
+
+    def test_ground_extent_never_reaches_the_stop_gate(self) -> None:
+        """地面范围是参考信号，不接安全门。
+
+        它是单帧启发式，失效模式比光流多（地板与墙同色、地毯花纹、栏杆下方
+        透视到远处地面）。接进停车判据会让 agent 在花纹地毯上莫名停住。这里
+        刻意把它伪装成光流的判定词并给满置信度，确认仍然不被采纳。
+        """
+        navigator = self._build_wander_navigator(0.0)
+        prediction = {
+            "available": True,
+            "state": "predicted_clear",
+            "captured_at_monotonic": 99.9,
+            "sectors": [],
+            "ground_extent": {
+                "available": True,
+                "state": "measured",
+                "captured_at_monotonic": 99.9,
+                "sectors": [
+                    {
+                        "bearing_deg": 0.0,
+                        "state": "predicted_blocked",
+                        "extent_ratio": 0.01,
+                        "confidence": 1.0,
+                    }
+                ],
+            },
+        }
+        self.world["traversability_prediction"] = prediction
+        reasons = []
+        for index in range(6):
+            reasons.append(navigator.tick().reason)
+            self.now[0] += 0.2
+            prediction["ground_extent"]["captured_at_monotonic"] = 99.9 + 0.2 * (index + 1)
+        self.assertNotIn("traversability_predicted_blocked", reasons)
+
+    def _build_wander_navigator(self, turn_deg: float) -> LocalNavigator:
+        self.goal = {
+            "state": "armed",
+            "goal": {
+                "kind": "wander",
+                "text": "向前探索",
+                "target_id": None,
+                "age_seconds": 0.0,
+                "constraints": {"turn_deg": turn_deg, "max_duration_s": 8.0},
+            },
+        }
+        navigator = LocalNavigator(
+            world_provider=lambda: self.world,
+            goal_provider=lambda: self.goal,
+            send_axes=lambda side, x, y, pulse: self.sent.append((side, x, y, pulse)) or True,
+            send_turn=lambda delta: self.turns.append(delta) or True,
+            release_inputs=lambda side: self.released.append(side),
+            turn_state_provider=lambda: self.turn_state,
+            clock=lambda: self.now[0],
+        )
+        navigator._complete_goal = lambda reason: None
+        return navigator
+
     def test_wander_summary_tracks_scheduler_heading_across_zero_without_calling_it_world_truth(self) -> None:
         self.goal = {
             "state": "armed",

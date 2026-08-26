@@ -116,7 +116,8 @@ history_size = 64
 # 默认关闭，未接入外部 detector 时不会抓屏或加载模型。
 [vision]
 enabled = true
-source = "none"
+# 直接从桌面镜像采集 VRChat；window_title 会在多屏环境中跟踪窗口区域。
+source = "desktop_mirror"
 capture = "desktop_mirror"
 local_backend = "openvino"
 # OpenVINO IR XML/ONNX 模型和可选标签文件。留空表示未部署本地模型；此时感知

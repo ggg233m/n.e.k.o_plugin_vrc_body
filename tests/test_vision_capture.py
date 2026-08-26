@@ -101,6 +101,29 @@ class VisionCaptureTests(unittest.TestCase):
         self.assertEqual(len(source._dxcam.calls), 2)
         self.assertNotIn("backend", source._dxcam.calls[-1])
 
+    def test_secondary_monitor_region_is_local_to_matching_output(self) -> None:
+        """第二屏窗口不能把虚拟桌面绝对坐标直接交给 DXcam。"""
+        source = object.__new__(DxcamFrameSource)
+        source._requested_region = {
+            "left": 2476,
+            "top": 155,
+            "right": 3637,
+            "bottom": 921,
+        }
+        source._region_origin = None
+        original = vision._display_monitor_rects
+        try:
+            vision._display_monitor_rects = lambda: [
+                (0, 0, 1920, 1080),
+                (1920, 0, 4260, 1080),
+            ]
+            primary = source._region_for_candidate((0, None, "dxgi"))
+            secondary = source._region_for_candidate((0, 1, "dxgi"))
+        finally:
+            vision._display_monitor_rects = original
+        self.assertEqual(primary, (2476, 155, 3637, 921))
+        self.assertEqual(secondary, (556, 155, 1717, 921))
+
 
 class RegionNormalizationTests(unittest.TestCase):
     def test_window_rect_form_gains_width_and_height(self) -> None:

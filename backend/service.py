@@ -382,6 +382,10 @@ class BackendService:
             interval_s=self.config.vision.interval_ms / 1000.0,
             queue_size=self.config.vision.queue_size,
             capture_only=not backend_available,
+            # 光流只需要读取现有 OSC/scheduler 状态，不向控制线程反向发送命令。
+            # provider 在 worker 真正启动后才调用，此时 scheduler/OSC 已完成初始化。
+            motion_provider=self._navigator_motion_feedback,
+            turning_provider=self._navigator_turn_state,
         )
 
     def _build_configured_vision_source(self) -> FrameSource | None:

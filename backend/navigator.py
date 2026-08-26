@@ -488,6 +488,11 @@ class LocalNavigator:
         # 最近一次绕行往哪边转（+1 右 / -1 左）。滑行时跟着滑行方向走，正面墙
         # 没有方向可用就沿用上次的，避免左右横跳原地打转。
         self._recover_sign = 1.0
+        # 光流预测只做“这一条 LLM 路线是否暂时不宜继续”的安全门，不替 LLM
+        # 选择另一条路线。两拍确认可抑制一帧光流尖峰导致的误停车；两拍必须
+        # 来自两个不同的采集时刻，所以另记一份 captured_at 去重。
+        self._traversability_block_streak = 0
+        self._traversability_block_frame: float | None = None
         # 已经为哪一次观测发过转向。故意不随目标切换重置：它描述的是「这一帧
         # 世界我已经转过了」，是观测的属性而不是目标的属性。换目标时观测没变，
         # 照样不该再转一次。
@@ -623,6 +628,8 @@ class LocalNavigator:
                 # 绕行方向在一个路段内锁定，但不跨路段：新目标面对的地形不同，
                 # 应重新由第一次滑行取样决定，而不是继承上一段的偏向。
                 self._recover_sign = 1.0
+                self._traversability_block_streak = 0
+                self._traversability_block_frame = None
                 self._completion_notified_goal_key = None
                 self._behavior_target_lost_at = None
                 self._behavior_outcome_notified = None
@@ -1207,6 +1214,7 @@ class LocalNavigator:
             "depart_complete",
             "wander_step_complete",
             "goal_expired",
+            "traversability_predicted_blocked",
         }
         if decision.reason not in terminal_reasons or self._complete_goal is None:
             return
@@ -1341,6 +1349,7 @@ class LocalNavigator:
             "movement_stalled",
             "target_unreachable",
             "goal_expired",
+            "traversability_predicted_blocked",
         }
         if decision.reason not in outcome_reasons:
             return
@@ -1688,8 +1697,10 @@ class LocalNavigator:
                     "continuous_retarget": self._turn_retarget_supported,
                 },
                 "stall": {
-                    # detectable=false 表示收不到 VRChat 内置 Velocity 参数，
-                    # 「卡墙」这件事在本次会话里根本无法被观测到——不是「没卡」。
+                    # detectable=false 表示导航器从未采样过运动反馈（autonomy 未 arm
+                    # 或从未进入 advance 状态），不是「收不到 VRChat Velocity 参数」。
+                    # motion.available=true 而 detectable=false 是正常组合：参数链路
+                    # 正常但导航器还没开始前进。「卡墙」判据在此状态下不可用。
                     "detectable": self._motion_feedback_usable,
                     "feedback_required": self._forward_started_at is not None,
                     "feedback_state": self._motion_feedback_state,
@@ -2237,6 +2248,29 @@ class LocalNavigator:
                 revision=revision,
                 observed_age_ms=observed_age,
             )
+        # 只在已经完成转向、即将持续前进时检查几何预测。转向中的全局光流
+        # 会被明确标成 unknown，不能拿来阻止主模型刚选定的转角。
+        guard = self._traversability_guard_reason(world)
+        with self._lock:
+            if guard is None:
+                self._traversability_block_streak = 0
+                self._traversability_block_frame = None
+            else:
+                # 采集约 6.5 帧/秒而 tick 是 10Hz，同一份预测会被重复读到。
+                # 按 captured_at 去重，确保「两拍」真的是两帧独立证据，而不是
+                # 一帧尖峰被读了两次。
+                frame_at = guard[1]
+                if self._traversability_block_frame != frame_at:
+                    self._traversability_block_frame = frame_at
+                    self._traversability_block_streak += 1
+            block_streak = self._traversability_block_streak
+        if guard is not None and block_streak >= 2:
+            return NavigationDecision(
+                "stop",
+                guard[0],
+                revision=revision,
+                observed_age_ms=observed_age,
+            )
         return NavigationDecision(
             "advance",
             "wander_forward",
@@ -2246,6 +2280,51 @@ class LocalNavigator:
             revision=revision,
             observed_age_ms=observed_age,
         )
+
+    def _traversability_guard_reason(
+        self,
+        world: Mapping[str, Any] | None,
+    ) -> tuple[str, float] | None:
+        """检查行进方向的几何预测，绝不替主 LLM 改选方向。
+
+        故意不接受 ``turn_deg``：光流扇区的 ``bearing_deg`` 由像素列算出，是
+        **相对当前视线**的偏角（±FOV/2），而 ``turn_deg`` 是相对转向前朝向的
+        增量。调用点在 ``_wander_turn_sent`` 与转向沉降门都放行之后，此时视线
+        已经是转完的朝向，所以「正前方」在预测里恒为 0°，两者相减只会把非零
+        转角的路段全部放行。
+
+        返回 ``(reason, captured_at)``；``captured_at`` 让调用方能区分「同一份
+        预测被读了两次」和「两帧独立证据」。
+        """
+        if not isinstance(world, Mapping):
+            return None
+        prediction = world.get("traversability_prediction")
+        if not isinstance(prediction, Mapping) or prediction.get("available") is not True:
+            return None
+        sectors = prediction.get("sectors")
+        if not isinstance(sectors, (list, tuple)):
+            return None
+        captured_at = _finite(prediction.get("captured_at_monotonic"))
+        if captured_at is None:
+            # 没有采集时刻就无法确认两拍来自不同帧，退回不拦截。
+            return None
+        candidates: list[tuple[float, float]] = []
+        for item in sectors:
+            if not isinstance(item, Mapping) or item.get("state") != "predicted_blocked":
+                continue
+            bearing = _finite(item.get("bearing_deg"))
+            confidence = _finite(item.get("confidence"))
+            if bearing is None or confidence is None:
+                continue
+            candidates.append((abs(bearing), confidence))
+        if not candidates:
+            return None
+        nearest_delta, confidence = min(candidates, key=lambda item: item[0])
+        # 5 个 30° 扇区的半宽是 15°；放宽到 18° 容许视场误差，但不会把侧面
+        # 另一扇区的墙误套到当前路线上。
+        if nearest_delta > 18.0 or confidence < 0.65:
+            return None
+        return "traversability_predicted_blocked", captured_at
 
     def _select_target(
         self,
