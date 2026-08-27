@@ -2040,6 +2040,11 @@ class BackendService:
                             "这次闲逛没有开始；必须如实告诉用户尚未移动，不能描述已经出发。"
                             if route_planning else
                             "这次导航没有开始；必须如实告诉用户尚未移动，不能描述正在接近。"
+                            "语义任务超时通常说明目标不是人：本机视觉只追踪人形，"
+                            "海报、屏幕、展台这类静态物体永远确认不了。用户要去的是这类"
+                            "目标时改用 vrc_autonomy_goal(kind=\"wander\") 一段段走过去——"
+                            "看画面估算方位填 constraints.turn_deg（正数左转、负数右转；"
+                            "目标在画面右侧填负值，例如右前方填 -20），不提交 selector。"
                         ),
                     }
                     self._pending_semantic_intent = None

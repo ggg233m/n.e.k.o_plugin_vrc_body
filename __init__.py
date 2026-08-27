@@ -789,6 +789,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                     "是否已经足够近。还不够就立刻再提交一段 wander（按画面重新估算 "
                     "turn_deg，可继续用 max_duration_s=3.0）；只有画面显示确实到了"
                     "近前才能说到达。不确定就说还在往那边走，绝不能凭走过一段就宣布到了。"
+                    # 实机反复出现：走对一段之后，模型看见目标周围站着人，就改用
+                    # approach/selector 去"绕开人群"，于是又回到锁不住的那条路。
+                    # 靠近静态物体全程只能靠 wander 续段，这里必须显式排除。
+                    "整个过程都用 wander 续段：即使目标周围围着人、需要绕开，也不要改用 "
+                    "approach/approach_observe 或带 selector 的目标搜索——锁住一个人"
+                    "不等于走到物体跟前，那条路只会 target_lost 或语义任务超时。"
+                    "要绕开就在下一段的 turn_deg 上偏几度，仍然用 wander。"
                 )
         elif reason == "approach_observe_target_lost":
             # 锁定的是人形实体，海报/屏幕之类根本进不了 world.entities。用户本来
