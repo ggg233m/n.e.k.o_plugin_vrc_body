@@ -1,0 +1,754 @@
+{
+  "document": "YUI_NPC_ProtocolConstants",
+  "spec": "1.1",
+  "wire_version": 1,
+  "status": "frozen",
+  "released_at": "2026-08-29",
+  "environment": {
+    "unity": "2022.3.22f1",
+    "project_type": "VCC Worlds",
+    "platform": "PC",
+    "npc_count": 1,
+    "expected_instance_players_min": 2,
+    "expected_instance_players_max": 3,
+    "sdk_version_policy": "在独立 Unity 仓库创建时选用最新稳定 Worlds SDK，并在 vpm-manifest.json 中锁定精确版本"
+  },
+  "identity": {
+    "npc": "yui",
+    "unbound_session": 0,
+    "session_min": 1,
+    "session_max": 268435455,
+    "session_bits": 28,
+    "slot_min": 0,
+    "slot_max": 63,
+    "slot_none": 127,
+    "world_id_source": "Inspector 必填稳定字符串"
+  },
+  "coordinate_conventions": {
+    "position_space": "Unity world coordinates",
+    "position_unit": "meter",
+    "yaw": {
+      "zero_direction": "+Z",
+      "positive_direction": "clockwise_when_viewed_from_above",
+      "range_degrees": { "min": 0, "min_inclusive": true, "max": 360, "max_inclusive": false }
+    },
+    "brg": {
+      "wire_field": "brg",
+      "meaning": "bearing relative to current NPC forward",
+      "zero_direction": "current NPC forward",
+      "positive_direction": "clockwise/right_when_viewed_from_above",
+      "negative_direction": "counterclockwise/left_when_viewed_from_above",
+      "range_degrees": { "min": -180, "min_inclusive": false, "max": 180, "max_inclusive": true },
+      "absolute_yaw_formula": "wrap360(npc_yaw_deg+brg_deg)",
+      "example": { "npc_yaw_deg": 350, "brg_deg": 20, "absolute_yaw_deg": 10, "turn_to_p0_q14": 455 }
+    }
+  },
+  "transport": {
+    "midi_port": "NEKO_MIDI",
+    "channels": {
+      "command": 0,
+      "upper_body_stream": 1,
+      "text": 2
+    },
+    "registers": {
+      "P0": { "bits": 14, "hi_cc": 20, "lo_cc": 21, "min": 0, "max": 16383 },
+      "P1": { "bits": 14, "hi_cc": 22, "lo_cc": 23, "min": 0, "max": 16383 },
+      "P2": { "bits": 14, "hi_cc": 24, "lo_cc": 25, "min": 0, "max": 16383 },
+      "P3": { "bits": 7, "cc": 26, "min": 0, "max": 127 },
+      "P4": { "bits": 7, "cc": 27, "min": 0, "max": 127 },
+      "P5": { "bits": 7, "cc": 28, "min": 0, "max": 127 }
+    },
+    "command_register_write_order": [20, 21, 22, 23, 24, 25, 26, 27, 28],
+    "write_all_registers_per_command": true,
+    "note_off_ignored": true,
+    "sequence_min": 1,
+    "sequence_max": 127,
+    "sequence_no_ack": 0,
+    "sequence_zero_policy": "仅 ESTOP 执行；其他命令忽略且不 ACK",
+    "reserved_command_id_ranges": [[0, 0], [23, 126]],
+    "request_hash": {
+      "algorithm": "CRC-16/CCITT-FALSE",
+      "polynomial_hex": "1021",
+      "initial_hex": "FFFF",
+      "reflect_input": false,
+      "reflect_output": false,
+      "xor_output_hex": "0000",
+      "byte_order": ["cmd_id", "seq", "P0_hi", "P0_lo", "P1_hi", "P1_lo", "P2_hi", "P2_lo", "P3", "P4", "P5"],
+      "log_format": "4 位大写十六进制字符串"
+    },
+    "ack_timeout_ms": 2000,
+    "dedupe_window_ms": 5000,
+    "midi_budget": {
+      "hard_max_messages_per_second": 200,
+      "normal_scheduler_budget": 199,
+      "estop_reserved_messages": 1,
+      "upper_body_messages_per_frame": 9,
+      "upper_body_nominal_frames_per_second": 20,
+      "upper_body_max_frames_per_sliding_second_by_reliable_commands": {
+        "0": 20,
+        "1": 20,
+        "2": 19
+      },
+      "reliable_command_messages": 10,
+      "reliable_command_max_hz": {
+        "upper_body_active": 2,
+        "text_transfer": 4,
+        "upper_body_inactive": 4
+      },
+      "normal_command_max_hz_with_heartbeat_reservation": {
+        "upper_body_active": 1,
+        "text_transfer": 3,
+        "upper_body_inactive": 3
+      },
+      "max_in_flight_normal_commands": 1,
+      "heartbeat_counts_as_reliable_command": true,
+      "heartbeat_consumes_normal_in_flight_slot": false,
+      "heartbeat_nominal_hz": 1,
+      "heartbeat_max_scheduler_lateness_ms": 250,
+      "heartbeat_uses_fresh_seq": true,
+      "heartbeat_retransmission": "never",
+      "heartbeat_ack_purpose": "diagnostic_only",
+      "normal_retry_after_new_heartbeat_seqs_allowed": true,
+      "watchdog_refresh_sources": ["valid_received_HEARTBEAT"],
+      "state_log_refreshes_watchdog": false,
+      "rate_limited_excess_frame_behavior": "drop_without_ack_or_dedupe_entry",
+      "rate_limited_sys_err_cooldown_ms": 5000,
+      "text_payload_max_messages_per_second": 159,
+      "normal_path_worst_case_messages_per_second": {
+        "upper_body_with_0_reliable_commands": 180,
+        "upper_body_with_1_reliable_command": 190,
+        "upper_body_with_2_reliable_commands": 191,
+        "text_with_4_reliable_commands": 199
+      },
+      "priority": ["ESTOP", "HEARTBEAT", "normal_reliable_command", "text_payload", "upper_body_stream"]
+    }
+  },
+  "commands": {
+    "SET_MODE": {
+      "id": 1,
+      "hex": "0x01",
+      "params": { "P3": "locomotion_mode" },
+      "range": { "P3": [0, 3] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "GOTO_XZ": {
+      "id": 2,
+      "hex": "0x02",
+      "params": { "P0": "x_q14", "P1": "z_q14", "P2": "yaw_q14", "P3": "speed_q7", "P4": "bit0=has_yaw" },
+      "range": { "P0": [0, 16383], "P1": [0, 16383], "P2": [0, 16383], "P3": [0, 127], "P4": [0, 1] },
+      "conditional_rules": ["P4=0 时 P2 必须为 0"],
+      "reserved_zero_mask": { "P4": 126, "P5": 127 }
+    },
+    "SET_SPEED": {
+      "id": 3,
+      "hex": "0x03",
+      "params": { "P3": "speed_q7" },
+      "range": { "P3": [0, 127] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "TURN_TO": {
+      "id": 4,
+      "hex": "0x04",
+      "params": { "P0": "yaw_q14" },
+      "range": { "P0": [0, 16383] },
+      "zero": ["P1", "P2", "P3", "P4", "P5"]
+    },
+    "LOOK_AT": {
+      "id": 5,
+      "hex": "0x05",
+      "params": { "P3": "player_slot_or_127_to_clear" },
+      "allowed_ranges": { "P3": [[0, 63], [127, 127]] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "PLAY_ANIM": {
+      "id": 6,
+      "hex": "0x06",
+      "params": { "P0": "action_seq", "P3": "action_id", "P4": "bit0=loop" },
+      "range": { "P0": [1, 16383], "P3": [0, 126], "P4": [0, 1] },
+      "reserved_zero_mask": { "P4": 126, "P5": 127 },
+      "zero": ["P1", "P2"]
+    },
+    "STOP": {
+      "id": 7,
+      "hex": "0x07",
+      "params": {},
+      "zero": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    },
+    "TEXT_PRESET": {
+      "id": 8,
+      "hex": "0x08",
+      "params": { "P3": "text_preset_id_or_127_to_clear", "P4": "display_seconds_or_0_for_default" },
+      "range": { "P4": [0, 127] },
+      "allowed_ranges": { "P3": [[0, 126], [127, 127]] },
+      "conditional_rules": ["P3=127 时 P4 必须为 0，并清除任意当前气泡"],
+      "zero": ["P0", "P1", "P2", "P5"]
+    },
+    "RAY_SCAN": {
+      "id": 9,
+      "hex": "0x09",
+      "params": { "P3": "ray_mode" },
+      "range": { "P3": [0, 1] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "SET_RATE": {
+      "id": 10,
+      "hex": "0x0A",
+      "params": { "P3": "state_rate_code", "P4": "pose_rate_code" },
+      "range": { "P3": [0, 3], "P4": [0, 2] },
+      "zero": ["P0", "P1", "P2", "P5"]
+    },
+    "HEARTBEAT": {
+      "id": 11,
+      "hex": "0x0B",
+      "params": {},
+      "zero": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    },
+    "DISCOVER": {
+      "id": 12,
+      "hex": "0x0C",
+      "params": { "P0": "session_low14", "P1": "session_high14", "P2": "driver_claim_code" },
+      "range": { "P0": [0, 16383], "P1": [0, 16383], "P2": [0, 16383], "combined_session": [1, 268435455] },
+      "zero": ["P3", "P4", "P5"]
+    },
+    "CLEAR_ESTOP": {
+      "id": 13,
+      "hex": "0x0D",
+      "params": {},
+      "zero": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    },
+    "STOP_ACTION": {
+      "id": 14,
+      "hex": "0x0E",
+      "params": { "P0": "action_seq_or_0_for_current" },
+      "range": { "P0": [0, 16383] },
+      "zero": ["P1", "P2", "P3", "P4", "P5"]
+    },
+    "SNAPSHOT_REQUEST": {
+      "id": 15,
+      "hex": "0x0F",
+      "params": {},
+      "zero": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    },
+    "SET_TARGET": {
+      "id": 16,
+      "hex": "0x10",
+      "params": { "P3": "player_slot_or_127_to_clear" },
+      "allowed_ranges": { "P3": [[0, 63], [127, 127]] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "LOOK_AT_XYZ": {
+      "id": 17,
+      "hex": "0x11",
+      "params": { "P0": "x_q14", "P1": "y_q14", "P2": "z_q14", "P3": "weight_q7", "P4": "duration_seconds_or_0_for_persistent", "P5": "bit0=allow_body_assist" },
+      "range": { "P0": [0, 16383], "P1": [0, 16383], "P2": [0, 16383], "P3": [0, 127], "P4": [0, 127], "P5": [0, 1] },
+      "reserved_zero_mask": { "P5": 126 }
+    },
+    "SET_EXPRESSION": {
+      "id": 18,
+      "hex": "0x12",
+      "params": { "P3": "expression_id_or_127_to_clear", "P4": "weight_q7", "P5": "duration_seconds_or_0_for_persistent" },
+      "range": { "P4": [0, 127], "P5": [0, 127] },
+      "allowed_ranges": { "P3": [[0, 126], [127, 127]] },
+      "conditional_rules": ["P3=127 时 P4/P5 必须为 0"],
+      "zero": ["P0", "P1", "P2"]
+    },
+    "TEXT_BEGIN": {
+      "id": 19,
+      "hex": "0x13",
+      "params": { "P0": "transfer_seq", "P1": "utf8_byte_length", "P2": "crc16_low14", "P3": "crc16_high2", "P4": "display_seconds_or_0_for_default" },
+      "range": { "P0": [1, 16383], "P1": [0, 16383], "P2": [0, 16383], "P3": [0, 3], "P4": [0, 127] },
+      "semantic_range": { "P1": [1, 384] },
+      "specific_errors": { "P1_outside_semantic_range": "text_too_long" },
+      "zero": ["P5"]
+    },
+    "TEXT_COMMIT": {
+      "id": 20,
+      "hex": "0x14",
+      "params": { "P0": "transfer_seq", "P1": "utf8_byte_length", "P2": "crc16_low14", "P3": "crc16_high2", "P4": "display_seconds_or_0_for_default" },
+      "range": { "P0": [1, 16383], "P1": [0, 16383], "P2": [0, 16383], "P3": [0, 3], "P4": [0, 127] },
+      "semantic_range": { "P1": [1, 384] },
+      "zero": ["P5"]
+    },
+    "SPEECH_CUE": {
+      "id": 21,
+      "hex": "0x15",
+      "params": { "P0": "speech_seq", "P1": "related_text_transfer_seq_or_0", "P2": "related_action_seq_or_0", "P3": "estimated_delay_100ms", "P4": "duration_250ms" },
+      "range": { "P0": [1, 16383], "P1": [0, 16383], "P2": [0, 16383], "P3": [0, 127], "P4": [1, 127] },
+      "zero": ["P5"]
+    },
+    "SET_CONTROL_MODE": {
+      "id": 22,
+      "hex": "0x16",
+      "params": { "P3": "control_mode" },
+      "range": { "P3": [0, 1] },
+      "zero": ["P0", "P1", "P2", "P4", "P5"]
+    },
+    "ESTOP": {
+      "id": 127,
+      "hex": "0x7F",
+      "any_channel": true,
+      "params": {},
+      "zero": ["P0", "P1", "P2", "P3", "P4", "P5"]
+    }
+  },
+  "enums": {
+    "control_mode": { "safe_idle": 0, "external": 1 },
+    "control_state": { "unhandshaken": 0, "safe_idle": 1, "external": 2, "moving": 3, "action": 4, "estop": 5 },
+    "locomotion_mode": { "idle": 0, "follow": 1, "goto": 2, "wander": 3 },
+    "ray_mode": { "horizontal_8": 0, "forward_fan_7": 1 },
+    "state_rate_code_hz": { "0": 0, "1": 1, "2": 5, "3": 10 },
+    "pose_rate_code_hz": { "0": 0, "1": 1, "2": 2 },
+    "action_layer": ["upper_body", "full_body"],
+    "action_movement": ["allow", "block"],
+    "action_cancel_reason": ["explicit_stop", "replaced", "movement", "control_safe_idle", "watchdog", "estop", "session_reset", "player_left"],
+    "blocked_reason": ["stuck", "no_path", "local_obstacle", "target_left"],
+    "voice_state": ["disabled", "loading", "ready", "playing", "error", "stopped"],
+    "operation_kind": ["goto", "follow", "wander", "turn", "look", "action", "expression"],
+    "operation_phase": ["started", "completed", "cancelled"],
+    "operation_result": ["arrived", "turned", "expired", "natural_end", "cleared"],
+    "operation_cancel_reason": ["explicit_stop", "replaced", "movement", "control_safe_idle", "watchdog", "estop", "session_reset", "player_left", "stuck", "local_obstacle", "target_left"]
+  },
+  "command_state_permissions": {
+    "SET_MODE": ["external", "moving", "action"],
+    "GOTO_XZ": ["external", "moving", "action"],
+    "SET_SPEED": ["external", "moving", "action"],
+    "TURN_TO": ["external", "moving", "action"],
+    "LOOK_AT": ["external", "moving", "action"],
+    "PLAY_ANIM": ["external", "moving", "action"],
+    "STOP": ["safe_idle", "external", "moving", "action"],
+    "TEXT_PRESET": ["external", "moving", "action"],
+    "RAY_SCAN": ["safe_idle", "external", "moving", "action"],
+    "SET_RATE": ["safe_idle", "external", "moving", "action"],
+    "HEARTBEAT": ["safe_idle", "external", "moving", "action", "estop"],
+    "DISCOVER": ["unhandshaken", "safe_idle", "external", "moving", "action", "estop"],
+    "CLEAR_ESTOP": ["estop"],
+    "STOP_ACTION": ["external", "moving", "action"],
+    "SNAPSHOT_REQUEST": ["safe_idle", "external", "moving", "action", "estop"],
+    "SET_TARGET": ["external", "moving", "action"],
+    "LOOK_AT_XYZ": ["external", "moving", "action"],
+    "SET_EXPRESSION": ["external", "moving", "action"],
+    "TEXT_BEGIN": ["external", "moving", "action"],
+    "TEXT_COMMIT": ["external", "moving", "action"],
+    "SPEECH_CUE": ["external", "moving", "action"],
+    "SET_CONTROL_MODE": ["safe_idle", "external", "moving", "action"],
+    "ESTOP": ["unhandshaken", "safe_idle", "external", "moving", "action", "estop"]
+  },
+  "error_precedence": [
+    "ESTOP_preemption",
+    "sequence_zero_ignore",
+    "request_hash_and_dedupe",
+    "unknown_cmd",
+    "DISCOVER_auth_and_ownership",
+    "not_handshaken",
+    "not_driver",
+    "not_owner",
+    "estop_latched",
+    "invalid_state",
+    "unsupported_capability",
+    "reserved_bits",
+    "command_specific_param_error",
+    "invalid_param",
+    "referenced_resource_error",
+    "navigation_or_runtime_error",
+    "execute"
+  ],
+  "bounds": {
+    "position_quantization_source": "wire_bounds",
+    "execution_validation_source": "activity_bounds",
+    "required_wire_margin_each_axis_m": 1.0,
+    "wire_must_strictly_contain_activity": true
+  },
+  "wander": {
+    "command": "SET_MODE",
+    "locomotion_mode_value": 3,
+    "capability_required": "wander",
+    "minimum_waypoints": 2,
+    "start_waypoint_index": 0,
+    "order": "inspector_array_order",
+    "loop_after_last": true,
+    "arrival_distance_m": 0.3,
+    "operation_natural_completion": false,
+    "stop_cancels_operation_with_reason": "explicit_stop",
+    "missing_or_unpublished_error": "unsupported_capability"
+  },
+  "quantization": {
+    "position_q14": {
+      "q_min": 0,
+      "q_max": 16383,
+      "encode": "floor(((value-min)/(max-min))*16383+0.5)",
+      "decode": "min+(q/16383)*(max-min)",
+      "bounds": "wire_bounds",
+      "out_of_activity_bounds": "reject"
+    },
+    "yaw_q14": {
+      "q_min": 0,
+      "q_max": 16383,
+      "encode": "floor((wrap360(deg)/360)*16384+0.5) mod 16384",
+      "decode": "q*360/16384",
+      "zero_direction": "+Z",
+      "positive_direction": "clockwise_when_viewed_from_above"
+    },
+    "speed_q7": {
+      "q_min": 0,
+      "q_max": 127,
+      "encode": "floor((mps/maxSpeed)*127+0.5)",
+      "decode": "q*maxSpeed/127",
+      "out_of_bounds": "reject"
+    },
+    "weight_q7": {
+      "q_min": 0,
+      "q_max": 127,
+      "encode": "floor(weight*127+0.5)",
+      "decode": "q/127"
+    },
+    "centered_q7": {
+      "neutral_q": 64,
+      "encode_negative_or_zero": "floor(64+(value/abs(min))*64+0.5)",
+      "encode_positive": "64+floor((value/max)*63+0.5)",
+      "decode_q_le_64": "((q-64)/64)*abs(min)",
+      "decode_q_gt_64": "((q-64)/63)*max"
+    },
+    "unsigned_q7": {
+      "encode": "floor(((value-min)/(max-min))*127+0.5)",
+      "decode": "min+(q/127)*(max-min)"
+    }
+  },
+  "upper_body_stream": {
+    "channel": 1,
+    "rate_hz": 20,
+    "commit_note": 64,
+    "sequence_min": 1,
+    "sequence_max": 127,
+    "timeout_ms": 250,
+    "neutral_fade_ms": 200,
+    "write_all_values_per_frame": true,
+    "parameters": [
+      { "key": "head_yaw", "cc": 20, "unit": "deg", "min": -60, "neutral": 0, "max": 60, "encoding": "centered_q7", "positive": "向 NPC 右侧转头" },
+      { "key": "head_pitch", "cc": 21, "unit": "deg", "min": -35, "neutral": 0, "max": 35, "encoding": "centered_q7", "positive": "抬头" },
+      { "key": "torso_yaw", "cc": 22, "unit": "deg", "min": -35, "neutral": 0, "max": 35, "encoding": "centered_q7", "positive": "向 NPC 右侧扭身" },
+      { "key": "torso_pitch", "cc": 23, "unit": "deg", "min": -20, "neutral": 0, "max": 20, "encoding": "centered_q7", "positive": "后仰" },
+      { "key": "left_arm_elevation", "cc": 24, "unit": "deg", "min": 0, "neutral": 0, "max": 160, "encoding": "unsigned_q7", "positive": "由自然下垂向上抬臂" },
+      { "key": "left_arm_azimuth", "cc": 25, "unit": "deg", "min": -120, "neutral": 0, "max": 120, "encoding": "centered_q7", "positive": "向 NPC 右侧" },
+      { "key": "right_arm_elevation", "cc": 26, "unit": "deg", "min": 0, "neutral": 0, "max": 160, "encoding": "unsigned_q7", "positive": "由自然下垂向上抬臂" },
+      { "key": "right_arm_azimuth", "cc": 27, "unit": "deg", "min": -120, "neutral": 0, "max": 120, "encoding": "centered_q7", "positive": "向 NPC 右侧" }
+    ],
+    "neutral_q": [64, 64, 64, 64, 0, 64, 0, 64]
+  },
+  "text": {
+    "channel": 2,
+    "payload_cc": 29,
+    "encoding": "UTF-8 strict",
+    "max_utf8_bytes": 384,
+    "default_display_seconds": 5,
+    "max_display_seconds": 127,
+    "transfer_timeout_ms": 5000,
+    "packing": "每组最多 7 个原始字节；先发送一个 MSB bitmap，再按原顺序发送各字节低 7 位；bitmap bit i 是第 i 个原始字节的 bit7",
+    "crc": "CRC-16/CCITT-FALSE over raw UTF-8 bytes",
+    "failed_commit_aborts_transaction_except_transfer_missing": true,
+    "sender_must_use_new_transfer_seq_after_failed_commit": true,
+    "pause_upper_body_during_transfer": true
+  },
+  "voice": {
+    "fixed_url_loads_per_world_lifetime": 1,
+    "speech_delay_quantum_ms": 100,
+    "speech_duration_quantum_ms": 250,
+    "speech_seq_min": 1,
+    "speech_seq_max": 16383,
+    "release_gate_p95_ms": 2000,
+    "release_gate_utterances": 30,
+    "release_gate_clients": 2,
+    "release_gate_max_stall_ms": 2000,
+    "lip_sync": false
+  },
+  "timeouts": {
+    "watchdog_ms": 3000,
+    "stuck_ms": 1500,
+    "stuck_min_progress_m": 0.05,
+    "arrival_distance_m": 0.3,
+    "follow_distance_m": 1.2,
+    "navmesh_sample_radius_m": 0.5,
+    "local_obstacle_ray_m": 1.0,
+    "turn_rate_deg_per_second": 180,
+    "default_max_speed_mps": 2.0,
+    "default_acceleration_mps2": 4.0
+  },
+  "telemetry": {
+    "marker": "[NEKO]",
+    "required_header": ["v", "spec", "session", "world_id", "npc", "log_seq", "t", "type"],
+    "max_lines_in_sliding_second": 20,
+    "max_json_utf8_bytes": 950,
+    "log_seq_min": 1,
+    "log_seq_max": 2147483647,
+    "log_seq_normal_max": 2147483646,
+    "log_seq_wrap_marker_value": 2147483647,
+    "log_seq_wrap_event_type": "sys.log_wrap",
+    "log_seq_allocation": "event_creation_before_budget_filtering",
+    "dropped_or_coalesced_event_consumes_log_seq": true,
+    "drop_report_event_type": "sys.telemetry",
+    "drop_report_never_dropped": true,
+    "drop_report_may_coalesce": true,
+    "state_default_hz": 5,
+    "pose_default_hz": 2,
+    "pose_players_per_page": 4,
+    "catalog_items_per_page": 1,
+    "same_internal_error_cooldown_ms": 5000
+  },
+  "network": {
+    "root": { "object": "RootSync", "mode": "VRCObjectSync", "owner": "driver" },
+    "upper_body": { "object": "UpperBodySync", "mode": "Continuous", "owner": "driver" },
+    "durable_state": { "object": "StateSync", "mode": "Manual", "owner": "driver" },
+    "remote_upper_body_rate_guaranteed": false
+  },
+  "capabilities": {
+    "goto": 0,
+    "follow": 1,
+    "wander": 2,
+    "actions": 3,
+    "expressions": 4,
+    "text_preset": 5,
+    "text_utf8": 6,
+    "upper_body_stream": 7,
+    "ray_scan": 8,
+    "touch": 9,
+    "player_pose": 10,
+    "voice_stream": 11,
+    "snapshot": 12,
+    "navmesh": 13,
+    "social_signals": 14,
+    "anchors": 15,
+    "operation_lifecycle": 16
+  },
+  "capability_contracts": {
+    "goto": {
+      "bit": 0,
+      "kind": "command_gate",
+      "gated_entries": ["GOTO_XZ", "SET_MODE:P3=2", "npc.go_to", "npc.go_to_xyz"],
+      "also_requires": ["navmesh"],
+      "disabled_behavior": "wire commands ACK unsupported_capability; adapter tools absent; no straight-line fallback",
+      "disabled_test_vector": "goto_capability_disabled"
+    },
+    "follow": {
+      "bit": 1,
+      "kind": "command_gate",
+      "gated_entries": ["SET_MODE:P3=1", "npc.follow"],
+      "also_requires": ["navmesh"],
+      "disabled_behavior": "SET_MODE ACK unsupported_capability; SET_TARGET may store slot but cannot start follow; adapter tool absent",
+      "disabled_test_vector": "follow_capability_disabled"
+    },
+    "wander": {
+      "bit": 2,
+      "kind": "command_gate",
+      "gated_entries": ["SET_MODE:P3=3"],
+      "also_requires": ["navmesh"],
+      "disabled_behavior": "ACK unsupported_capability; no idle or random-walk fallback",
+      "disabled_test_vector": "wander_capability_disabled"
+    },
+    "actions": {
+      "bit": 3,
+      "kind": "command_and_catalog_gate",
+      "gated_entries": ["PLAY_ANIM", "STOP_ACTION", "catalog:action"],
+      "disabled_behavior": "commands ACK unsupported_capability; action catalog empty; Animator action unchanged",
+      "disabled_test_vector": "actions_capability_disabled"
+    },
+    "expressions": {
+      "bit": 4,
+      "kind": "command_and_catalog_gate",
+      "gated_entries": ["SET_EXPRESSION", "catalog:expression"],
+      "disabled_behavior": "ACK unsupported_capability; expression catalog empty; expression remains neutral",
+      "disabled_test_vector": "expressions_capability_disabled"
+    },
+    "text_preset": {
+      "bit": 5,
+      "kind": "command_and_catalog_gate",
+      "gated_entries": ["TEXT_PRESET", "catalog:text_preset"],
+      "disabled_behavior": "ACK unsupported_capability; text_preset catalog empty",
+      "disabled_test_vector": "text_preset_capability_disabled"
+    },
+    "text_utf8": {
+      "bit": 6,
+      "kind": "command_and_ingress_gate",
+      "gated_entries": ["TEXT_BEGIN", "TEXT_COMMIT", "channel2:CC29"],
+      "disabled_behavior": "commands ACK unsupported_capability; Channel 2 payload silently discarded without transaction or error",
+      "disabled_test_vector": "text_utf8_capability_disabled"
+    },
+    "upper_body_stream": {
+      "bit": 7,
+      "kind": "ingress_and_telemetry_gate",
+      "gated_entries": ["channel1:CC20..27+NoteOn64", "npc.stream_stats"],
+      "disabled_behavior": "silently discard frame; no Animator/sync/stat/invalid_events/sys.err change",
+      "disabled_test_vector": "upper_body_stream_capability_disabled"
+    },
+    "ray_scan": {
+      "bit": 8,
+      "kind": "command_and_telemetry_gate",
+      "gated_entries": ["RAY_SCAN", "env.ray"],
+      "disabled_behavior": "ACK unsupported_capability; no env.ray",
+      "disabled_test_vector": "ray_scan_capability_disabled"
+    },
+    "touch": {
+      "bit": 9,
+      "kind": "telemetry_gate",
+      "gated_entries": ["TouchZones", "player.touch"],
+      "disabled_behavior": "touch colliders/callbacks disabled; no player.touch; player slot management unaffected",
+      "disabled_test_vector": "touch_capability_disabled"
+    },
+    "player_pose": {
+      "bit": 10,
+      "kind": "telemetry_gate",
+      "gated_entries": ["player.pose"],
+      "disabled_behavior": "no periodic player.pose; snapshot players remains present when snapshot capability is published",
+      "disabled_test_vector": "player_pose_capability_disabled"
+    },
+    "voice_stream": {
+      "bit": 11,
+      "kind": "command_and_subsystem_gate",
+      "gated_entries": ["SPEECH_CUE", "AVPro.LoadURL", "voice.state", "voice.cue"],
+      "disabled_behavior": "ACK unsupported_capability; no URL load or voice logs; snapshot voice is disabled/null/false/null",
+      "disabled_test_vector": "voice_stream_capability_disabled"
+    },
+    "snapshot": {
+      "bit": 12,
+      "kind": "command_gate",
+      "gated_entries": ["SNAPSHOT_REQUEST", "sys.snapshot"],
+      "disabled_behavior": "ACK unsupported_capability; no sys.snapshot parts",
+      "disabled_test_vector": "snapshot_capability_disabled"
+    },
+    "navmesh": {
+      "bit": 13,
+      "kind": "shared_command_dependency",
+      "gated_entries": ["GOTO_XZ", "SET_MODE:P3=1", "SET_MODE:P3=2", "SET_MODE:P3=3"],
+      "disabled_behavior": "ACK unsupported_capability before path checks; no straight-line fallback and no no_path substitution; TURN_TO unaffected",
+      "disabled_test_vector": "navmesh_capability_disabled"
+    },
+    "social_signals": {
+      "bit": 14,
+      "kind": "telemetry_gate",
+      "gated_entries": ["social.gaze", "social.wave", "social.approach"],
+      "disabled_behavior": "detectors disabled; no social.*; touch and player.pose unaffected",
+      "disabled_test_vector": "social_signals_capability_disabled"
+    },
+    "anchors": {
+      "bit": 15,
+      "kind": "catalog_and_adapter_gate",
+      "gated_entries": ["catalog:anchor", "npc.go_to"],
+      "disabled_behavior": "hello anchor count zero; emit one empty anchor catalog page; adapter tool absent; no inferred anchors",
+      "disabled_test_vector": "anchors_capability_disabled"
+    },
+    "operation_lifecycle": {
+      "bit": 16,
+      "kind": "telemetry_shape_gate",
+      "gated_entries": ["npc.operation_started", "npc.operation_completed", "npc.operation_cancelled", "active_ops"],
+      "disabled_behavior": "commands and domain events continue; no npc.operation_*; required active_ops fields fixed to empty array",
+      "disabled_test_vector": "operation_lifecycle_capability_disabled"
+    }
+  },
+  "semantic_catalog": {
+    "core_actions": {
+      "0": "greet",
+      "1": "agree_nod",
+      "2": "disagree_shake_head",
+      "3": "greet_wave",
+      "4": "apologize_bow",
+      "5": "explain",
+      "6": "think",
+      "7": "celebrate",
+      "8": "listen",
+      "9": "confused",
+      "10": "point_left",
+      "11": "point_right",
+      "12": "point_forward",
+      "13": "shrug",
+      "14": "laugh",
+      "15": "comfort"
+    },
+    "extension_action_id_range": [16, 126],
+    "core_expressions": {
+      "0": "neutral",
+      "1": "happy",
+      "2": "sad",
+      "3": "surprised"
+    },
+    "extension_expression_id_range": [4, 126],
+    "action_required_semantic_fields": ["semantic_key", "description_zh", "intent_tags", "target_required", "speech_compatible"],
+    "anchor_required_fields": ["id", "semantic_key", "description_zh", "pos", "yaw", "has_yaw", "arrival_radius", "tags"]
+  },
+  "llm_adapter": {
+    "tool_defaults": {
+      "npc.arm": {
+        "in_minimum_tool_surface": true,
+        "input_schema": {},
+        "expansion": "SET_CONTROL_MODE P3=1",
+        "auto_insert_before_other_tools": false,
+        "requires_host_session_authorization": true,
+        "authorization_flag": "host_arm_authorized",
+        "authorization_cleared_by": ["session_reset", "watchdog", "ESTOP", "driver_leave", "owner_lost"],
+        "already_external_states": ["external", "moving", "action"],
+        "already_external_result": { "status": "succeeded", "already_external": true, "midi_sent": false },
+        "rejected_states": ["unhandshaken", "estop"],
+        "local_rejection_error": "arm_not_authorized"
+      },
+      "npc.go_to_xyz": {
+        "enabled": false,
+        "explicit_enable_flag": "free_coordinate_navigation",
+        "missing_flag_value": false
+      },
+      "npc.wander": {
+        "in_minimum_tool_surface": false,
+        "optional_expansion": "SET_MODE P3=3",
+        "allowed_parameters": [],
+        "stop_expansion": "npc.stop(scope=movement)"
+      }
+    },
+    "anchor_navigation_scope": "Inspector-configured static named locations only",
+    "anchor_navigation_excludes": ["visual target detection", "dynamic object tracking", "arbitrary object navigation"],
+    "wander_scope": "preconfigured waypoint loop patrol; not relative displacement or geometric approach",
+    "operation_tools_require_capability": "operation_lifecycle",
+    "tools_hidden_without_operation_lifecycle": ["npc.go_to", "npc.go_to_xyz", "npc.follow", "npc.look_at", "npc.act", "npc.set_expression"],
+    "active_ops_empty_without_operation_lifecycle_is_completion_evidence": false,
+    "observe_required_fields": ["caps", "operation_lifecycle", "active_ops_authoritative", "active_ops"],
+    "observe_operation_lifecycle_formula": "caps contains operation_lifecycle",
+    "observe_active_ops_authoritative_formula": "operation_lifecycle",
+    "observe_active_ops_always_array": true,
+    "local_errors": ["arm_not_authorized", "requires_arm"]
+  },
+  "reserved_error_codes": [2],
+  "error_codes": {
+    "unknown_cmd": 1,
+    "not_handshaken": 3,
+    "not_driver": 4,
+    "not_owner": 5,
+    "invalid_state": 6,
+    "estop_latched": 7,
+    "invalid_param": 8,
+    "reserved_bits": 9,
+    "target_out_of_bounds": 10,
+    "target_not_on_navmesh": 11,
+    "no_path": 12,
+    "target_missing": 13,
+    "slot_unknown": 14,
+    "unsupported_capability": 15,
+    "action_not_found": 16,
+    "action_busy": 17,
+    "expression_not_found": 18,
+    "text_preset_not_found": 19,
+    "transfer_busy": 20,
+    "transfer_missing": 21,
+    "transfer_seq_mismatch": 22,
+    "text_too_long": 23,
+    "length_mismatch": 24,
+    "crc_mismatch": 25,
+    "invalid_utf8": 26,
+    "text_timeout": 27,
+    "stream_incomplete": 28,
+    "seq_conflict": 29,
+    "voice_unavailable": 30,
+    "ownership_failed": 31,
+    "session_conflict": 32,
+    "rate_limited": 33,
+    "internal_error": 34,
+    "driver_auth_failed": 35,
+    "action_seq_conflict": 36,
+    "speech_seq_conflict": 37,
+    "catalog_invalid": 38
+  }
+}
