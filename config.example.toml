@@ -1,0 +1,32 @@
+[plugin_runtime]
+enabled = true
+auto_start = false
+startup_failure = "fail"
+
+[yui]
+# 与世界端约定的 MIDI 输出端口。
+midi_port = "NEKO_MIDI"
+claim_code = 0
+
+# 留空时自动跟随当前用户最新的 VRChat output_log。
+log_path = ""
+log_directory = ""
+log_from_end = true
+log_poll_interval_s = 0.1
+
+ack_timeout_s = 2.0
+command_deadline_s = 5.0
+heartbeat_interval_s = 1.0
+
+# 默认只允许世界目录锚点导航；坐标工具必须显式开启。
+free_coordinate_navigation = false
+
+# 默认不把玩家显示名交给模型，只使用会话级 player_slot。
+include_player_names = false
+
+# 人工安全门。只有宿主配置明确改为 true，连接后才会向 LLM 暴露 arm；
+# ESTOP 会在运行时撤销当前 session 的授权，恢复控制需人工重新加载配置并连接。
+host_arm_authorized = false
+
+# 可选工具；只映射为 SET_MODE wander，不接受任何参数。
+enable_wander_tool = false

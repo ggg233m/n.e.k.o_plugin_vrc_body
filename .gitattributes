@@ -1,0 +1,8 @@
+* text=auto
+
+# Unity 源码和 meta 已与验收工程逐字节核对，禁止换行自动转换。
+*.cs -text
+*.meta -text whitespace=-trailing-space
+
+# 插件安装包属于二进制构建产物。
+*.neko-plugin binary

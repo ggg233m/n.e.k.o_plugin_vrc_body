@@ -1,0 +1,1442 @@
+{
+  "document": "YUI_NPC_TestVectors",
+  "spec": "1.1",
+  "wire_version": 1,
+  "status": "frozen",
+  "released_at": "2026-08-29",
+  "constants_file": "YUI_NPC_ProtocolConstants_v1.1.json",
+  "execution_model": "除 vector 自身 steps 外，每个 vector 都从 initial_state 独立运行；expected_logs 为按顺序匹配的完整 JSON 对象，字段和值必须相同，浮点按 comparison 规则比较",
+  "comparison": { "float_absolute_tolerance": 0.000001, "array_order_significant": true, "object_key_order_significant": false, "unexpected_log_is_failure": true },
+  "assertion_schema": { "shape": "assertions 数组中的每项均含 kind；path 使用点分对象路径", "kinds": ["log_count", "forbid_log_type", "forbid_log_type_prefix", "require_log_field", "require_catalog_page", "decode_equals"], "value_comparison": "沿用 comparison；require_log_field 至少匹配一条指定 type 日志；require_catalog_page 精确匹配 kind/page/pages/items" },
+  "capability_override_semantics": { "caps_remove": "从 fixture.caps 删除且只删除所列能力", "caps_add": "向 fixture.caps 增加所列能力", "caps_override": "完全替换 fixture.caps；cap_bits 必须按最终集合重算" },
+  "midi_event_schema": {
+    "cc": { "at_ms": "int", "type": "cc", "channel": "0..15", "number": "0..127", "value": "0..127" },
+    "note_on": { "at_ms": "int", "type": "note_on", "channel": "0..15", "number": "0..127", "velocity": "0..127" }
+  },
+  "fixture": {
+    "world_id": "wrld_test_yui",
+    "world_name": "YUI Test",
+    "npc": "yui",
+    "driver_pid": 1,
+    "driver_name": "Driver",
+    "driver_claim_code": 4242,
+    "session": 1193046,
+    "telemetry_dropped_total": 0,
+    "log_wrap_count": 0,
+    "test_harness": "除 expected_logs 显式列出的周期统计外，测试运行器暂停 npc.state/player.pose 等周期遥测，避免与协议事件断言互相干扰",
+    "wire_bounds": [-12.0, -1.0, -22.0, 12.0, 5.0, 22.0],
+    "activity_bounds": [-10.0, 0.0, -20.0, 10.0, 4.0, 20.0],
+    "max_speed": 2.0,
+    "navmesh": "activity bounds 内的 GOTO 测试点均在已烘焙 NavMesh 上且可由测试起点完整到达；wire 极值在 activity bounds 外，不进入 NavMesh 采样",
+    "catalog_rev": 1,
+    "caps": ["goto", "follow", "actions", "expressions", "text_preset", "text_utf8", "upper_body_stream", "ray_scan", "touch", "player_pose", "voice_stream", "snapshot", "navmesh", "social_signals", "anchors", "operation_lifecycle"],
+    "cap_bits": 131067,
+    "catalog": {
+      "action": [
+        { "id": 3, "name": "wave", "semantic_key": "greet_wave", "description_zh": "向目标友好挥手", "intent_tags": ["greeting", "friendly"], "target_required": "none", "speech_compatible": true, "layer": "upper_body", "duration_ms": 1800, "loopable": false, "movement": "allow", "priority": 40, "interruptible": true, "fade_in_ms": 120, "fade_out_ms": 180 }
+      ],
+      "expression": [
+        { "id": 0, "name": "neutral", "semantic_key": "neutral", "description_zh": "中立表情", "default_duration_ms": 0, "fade_ms": 150 }
+      ],
+      "text_preset": [
+        { "id": 0, "name": "hello", "text": "你好", "default_display_seconds": 5 }
+      ],
+      "anchor": [
+        { "id": 0, "semantic_key": "stage_center", "description_zh": "舞台中央", "pos": [0.0, 0.0, 4.0], "yaw": 180.0, "has_yaw": true, "arrival_radius": 0.3, "tags": ["stage", "social"] }
+      ]
+    }
+  },
+  "vectors": [
+    {
+      "id": "goto_capability_disabled",
+      "purpose": "未发布 goto 时 GOTO_XZ 必须返回 unsupported_capability，不得移动或进入 NavMesh 校验",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["goto"], "old_target": null, "log_seq_next": 1, "world_time_s": 36.0 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 115, "x": 0.0, "z": 0.0, "speed": 1.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 115 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 115, "P": [8192,8192,0,64,0,0], "request_hash": "856A", "missing_capability": "goto", "error": "unsupported_capability", "navmesh_checked": false, "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 36.0, "type": "npc.ack", "seq": 115, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "856A", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "follow_capability_disabled",
+      "purpose": "目标有效但未发布 follow 时 SET_MODE follow 必须在目标检查前拒绝",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["follow"], "target_slot": 1, "players": [{ "slot": 1, "pid": 2, "name": "Guest B" }], "log_seq_next": 1, "world_time_s": 36.2 },
+      "semantic_input": { "command": "SET_MODE", "seq": 116, "mode": "follow" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 1 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 1, "velocity": 116 }
+      ],
+      "udon_decode": { "cmd_id": 1, "seq": 116, "P": [0,0,0,1,0,0], "request_hash": "49C2", "missing_capability": "follow", "error": "unsupported_capability", "target_checked": false, "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 36.2, "type": "npc.ack", "seq": 116, "cmd_id": 1, "cmd": "SET_MODE", "request_hash": "49C2", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "actions_capability_disabled",
+      "purpose": "动作 id 有效但未发布 actions 时 PLAY_ANIM 必须拒绝且不触发 Animator",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["actions"], "catalog_effective": { "action": [] }, "log_seq_next": 1, "world_time_s": 36.4 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 117, "action_seq": 80, "action_id": 3 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 80 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 117 }
+      ],
+      "udon_decode": { "cmd_id": 6, "seq": 117, "P": [80,0,0,3,0,0], "request_hash": "AA3E", "missing_capability": "actions", "error": "unsupported_capability", "catalog_checked": false, "animator_triggered": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 36.4, "type": "npc.ack", "seq": 117, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "AA3E", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "expressions_capability_disabled",
+      "purpose": "未发布 expressions 时 SET_EXPRESSION 必须拒绝并保持 neutral",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["expressions"], "catalog_effective": { "expression": [] }, "expression_id": null, "log_seq_next": 1, "world_time_s": 36.6 },
+      "semantic_input": { "command": "SET_EXPRESSION", "seq": 118, "expression_id": 0, "weight": 1.0, "duration_seconds": 1 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 127 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 1 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 18, "velocity": 118 }
+      ],
+      "udon_decode": { "cmd_id": 18, "seq": 118, "P": [0,0,0,0,127,1], "request_hash": "85F9", "missing_capability": "expressions", "error": "unsupported_capability", "expression_after": null },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 36.6, "type": "npc.ack", "seq": 118, "cmd_id": 18, "cmd": "SET_EXPRESSION", "request_hash": "85F9", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "text_preset_capability_disabled",
+      "purpose": "未发布 text_preset 时 TEXT_PRESET 必须拒绝且不显示文本",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["text_preset"], "catalog_effective": { "text_preset": [] }, "text": null, "log_seq_next": 1, "world_time_s": 36.8 },
+      "semantic_input": { "command": "TEXT_PRESET", "seq": 119, "preset_id": 0, "display_seconds": 5 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 8, "velocity": 119 }
+      ],
+      "udon_decode": { "cmd_id": 8, "seq": 119, "P": [0,0,0,0,5,0], "request_hash": "4A0F", "missing_capability": "text_preset", "error": "unsupported_capability", "text_after": null },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 36.8, "type": "npc.ack", "seq": 119, "cmd_id": 8, "cmd": "TEXT_PRESET", "request_hash": "4A0F", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "text_utf8_capability_disabled",
+      "purpose": "未发布 text_utf8 时 BEGIN 拒绝，随后 Channel 2 payload 静默丢弃且不建立事务",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["text_utf8"], "active_text_transaction": null, "log_seq_next": 1, "world_time_s": 37.0 },
+      "semantic_input": { "command": "TEXT_BEGIN", "seq": 120, "transfer_seq": 13, "utf8_length": 1, "crc16": "B915", "payload_after_rejection": [65] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 13 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 120 },
+        { "at_ms": 15, "type": "cc", "channel": 2, "number": 29, "value": 65 }
+      ],
+      "udon_decode": { "cmd_id": 19, "seq": 120, "P": [13,1,14613,2,5,0], "request_hash": "10B4", "missing_capability": "text_utf8", "error": "unsupported_capability", "channel2_payload_discarded": true, "transaction_active_after": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 37.0, "type": "npc.ack", "seq": 120, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "10B4", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "upper_body_stream_capability_disabled",
+      "purpose": "未发布 upper_body_stream 时完整 Channel 1 帧静默丢弃且不产生统计或错误",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["upper_body_stream"], "stream_invalid_events": 0, "log_seq_next": 1, "world_time_s": 37.2 },
+      "semantic_input": { "stream_seq": 12, "values": [64,64,64,64,0,64,0,64] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 64 }, { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 64 }, { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 64 }, { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 1, "number": 27, "value": 64 }, { "at_ms": 8, "type": "note_on", "channel": 1, "number": 64, "velocity": 12 }
+      ],
+      "udon_decode": { "frame_applied": false, "continuous_sync_written": false, "stream_invalid_events_after": 0, "stream_stats_emitted": false, "log_seq_next_after": 1 },
+      "assertions": [{ "kind": "log_count", "value": 0 }, { "kind": "forbid_log_type", "value": "sys.err" }, { "kind": "forbid_log_type", "value": "npc.stream_stats" }, { "kind": "decode_equals", "path": "stream_invalid_events_after", "value": 0 }, { "kind": "decode_equals", "path": "continuous_sync_written", "value": false }],
+      "expected_logs": []
+    },
+    {
+      "id": "ray_scan_capability_disabled",
+      "purpose": "未发布 ray_scan 时 RAY_SCAN 必须拒绝且不发 env.ray",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["ray_scan"], "log_seq_next": 1, "world_time_s": 37.4 },
+      "semantic_input": { "command": "RAY_SCAN", "seq": 121, "mode": 0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 9, "velocity": 121 }
+      ],
+      "udon_decode": { "cmd_id": 9, "seq": 121, "P": [0,0,0,0,0,0], "request_hash": "5447", "missing_capability": "ray_scan", "error": "unsupported_capability", "raycast_count": 0 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 37.4, "type": "npc.ack", "seq": 121, "cmd_id": 9, "cmd": "RAY_SCAN", "request_hash": "5447", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "goto_invalid_yaw_flag",
+      "purpose": "has_yaw=false 时 P2 非零必须按条件规则拒绝，且不创建 operation",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 15.0 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 70, "P": [8192, 8192, 8192, 64, 0, 0], "invalid_condition": "P4=0 but P2!=0" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 64 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 70 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 70, "P": [8192, 8192, 8192, 64, 0, 0], "request_hash": "FBE9", "error": "invalid_param", "side_effects": false, "operation_created": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 15.0, "type": "npc.ack", "seq": 70, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "FBE9", "ok": false, "replayed": false, "state": "external", "err": "invalid_param" }
+      ]
+    },
+    {
+      "id": "error_precedence_invalid_state",
+      "purpose": "safe_idle 中 PLAY_ANIM 同时含保留位错误时，只返回优先级更高的 invalid_state",
+      "initial_state": { "session": 1193046, "control_state": "safe_idle", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 15.2 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 71, "action_seq": 77, "action_id": 3, "P4": 2, "P5": 1, "invalidities": ["invalid_state", "reserved_bits"] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 77 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 2 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 1 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 71 }
+      ],
+      "udon_decode": { "cmd_id": 6, "seq": 71, "P": [77, 0, 0, 3, 2, 1], "request_hash": "C4BC", "selected_error_stage": 10, "error": "invalid_state", "side_effects": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 15.2, "type": "npc.ack", "seq": 71, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "C4BC", "ok": false, "replayed": false, "state": "safe_idle", "err": "invalid_state" }
+      ]
+    },
+    {
+      "id": "text_crc_mismatch",
+      "purpose": "BEGIN 声明 ASCII A 的 CRC，但载荷为 B；COMMIT 拒绝、销毁事务且不显示文本",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 15.4 },
+      "semantic_input": { "transfer_seq": 8, "declared_utf8_bytes": [65], "sent_utf8_bytes": [66], "declared_crc16": "B915", "display_seconds": 5 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 8 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 72 },
+        { "at_ms": 20, "type": "cc", "channel": 2, "number": 29, "value": 0 }, { "at_ms": 21, "type": "cc", "channel": 2, "number": 29, "value": 66 },
+        { "at_ms": 30, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 31, "type": "cc", "channel": 0, "number": 21, "value": 8 },
+        { "at_ms": 32, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 33, "type": "cc", "channel": 0, "number": 23, "value": 1 },
+        { "at_ms": 34, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 35, "type": "cc", "channel": 0, "number": 25, "value": 21 },
+        { "at_ms": 36, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 37, "type": "cc", "channel": 0, "number": 27, "value": 5 },
+        { "at_ms": 38, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 39, "type": "note_on", "channel": 0, "number": 20, "velocity": 73 }
+      ],
+      "udon_decode": { "begin": { "seq": 72, "P": [8, 1, 14613, 2, 5, 0], "request_hash": "F591" }, "packed_values": [0, 66], "raw_utf8_bytes": [66], "actual_crc16": "8976", "commit": { "seq": 73, "request_hash": "B369", "error": "crc_mismatch" }, "transaction_active_after": false, "text_displayed": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 15.4, "type": "npc.ack", "seq": 72, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "F591", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 15.43, "type": "npc.ack", "seq": 73, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "B369", "ok": false, "replayed": false, "state": "external", "err": "crc_mismatch" }
+      ]
+    },
+    {
+      "id": "text_invalid_utf8",
+      "purpose": "CRC 正确的 0xFF 单字节仍必须因严格 UTF-8 解码失败而拒绝",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 15.6 },
+      "semantic_input": { "transfer_seq": 9, "raw_utf8_bytes": [255], "crc16": "FF00", "display_seconds": 5 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 9 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 126 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 74 },
+        { "at_ms": 20, "type": "cc", "channel": 2, "number": 29, "value": 1 }, { "at_ms": 21, "type": "cc", "channel": 2, "number": 29, "value": 127 },
+        { "at_ms": 30, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 31, "type": "cc", "channel": 0, "number": 21, "value": 9 },
+        { "at_ms": 32, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 33, "type": "cc", "channel": 0, "number": 23, "value": 1 },
+        { "at_ms": 34, "type": "cc", "channel": 0, "number": 24, "value": 126 }, { "at_ms": 35, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 36, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 37, "type": "cc", "channel": 0, "number": 27, "value": 5 },
+        { "at_ms": 38, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 39, "type": "note_on", "channel": 0, "number": 20, "velocity": 75 }
+      ],
+      "udon_decode": { "begin": { "seq": 74, "P": [9, 1, 16128, 3, 5, 0], "request_hash": "7731" }, "packed_values": [1, 127], "raw_utf8_bytes": [255], "commit": { "seq": 75, "request_hash": "31C9", "error": "invalid_utf8" }, "transaction_active_after": false, "text_displayed": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 15.6, "type": "npc.ack", "seq": 74, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "7731", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 15.63, "type": "npc.ack", "seq": 75, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "31C9", "ok": false, "replayed": false, "state": "external", "err": "invalid_utf8" }
+      ]
+    },
+    {
+      "id": "text_transaction_timeout",
+      "purpose": "TEXT_BEGIN 后 5 秒未 COMMIT，事务取消并只发一次异步 text_timeout",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 16.0 },
+      "semantic_input": { "command": "TEXT_BEGIN", "seq": 76, "transfer_seq": 10, "utf8_length": 1, "crc16": "B915", "wait_without_commit_ms": 5000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 10 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 76 }
+      ],
+      "external_events": [{ "at_ms": 5000, "type": "text_transaction_timer" }],
+      "udon_decode": { "cmd_id": 19, "seq": 76, "P": [10, 1, 14613, 2, 5, 0], "request_hash": "D702", "transaction_active_after": false, "stream_returns_to_neutral": true },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 16.0, "type": "npc.ack", "seq": 76, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "D702", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 21.0, "type": "sys.err", "err": "text_timeout", "code": 27, "source": "text", "fatal": false, "related_seq": 10, "detail": "transfer timed out" }
+      ]
+    },
+    {
+      "id": "discover_hello_catalog",
+      "purpose": "DISCOVER 建立 session，并验证 ACK、session、hello 与四类 catalog 的固定顺序；测试夹具使用每类一个 item，不替代完整 Prefab 的 16 核心动作验收",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "log_seq_next": 1, "world_time_s": 0.1 },
+      "semantic_input": { "command": "DISCOVER", "seq": 1, "session": 1193046, "driver_claim_code": 4242 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 104 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 86 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 72 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 18 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 1 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 1, "P": [13398, 72, 4242, 0, 0, 0], "session": 1193046, "request_hash": "E18E", "result_state": "safe_idle" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 0.1, "type": "npc.ack", "seq": 1, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "E18E", "ok": true, "replayed": false, "state": "safe_idle" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 0.11, "type": "sys.session", "previous_session": 0, "new_session": 1193046, "driver_pid": 1, "reset": false, "estop_preserved": false },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 0.12, "type": "sys.hello", "world_name": "YUI Test", "wire_bounds": [-12.0, -1.0, -22.0, 12.0, 5.0, 22.0], "activity_bounds": [-10.0, 0.0, -20.0, 10.0, 4.0, 20.0], "max_speed": 2.0, "watchdog_ms": 3000, "caps": ["goto", "follow", "actions", "expressions", "text_preset", "text_utf8", "upper_body_stream", "ray_scan", "touch", "player_pose", "voice_stream", "snapshot", "navmesh", "social_signals", "anchors", "operation_lifecycle"], "cap_bits": 131067, "catalog_rev": 1, "catalog_counts": { "action": 1, "expression": 1, "text_preset": 1, "anchor": 1 } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 0.13, "type": "sys.catalog", "catalog_rev": 1, "kind": "action", "page": 1, "pages": 1, "items": [{ "id": 3, "name": "wave", "semantic_key": "greet_wave", "description_zh": "向目标友好挥手", "intent_tags": ["greeting", "friendly"], "target_required": "none", "speech_compatible": true, "layer": "upper_body", "duration_ms": 1800, "loopable": false, "movement": "allow", "priority": 40, "interruptible": true, "fade_in_ms": 120, "fade_out_ms": 180 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 0.14, "type": "sys.catalog", "catalog_rev": 1, "kind": "expression", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "neutral", "semantic_key": "neutral", "description_zh": "中立表情", "default_duration_ms": 0, "fade_ms": 150 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 0.15, "type": "sys.catalog", "catalog_rev": 1, "kind": "text_preset", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "hello", "text": "你好", "default_display_seconds": 5 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 7, "t": 0.16, "type": "sys.catalog", "catalog_rev": 1, "kind": "anchor", "page": 1, "pages": 1, "items": [{ "id": 0, "semantic_key": "stage_center", "description_zh": "舞台中央", "pos": [0.0, 0.0, 4.0], "yaw": 180.0, "has_yaw": true, "arrival_radius": 0.3, "tags": ["stage", "social"] }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 8, "t": 0.17, "type": "player.join", "pid": 1, "name": "Driver", "slot": 0, "count": 1 }
+      ]
+    },
+    {
+      "id": "set_control_external",
+      "purpose": "LLM 只可通过显式 npc.arm 进入 external，适配层不得在其他工具前自动插入",
+      "initial_state": { "session": 1193046, "control_state": "safe_idle", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 0.2 },
+      "semantic_input": { "tool": "npc.arm", "input": {}, "host_arm_authorized": true, "adapter_expansion": { "command": "SET_CONTROL_MODE", "P3": 1 }, "seq": 2, "auto_inserted": false, "negative_adapter_cases": ["other_tool_while_safe_idle", "arm_after_authorization_cleared"] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 1 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 22, "velocity": 2 }
+      ],
+      "udon_decode": { "adapter_tool": "npc.arm", "auto_inserted": false, "host_arm_authorized": true, "other_tools_auto_insert_arm": false, "after_authorization_cleared": { "midi_sent": false, "error": "arm_not_authorized" }, "cmd_id": 22, "seq": 2, "P": [0, 0, 0, 1, 0, 0], "request_hash": "997C", "result_state": "external" },
+      "assertions": [{ "kind": "decode_equals", "path": "adapter_tool", "value": "npc.arm" }, { "kind": "decode_equals", "path": "auto_inserted", "value": false }, { "kind": "decode_equals", "path": "other_tools_auto_insert_arm", "value": false }, { "kind": "decode_equals", "path": "after_authorization_cleared.midi_sent", "value": false }, { "kind": "decode_equals", "path": "after_authorization_cleared.error", "value": "arm_not_authorized" }, { "kind": "decode_equals", "path": "P", "value": [0,0,0,1,0,0] }],
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 0.2, "type": "npc.ack", "seq": 2, "cmd_id": 22, "cmd": "SET_CONTROL_MODE", "request_hash": "997C", "ok": true, "replayed": false, "state": "external" }
+      ]
+    },
+    {
+      "id": "goto_minimum",
+      "purpose": "GOTO 的 wire 边界最小值可解码，但越出 activity bounds，必须拒绝",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 1.0 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 10, "x": -12.0, "z": -22.0, "yaw": 0.0, "has_yaw": true, "speed": 0.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 1 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 10 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 10, "P": [0, 0, 0, 0, 1, 0], "request_hash": "D34C", "target_x": -12.0, "target_z": -22.0, "yaw": 0.0, "has_yaw": true, "speed": 0.0, "error": "target_out_of_bounds", "side_effects": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 1.0, "type": "npc.ack", "seq": 10, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "D34C", "ok": false, "replayed": false, "state": "external", "err": "target_out_of_bounds" }
+      ]
+    },
+    {
+      "id": "goto_midpoint",
+      "purpose": "GOTO 的中点取整与 180 度 yaw",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 1.1 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 11, "x": 0.0, "z": 0.0, "yaw": 180.0, "has_yaw": true, "speed": 1.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 64 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 1 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 11 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 11, "P": [8192, 8192, 8192, 64, 1, 0], "request_hash": "32F9", "target_x": 0.000732466581212066, "target_z": 0.00134285539888879, "yaw": 180.0, "has_yaw": true, "speed": 1.0078740157480315, "op_id": "1193046:11:32F9" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 1.1, "type": "npc.ack", "seq": 11, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "32F9", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 1.11, "type": "npc.operation_started", "op_id": "1193046:11:32F9", "kind": "goto", "request_seq": 11, "request_hash": "32F9", "expected_end_ms": null }
+      ]
+    },
+    {
+      "id": "goto_maximum",
+      "purpose": "GOTO 的 wire 边界最大值可解码，但越出 activity bounds，必须拒绝",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 1.2 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 12, "x": 12.0, "z": 22.0, "yaw": 359.97802734375, "has_yaw": true, "speed": 2.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 127 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 127 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 127 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 127 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 127 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 127 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 127 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 1 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 12 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 12, "P": [16383, 16383, 16383, 127, 1, 0], "request_hash": "6E78", "target_x": 12.0, "target_z": 22.0, "yaw": 359.97802734375, "has_yaw": true, "speed": 2.0, "error": "target_out_of_bounds", "side_effects": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 1.2, "type": "npc.ack", "seq": 12, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "6E78", "ok": false, "replayed": false, "state": "external", "err": "target_out_of_bounds" }
+      ]
+    },
+    {
+      "id": "goto_without_yaw",
+      "purpose": "P4 bit0 代替非法哨兵，P2 在无 yaw 时必须为 0",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 1.3 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 13, "x": 2.5, "z": -5.0, "yaw": null, "has_yaw": false, "speed": 1.5 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 77 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 42 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 49 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 58 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 95 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 13 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 13, "P": [9898, 6330, 0, 95, 0, 0], "request_hash": "2DE4", "target_x": 2.49990844167735, "target_z": -4.99945065006409, "yaw": null, "has_yaw": false, "speed": 1.4960629921259843, "op_id": "1193046:13:2DE4" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 1.3, "type": "npc.ack", "seq": 13, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "2DE4", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 1.31, "type": "npc.operation_started", "op_id": "1193046:13:2DE4", "kind": "goto", "request_seq": 13, "request_hash": "2DE4", "expected_end_ms": null }
+      ]
+    },
+    {
+      "id": "duplicate_ack_replay",
+      "purpose": "接收端健壮性：注入不合规的重复 HEARTBEAT，相同幂等键仍只执行一次并重放 ACK；合规 Python 发送端不得产生该重发",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 2.0 },
+      "semantic_input": { "command": "HEARTBEAT", "seq": 20, "repeat_after_ms": 100, "injection": "nonconforming_sender_duplicate_for_receiver_idempotency_only", "sender_conformance_expected": false },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 20 },
+        { "at_ms": 100, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 101, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 102, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 103, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 104, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 105, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 106, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 107, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 108, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 109, "type": "note_on", "channel": 0, "number": 11, "velocity": 20 }
+      ],
+      "udon_decode": { "cmd_id": 11, "seq": 20, "P": [0, 0, 0, 0, 0, 0], "request_hash": "37D8", "executions": 1, "ack_count": 2, "pong_count": 1 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 2.0, "type": "npc.ack", "seq": 20, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "37D8", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 2.01, "type": "sys.pong", "seq": 20, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 2.1, "type": "npc.ack", "seq": 20, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "37D8", "ok": true, "replayed": true, "state": "external" }
+      ]
+    },
+    {
+      "id": "sequence_conflict",
+      "purpose": "接收端健壮性：注入不合规的同 HEARTBEAT seq 不同 hash；幂等检查先于参数校验并固定回 seq_conflict",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 2.5 },
+      "semantic_input": { "first": { "command": "HEARTBEAT", "seq": 20, "P5": 0 }, "second": { "command": "HEARTBEAT", "seq": 20, "P5": 1 }, "injection": "nonconforming_sender_seq_conflict", "sender_conformance_expected": false },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 20 },
+        { "at_ms": 100, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 101, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 102, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 103, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 104, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 105, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 106, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 107, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 108, "type": "cc", "channel": 0, "number": 28, "value": 1 },
+        { "at_ms": 109, "type": "note_on", "channel": 0, "number": 11, "velocity": 20 }
+      ],
+      "udon_decode": { "first_hash": "37D8", "second_hash": "27F9", "second_result": "seq_conflict", "processing_order": "dedupe_before_command_parameter_validation" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 2.5, "type": "npc.ack", "seq": 20, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "37D8", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 2.51, "type": "sys.pong", "seq": 20, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 2.6, "type": "npc.ack", "seq": 20, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "27F9", "ok": false, "replayed": false, "state": "external", "err": "seq_conflict" }
+      ]
+    },
+    {
+      "id": "estop_and_clear",
+      "purpose": "任意通道 ESTOP 锁存，CLEAR_ESTOP 只回 safe_idle",
+      "initial_state": { "session": 1193046, "control_state": "moving", "driver_pid": 1, "command_registers": [0, 0, 0, 0, 0, 0], "log_seq_next": 1, "world_time_s": 3.0 },
+      "semantic_input": { "estop": { "channel": 2, "seq": 21 }, "clear": { "seq": 22 } },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "note_on", "channel": 2, "number": 127, "velocity": 21 },
+        { "at_ms": 100, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 101, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 102, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 103, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 104, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 105, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 106, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 107, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 108, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 109, "type": "note_on", "channel": 0, "number": 13, "velocity": 22 }
+      ],
+      "udon_decode": { "estop": { "cmd_id": 127, "seq": 21, "request_hash": "B248", "result_state": "estop" }, "clear": { "cmd_id": 13, "seq": 22, "request_hash": "18A6", "result_state": "safe_idle" } },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 3.0, "type": "npc.ack", "seq": 21, "cmd_id": 127, "cmd": "ESTOP", "request_hash": "B248", "ok": true, "replayed": false, "state": "estop" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 3.1, "type": "npc.ack", "seq": 22, "cmd_id": 13, "cmd": "CLEAR_ESTOP", "request_hash": "18A6", "ok": true, "replayed": false, "state": "safe_idle" }
+      ]
+    },
+    {
+      "id": "upper_body_minimum_frame",
+      "purpose": "8 参数最小帧",
+      "initial_state": { "session": 1193046, "control_state": "external", "stream_initialized": false, "log_seq_next": 1, "world_time_s": 4.0 },
+      "semantic_input": { "stream_seq": 1, "q": [0, 0, 0, 0, 0, 0, 0, 0] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 1, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "note_on", "channel": 1, "number": 64, "velocity": 1 }
+      ],
+      "udon_decode": { "stream_seq": 1, "head_yaw": -60.0, "head_pitch": -35.0, "torso_yaw": -35.0, "torso_pitch": -20.0, "left_arm_elevation": 0.0, "left_arm_azimuth": -120.0, "right_arm_elevation": 0.0, "right_arm_azimuth": -120.0 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 4.0, "type": "npc.stream_stats", "interval_ms": 1000, "received_frames": 1, "applied_frames": 1, "dropped_frames": 0, "duplicate_frames": 0, "invalid_events": 0, "last_seq": 1, "age_ms": 0, "active": true, "suspended_for_text": false, "faded_to_neutral": false }
+      ]
+    },
+    {
+      "id": "upper_body_neutral_frame",
+      "purpose": "8 参数中立帧",
+      "initial_state": { "session": 1193046, "control_state": "external", "stream_initialized": false, "log_seq_next": 1, "world_time_s": 4.1 },
+      "semantic_input": { "stream_seq": 64, "q": [64, 64, 64, 64, 0, 64, 0, 64] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 64 },
+        { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 64 },
+        { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 64 },
+        { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 64 },
+        { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 64 },
+        { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 1, "number": 27, "value": 64 },
+        { "at_ms": 8, "type": "note_on", "channel": 1, "number": 64, "velocity": 64 }
+      ],
+      "udon_decode": { "stream_seq": 64, "head_yaw": 0.0, "head_pitch": 0.0, "torso_yaw": 0.0, "torso_pitch": 0.0, "left_arm_elevation": 0.0, "left_arm_azimuth": 0.0, "right_arm_elevation": 0.0, "right_arm_azimuth": 0.0 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 4.1, "type": "npc.stream_stats", "interval_ms": 1000, "received_frames": 1, "applied_frames": 1, "dropped_frames": 0, "duplicate_frames": 0, "invalid_events": 0, "last_seq": 64, "age_ms": 0, "active": true, "suspended_for_text": false, "faded_to_neutral": false }
+      ]
+    },
+    {
+      "id": "upper_body_maximum_frame",
+      "purpose": "8 参数最大帧",
+      "initial_state": { "session": 1193046, "control_state": "external", "stream_initialized": false, "log_seq_next": 1, "world_time_s": 4.2 },
+      "semantic_input": { "stream_seq": 127, "q": [127, 127, 127, 127, 127, 127, 127, 127] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 127 },
+        { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 127 },
+        { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 127 },
+        { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 127 },
+        { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 127 },
+        { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 127 },
+        { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 127 },
+        { "at_ms": 7, "type": "cc", "channel": 1, "number": 27, "value": 127 },
+        { "at_ms": 8, "type": "note_on", "channel": 1, "number": 64, "velocity": 127 }
+      ],
+      "udon_decode": { "stream_seq": 127, "head_yaw": 60.0, "head_pitch": 35.0, "torso_yaw": 35.0, "torso_pitch": 20.0, "left_arm_elevation": 160.0, "left_arm_azimuth": 120.0, "right_arm_elevation": 160.0, "right_arm_azimuth": 120.0 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 4.2, "type": "npc.stream_stats", "interval_ms": 1000, "received_frames": 1, "applied_frames": 1, "dropped_frames": 0, "duplicate_frames": 0, "invalid_events": 0, "last_seq": 127, "age_ms": 0, "active": true, "suspended_for_text": false, "faded_to_neutral": false }
+      ]
+    },
+    {
+      "id": "utf8_text_nihao_yui_wave",
+      "purpose": "验证中文、ASCII 和 emoji 的 UTF-8、7-bit packing、CRC16 与完整 MIDI 序列",
+      "initial_state": { "session": 1193046, "control_state": "external", "active_text_transfer": null, "log_seq_next": 1, "world_time_s": 5.0 },
+      "semantic_input": { "text": "你好，YUI 👋", "transfer_seq": 7, "display_seconds": 6, "utf8_hex": "e4 bd a0 e5 a5 bd ef bc 8c 59 55 49 20 f0 9f 91 8b", "utf8_length": 17, "crc16": "57C6" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 7 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 17 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 47 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 70 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 1 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 6 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 50 },
+        { "at_ms": 20, "type": "cc", "channel": 2, "number": 29, "value": 127 },
+        { "at_ms": 21, "type": "cc", "channel": 2, "number": 29, "value": 100 },
+        { "at_ms": 22, "type": "cc", "channel": 2, "number": 29, "value": 61 },
+        { "at_ms": 23, "type": "cc", "channel": 2, "number": 29, "value": 32 },
+        { "at_ms": 24, "type": "cc", "channel": 2, "number": 29, "value": 101 },
+        { "at_ms": 25, "type": "cc", "channel": 2, "number": 29, "value": 37 },
+        { "at_ms": 26, "type": "cc", "channel": 2, "number": 29, "value": 61 },
+        { "at_ms": 27, "type": "cc", "channel": 2, "number": 29, "value": 111 },
+        { "at_ms": 28, "type": "cc", "channel": 2, "number": 29, "value": 67 },
+        { "at_ms": 29, "type": "cc", "channel": 2, "number": 29, "value": 60 },
+        { "at_ms": 30, "type": "cc", "channel": 2, "number": 29, "value": 12 },
+        { "at_ms": 31, "type": "cc", "channel": 2, "number": 29, "value": 89 },
+        { "at_ms": 32, "type": "cc", "channel": 2, "number": 29, "value": 85 },
+        { "at_ms": 33, "type": "cc", "channel": 2, "number": 29, "value": 73 },
+        { "at_ms": 34, "type": "cc", "channel": 2, "number": 29, "value": 32 },
+        { "at_ms": 35, "type": "cc", "channel": 2, "number": 29, "value": 112 },
+        { "at_ms": 36, "type": "cc", "channel": 2, "number": 29, "value": 7 },
+        { "at_ms": 37, "type": "cc", "channel": 2, "number": 29, "value": 31 },
+        { "at_ms": 38, "type": "cc", "channel": 2, "number": 29, "value": 17 },
+        { "at_ms": 39, "type": "cc", "channel": 2, "number": 29, "value": 11 },
+        { "at_ms": 50, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 51, "type": "cc", "channel": 0, "number": 21, "value": 7 },
+        { "at_ms": 52, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 53, "type": "cc", "channel": 0, "number": 23, "value": 17 },
+        { "at_ms": 54, "type": "cc", "channel": 0, "number": 24, "value": 47 },
+        { "at_ms": 55, "type": "cc", "channel": 0, "number": 25, "value": 70 },
+        { "at_ms": 56, "type": "cc", "channel": 0, "number": 26, "value": 1 },
+        { "at_ms": 57, "type": "cc", "channel": 0, "number": 27, "value": 6 },
+        { "at_ms": 58, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 59, "type": "note_on", "channel": 0, "number": 20, "velocity": 51 }
+      ],
+      "udon_decode": { "begin": { "seq": 50, "P": [7, 17, 6086, 1, 6, 0], "request_hash": "AB3B" }, "packed_values": [127, 100, 61, 32, 101, 37, 61, 111, 67, 60, 12, 89, 85, 73, 32, 112, 7, 31, 17, 11], "raw_utf8_bytes": [228, 189, 160, 229, 165, 189, 239, 188, 140, 89, 85, 73, 32, 240, 159, 145, 139], "commit": { "seq": 51, "P": [7, 17, 6086, 1, 6, 0], "request_hash": "EDC3" }, "text": "你好，YUI 👋" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 5.0, "type": "npc.ack", "seq": 50, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "AB3B", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 5.05, "type": "npc.ack", "seq": 51, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "EDC3", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 5.06, "type": "npc.text_displayed", "transfer_seq": 7, "utf8_bytes": 17, "crc16": "57C6", "display_seconds": 6, "text": "你好，YUI 👋" }
+      ]
+    },
+    {
+      "id": "action_natural_finish",
+      "purpose": "动作开始和自然结束生命周期",
+      "initial_state": { "session": 1193046, "control_state": "external", "current_action": null, "log_seq_next": 1, "world_time_s": 6.0, "server_time_ms": 1000000 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 30, "action_seq": 77, "action_id": 3, "loop": false },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 77 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 30 }
+      ],
+      "external_events": [{ "at_ms": 1800, "type": "animator_state_complete", "action_seq": 77 }],
+      "udon_decode": { "cmd_id": 6, "seq": 30, "P": [77, 0, 0, 3, 0, 0], "request_hash": "717D", "op_id": "1193046:30:717D", "action": "wave", "semantic_key": "greet_wave", "duration_ms": 1800 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 6.0, "type": "npc.ack", "seq": 30, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "717D", "ok": true, "replayed": false, "state": "action" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 6.001, "type": "npc.operation_started", "op_id": "1193046:30:717D", "kind": "action", "request_seq": 30, "request_hash": "717D", "expected_end_ms": 1800 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 6.01, "type": "npc.action_started", "op_id": "1193046:30:717D", "request_seq": 30, "request_hash": "717D", "action_id": 3, "action_seq": 77, "semantic_key": "greet_wave", "name": "wave", "layer": "upper_body", "loop": false, "started_at_server_ms": 1000000 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 7.8, "type": "npc.action_finished", "op_id": "1193046:30:717D", "request_seq": 30, "request_hash": "717D", "action_id": 3, "action_seq": 77, "semantic_key": "greet_wave", "name": "wave", "layer": "upper_body", "elapsed_ms": 1800 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 7.801, "type": "npc.operation_completed", "op_id": "1193046:30:717D", "kind": "action", "request_seq": 30, "request_hash": "717D", "elapsed_ms": 1800, "result": "natural_end" }
+      ]
+    },
+    {
+      "id": "action_explicit_cancel",
+      "purpose": "STOP_ACTION 产生唯一 cancelled 事件，不伪造 finished",
+      "initial_state": { "session": 1193046, "control_state": "external", "current_action": null, "log_seq_next": 1, "world_time_s": 8.0, "server_time_ms": 2000000 },
+      "semantic_input": { "start": { "command": "PLAY_ANIM", "seq": 30, "action_seq": 77, "action_id": 3 }, "stop": { "command": "STOP_ACTION", "seq": 31, "action_seq": 77, "after_ms": 700 } },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 77 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 30 },
+        { "at_ms": 700, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 701, "type": "cc", "channel": 0, "number": 21, "value": 77 },
+        { "at_ms": 702, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 703, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 704, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 705, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 706, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 707, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 708, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 709, "type": "note_on", "channel": 0, "number": 14, "velocity": 31 }
+      ],
+      "udon_decode": { "start_hash": "717D", "stop_hash": "E5E6", "op_id": "1193046:30:717D", "cancel_reason": "explicit_stop", "finished_event": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 8.0, "type": "npc.ack", "seq": 30, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "717D", "ok": true, "replayed": false, "state": "action" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 8.001, "type": "npc.operation_started", "op_id": "1193046:30:717D", "kind": "action", "request_seq": 30, "request_hash": "717D", "expected_end_ms": 1800 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 8.01, "type": "npc.action_started", "op_id": "1193046:30:717D", "request_seq": 30, "request_hash": "717D", "action_id": 3, "action_seq": 77, "semantic_key": "greet_wave", "name": "wave", "layer": "upper_body", "loop": false, "started_at_server_ms": 2000000 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 8.7, "type": "npc.ack", "seq": 31, "cmd_id": 14, "cmd": "STOP_ACTION", "request_hash": "E5E6", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 8.71, "type": "npc.action_cancelled", "op_id": "1193046:30:717D", "request_seq": 30, "request_hash": "717D", "action_id": 3, "action_seq": 77, "semantic_key": "greet_wave", "name": "wave", "layer": "upper_body", "elapsed_ms": 700, "reason": "explicit_stop" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 8.711, "type": "npc.operation_cancelled", "op_id": "1193046:30:717D", "kind": "action", "request_seq": 30, "request_hash": "717D", "elapsed_ms": 700, "reason": "explicit_stop" }
+      ]
+    },
+    {
+      "id": "session_rebuild",
+      "purpose": "同 driver 在无活动 operation 时建立新 session，幂等缓存与 slot 映射重建且 ESTOP 不被隐式解除",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "estop": false, "active_ops": [], "log_seq_next": 100, "world_time_s": 10.0 },
+      "semantic_input": { "command": "DISCOVER", "seq": 1, "session": 2311527, "driver_claim_code": 4242 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 10 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 103 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 1 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 13 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 18 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 1 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 1, "P": [1383, 141, 4242, 0, 0, 0], "new_session": 2311527, "request_hash": "4FB3", "result_state": "safe_idle", "idempotency_cache_reset": true, "slot_map_reset": true },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 100, "t": 10.0, "type": "npc.ack", "seq": 1, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "4FB3", "ok": true, "replayed": false, "state": "safe_idle" },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 101, "t": 10.01, "type": "sys.session", "previous_session": 1193046, "new_session": 2311527, "driver_pid": 1, "reset": true, "estop_preserved": false },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 102, "t": 10.02, "type": "sys.hello", "world_name": "YUI Test", "wire_bounds": [-12.0, -1.0, -22.0, 12.0, 5.0, 22.0], "activity_bounds": [-10.0, 0.0, -20.0, 10.0, 4.0, 20.0], "max_speed": 2.0, "watchdog_ms": 3000, "caps": ["goto", "follow", "actions", "expressions", "text_preset", "text_utf8", "upper_body_stream", "ray_scan", "touch", "player_pose", "voice_stream", "snapshot", "navmesh", "social_signals", "anchors", "operation_lifecycle"], "cap_bits": 131067, "catalog_rev": 1, "catalog_counts": { "action": 1, "expression": 1, "text_preset": 1, "anchor": 1 } },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 103, "t": 10.03, "type": "sys.catalog", "catalog_rev": 1, "kind": "action", "page": 1, "pages": 1, "items": [{ "id": 3, "name": "wave", "semantic_key": "greet_wave", "description_zh": "向目标友好挥手", "intent_tags": ["greeting", "friendly"], "target_required": "none", "speech_compatible": true, "layer": "upper_body", "duration_ms": 1800, "loopable": false, "movement": "allow", "priority": 40, "interruptible": true, "fade_in_ms": 120, "fade_out_ms": 180 }] },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 104, "t": 10.04, "type": "sys.catalog", "catalog_rev": 1, "kind": "expression", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "neutral", "semantic_key": "neutral", "description_zh": "中立表情", "default_duration_ms": 0, "fade_ms": 150 }] },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 105, "t": 10.05, "type": "sys.catalog", "catalog_rev": 1, "kind": "text_preset", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "hello", "text": "你好", "default_display_seconds": 5 }] },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 106, "t": 10.06, "type": "sys.catalog", "catalog_rev": 1, "kind": "anchor", "page": 1, "pages": 1, "items": [{ "id": 0, "semantic_key": "stage_center", "description_zh": "舞台中央", "pos": [0.0, 0.0, 4.0], "yaw": 180.0, "has_yaw": true, "arrival_radius": 0.3, "tags": ["stage", "social"] }] },
+        { "v": 1, "spec": "1.1", "session": 2311527, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 107, "t": 10.07, "type": "player.join", "pid": 1, "name": "Driver", "slot": 0, "count": 1 }
+      ]
+    },
+    {
+      "id": "player_leave_follow_target",
+      "purpose": "player leave 使 slot 立即失效，并终止以该 slot 为目标的 follow",
+      "initial_state": { "session": 1193046, "control_state": "moving", "locomotion_mode": "follow", "target_slot": 1, "active_ops": [{ "op_id": "1193046:35:C0DE", "kind": "follow", "request_seq": 35, "request_hash": "C0DE", "elapsed_ms": 2500 }], "players": [{ "slot": 0, "pid": 1, "name": "Driver" }, { "slot": 1, "pid": 2, "name": "Guest B" }], "npc_pos": [0.0, 0.0, 0.0], "log_seq_next": 1, "world_time_s": 11.0 },
+      "semantic_input": { "external_event": "OnPlayerLeft", "pid": 2 },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "player_left", "pid": 2 }],
+      "udon_decode": { "released_slot": 1, "player_count": 1, "result_state": "external", "target_slot": null, "blocked_reason": "target_left", "cancelled_op_id": "1193046:35:C0DE" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 11.0, "type": "player.leave", "pid": 2, "name": "Guest B", "slot": 1, "count": 1 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 11.01, "type": "npc.blocked", "op_id": "1193046:35:C0DE", "request_seq": 35, "request_hash": "C0DE", "pos": [0.0, 0.0, 0.0], "reason": "target_left", "target": null },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 11.011, "type": "npc.operation_cancelled", "op_id": "1193046:35:C0DE", "kind": "follow", "request_seq": 35, "request_hash": "C0DE", "elapsed_ms": 2500, "reason": "player_left" }
+      ]
+    },
+    {
+      "id": "complete_snapshot",
+      "purpose": "完整运行期 snapshot 的固定 section 顺序和数据结构",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "watchdog_age_ms": 120, "players": [{ "slot": 0, "pid": 1, "name": "Driver" }, { "slot": 1, "pid": 2, "name": "Guest B" }], "log_seq_next": 1, "world_time_s": 12.0 },
+      "semantic_input": { "command": "SNAPSHOT_REQUEST", "seq": 40 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 15, "velocity": 40 }
+      ],
+      "udon_decode": { "cmd_id": 15, "seq": 40, "P": [0, 0, 0, 0, 0, 0], "request_hash": "2C7A", "snapshot_parts": 5 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 12.0, "type": "npc.ack", "seq": 40, "cmd_id": 15, "cmd": "SNAPSHOT_REQUEST", "request_hash": "2C7A", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 12.01, "type": "sys.snapshot", "snapshot_seq": 40, "part": 1, "parts": 5, "section": "session", "data": { "driver_pid": 1, "control_state": "external", "watchdog_age_ms": 120, "estop": false, "catalog_rev": 1, "catalog_counts": { "action": 1, "expression": 1, "text_preset": 1, "anchor": 1 }, "caps": ["goto", "follow", "actions", "expressions", "text_preset", "text_utf8", "upper_body_stream", "ray_scan", "touch", "player_pose", "voice_stream", "snapshot", "navmesh", "social_signals", "anchors", "operation_lifecycle"], "telemetry_dropped_total": 0, "log_wrap_count": 0 } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 12.02, "type": "sys.snapshot", "snapshot_seq": 40, "part": 2, "parts": 5, "section": "npc", "data": { "pos": [0.0, 0.0, 1.0], "yaw": 0.0, "vel": [0.0, 0.0], "speed": 0.0, "state": "external", "mode": "idle", "grounded": true, "target_slot": null, "action_id": null, "action_seq": null, "expression_id": 0, "estop": false, "active_ops": [], "target_pos": null, "action_started_at_server_ms": null, "text_transfer_seq": 7 } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 12.03, "type": "sys.snapshot", "snapshot_seq": 40, "part": 3, "parts": 5, "section": "players", "data": { "page": 1, "pages": 1, "players": [{ "slot": 0, "pid": 1, "name": "Driver", "d": 1.0, "brg": 180.0, "yaw": 0.0, "vr": true }, { "slot": 1, "pid": 2, "name": "Guest B", "d": 2.0, "brg": 45.0, "yaw": 270.0, "vr": false }] } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 12.04, "type": "sys.snapshot", "snapshot_seq": 40, "part": 4, "parts": 5, "section": "voice", "data": { "state": "playing", "error_code": null, "url_loaded": true, "last_speech_seq": null } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 12.05, "type": "sys.snapshot", "snapshot_seq": 40, "part": 5, "parts": 5, "section": "text", "data": { "transfer_seq": 7, "utf8_bytes": 17, "crc16": "57C6", "display_until_server_ms": 3000000, "text": "你好，YUI 👋" } }
+      ]
+    },
+    {
+      "id": "avpro_ready_and_playing",
+      "purpose": "固定 URL 的 AVPro Ready/Start 状态",
+      "initial_state": { "session": 1193046, "voice_state": "loading", "url_loaded": true, "load_url_calls": 1, "log_seq_next": 1, "world_time_s": 13.0 },
+      "semantic_input": { "external_events": ["OnVideoReady", "OnVideoStart"] },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "video_ready" }, { "at_ms": 20, "type": "video_start" }],
+      "udon_decode": { "states": ["ready", "playing"], "load_url_calls_after": 1 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 13.0, "type": "voice.state", "state": "ready", "reason": "video_ready", "error_code": null, "url_loaded": true },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 13.02, "type": "voice.state", "state": "playing", "reason": "video_start", "error_code": null, "url_loaded": true }
+      ]
+    },
+    {
+      "id": "avpro_error",
+      "purpose": "AVPro 错误保持稳定枚举字符串，且不自动重载 URL",
+      "initial_state": { "session": 1193046, "voice_state": "loading", "url_loaded": true, "load_url_calls": 1, "log_seq_next": 1, "world_time_s": 13.5 },
+      "semantic_input": { "external_event": "OnVideoError", "error_code": "InvalidURL" },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "video_error", "error_code": "InvalidURL" }],
+      "udon_decode": { "result_state": "error", "error_code": "InvalidURL", "load_url_calls_after": 1 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 13.5, "type": "voice.state", "state": "error", "reason": "video_error", "error_code": "InvalidURL", "url_loaded": true }
+      ]
+    },
+    {
+      "id": "speech_cue",
+      "purpose": "SPEECH_CUE 只关联正在播放的固定流、文本和动作，不触发播放或动作",
+      "initial_state": { "session": 1193046, "control_state": "external", "voice_state": "playing", "known_text_transfer_seq": 7, "known_action_seq": 77, "log_seq_next": 1, "world_time_s": 14.0 },
+      "semantic_input": { "command": "SPEECH_CUE", "seq": 60, "speech_seq": 91, "text_transfer_seq": 7, "action_seq": 77, "estimated_delay_ms": 800, "duration_ms": 6000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 },
+        { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 91 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 },
+        { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 7 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 77 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 8 },
+        { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 24 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 },
+        { "at_ms": 9, "type": "note_on", "channel": 0, "number": 21, "velocity": 60 }
+      ],
+      "udon_decode": { "cmd_id": 21, "seq": 60, "P": [91, 7, 77, 8, 24, 0], "request_hash": "E332", "speech_seq": 91, "text_transfer_seq": 7, "action_seq": 77, "estimated_delay_ms": 800, "duration_ms": 6000, "starts_audio": false, "starts_action": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 14.0, "type": "npc.ack", "seq": 60, "cmd_id": 21, "cmd": "SPEECH_CUE", "request_hash": "E332", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 14.01, "type": "voice.cue", "speech_seq": 91, "text_transfer_seq": 7, "action_seq": 77, "estimated_delay_ms": 800, "duration_ms": 6000 }
+      ]
+    },
+    {
+      "id": "upper_body_timeout_fade",
+      "purpose": "最后一帧后 250ms 触发断流，并在其后 200ms 内完成淡回中立",
+      "initial_state": { "session": 1193046, "control_state": "external", "stream_active": false, "log_seq_next": 1, "world_time_s": 16.5 },
+      "semantic_input": { "upper_body_values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "stream_seq": 10, "wait_ms": 1000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 64 },
+        { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 64 },
+        { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 64 },
+        { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 64 },
+        { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 0 },
+        { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 64 },
+        { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 0 },
+        { "at_ms": 7, "type": "cc", "channel": 1, "number": 27, "value": 64 },
+        { "at_ms": 8, "type": "note_on", "channel": 1, "number": 64, "velocity": 10 }
+      ],
+      "external_events": [{ "at_ms": 250, "type": "stream_timeout" }, { "at_ms": 450, "type": "stream_fade_complete" }, { "at_ms": 1000, "type": "stream_stats_window" }],
+      "udon_decode": { "q": [64, 64, 64, 64, 0, 64, 0, 64], "values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "stream_seq": 10, "fade_started_ms": 250, "fade_completed_ms": 450, "final_values": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 17.5, "type": "npc.stream_stats", "interval_ms": 1000, "received_frames": 1, "applied_frames": 1, "dropped_frames": 0, "duplicate_frames": 0, "invalid_events": 0, "last_seq": 10, "age_ms": 1000, "active": false, "suspended_for_text": false, "faded_to_neutral": true }
+      ]
+    },
+    {
+      "id": "watchdog_safe_idle",
+      "purpose": "没有活动 operation 时心跳年龄达到 3000ms，确定性进入 safe_idle 且不恢复旧任务",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "watchdog_age_ms": 2999, "active_ops": [], "log_seq_next": 1, "world_time_s": 18.0 },
+      "semantic_input": { "external_event": "watchdog_tick", "elapsed_ms": 3000 },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 1, "type": "watchdog_tick", "elapsed_ms": 3000 }],
+      "udon_decode": { "previous_state": "external", "result_state": "safe_idle", "tasks_restored_on_later_heartbeat": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 18.001, "type": "sys.watchdog", "elapsed_ms": 3000, "previous_state": "external" }
+      ]
+    },
+    {
+      "id": "goto_target_not_on_navmesh",
+      "purpose": "activity bounds 内目标若 0.5m 内没有 NavMesh 点，必须拒绝且旧目标不变",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "old_target": [1.0, 0.0, 1.0], "navmesh_override": "目标周围 0.5m 无可采样点", "log_seq_next": 1, "world_time_s": 18.2 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 78, "x": 0.0, "z": 0.0, "has_yaw": false, "speed": 1.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 78 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 78, "P": [8192, 8192, 0, 64, 0, 0], "request_hash": "A0CA", "target_x": 0.000732466581212066, "target_z": 0.00134285539888879, "error": "target_not_on_navmesh", "old_target_after": [1.0, 0.0, 1.0], "operation_created": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 18.2, "type": "npc.ack", "seq": 78, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "A0CA", "ok": false, "replayed": false, "state": "external", "err": "target_not_on_navmesh" }
+      ]
+    },
+    {
+      "id": "speech_cue_voice_unavailable",
+      "purpose": "固定流不在 playing 时 SPEECH_CUE 返回 voice_unavailable 且不产生 voice.cue",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "voice_state": "error", "log_seq_next": 1, "world_time_s": 18.4 },
+      "semantic_input": { "command": "SPEECH_CUE", "seq": 77, "speech_seq": 92, "estimated_delay_ms": 800, "duration_ms": 6000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 92 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 8 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 24 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 21, "velocity": 77 }
+      ],
+      "udon_decode": { "cmd_id": 21, "seq": 77, "P": [92, 0, 0, 8, 24, 0], "request_hash": "0BB5", "error": "voice_unavailable", "voice_cue_emitted": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 18.4, "type": "npc.ack", "seq": 77, "cmd_id": 21, "cmd": "SPEECH_CUE", "request_hash": "0BB5", "ok": false, "replayed": false, "state": "external", "err": "voice_unavailable" }
+      ]
+    },
+    {
+      "id": "turn_operation_lifecycle",
+      "purpose": "TURN_TO 具有可关联的 started/completed 生命周期",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "yaw": 0.0, "log_seq_next": 1, "world_time_s": 18.6 },
+      "semantic_input": { "command": "TURN_TO", "seq": 80, "yaw": 180.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 4, "velocity": 80 }
+      ],
+      "external_events": [{ "at_ms": 1000, "type": "turn_reached", "yaw_error_deg": 1.5 }],
+      "udon_decode": { "cmd_id": 4, "seq": 80, "P": [8192, 0, 0, 0, 0, 0], "request_hash": "3C1D", "yaw": 180.0, "op_id": "1193046:80:3C1D" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 18.6, "type": "npc.ack", "seq": 80, "cmd_id": 4, "cmd": "TURN_TO", "request_hash": "3C1D", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 18.601, "type": "npc.operation_started", "op_id": "1193046:80:3C1D", "kind": "turn", "request_seq": 80, "request_hash": "3C1D", "expected_end_ms": null },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 19.6, "type": "npc.operation_completed", "op_id": "1193046:80:3C1D", "kind": "turn", "request_seq": 80, "request_hash": "3C1D", "elapsed_ms": 1000, "result": "turned" }
+      ]
+    },
+    {
+      "id": "look_operation_lifecycle",
+      "purpose": "LOOK_AT_XYZ 的持续时间到期必须产生 completed，而不是让 LLM 永久等待",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 19.8 },
+      "semantic_input": { "command": "LOOK_AT_XYZ", "seq": 81, "wire_midpoint_xyz": true, "weight": 1.0, "duration_seconds": 1, "allow_body_assist": false },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 64 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 127 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 1 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 17, "velocity": 81 }
+      ],
+      "external_events": [{ "at_ms": 1000, "type": "look_duration_expired" }],
+      "udon_decode": { "cmd_id": 17, "seq": 81, "P": [8192, 8192, 8192, 127, 1, 0], "request_hash": "84E7", "target_xyz": [0.000732466581212066, 2.000183116645303, 0.00134285539888879], "op_id": "1193046:81:84E7" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 19.8, "type": "npc.ack", "seq": 81, "cmd_id": 17, "cmd": "LOOK_AT_XYZ", "request_hash": "84E7", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 19.801, "type": "npc.operation_started", "op_id": "1193046:81:84E7", "kind": "look", "request_seq": 81, "request_hash": "84E7", "expected_end_ms": 1000 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 20.8, "type": "npc.operation_completed", "op_id": "1193046:81:84E7", "kind": "look", "request_seq": 81, "request_hash": "84E7", "elapsed_ms": 1000, "result": "expired" }
+      ]
+    },
+    {
+      "id": "expression_operation_lifecycle",
+      "purpose": "定时表情具有 started/completed 生命周期和稳定 semantic_key",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "expression_id": null, "log_seq_next": 1, "world_time_s": 21.0 },
+      "semantic_input": { "command": "SET_EXPRESSION", "seq": 79, "expression_key": "neutral", "weight": 1.0, "duration_seconds": 1 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 127 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 1 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 18, "velocity": 79 }
+      ],
+      "external_events": [{ "at_ms": 1000, "type": "expression_duration_expired" }],
+      "udon_decode": { "cmd_id": 18, "seq": 79, "P": [0, 0, 0, 0, 127, 1], "request_hash": "0D6C", "expression_id": 0, "semantic_key": "neutral", "op_id": "1193046:79:0D6C" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 21.0, "type": "npc.ack", "seq": 79, "cmd_id": 18, "cmd": "SET_EXPRESSION", "request_hash": "0D6C", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 21.001, "type": "npc.operation_started", "op_id": "1193046:79:0D6C", "kind": "expression", "request_seq": 79, "request_hash": "0D6C", "expected_end_ms": 1000 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 22.0, "type": "npc.operation_completed", "op_id": "1193046:79:0D6C", "kind": "expression", "request_seq": 79, "request_hash": "0D6C", "elapsed_ms": 1000, "result": "expired" }
+      ]
+    },
+    {
+      "id": "wander_capability_disabled",
+      "purpose": "fixture 未发布 wander capability 时 SET_MODE wander 必须明确拒绝",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps": "fixture", "log_seq_next": 1, "world_time_s": 23.0 },
+      "semantic_input": { "command": "SET_MODE", "seq": 82, "mode": "wander" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 1, "velocity": 82 }
+      ],
+      "udon_decode": { "cmd_id": 1, "seq": 82, "P": [0, 0, 0, 3, 0, 0], "request_hash": "6D10", "error": "unsupported_capability", "operation_created": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 23.0, "type": "npc.ack", "seq": 82, "cmd_id": 1, "cmd": "SET_MODE", "request_hash": "6D10", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }
+      ]
+    },
+    {
+      "id": "wander_cycle_and_stop",
+      "purpose": "wander 开启时从 waypoint 0 顺序循环，STOP 只取消 operation",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_add": ["wander"], "wander_waypoints": [[-1.0,0.0,0.0],[1.0,0.0,0.0]], "log_seq_next": 1, "world_time_s": 23.2 },
+      "semantic_input": { "start": { "command": "SET_MODE", "seq": 83, "mode": "wander" }, "stop": { "command": "STOP", "seq": 84, "after_ms": 2500 } },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 1, "velocity": 83 },
+        { "at_ms": 2500, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 2501, "type": "cc", "channel": 0, "number": 21, "value": 0 },
+        { "at_ms": 2502, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 2503, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 2504, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 2505, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 2506, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 2507, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 2508, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 2509, "type": "note_on", "channel": 0, "number": 7, "velocity": 84 }
+      ],
+      "external_events": [{ "at_ms": 1000, "type": "waypoint_reached", "index": 0, "pos": [-1.0,0.0,0.0] }, { "at_ms": 2000, "type": "waypoint_reached", "index": 1, "pos": [1.0,0.0,0.0] }],
+      "udon_decode": { "start_hash": "0255", "stop_hash": "B60B", "op_id": "1193046:83:0255", "visited_indices": [0,1], "next_index_before_stop": 0, "completed_event": false },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 23.2, "type": "npc.ack", "seq": 83, "cmd_id": 1, "cmd": "SET_MODE", "request_hash": "0255", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 23.201, "type": "npc.operation_started", "op_id": "1193046:83:0255", "kind": "wander", "request_seq": 83, "request_hash": "0255", "expected_end_ms": null },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 24.2, "type": "npc.arrived", "op_id": "1193046:83:0255", "request_seq": 83, "request_hash": "0255", "pos": [-1.0,0.0,0.0], "yaw": 0.0, "error_m": 0.0, "final": false, "waypoint_index": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 25.2, "type": "npc.arrived", "op_id": "1193046:83:0255", "request_seq": 83, "request_hash": "0255", "pos": [1.0,0.0,0.0], "yaw": 0.0, "error_m": 0.0, "final": false, "waypoint_index": 1 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 25.7, "type": "npc.ack", "seq": 84, "cmd_id": 7, "cmd": "STOP", "request_hash": "B60B", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 25.701, "type": "npc.operation_cancelled", "op_id": "1193046:83:0255", "kind": "wander", "request_seq": 83, "request_hash": "0255", "elapsed_ms": 2500, "reason": "explicit_stop" }
+      ]
+    },
+    {
+      "id": "unknown_command",
+      "purpose": "未定义 cmdId 0x17 返回 unknown_cmd 且不执行",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 26.0 },
+      "semantic_input": { "cmd_id": 23, "seq": 85 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 23, "velocity": 85 }
+      ],
+      "udon_decode": { "cmd_id": 23, "seq": 85, "P": [0,0,0,0,0,0], "request_hash": "8C73", "error": "unknown_cmd", "side_effects": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 26.0, "type": "npc.ack", "seq": 85, "cmd_id": 23, "cmd": "UNKNOWN", "request_hash": "8C73", "ok": false, "replayed": false, "state": "external", "err": "unknown_cmd" }]
+    },
+    {
+      "id": "not_handshaken_gate",
+      "purpose": "无 session 的已知命令返回 not_handshaken",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "log_seq_next": 1, "world_time_s": 26.2 },
+      "semantic_input": { "command": "HEARTBEAT", "seq": 86 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 86 }
+      ],
+      "udon_decode": { "cmd_id": 11, "seq": 86, "P": [0,0,0,0,0,0], "request_hash": "9B48", "error": "not_handshaken" },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 0, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 26.2, "type": "npc.ack", "seq": 86, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "9B48", "ok": false, "replayed": false, "state": "unhandshaken", "err": "not_handshaken" }]
+    },
+    {
+      "id": "not_driver_gate",
+      "purpose": "本地玩家不是 driver 时优先返回 not_driver",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "local_pid": 2, "owns_all_sync_objects": false, "log_seq_next": 1, "world_time_s": 26.4 },
+      "semantic_input": { "command": "HEARTBEAT", "seq": 87 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 87 }
+      ],
+      "udon_decode": { "cmd_id": 11, "seq": 87, "P": [0,0,0,0,0,0], "request_hash": "F40D", "selected_error_stage": 7, "error": "not_driver" },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 26.4, "type": "npc.ack", "seq": 87, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "F40D", "ok": false, "replayed": false, "state": "external", "err": "not_driver" }]
+    },
+    {
+      "id": "not_owner_gate",
+      "purpose": "本地玩家是 driver 但所有权不完整时返回 not_owner",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "local_pid": 1, "owns_all_sync_objects": false, "log_seq_next": 1, "world_time_s": 26.6 },
+      "semantic_input": { "command": "HEARTBEAT", "seq": 88 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 88 }
+      ],
+      "udon_decode": { "cmd_id": 11, "seq": 88, "P": [0,0,0,0,0,0], "request_hash": "A2BC", "selected_error_stage": 8, "error": "not_owner" },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 26.6, "type": "npc.ack", "seq": 88, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "A2BC", "ok": false, "replayed": false, "state": "external", "err": "not_owner" }]
+    },
+    {
+      "id": "estop_latched_gate",
+      "purpose": "ESTOP 锁存时普通 STOP 也不能解除，返回 estop_latched",
+      "initial_state": { "session": 1193046, "control_state": "estop", "estop": true, "driver_pid": 1, "local_pid": 1, "owns_all_sync_objects": true, "log_seq_next": 1, "world_time_s": 26.8 },
+      "semantic_input": { "command": "STOP", "seq": 89 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 7, "velocity": 89 }
+      ],
+      "udon_decode": { "cmd_id": 7, "seq": 89, "P": [0,0,0,0,0,0], "request_hash": "3E30", "error": "estop_latched", "estop_after": true },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 26.8, "type": "npc.ack", "seq": 89, "cmd_id": 7, "cmd": "STOP", "request_hash": "3E30", "ok": false, "replayed": false, "state": "estop", "err": "estop_latched" }]
+    },
+    {
+      "id": "reserved_bits_rejected",
+      "purpose": "GOTO P4 保留 bit 非零时返回 reserved_bits，先于普通参数检查",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "local_pid": 1, "owns_all_sync_objects": true, "log_seq_next": 1, "world_time_s": 27.0 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 90, "P": [8192,8192,0,64,2,0] },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 2 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 90 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 90, "P": [8192,8192,0,64,2,0], "request_hash": "FF0B", "selected_error_stage": 12, "error": "reserved_bits", "side_effects": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 27.0, "type": "npc.ack", "seq": 90, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "FF0B", "ok": false, "replayed": false, "state": "external", "err": "reserved_bits" }]
+    },
+    {
+      "id": "discover_ownership_failed",
+      "purpose": "DISCOVER 鉴权通过但三个同步对象 ownership 未全部取得时返回 ownership_failed",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "local_pid": 1, "ownership_result": [true,false,true], "log_seq_next": 1, "world_time_s": 27.2 },
+      "semantic_input": { "command": "DISCOVER", "seq": 91, "session": 1193046, "driver_claim_code": 4242 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 104 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 86 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 72 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 18 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 91 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 91, "P": [13398,72,4242,0,0,0], "requested_session": 1193046, "request_hash": "93C3", "error": "ownership_failed", "session_after": 0 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 0, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 27.2, "type": "npc.ack", "seq": 91, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "93C3", "ok": false, "replayed": false, "state": "unhandshaken", "err": "ownership_failed" }]
+    },
+    {
+      "id": "discover_session_conflict",
+      "purpose": "仍在场的其他 driver 已占用 session 时拒绝新 DISCOVER",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 2, "local_pid": 1, "owns_all_sync_objects": false, "log_seq_next": 1, "world_time_s": 27.4 },
+      "semantic_input": { "command": "DISCOVER", "seq": 92, "session": 2311527, "driver_claim_code": 4242 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 10 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 103 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 1 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 13 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 18 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 92 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 92, "P": [1383,141,4242,0,0,0], "requested_session": 2311527, "request_hash": "2104", "error": "session_conflict", "session_after": 1193046 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 27.4, "type": "npc.ack", "seq": 92, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "2104", "ok": false, "replayed": false, "state": "external", "err": "session_conflict" }]
+    },
+    {
+      "id": "discover_driver_auth_failed",
+      "purpose": "claim code 不符时在 ownership 前返回 driver_auth_failed",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "local_pid": 1, "log_seq_next": 1, "world_time_s": 27.6 },
+      "semantic_input": { "command": "DISCOVER", "seq": 93, "session": 1193046, "driver_claim_code": 4243 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 104 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 86 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 72 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 19 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 93 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 93, "P": [13398,72,4243,0,0,0], "requested_session": 1193046, "request_hash": "96C8", "selected_error": "driver_auth_failed", "ownership_attempted": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 0, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 27.6, "type": "npc.ack", "seq": 93, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "96C8", "ok": false, "replayed": false, "state": "unhandshaken", "err": "driver_auth_failed" }]
+    },
+    {
+      "id": "reliable_command_rate_limited",
+      "purpose": "上身流 inactive 时一秒内第五个完整可靠帧不执行、不 ACK，只发一次 rate_limited",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "local_pid": 1, "owns_all_sync_objects": true, "upper_body_active": false, "rate_window_count": 0, "log_seq_next": 1, "world_time_s": 28.0 },
+      "semantic_input": { "commands": [{"command":"HEARTBEAT","seq":94,"at_ms":0},{"command":"HEARTBEAT","seq":95,"at_ms":200},{"command":"HEARTBEAT","seq":96,"at_ms":400},{"command":"HEARTBEAT","seq":97,"at_ms":600},{"command":"HEARTBEAT","seq":98,"at_ms":800}], "ack_received_before_next": true },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 94 },
+        { "at_ms": 200, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 201, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 202, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 203, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 204, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 205, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 206, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 207, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 208, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 209, "type": "note_on", "channel": 0, "number": 11, "velocity": 95 },
+        { "at_ms": 400, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 401, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 402, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 403, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 404, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 405, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 406, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 407, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 408, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 409, "type": "note_on", "channel": 0, "number": 11, "velocity": 96 },
+        { "at_ms": 600, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 601, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 602, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 603, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 604, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 605, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 606, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 607, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 608, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 609, "type": "note_on", "channel": 0, "number": 11, "velocity": 97 },
+        { "at_ms": 800, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 801, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 802, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 803, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 804, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 805, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 806, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 807, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 808, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 809, "type": "note_on", "channel": 0, "number": 11, "velocity": 98 }
+      ],
+      "udon_decode": { "accepted": [{"seq":94,"request_hash":"D103"},{"seq":95,"request_hash":"BE46"},{"seq":96,"request_hash":"456C"},{"seq":97,"request_hash":"2A29"}], "dropped_without_ack": {"seq":98,"request_hash":"9BE6"}, "dedupe_entry_for_98": false, "sys_err_count": 1 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 28.0, "type": "npc.ack", "seq": 94, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "D103", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 28.001, "type": "sys.pong", "seq": 94, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 28.2, "type": "npc.ack", "seq": 95, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "BE46", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 28.201, "type": "sys.pong", "seq": 95, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 28.4, "type": "npc.ack", "seq": 96, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "456C", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 28.401, "type": "sys.pong", "seq": 96, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 7, "t": 28.6, "type": "npc.ack", "seq": 97, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "2A29", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 8, "t": 28.601, "type": "sys.pong", "seq": 97, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 9, "t": 28.8, "type": "sys.err", "err": "rate_limited", "code": 33, "source": "midi", "fatal": false, "related_seq": 98, "detail": "reliable command rate exceeded" }
+      ]
+    },
+    {
+      "id": "action_not_found",
+      "purpose": "PLAY_ANIM 引用目录外 actionId 时返回 action_not_found",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 29.0 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 99, "action_seq": 78, "action_id": 126 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 78 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 126 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 99 }
+      ],
+      "udon_decode": { "cmd_id": 6, "seq": 99, "P": [78,0,0,126,0,0], "request_hash": "74EB", "error": "action_not_found", "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 29.0, "type": "npc.ack", "seq": 99, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "74EB", "ok": false, "replayed": false, "state": "external", "err": "action_not_found" }]
+    },
+    {
+      "id": "expression_not_found",
+      "purpose": "SET_EXPRESSION 引用目录外 expressionId 时返回 expression_not_found",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 29.2 },
+      "semantic_input": { "command": "SET_EXPRESSION", "seq": 100, "expression_id": 126, "weight": 1.0, "duration_seconds": 1 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 126 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 127 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 1 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 18, "velocity": 100 }
+      ],
+      "udon_decode": { "cmd_id": 18, "seq": 100, "P": [0,0,0,126,127,1], "request_hash": "0CEC", "error": "expression_not_found", "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 29.2, "type": "npc.ack", "seq": 100, "cmd_id": 18, "cmd": "SET_EXPRESSION", "request_hash": "0CEC", "ok": false, "replayed": false, "state": "external", "err": "expression_not_found" }]
+    },
+    {
+      "id": "text_too_long",
+      "purpose": "TEXT_BEGIN P1=385 使用专用 text_too_long，而不是 invalid_param",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 29.4 },
+      "semantic_input": { "command": "TEXT_BEGIN", "seq": 101, "transfer_seq": 11, "utf8_length": 385 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 11 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 3 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 101 }
+      ],
+      "udon_decode": { "cmd_id": 19, "seq": 101, "P": [11,385,0,0,5,0], "request_hash": "C4D7", "selected_error_stage": 13, "error": "text_too_long", "transaction_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 29.4, "type": "npc.ack", "seq": 101, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "C4D7", "ok": false, "replayed": false, "state": "external", "err": "text_too_long" }]
+    },
+    {
+      "id": "telemetry_drop_is_detectable",
+      "purpose": "预算丢弃事件仍消耗 log_seq，并由下一条 sys.telemetry 报告",
+      "initial_state": { "session": 1193046, "control_state": "external", "log_seq_next": 100, "last_emitted_log_seq": 99, "telemetry_window_lines": 20, "telemetry_dropped_total": 0, "log_wrap_count": 0, "world_time_s": 29.6 },
+      "semantic_input": { "external_events": ["low_priority_state_created_and_dropped", "next_window_available"] },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "state_tick", "budget_action": "drop" }, { "at_ms": 1000, "type": "telemetry_window_available" }],
+      "udon_decode": { "dropped_event_assigned_log_seq": 100, "next_emitted_log_seq": 101, "detected_gap": [100,100], "dropped_total_after": 1 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 101, "t": 30.6, "type": "sys.telemetry", "dropped_since_last_report": 1, "dropped_total": 1, "first_dropped_log_seq": 100, "last_dropped_log_seq": 100, "wrap_count": 0 }]
+    },
+    {
+      "id": "log_seq_wrap_marker",
+      "purpose": "普通序号到 2147483646 后先发 sys.log_wrap，再从 1 继续业务日志",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 2147483647, "last_emitted_log_seq": 2147483646, "log_wrap_count": 0, "world_time_s": 31.0 },
+      "semantic_input": { "command": "HEARTBEAT", "seq": 102 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 102 }
+      ],
+      "udon_decode": { "cmd_id": 11, "seq": 102, "P": [0,0,0,0,0,0], "request_hash": "36D3", "wrap_count_after": 1, "ack_log_seq": 1 },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2147483647, "t": 31.0, "type": "sys.log_wrap", "previous_log_seq": 2147483646, "next_log_seq": 1, "wrap_count": 1 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 31.001, "type": "npc.ack", "seq": 102, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "36D3", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 31.002, "type": "sys.pong", "seq": 102, "watchdog_age_ms": 0 }
+      ]
+    },
+    {
+      "id": "goto_no_path",
+      "purpose": "目标可采样到 NavMesh 但只有 partial/invalid path 时返回 no_path",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "navmesh_override": "sample succeeds; CalculatePath is partial", "log_seq_next": 1, "world_time_s": 32.0 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 103, "x": 0.0, "z": 0.0, "has_yaw": false, "speed": 1.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 103 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 103, "P": [8192,8192,0,64,0,0], "request_hash": "BCC9", "sample_position": true, "path_status": "PathPartial", "error": "no_path", "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 32.0, "type": "npc.ack", "seq": 103, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "BCC9", "ok": false, "replayed": false, "state": "external", "err": "no_path" }]
+    },
+    {
+      "id": "set_mode_target_missing",
+      "purpose": "没有 SET_TARGET 时 SET_MODE follow 返回 target_missing",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "target_slot": null, "log_seq_next": 1, "world_time_s": 32.2 },
+      "semantic_input": { "command": "SET_MODE", "seq": 104, "mode": "follow" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 1 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 1, "velocity": 104 }
+      ],
+      "udon_decode": { "cmd_id": 1, "seq": 104, "P": [0,0,0,1,0,0], "request_hash": "3A2A", "error": "target_missing", "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 32.2, "type": "npc.ack", "seq": 104, "cmd_id": 1, "cmd": "SET_MODE", "request_hash": "3A2A", "ok": false, "replayed": false, "state": "external", "err": "target_missing" }]
+    },
+    {
+      "id": "look_at_slot_unknown",
+      "purpose": "LOOK_AT 引用未分配 slot 时返回 slot_unknown",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "allocated_slots": [0], "log_seq_next": 1, "world_time_s": 32.4 },
+      "semantic_input": { "command": "LOOK_AT", "seq": 105, "slot": 63 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 63 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 5, "velocity": 105 }
+      ],
+      "udon_decode": { "cmd_id": 5, "seq": 105, "P": [0,0,0,63,0,0], "request_hash": "DA8C", "error": "slot_unknown", "look_target_after": null },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 32.4, "type": "npc.ack", "seq": 105, "cmd_id": 5, "cmd": "LOOK_AT", "request_hash": "DA8C", "ok": false, "replayed": false, "state": "external", "err": "slot_unknown" }]
+    },
+    {
+      "id": "action_busy",
+      "purpose": "当前不可打断动作拒绝新 PLAY_ANIM 并返回 action_busy",
+      "initial_state": { "session": 1193046, "control_state": "action", "driver_pid": 1, "current_action": { "action_id": 3, "action_seq": 77, "priority": 40, "interruptible": false }, "catalog_override": { "action_3_interruptible": false }, "log_seq_next": 1, "world_time_s": 32.6 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 106, "action_seq": 79, "action_id": 3 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 79 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 3 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 106 }
+      ],
+      "udon_decode": { "cmd_id": 6, "seq": 106, "P": [79,0,0,3,0,0], "request_hash": "8C6F", "error": "action_busy", "current_action_unchanged": true },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 32.6, "type": "npc.ack", "seq": 106, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "8C6F", "ok": false, "replayed": false, "state": "action", "err": "action_busy" }]
+    },
+    {
+      "id": "text_preset_not_found",
+      "purpose": "TEXT_PRESET 引用目录外 id 时返回 text_preset_not_found",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "log_seq_next": 1, "world_time_s": 32.8 },
+      "semantic_input": { "command": "TEXT_PRESET", "seq": 107, "preset_id": 126, "display_seconds": 5 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 126 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 8, "velocity": 107 }
+      ],
+      "udon_decode": { "cmd_id": 8, "seq": 107, "P": [0,0,0,126,5,0], "request_hash": "FAEE", "error": "text_preset_not_found", "text_unchanged": true },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 32.8, "type": "npc.ack", "seq": 107, "cmd_id": 8, "cmd": "TEXT_PRESET", "request_hash": "FAEE", "ok": false, "replayed": false, "state": "external", "err": "text_preset_not_found" }]
+    },
+    {
+      "id": "text_transfer_busy",
+      "purpose": "已有不同文本事务时新的 TEXT_BEGIN 返回 transfer_busy",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "active_text_transaction": { "transfer_seq": 7, "utf8_length": 17, "crc16": "57C6" }, "log_seq_next": 1, "world_time_s": 33.0 },
+      "semantic_input": { "command": "TEXT_BEGIN", "seq": 108, "transfer_seq": 8, "utf8_length": 1, "crc16": "B915" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 8 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 19, "velocity": 108 }
+      ],
+      "udon_decode": { "cmd_id": 19, "seq": 108, "P": [8,1,14613,2,5,0], "request_hash": "61A9", "error": "transfer_busy", "active_transfer_after": 7 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 33.0, "type": "npc.ack", "seq": 108, "cmd_id": 19, "cmd": "TEXT_BEGIN", "request_hash": "61A9", "ok": false, "replayed": false, "state": "external", "err": "transfer_busy" }]
+    },
+    {
+      "id": "text_transfer_missing",
+      "purpose": "没有活动事务时 TEXT_COMMIT 返回 transfer_missing",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "active_text_transaction": null, "log_seq_next": 1, "world_time_s": 33.2 },
+      "semantic_input": { "command": "TEXT_COMMIT", "seq": 109, "transfer_seq": 8, "utf8_length": 1, "crc16": "B915" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 8 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 20, "velocity": 109 }
+      ],
+      "udon_decode": { "cmd_id": 20, "seq": 109, "P": [8,1,14613,2,5,0], "request_hash": "2751", "error": "transfer_missing", "transaction_active_after": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 33.2, "type": "npc.ack", "seq": 109, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "2751", "ok": false, "replayed": false, "state": "external", "err": "transfer_missing" }]
+    },
+    {
+      "id": "text_transfer_seq_mismatch",
+      "purpose": "TEXT_COMMIT 的 transferSeq 与活动事务不一致时返回 transfer_seq_mismatch 并销毁事务",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "active_text_transaction": { "transfer_seq": 7, "utf8_length": 1, "crc16": "B915", "received_raw_bytes": [65] }, "log_seq_next": 1, "world_time_s": 33.4 },
+      "semantic_input": { "command": "TEXT_COMMIT", "seq": 110, "transfer_seq": 8, "utf8_length": 1, "crc16": "B915" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 8 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 1 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 114 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 21 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 2 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 20, "velocity": 110 }
+      ],
+      "udon_decode": { "cmd_id": 20, "seq": 110, "P": [8,1,14613,2,5,0], "request_hash": "969E", "error": "transfer_seq_mismatch", "transaction_active_after": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 33.4, "type": "npc.ack", "seq": 110, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "969E", "ok": false, "replayed": false, "state": "external", "err": "transfer_seq_mismatch" }]
+    },
+    {
+      "id": "text_length_mismatch",
+      "purpose": "接收原始 UTF-8 字节数与声明长度不同时返回 length_mismatch 并销毁事务",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "active_text_transaction": { "transfer_seq": 12, "utf8_length": 2, "crc16": "4B74", "received_raw_bytes": [65] }, "log_seq_next": 1, "world_time_s": 33.6 },
+      "semantic_input": { "command": "TEXT_COMMIT", "seq": 111, "transfer_seq": 12, "declared_utf8_length": 2, "received_utf8_length": 1, "crc16": "4B74" },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 12 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 2 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 22 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 116 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 1 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 5 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 20, "velocity": 111 }
+      ],
+      "udon_decode": { "cmd_id": 20, "seq": 111, "P": [12,2,2932,1,5,0], "request_hash": "DEBA", "received_raw_length": 1, "error": "length_mismatch", "transaction_active_after": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 33.6, "type": "npc.ack", "seq": 111, "cmd_id": 20, "cmd": "TEXT_COMMIT", "request_hash": "DEBA", "ok": false, "replayed": false, "state": "external", "err": "length_mismatch" }]
+    },
+    {
+      "id": "upper_body_stream_incomplete",
+      "purpose": "session 首个上身帧缺少任一 CC 时丢帧、累计 invalid_events 并报告 stream_incomplete",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "stream_cc_initialized": [], "stream_invalid_events": 0, "log_seq_next": 1, "world_time_s": 33.8 },
+      "semantic_input": { "stream_seq": 11, "omitted_cc": 27 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 1, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 1, "number": 21, "value": 64 }, { "at_ms": 2, "type": "cc", "channel": 1, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 1, "number": 23, "value": 64 }, { "at_ms": 4, "type": "cc", "channel": 1, "number": 24, "value": 64 }, { "at_ms": 5, "type": "cc", "channel": 1, "number": 25, "value": 64 }, { "at_ms": 6, "type": "cc", "channel": 1, "number": 26, "value": 64 }, { "at_ms": 7, "type": "note_on", "channel": 1, "number": 64, "velocity": 11 }
+      ],
+      "udon_decode": { "frame_applied": false, "missing_cc": [27], "stream_invalid_events_after": 1, "error": "stream_incomplete" },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 33.8, "type": "sys.err", "err": "stream_incomplete", "code": 28, "source": "stream", "fatal": false, "related_seq": 11, "detail": "initial stream frame incomplete" }]
+    },
+    {
+      "id": "internal_reference_failure_boot",
+      "purpose": "启动引用自检发现必需同步对象缺失时发 fatal internal_error 并保持 unhandshaken",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "log_seq_next": 1, "world_time_s": 34.0, "missing_reference": "RootSync.ManualSyncObject" },
+      "semantic_input": { "external_event": "prefab_start_reference_validation" },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "prefab_start" }],
+      "udon_decode": { "references_valid": false, "error": "internal_error", "control_state_after": "unhandshaken", "discover_blocked": true },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 0, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 34.0, "type": "sys.err", "err": "internal_error", "code": 34, "source": "network", "fatal": true, "related_seq": null, "detail": "missing RootSync manual sync object" }]
+    },
+    {
+      "id": "action_seq_conflict",
+      "purpose": "已见 actionSeq 绑定不同动作元数据时返回 action_seq_conflict",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "seen_action_sequences": { "77": { "action_id": 3, "loop": false } }, "catalog_override": { "action_4": { "layer": "upper", "duration_ms": 1200, "movement": "stationary", "priority": 20, "interruptible": true, "fade_in_ms": 100, "fade_out_ms": 100 } }, "log_seq_next": 1, "world_time_s": 34.2 },
+      "semantic_input": { "command": "PLAY_ANIM", "seq": 112, "action_seq": 77, "action_id": 4, "loop": false },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 77 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 4 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 6, "velocity": 112 }
+      ],
+      "udon_decode": { "cmd_id": 6, "seq": 112, "P": [77,0,0,4,0,0], "request_hash": "860E", "error": "action_seq_conflict", "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 34.2, "type": "npc.ack", "seq": 112, "cmd_id": 6, "cmd": "PLAY_ANIM", "request_hash": "860E", "ok": false, "replayed": false, "state": "external", "err": "action_seq_conflict" }]
+    },
+    {
+      "id": "speech_seq_conflict",
+      "purpose": "已见 speechSeq 绑定不同 cue 元数据时返回 speech_seq_conflict",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "voice_state": "playing", "seen_speech_sequences": { "91": { "text_transfer_seq": 7, "action_seq": 77, "delay_ms": 800, "duration_ms": 6000 } }, "log_seq_next": 1, "world_time_s": 34.4 },
+      "semantic_input": { "command": "SPEECH_CUE", "seq": 113, "speech_seq": 91, "text_transfer_seq": 7, "action_seq": 77, "delay_ms": 800, "duration_ms": 6250 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 91 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 7 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 77 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 8 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 25 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 21, "velocity": 113 }
+      ],
+      "udon_decode": { "cmd_id": 21, "seq": 113, "P": [91,7,77,8,25,0], "request_hash": "2A22", "error": "speech_seq_conflict", "voice_cue_emitted": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 34.4, "type": "npc.ack", "seq": 113, "cmd_id": 21, "cmd": "SPEECH_CUE", "request_hash": "2A22", "ok": false, "replayed": false, "state": "external", "err": "speech_seq_conflict" }]
+    },
+    {
+      "id": "catalog_invalid_boot",
+      "purpose": "启动目录自检发现重复 id 时发 fatal catalog_invalid，保持 unhandshaken",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "log_seq_next": 1, "world_time_s": 34.6, "catalog_override": { "duplicate_action_id": 3 } },
+      "semantic_input": { "external_event": "prefab_start_catalog_validation" },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "prefab_start" }],
+      "udon_decode": { "catalog_valid": false, "error": "catalog_invalid", "control_state_after": "unhandshaken", "discover_blocked": true },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 0, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 34.6, "type": "sys.err", "err": "catalog_invalid", "code": 38, "source": "action", "fatal": true, "related_seq": null, "detail": "duplicate action id 3" }]
+    },
+    {
+      "id": "bearing_right_positive_to_turn_q14",
+      "purpose": "锁定 brg 右正号、绝对 yaw 加法、360 度回绕及 TURN_TO q14 编码",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "yaw": 350.0, "log_seq_next": 1, "world_time_s": 35.0 },
+      "semantic_input": { "observation": { "npc_yaw": 350.0, "target_brg": 20.0, "target_side": "right_front" }, "adapter_formula": "wrap360(npc_yaw_deg+brg_deg)", "expected_absolute_yaw": 10.0, "command": "TURN_TO", "seq": 114 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 3 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 71 },
+        { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 },
+        { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 },
+        { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 },
+        { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 4, "velocity": 114 }
+      ],
+      "external_events": [{ "at_ms": 500, "type": "turn_reached", "yaw_error_deg": 1.0 }],
+      "udon_decode": { "cmd_id": 4, "seq": 114, "P": [455,0,0,0,0,0], "request_hash": "98CF", "brg_positive_side": "right", "adapter_absolute_yaw": 10.0, "decoded_yaw": 9.99755859375, "op_id": "1193046:114:98CF" },
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 35.0, "type": "npc.ack", "seq": 114, "cmd_id": 4, "cmd": "TURN_TO", "request_hash": "98CF", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 35.001, "type": "npc.operation_started", "op_id": "1193046:114:98CF", "kind": "turn", "request_seq": 114, "request_hash": "98CF", "expected_end_ms": null },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 35.5, "type": "npc.operation_completed", "op_id": "1193046:114:98CF", "kind": "turn", "request_seq": 114, "request_hash": "98CF", "elapsed_ms": 500, "result": "turned" }
+      ]
+    },
+    {
+      "id": "touch_capability_disabled",
+      "purpose": "未发布 touch 时即使测试夹具注入触摸，也不得注册回调、改变状态或发 player.touch",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["touch"], "touch_zones_enabled": false, "log_seq_next": 1, "world_time_s": 37.6 },
+      "semantic_input": { "external_event": "player_trigger_enter", "slot": 1, "part": "handR" },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "touch_enter", "slot": 1, "part": "handR" }],
+      "udon_decode": { "touch_callbacks_registered": false, "touch_event_emitted": false, "slot_mapping_unchanged": true, "log_seq_next_after": 1 },
+      "assertions": [{ "kind": "log_count", "value": 0 }, { "kind": "forbid_log_type", "value": "player.touch" }, { "kind": "decode_equals", "path": "log_seq_next_after", "value": 1 }],
+      "expected_logs": []
+    },
+    {
+      "id": "player_pose_capability_disabled",
+      "purpose": "未发布 player_pose 时周期 timer 不得产生 player.pose，但 slot 管理保持可用",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["player_pose"], "players": [{ "slot": 0, "pid": 1, "name": "Driver" }, { "slot": 1, "pid": 2, "name": "Guest B" }], "pose_batch_seq": 10, "log_seq_next": 1, "world_time_s": 37.8 },
+      "semantic_input": { "external_event": "pose_timer", "scheduled_rate_hz": 2 },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "pose_timer" }],
+      "udon_decode": { "pose_timer_running": false, "pose_batch_seq_after": 10, "player_pose_emitted": false, "slot_count_after": 2, "log_seq_next_after": 1 },
+      "assertions": [{ "kind": "log_count", "value": 0 }, { "kind": "forbid_log_type", "value": "player.pose" }, { "kind": "decode_equals", "path": "pose_batch_seq_after", "value": 10 }, { "kind": "decode_equals", "path": "log_seq_next_after", "value": 1 }],
+      "expected_logs": []
+    },
+    {
+      "id": "voice_stream_capability_disabled",
+      "purpose": "未发布 voice_stream 时 SPEECH_CUE 在播放器状态检查前拒绝，且不加载 URL 或发 voice 日志",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["voice_stream"], "voice_state": "disabled", "url_loaded": false, "load_url_calls": 0, "log_seq_next": 1, "world_time_s": 38.0 },
+      "semantic_input": { "command": "SPEECH_CUE", "seq": 122, "speech_seq": 93, "text_transfer_seq": 0, "action_seq": 0, "delay_ms": 800, "duration_ms": 6000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 93 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 8 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 24 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 21, "velocity": 122 }
+      ],
+      "udon_decode": { "cmd_id": 21, "seq": 122, "P": [93,0,0,8,24,0], "request_hash": "FD07", "missing_capability": "voice_stream", "error": "unsupported_capability", "voice_state_checked": false, "load_url_calls_after": 0, "voice_cue_emitted": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 38.0, "type": "npc.ack", "seq": 122, "cmd_id": 21, "cmd": "SPEECH_CUE", "request_hash": "FD07", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "snapshot_capability_disabled",
+      "purpose": "状态矩阵允许但未发布 snapshot 时 SNAPSHOT_REQUEST 必须失败且不输出任何 snapshot part",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["snapshot"], "log_seq_next": 1, "world_time_s": 38.2 },
+      "semantic_input": { "command": "SNAPSHOT_REQUEST", "seq": 123 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 15, "velocity": 123 }
+      ],
+      "udon_decode": { "cmd_id": 15, "seq": 123, "P": [0,0,0,0,0,0], "request_hash": "7B39", "missing_capability": "snapshot", "error": "unsupported_capability", "snapshot_parts_emitted": 0 },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 38.2, "type": "npc.ack", "seq": 123, "cmd_id": 15, "cmd": "SNAPSHOT_REQUEST", "request_hash": "7B39", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "navmesh_capability_disabled",
+      "purpose": "goto 已发布但 navmesh 未发布时 GOTO_XZ 必须回 unsupported_capability，不得直线移动或误回 no_path",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["navmesh"], "old_target": null, "log_seq_next": 1, "world_time_s": 38.4 },
+      "semantic_input": { "command": "GOTO_XZ", "seq": 124, "x": 0.0, "z": 0.0, "speed": 1.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 64 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 64 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 2, "velocity": 124 }
+      ],
+      "udon_decode": { "cmd_id": 2, "seq": 124, "P": [8192,8192,0,64,0,0], "request_hash": "D3DB", "missing_capability": "navmesh", "error": "unsupported_capability", "path_calculation_attempted": false, "straight_line_fallback": false, "operation_created": false },
+      "expected_logs": [{ "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 38.4, "type": "npc.ack", "seq": 124, "cmd_id": 2, "cmd": "GOTO_XZ", "request_hash": "D3DB", "ok": false, "replayed": false, "state": "external", "err": "unsupported_capability" }]
+    },
+    {
+      "id": "social_signals_capability_disabled",
+      "purpose": "未发布 social_signals 时满足 wave 条件也不得运行检测器或发 social.wave",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["social_signals"], "social_detectors_enabled": false, "log_seq_next": 1, "world_time_s": 38.6 },
+      "semantic_input": { "external_event": "wave_pattern_detected", "slot": 1, "hand": "right", "brg": 20.0 },
+      "raw_midi_events": [],
+      "external_events": [{ "at_ms": 0, "type": "wave_pattern_detected", "slot": 1, "hand": "right", "brg": 20.0 }],
+      "udon_decode": { "social_detectors_running": false, "social_event_emitted": false, "touch_and_pose_unchanged": true, "log_seq_next_after": 1 },
+      "assertions": [{ "kind": "log_count", "value": 0 }, { "kind": "forbid_log_type_prefix", "value": "social." }, { "kind": "decode_equals", "path": "log_seq_next_after", "value": 1 }],
+      "expected_logs": []
+    },
+    {
+      "id": "anchors_capability_disabled",
+      "purpose": "未发布 anchors 时 hello count 为 0 且仍输出一页空 anchor catalog，适配层不得猜地点",
+      "initial_state": { "session": 0, "control_state": "unhandshaken", "driver_pid": null, "local_pid": 1, "caps_remove": ["anchors"], "catalog_effective": { "anchor": [] }, "log_seq_next": 1, "world_time_s": 39.0 },
+      "semantic_input": { "command": "DISCOVER", "seq": 126, "session": 1193046, "driver_claim_code": 4242 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 104 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 86 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 72 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 33 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 18 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 12, "velocity": 126 }
+      ],
+      "udon_decode": { "cmd_id": 12, "seq": 126, "P": [13398,72,4242,0,0,0], "request_hash": "68BE", "session": 1193046, "result_state": "safe_idle", "anchor_tool_exposed": false },
+      "assertions": [{ "kind": "require_log_field", "type": "sys.hello", "path": "catalog_counts.anchor", "value": 0 }, { "kind": "require_catalog_page", "catalog_kind": "anchor", "page": 1, "pages": 1, "items": [] }, { "kind": "decode_equals", "path": "anchor_tool_exposed", "value": false }],
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 39.0, "type": "npc.ack", "seq": 126, "cmd_id": 12, "cmd": "DISCOVER", "request_hash": "68BE", "ok": true, "replayed": false, "state": "safe_idle" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 39.01, "type": "sys.session", "previous_session": 0, "new_session": 1193046, "driver_pid": 1, "reset": false, "estop_preserved": false },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 39.02, "type": "sys.hello", "world_name": "YUI Test", "wire_bounds": [-12.0,-1.0,-22.0,12.0,5.0,22.0], "activity_bounds": [-10.0,0.0,-20.0,10.0,4.0,20.0], "max_speed": 2.0, "watchdog_ms": 3000, "caps": ["goto","follow","actions","expressions","text_preset","text_utf8","upper_body_stream","ray_scan","touch","player_pose","voice_stream","snapshot","navmesh","social_signals","operation_lifecycle"], "cap_bits": 98299, "catalog_rev": 1, "catalog_counts": { "action": 1, "expression": 1, "text_preset": 1, "anchor": 0 } },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 39.03, "type": "sys.catalog", "catalog_rev": 1, "kind": "action", "page": 1, "pages": 1, "items": [{ "id": 3, "name": "wave", "semantic_key": "greet_wave", "description_zh": "向目标友好挥手", "intent_tags": ["greeting","friendly"], "target_required": "none", "speech_compatible": true, "layer": "upper_body", "duration_ms": 1800, "loopable": false, "movement": "allow", "priority": 40, "interruptible": true, "fade_in_ms": 120, "fade_out_ms": 180 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 39.04, "type": "sys.catalog", "catalog_rev": 1, "kind": "expression", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "neutral", "semantic_key": "neutral", "description_zh": "中立表情", "default_duration_ms": 0, "fade_ms": 150 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 39.05, "type": "sys.catalog", "catalog_rev": 1, "kind": "text_preset", "page": 1, "pages": 1, "items": [{ "id": 0, "name": "hello", "text": "你好", "default_display_seconds": 5 }] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 7, "t": 39.06, "type": "sys.catalog", "catalog_rev": 1, "kind": "anchor", "page": 1, "pages": 1, "items": [] },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 8, "t": 39.07, "type": "player.join", "pid": 1, "name": "Driver", "slot": 0, "count": 1 }
+      ]
+    },
+    {
+      "id": "operation_lifecycle_capability_disabled",
+      "purpose": "未发布 operation_lifecycle 时 TURN_TO 仍执行，但不发 operation 日志且 active_ops 始终为空",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "caps_remove": ["operation_lifecycle"], "npc_pos": [0.0,0.0,0.0], "yaw": 0.0, "grounded": true, "target_slot": null, "action_id": null, "action_seq": null, "expression_id": null, "estop": false, "active_ops": [], "log_seq_next": 1, "world_time_s": 40.0 },
+      "semantic_input": { "command": "TURN_TO", "seq": 125, "yaw": 90.0 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 32 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 4, "velocity": 125 }
+      ],
+      "external_events": [{ "at_ms": 100, "type": "state_timer", "turn_progress_yaw": 18.0 }, { "at_ms": 500, "type": "turn_reached", "yaw_error_deg": 1.0 }],
+      "udon_decode": { "cmd_id": 4, "seq": 125, "P": [4096,0,0,0,0,0], "request_hash": "750E", "turn_executed": true, "operation_internal_completed": true, "operation_logs_emitted": 0, "state_tick_during_operation": { "state": "moving", "mode": "idle", "active_ops": [] }, "active_ops_after_start": [], "active_ops_after_complete": [], "adapter_operation_tools_exposed": false, "adapter_observe": { "caps": ["goto","follow","actions","expressions","text_preset","text_utf8","upper_body_stream","ray_scan","touch","player_pose","voice_stream","snapshot","navmesh","social_signals","anchors"], "operation_lifecycle": false, "active_ops_authoritative": false, "active_ops": [] } },
+      "assertions": [{ "kind": "forbid_log_type_prefix", "value": "npc.operation_" }, { "kind": "require_log_field", "type": "npc.state", "path": "active_ops", "value": [] }, { "kind": "decode_equals", "path": "adapter_operation_tools_exposed", "value": false }, { "kind": "decode_equals", "path": "adapter_observe.operation_lifecycle", "value": false }, { "kind": "decode_equals", "path": "adapter_observe.active_ops_authoritative", "value": false }, { "kind": "decode_equals", "path": "adapter_observe.active_ops", "value": [] }],
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 1, "t": 40.0, "type": "npc.ack", "seq": 125, "cmd_id": 4, "cmd": "TURN_TO", "request_hash": "750E", "ok": true, "replayed": false, "state": "moving" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 40.1, "type": "npc.state", "pos": [0.0,0.0,0.0], "yaw": 18.0, "vel": [0.0,0.0], "speed": 0.0, "state": "moving", "mode": "idle", "grounded": true, "target_slot": null, "action_id": null, "action_seq": null, "expression_id": null, "estop": false, "active_ops": [] }
+      ]
+    },
+    {
+      "id": "heartbeat_bypasses_normal_in_flight",
+      "purpose": "普通命令 ACK 丢失和 2 秒重发期间，独立 1Hz HEARTBEAT 不占普通未决槽并阻止 3 秒看门狗误触发",
+      "initial_state": { "session": 1193046, "control_state": "external", "driver_pid": 1, "owner_pid": 1, "upper_body_active": false, "last_valid_heartbeat_s": 40.1, "normal_command_in_flight": { "cmd_id": 3, "seq": 30, "request_hash": "1C3A", "first_sent_s": 41.0, "ack_visible_to_python": false }, "transport_drop_before_vector": { "type": "npc.ack", "seq": 30, "log_seq": 1 }, "udon_dedupe_cache": [{ "cmd_id": 3, "seq": 30, "request_hash": "1C3A", "ok": true, "state": "external", "execution_count": 1 }], "log_seq_next": 2, "world_time_s": 41.0 },
+      "semantic_input": { "pending_normal_command": { "command": "SET_SPEED", "seq": 30, "speed_q7": 64, "original_ack_lost": true, "retry_at_ms": 2000 }, "heartbeat_lane": { "nominal_hz": 1, "fresh_seqs": [115,116,117,118], "retransmit": false }, "watchdog_check_at_ms": 3000 },
+      "raw_midi_events": [
+        { "at_ms": 0, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 4, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 5, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 6, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 7, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 8, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 9, "type": "note_on", "channel": 0, "number": 11, "velocity": 115 },
+        { "at_ms": 1000, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 1001, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 1002, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 1003, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 1004, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 1005, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 1006, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 1007, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 1008, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 1009, "type": "note_on", "channel": 0, "number": 11, "velocity": 116 },
+        { "at_ms": 2000, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 2001, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2002, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 2003, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 2004, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 2005, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 2006, "type": "cc", "channel": 0, "number": 26, "value": 64 }, { "at_ms": 2007, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 2008, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 2009, "type": "note_on", "channel": 0, "number": 3, "velocity": 30 },
+        { "at_ms": 2100, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 2101, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 2102, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 2103, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 2104, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 2105, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 2106, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 2107, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 2108, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 2109, "type": "note_on", "channel": 0, "number": 11, "velocity": 117 },
+        { "at_ms": 3100, "type": "cc", "channel": 0, "number": 20, "value": 0 }, { "at_ms": 3101, "type": "cc", "channel": 0, "number": 21, "value": 0 }, { "at_ms": 3102, "type": "cc", "channel": 0, "number": 22, "value": 0 }, { "at_ms": 3103, "type": "cc", "channel": 0, "number": 23, "value": 0 }, { "at_ms": 3104, "type": "cc", "channel": 0, "number": 24, "value": 0 }, { "at_ms": 3105, "type": "cc", "channel": 0, "number": 25, "value": 0 }, { "at_ms": 3106, "type": "cc", "channel": 0, "number": 26, "value": 0 }, { "at_ms": 3107, "type": "cc", "channel": 0, "number": 27, "value": 0 }, { "at_ms": 3108, "type": "cc", "channel": 0, "number": 28, "value": 0 }, { "at_ms": 3109, "type": "note_on", "channel": 0, "number": 11, "velocity": 118 }
+      ],
+      "external_events": [{ "at_ms": 3000, "type": "watchdog_tick" }],
+      "udon_decode": { "frame_decodes": [{ "cmd_id": 11, "seq": 115, "P": [0,0,0,0,0,0], "request_hash": "6035" }, { "cmd_id": 11, "seq": 116, "P": [0,0,0,0,0,0], "request_hash": "7CCF" }, { "cmd_id": 3, "seq": 30, "P": [0,0,0,64,0,0], "request_hash": "1C3A", "replayed": true }, { "cmd_id": 11, "seq": 117, "P": [0,0,0,0,0,0], "request_hash": "138A" }, { "cmd_id": 11, "seq": 118, "P": [0,0,0,0,0,0], "request_hash": "A245" }], "heartbeat_sent_while_normal_in_flight": true, "heartbeat_fresh_seq_count": 4, "normal_command_execution_count_total": 1, "normal_retry_replayed": true, "last_heartbeat_age_at_watchdog_ms": 900, "watchdog_triggered": false, "result_state": "external" },
+      "assertions": [{ "kind": "forbid_log_type", "value": "sys.watchdog" }, { "kind": "require_log_field", "type": "sys.pong", "path": "seq", "value": 117 }, { "kind": "decode_equals", "path": "heartbeat_sent_while_normal_in_flight", "value": true }, { "kind": "decode_equals", "path": "heartbeat_fresh_seq_count", "value": 4 }, { "kind": "decode_equals", "path": "normal_retry_replayed", "value": true }, { "kind": "decode_equals", "path": "watchdog_triggered", "value": false }, { "kind": "decode_equals", "path": "result_state", "value": "external" }],
+      "expected_logs": [
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 2, "t": 41.0, "type": "npc.ack", "seq": 115, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "6035", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 3, "t": 41.001, "type": "sys.pong", "seq": 115, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 4, "t": 42.0, "type": "npc.ack", "seq": 116, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "7CCF", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 5, "t": 42.001, "type": "sys.pong", "seq": 116, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 6, "t": 43.0, "type": "npc.ack", "seq": 30, "cmd_id": 3, "cmd": "SET_SPEED", "request_hash": "1C3A", "ok": true, "replayed": true, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 7, "t": 43.1, "type": "npc.ack", "seq": 117, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "138A", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 8, "t": 43.101, "type": "sys.pong", "seq": 117, "watchdog_age_ms": 0 },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 9, "t": 44.1, "type": "npc.ack", "seq": 118, "cmd_id": 11, "cmd": "HEARTBEAT", "request_hash": "A245", "ok": true, "replayed": false, "state": "external" },
+        { "v": 1, "spec": "1.1", "session": 1193046, "world_id": "wrld_test_yui", "npc": "yui", "log_seq": 10, "t": 44.101, "type": "sys.pong", "seq": 118, "watchdog_age_ms": 0 }
+      ]
+    }
+  ]
+}

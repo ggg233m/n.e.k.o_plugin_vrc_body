@@ -1,0 +1,2 @@
+ordinary VRChat diagnostic line for YUI plugin fixture
+2026.08.29 00:00:00 Log - [NEKO]{"v":1,"spec":"1.1","session":1193046,"world_id":"wrld_test_yui","npc":"yui","log_seq":1,"t":0.01,"type":"sys.boot","ready":true}
