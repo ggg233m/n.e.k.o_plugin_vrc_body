@@ -47,11 +47,11 @@ $PluginsRoot = Join-Path $NekoProject "plugin\plugins"
 
 Set-Location $NekoProject
 
-& $NekoPython -m plugin.neko_plugin_cli check $YuiProject
-
 & $NekoPython -m plugin.neko_plugin_cli sync `
   --python $Python311 `
   $YuiProject
+
+& $NekoPython -m plugin.neko_plugin_cli check $YuiProject
 
 & $NekoPython -m plugin.neko_plugin_cli build `
   $YuiProject `

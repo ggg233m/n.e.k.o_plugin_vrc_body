@@ -17,3 +17,6 @@ store.db
 .DS_Store
 tmp/
 memory/
+
+# 同一工作区中的独立 YUI 工作副本，禁止再次提交为自嵌套 gitlink。
+yui_npc_controller/
