@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.codex_staging/
+.tmp/
+unity_compile.log
+yui_npc_controller/
 dist/
 build/
 *.neko-plugin

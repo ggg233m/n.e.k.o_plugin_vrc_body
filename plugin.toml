@@ -15,6 +15,11 @@ name = "N.E.K.O Community"
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"
 
+# AnyDance/YOLO 身体方案与 YUI 世界原生 NPC 方案不能同时启用。
+[[plugin.dependency]]
+id = "yui_npc_controller"
+conflicts = true
+
 [plugin.ui]
 enabled = true
 

@@ -1,6 +1,7 @@
 ## 此项目正在开发中功能尚未完善
 
-- 2026-08-29：将在unity分支进行开发
+- 2026-08-29：将在yui-npc-controller分支进行地图NPC开发
+- [当前主要开发分支](https://github.com/ggg233m/n.e.k.o_plugin_vrc_body/tree/codex/yui-npc-controller)
 
 - [开发进度](ROADMAP.md)
 - [独立后端](backend/README.md)
