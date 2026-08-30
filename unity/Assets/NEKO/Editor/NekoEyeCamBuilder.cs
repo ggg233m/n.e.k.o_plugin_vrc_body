@@ -16,6 +16,9 @@ using UnityEngine;
 
 public static class NekoEyeCamBuilder
 {
+    public const int PlayerLayersMask = (1 << 9) | (1 << 10);
+    public const int EyeCamExcludedMask = (1 << 5) | (1 << 18);
+
     const string RootName = "NekoNpc_YUI";
     const string Dir = "Assets/NEKO/Animations";
     const string RtPath = Dir + "/EyeCamRT.renderTexture";
@@ -68,7 +71,7 @@ public static class NekoEyeCamBuilder
         cam.useOcclusionCulling = true;
         // 渲染完整世界（含远端 Player 与本地 PlayerLocal），只排除 HUD 自身所在的 UI 层
         // 和镜面反射专用层。这样单人本地测试也能在小窗里看到本地 avatar。
-        cam.cullingMask = ~((1 << 5) | (1 << 18));
+        EnsurePlayerLayersVisible(cam);
         var al = camGo.GetComponent<AudioListener>();
         if (al != null) UnityEngine.Object.DestroyImmediate(al);
         cam.enabled = false; // 运行时由 NekoEyeCam 按 driver 身份打开
@@ -114,6 +117,20 @@ public static class NekoEyeCamBuilder
         }
         AssetDatabase.SaveAssets();
         Selection.activeGameObject = camGo;
+    }
+
+    public static void EnsurePlayerLayersVisible(Camera cam)
+    {
+        if (cam == null) return;
+        cam.cullingMask = (cam.cullingMask | PlayerLayersMask) & ~EyeCamExcludedMask;
+        EditorUtility.SetDirty(cam);
+    }
+
+    public static bool PlayerLayersAreVisible(Camera cam)
+    {
+        return cam != null
+               && (cam.cullingMask & PlayerLayersMask) == PlayerLayersMask
+               && (cam.cullingMask & EyeCamExcludedMask) == 0;
     }
 
     static Transform FindDeep(Transform t, string name)

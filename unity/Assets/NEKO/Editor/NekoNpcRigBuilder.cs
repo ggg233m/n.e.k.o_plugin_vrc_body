@@ -224,7 +224,7 @@ public static class NekoNpcRigBuilder
                     var cam = camT.GetComponent<Camera>();
                     eyeCam.eyeCamera = cam;
                     // 保留本地与远端玩家，只排除 HUD 所在 UI 层和镜面反射专用层。
-                    if (cam != null) cam.cullingMask = ~((1 << 5) | (1 << 18));
+                    NekoEyeCamBuilder.EnsurePlayerLayersVisible(cam);
                 }
             }
             var hud = root.transform.Find("EyeCamHud");

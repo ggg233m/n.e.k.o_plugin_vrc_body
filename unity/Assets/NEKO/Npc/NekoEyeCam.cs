@@ -15,6 +15,9 @@ using VRC.SDKBase;
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class NekoEyeCam : UdonSharpBehaviour
 {
+    private const int PlayerLayersMask = (1 << 9) | (1 << 10);
+    private const int EyeCamExcludedMask = (1 << 5) | (1 << 18);
+
     [Header("依赖")]
     public NekoNpcTelemetry telemetry;
     [Tooltip("NPC 眼位相机（子物体 EyeCamera 上的 Camera，targetTexture 已在编辑器指到 RT）")]
@@ -37,8 +40,11 @@ public class NekoEyeCam : UdonSharpBehaviour
 
     void Start()
     {
+        EnsurePlayerLayersVisible();
         // 诊断：不经 Telemetry 门限，直接打日志，证明本脚本被执行（2026-08-29 排查 HUD 不显示）
-        Debug.Log("[NEKO-EYECAM] Start: startEnabled=" + startEnabled + " cam=" + (eyeCamera != null) + " hud=" + (hudQuad != null) + " tel=" + (telemetry != null));
+        Debug.Log("[NEKO-EYECAM] Start: startEnabled=" + startEnabled + " cam=" + (eyeCamera != null)
+                  + " hud=" + (hudQuad != null) + " tel=" + (telemetry != null)
+                  + " cullingMask=" + (eyeCamera == null ? 0 : eyeCamera.cullingMask));
         _active = startEnabled;
         Apply();
         if (hudQuad != null) hudQuad.localScale = new Vector3(hudWidth, hudWidth * 9f / 16f, 1f);
@@ -53,9 +59,17 @@ public class NekoEyeCam : UdonSharpBehaviour
 
     private void Apply()
     {
+        EnsurePlayerLayersVisible();
         bool on = _active && (telemetry == null || telemetry.IsDriver());
         if (eyeCamera != null) eyeCamera.enabled = on;
         if (hudQuad != null) hudQuad.gameObject.SetActive(on);
+    }
+
+    private void EnsurePlayerLayersVisible()
+    {
+        if (eyeCamera == null) return;
+        // Player(9) 是远端玩家，PlayerLocal(10) 是本地玩家；HUD 与镜面层必须继续排除。
+        eyeCamera.cullingMask = (eyeCamera.cullingMask | PlayerLayersMask) & ~EyeCamExcludedMask;
     }
 
     void Update()
