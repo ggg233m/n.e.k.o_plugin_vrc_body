@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 import _bootstrap  # noqa: F401
@@ -29,6 +31,7 @@ class RecordingTransport:
         self.results = []
         self.heartbeat_enabled = False
         self.heartbeat_started = False
+        self.command_deadline_s = 0.5
 
     def send_command(self, command, parameters=(0, 0, 0, 0, 0, 0)):
         self.calls.append((command, tuple(parameters)))
@@ -106,6 +109,57 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         accepted = self.adapter.arm()
         self.assertEqual(accepted["status"], "succeeded")
         self.assertEqual(self.transport.calls, [("SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0))])
+
+    def test_connect_waits_until_declared_catalog_is_complete(self) -> None:
+        result: list[dict] = []
+        thread = threading.Thread(
+            target=lambda: result.append(self.adapter.connect(0, session=1193046))
+        )
+        thread.start()
+        base = {
+            "v": 1,
+            "spec": "1.2",
+            "session": 1193046,
+            "world_id": "wrld_test",
+            "npc": "yui",
+            "t": 0.0,
+        }
+        self.state.ingest({
+            **base,
+            "log_seq": 1,
+            "type": "sys.session",
+            "new_session": 1193046,
+            "driver_pid": 7,
+            "reset": False,
+            "estop_preserved": False,
+        })
+        self.state.ingest({
+            **base,
+            "log_seq": 2,
+            "type": "sys.hello",
+            "world_name": "测试世界",
+            "caps": ["world_map"],
+            "cap_bits": 0,
+            "catalog_rev": 2,
+            "catalog_counts": {"entity": 1},
+            "wire_bounds": [-5, -1, -5, 5, 5, 5],
+            "activity_bounds": [-4, 0, -4, 4, 4, 4],
+            "max_speed": 2.0,
+        })
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        self.state.ingest({
+            **base,
+            "log_seq": 3,
+            "type": "sys.catalog",
+            "kind": "entity",
+            "page": 1,
+            "pages": 1,
+            "items": [{"id": 0, "semantic_key": "central_obstacle"}],
+        })
+        thread.join(timeout=1.0)
+        self.assertEqual(result[0]["status"], "succeeded")
+        self.assertTrue(self.transport.heartbeat_started)
 
     def test_go_to_uses_only_published_anchor_and_world_bounds(self) -> None:
         self._ready()

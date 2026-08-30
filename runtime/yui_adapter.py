@@ -170,6 +170,12 @@ class YuiSemanticAdapter:
                         "DISCOVER 已 ACK，但未在期限内收到同一会话的 sys.session",
                         requested_session=session_value,
                     )
+                if not self.session.wait_for_discovery(session_value, session_timeout):
+                    return _local_result(
+                        "discovery_timeout",
+                        "当前会话的 sys.hello 或声明目录未在期限内完整到达",
+                        requested_session=session_value,
+                    )
             return self._outcome(outcome, requested_session=session_value)
 
     def authorize_arm(self, authorized: bool) -> dict[str, Any]:

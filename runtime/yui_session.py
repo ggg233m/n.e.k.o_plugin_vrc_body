@@ -91,6 +91,8 @@ class YuiSessionState:
         self._snapshot_part_counts: dict[tuple[int, int], int] = {}
         self._catalog_pages: dict[str, set[int]] = {}
         self._catalog_expected_pages: dict[str, int] = {}
+        self._catalog_expected_counts: dict[str, int] = {}
+        self._hello_session = 0
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self.session = 0
         self.spec_version: str | None = None
@@ -158,6 +160,12 @@ class YuiSessionState:
     def semantic_navigation(self) -> bool:
         return self.spec_version == "1.2" and "semantic_navigation" in self.capabilities
 
+    @property
+    def discovery_ready(self) -> bool:
+        """当前会话的 hello 与声明目录是否已经完整投影。"""
+        with self._condition:
+            return self._discovery_ready_locked(self.session)
+
     def set_host_arm_authorized(self, authorized: bool) -> None:
         with self._condition:
             self.host_arm_authorized = bool(authorized)
@@ -188,6 +196,8 @@ class YuiSessionState:
             catalog.clear()
         self._catalog_pages.clear()
         self._catalog_expected_pages.clear()
+        self._catalog_expected_counts.clear()
+        self._hello_session = 0
         self.players.clear()
         self.npc_state = {"active_ops": []}
         self.operations.clear()
@@ -263,10 +273,20 @@ class YuiSessionState:
                 self.driver_pid = int(event_copy["driver_pid"])
             elif event_type == "sys.hello":
                 self.session = int(event_copy["session"])
+                self._hello_session = self.session
                 self.world_name = str(event_copy["world_name"])
                 self.capabilities = tuple(str(item) for item in event_copy.get("caps", []))
                 self.capability_bits = int(event_copy.get("cap_bits", 0))
                 self.catalog_revision = int(event_copy["catalog_rev"])
+                counts = event_copy.get("catalog_counts")
+                self._catalog_expected_counts = {
+                    str(kind): int(count)
+                    for kind, count in counts.items()
+                    if kind in self.catalogs
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count >= 0
+                } if isinstance(counts, Mapping) else {}
                 wire_bounds = event_copy.get("wire_bounds")
                 activity_bounds = event_copy.get("activity_bounds")
                 if isinstance(wire_bounds, list) and len(wire_bounds) == 6:
@@ -495,6 +515,31 @@ class YuiSessionState:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         with self._condition:
             while self.session != expected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    def _discovery_ready_locked(self, session: int) -> bool:
+        if self.session != session or self._hello_session != session or self.catalog_revision is None:
+            return False
+        return all(
+            len(self.catalogs[kind]) == expected
+            for kind, expected in self._catalog_expected_counts.items()
+        )
+
+    def wait_for_discovery(self, session: int, timeout_s: float) -> bool:
+        """等待当前会话的 ``sys.hello`` 和其声明的全部目录项。
+
+        ``sys.session`` 只证明安全边界已经切换；能力和目录在随后到达。宿主只有
+        等这些事实完整投影后才能宣布连接完成，否则刚出现的语义工具会误报
+        ``target_missing``。
+        """
+        expected = int(session)
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._condition:
+            while not self._discovery_ready_locked(expected):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     return False

@@ -237,6 +237,61 @@ class YuiSessionTests(unittest.TestCase):
 
         self.assertFalse(state.wait_for_session(7654321, 0.01))
 
+    def test_wait_for_discovery_requires_hello_and_all_declared_catalog_items(self) -> None:
+        state = YuiSessionState()
+        result: list[bool] = []
+        thread = threading.Thread(
+            target=lambda: result.append(state.wait_for_discovery(1193046, 0.5))
+        )
+        thread.start()
+
+        state.ingest(_header(
+            1,
+            "sys.session",
+            new_session=1193046,
+            driver_pid=7,
+            reset=False,
+            estop_preserved=False,
+        ))
+        state.ingest(_header(
+            2,
+            "sys.hello",
+            world_name="测试世界",
+            caps=["anchors", "world_map", "semantic_navigation"],
+            cap_bits=0,
+            catalog_rev=3,
+            catalog_counts={"action": 1, "anchor": 2, "entity": 0},
+            wire_bounds=[-5, -1, -5, 5, 5, 5],
+            activity_bounds=[-4, 0, -4, 4, 4, 4],
+            max_speed=2.0,
+        ))
+        state.ingest(_header(
+            3,
+            "sys.catalog",
+            kind="action",
+            page=1,
+            pages=1,
+            items=[{"id": 1, "semantic_key": "wave"}],
+        ))
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive(), "Anchor 目录未收齐时不得宣布 DISCOVER 完成")
+        self.assertFalse(state.discovery_ready)
+
+        state.ingest(_header(
+            4,
+            "sys.catalog",
+            kind="anchor",
+            page=1,
+            pages=1,
+            items=[
+                {"id": 0, "semantic_key": "spawn"},
+                {"id": 1, "semantic_key": "upper"},
+            ],
+        ))
+        thread.join(timeout=1.0)
+        self.assertEqual(result, [True])
+        self.assertTrue(state.discovery_ready)
+
     def test_reliable_transport_correlates_ack_and_marks_long_operation_accepted(self) -> None:
         state = YuiSessionState()
         state.session = 1193046
