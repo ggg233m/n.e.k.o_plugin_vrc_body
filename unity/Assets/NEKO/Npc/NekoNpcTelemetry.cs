@@ -1,5 +1,5 @@
 /*
- * NekoNpcTelemetry —— YUI v1.1/v1.2 上行日志的唯一出口（UdonSharp）
+ * NekoNpcTelemetry —— YUI v1.1/v1.2/v1.3 上行日志的唯一出口（UdonSharp）
  *
  * 所有业务脚本继续只提交 type/body；本类统一补齐公共头、分配 log_seq、执行
  * 20 行/滑动秒预算并按 UTF-8 字节数限制单行。超预算事件进入有界队列，不能
@@ -13,7 +13,7 @@ using VRC.SDKBase;
 public class NekoNpcTelemetry : UdonSharpBehaviour
 {
     [Header("YUI 身份")]
-    [Tooltip("旧世界保持 1.1；发布 world_map/semantic_navigation 时必须为 1.2")]
+    [Tooltip("旧世界保持 1.1；语义地图为 1.2；Region 定位/局部导航为 1.3")]
     public string specVersion = "1.1";
     [Tooltip("稳定世界标识；发布前必须改成实际 world id 或项目内约定的稳定 id")]
     public string worldId = "wrld_neko_n4lab";
@@ -296,7 +296,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
 
     private string Header(int seq, string type)
     {
-        string spec = specVersion == "1.2" ? "1.2" : "1.1";
+        string spec = specVersion == "1.3" ? "1.3" : (specVersion == "1.2" ? "1.2" : "1.1");
         return "{\"v\":1,\"spec\":" + J(spec) + ",\"session\":" + _session
             + ",\"world_id\":" + J(worldId)
             + ",\"npc\":" + J(npcId)

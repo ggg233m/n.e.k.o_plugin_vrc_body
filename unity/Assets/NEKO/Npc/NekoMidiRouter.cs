@@ -1,5 +1,5 @@
 /*
- * NekoMidiRouter —— YUI NPC 协议 v1.1/v1.2 的唯一 MIDI 路由、安全状态机与生命周期协调器。
+ * NekoMidiRouter —— YUI NPC 协议 v1.1/v1.2/v1.3 的唯一 MIDI 路由、安全状态机与生命周期协调器。
  * AnyDance/YOLO 不得导入、回退或共享本脚本的任何状态。
  */
 using UdonSharp;
@@ -49,6 +49,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
     public bool enableOperationLifecycle = true;
     public bool enableWorldMap;
     public bool enableSemanticNavigation;
+    public bool enableRegionLocalization;
+    public bool enableLocalNavigation;
 
     [Header("动作目录（id 为数组下标）")]
     public string[] actionNames = new string[] { "greet", "nod", "shake_head", "wave", "bow", "explain", "think", "celebrate", "listen", "confused", "point_left", "point_right", "point_forward", "shrug", "laugh", "comfort" };
@@ -96,6 +98,13 @@ public class NekoMidiRouter : UdonSharpBehaviour
     public string[] regionTagsJson = new string[0];
     public string[] regionFloorLabels = new string[0];
     public int[] regionEntryAnchorIds = new int[0];
+    [Tooltip("v1.3：是否允许 EXPLORE_REGION；楼梯等仅通行区域必须为 false")]
+    public bool[] regionExplorable = new bool[0];
+
+    [Header("v1.3 Region 定位体积（本地单位立方体）")]
+    public Transform[] regionVolumeTransforms = new Transform[0];
+    public int[] regionVolumeRegionIds = new int[0];
+    public int[] regionVolumePriorities = new int[0];
 
     [Header("v1.2 Entity 目录（id 为数组下标）")]
     public Transform[] entityCenters = new Transform[0];
@@ -142,6 +151,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
     private const int CMD_SET_CONTROL_MODE = 0x16;
     private const int CMD_GOTO_ANCHOR = 0x17;
     private const int CMD_ORBIT_ENTITY = 0x18;
+    private const int CMD_MOVE_RELATIVE = 0x19;
+    private const int CMD_EXPLORE_REGION = 0x1A;
     private const int CMD_ESTOP = 0x7F;
 
     public const int STATE_UNHANDSHAKEN = 0;
@@ -248,8 +259,11 @@ public class NekoMidiRouter : UdonSharpBehaviour
         else if (telemetry.worldId == null || telemetry.worldId.Length < 1 || telemetry.worldId.Length > 64) detail = "worldId 必须为 1..64 字符";
         else if (driverClaimCode < 0 || driverClaimCode > Q14) detail = "driverClaimCode 必须为 0..16383";
         else if (catalogRevision < 1) detail = "catalogRevision 必须大于 0";
-        else if ((enableWorldMap || enableSemanticNavigation) && telemetry.specVersion != "1.2") detail = "v1.2 capability 要求 telemetry.specVersion=1.2";
+        else if ((enableWorldMap || enableSemanticNavigation) && !IsSpecV12Plus()) detail = "v1.2 capability 要求 telemetry.specVersion>=1.2";
+        else if ((enableRegionLocalization || enableLocalNavigation) && !IsSpecV13()) detail = "v1.3 capability 要求 telemetry.specVersion=1.3";
         else if (enableSemanticNavigation && (!enableWorldMap || !enableAnchors || !enableGoto)) detail = "semantic_navigation 要求 world_map+anchors+goto";
+        else if (enableRegionLocalization && !enableWorldMap) detail = "region_localization 要求 world_map";
+        else if (enableLocalNavigation && (!enableRegionLocalization || !enableSemanticNavigation || !enableOperationLifecycle)) detail = "local_navigation 要求 region_localization+semantic_navigation+operation_lifecycle";
         else if (_sync == null) detail = "NPC 根缺少 NekoNpcSync";
         else if ((enableGoto || enableFollow || enableWander) && !locomotion.HasNavMeshAgent()) detail = "导航能力要求 NavMeshAgent";
         else if (enableWander && !locomotion.HasWanderWaypoints()) detail = "wander 至少需要两个 Inspector 航点";
@@ -261,6 +275,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (detail == null && enableTextPreset) detail = ValidateTextPresetCatalog();
         if (detail == null && enableAnchors) detail = ValidateAnchorCatalog();
         if (detail == null && enableWorldMap) detail = ValidateWorldMapCatalog();
+        if (detail == null && (enableRegionLocalization || enableLocalNavigation)) detail = ValidateRegionVolumes();
         if (detail != null)
         {
             if (telemetry != null) telemetry.EmitProtocolError("catalog_invalid", "safety", true, -1, detail);
@@ -342,6 +357,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (regions < 1 || regions > 127 || regionDescriptionsZh == null || regionDescriptionsZh.Length != regions
             || regionTagsJson == null || regionTagsJson.Length != regions || regionFloorLabels == null || regionFloorLabels.Length != regions
             || regionEntryAnchorIds == null || regionEntryAnchorIds.Length != regions) return "region 目录字段长度不一致";
+        if (IsSpecV13() && (regionExplorable == null || regionExplorable.Length != regions)) return "v1.3 regionExplorable 长度必须与 region 一致";
         int entities = entityCenters == null ? 0 : entityCenters.Length;
         if (entities < 1 || entities > 127 || entitySemanticKeys == null || entitySemanticKeys.Length != entities
             || entityDescriptionsZh == null || entityDescriptionsZh.Length != entities || entityTagsJson == null || entityTagsJson.Length != entities
@@ -378,6 +394,30 @@ public class NekoMidiRouter : UdonSharpBehaviour
             for (int j = 0; j < entitySemanticKeys.Length; j++) if (anchorSemanticKeys[i] == entitySemanticKeys[j]) return "跨目录 semantic_key 必须唯一";
         }
         for (int i = 0; i < regionSemanticKeys.Length; i++) for (int j = 0; j < entitySemanticKeys.Length; j++) if (regionSemanticKeys[i] == entitySemanticKeys[j]) return "跨目录 semantic_key 必须唯一";
+        return null;
+    }
+
+    private string ValidateRegionVolumes()
+    {
+        int count = regionVolumeTransforms == null ? 0 : regionVolumeTransforms.Length;
+        if (count < 1 || regionVolumeRegionIds == null || regionVolumeRegionIds.Length != count
+            || regionVolumePriorities == null || regionVolumePriorities.Length != count) return "Region 定位体积字段长度不一致";
+        int regions = regionSemanticKeys == null ? 0 : regionSemanticKeys.Length;
+        bool[] seen = new bool[regions];
+        for (int i = 0; i < count; i++)
+        {
+            Transform volume = regionVolumeTransforms[i];
+            int regionId = regionVolumeRegionIds[i];
+            if (volume == null || regionId < 0 || regionId >= regions) return "Region 定位体积引用非法";
+            Vector3 euler = volume.rotation.eulerAngles;
+            if (Mathf.Abs(Mathf.DeltaAngle(euler.x, 0f)) > 0.1f || Mathf.Abs(Mathf.DeltaAngle(euler.z, 0f)) > 0.1f)
+                return "Region 定位体积只允许 Y 轴旋转";
+            Vector3 scale = volume.lossyScale;
+            if (Mathf.Abs(scale.x) < 0.01f || Mathf.Abs(scale.y) < 0.01f || Mathf.Abs(scale.z) < 0.01f)
+                return "Region 定位体积缩放必须非零";
+            seen[regionId] = true;
+        }
+        for (int i = 0; i < regions; i++) if (!seen[i]) return "每个 Region 至少需要一个定位体积";
         return null;
     }
 
@@ -517,6 +557,35 @@ public class NekoMidiRouter : UdonSharpBehaviour
                 }
             }
         }
+        else if (cmd == CMD_MOVE_RELATIVE)
+        {
+            err = PrepareMovementCommand();
+            if (err == null)
+            {
+                cancelActionForMovement = _currentActionId >= 0 && CurrentActionBlocksMovement();
+                float distance = p0 / 1000f;
+                float bearing = (p2 / 16384f) * 360f;
+                bool faceTravel = (_p5 & 1) != 0;
+                bool allowShorter = (_p5 & 2) != 0;
+                err = locomotion.StartRelative(distance, bearing, faceTravel, allowShorter, (_p4 / 127f) * locomotion.maxSpeed);
+                if (err == null) { _movementSemanticKey = null; SetState(STATE_MOVING); post = 23; }
+            }
+        }
+        else if (cmd == CMD_EXPLORE_REGION)
+        {
+            err = PrepareMovementCommand();
+            if (err == null)
+            {
+                cancelActionForMovement = _currentActionId >= 0 && CurrentActionBlocksMovement();
+                if (regionSemanticKeys == null || _p3 >= regionSemanticKeys.Length || regionExplorable == null
+                    || _p3 >= regionExplorable.Length || !regionExplorable[_p3]) err = "target_missing";
+                else
+                {
+                    err = locomotion.StartExplore(_p3, p0 * 0.1f, _p5 == 1, (_p4 / 127f) * locomotion.maxSpeed);
+                    if (err == null) { _movementSemanticKey = regionSemanticKeys[_p3]; SetState(STATE_MOVING); post = 24; }
+                }
+            }
+        }
         else if (cmd == CMD_SET_SPEED) locomotion.SetSpeed((_p3 / 127f) * locomotion.maxSpeed);
         else if (cmd == CMD_TURN_TO)
         {
@@ -597,6 +666,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
         else if (post == 20) CommitPreparedText();
         else if (post == 21) BeginOperation(LaneMovement, "goto", seq, hash, -1);
         else if (post == 22) BeginOperation(LaneMovement, "orbit", seq, hash, -1);
+        else if (post == 23) BeginOperation(LaneMovement, "move_relative", seq, hash, -1);
+        else if (post == 24) BeginOperation(LaneMovement, "explore", seq, hash, p0 * 100);
     }
 
     private string PrepareMovementCommand()
@@ -769,7 +840,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         int entityCount = enableWorldMap && entityCenters != null ? entityCenters.Length : 0;
         int routeCount = enableWorldMap && routeFromAnchorIds != null ? routeFromAnchorIds.Length : 0;
         string catalogCounts = "\"catalog_counts\":{\"action\":" + actionCount + ",\"expression\":" + expressionCount + ",\"text_preset\":" + presetCount + ",\"anchor\":" + anchorCount;
-        if (telemetry.specVersion == "1.2") catalogCounts += ",\"region\":" + regionCount + ",\"entity\":" + entityCount + ",\"route_edge\":" + routeCount;
+        if (IsSpecV12Plus()) catalogCounts += ",\"region\":" + regionCount + ",\"entity\":" + entityCount + ",\"route_edge\":" + routeCount;
         catalogCounts += "}";
         string body = "\"world_name\":" + telemetry.J(worldName)
             + ",\"wire_bounds\":[" + telemetry.F2(wireBoundsMin.x) + "," + telemetry.F2(wireBoundsMin.y) + "," + telemetry.F2(wireBoundsMin.z) + "," + telemetry.F2(wireBoundsMax.x) + "," + telemetry.F2(wireBoundsMax.y) + "," + telemetry.F2(wireBoundsMax.z) + "]"
@@ -779,7 +850,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
             + "," + catalogCounts;
         telemetry.Emit("sys.hello", body);
         SendActionCatalog(); SendExpressionCatalog(); SendTextCatalog(); SendAnchorCatalog();
-        if (telemetry.specVersion == "1.2") SendWorldMapCatalogs();
+        if (IsSpecV12Plus()) SendWorldMapCatalogs();
         if (includePlayers) perception.DumpSlots();
     }
 
@@ -853,7 +924,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
         {
             string item = "{\"id\":" + i + ",\"semantic_key\":" + telemetry.J(regionSemanticKeys[i])
                 + ",\"description_zh\":" + telemetry.J(regionDescriptionsZh[i]) + ",\"tags\":" + regionTagsJson[i]
-                + ",\"floor_label\":" + telemetry.J(regionFloorLabels[i]) + ",\"entry_anchor_id\":" + regionEntryAnchorIds[i] + "}";
+                + ",\"floor_label\":" + telemetry.J(regionFloorLabels[i]) + ",\"entry_anchor_id\":" + regionEntryAnchorIds[i]
+                + (IsSpecV13() ? ",\"explorable\":" + telemetry.B(regionExplorable[i]) : "") + "}";
             telemetry.Emit("sys.catalog", "\"catalog_rev\":" + catalogRevision + ",\"kind\":\"region\",\"page\":" + (i + 1) + ",\"pages\":" + regions + ",\"items\":[" + item + "]");
         }
         int entities = entityCenters == null ? 0 : entityCenters.Length;
@@ -889,7 +961,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         int entityCount = enableWorldMap && entityCenters != null ? entityCenters.Length : 0;
         int routeCount = enableWorldMap && routeFromAnchorIds != null ? routeFromAnchorIds.Length : 0;
         string catalogCounts = "\"catalog_counts\":{\"action\":" + actionCount + ",\"expression\":" + expressionCount + ",\"text_preset\":" + presetCount + ",\"anchor\":" + anchorCount;
-        if (telemetry.specVersion == "1.2") catalogCounts += ",\"region\":" + regionCount + ",\"entity\":" + entityCount + ",\"route_edge\":" + routeCount;
+        if (IsSpecV12Plus()) catalogCounts += ",\"region\":" + regionCount + ",\"entity\":" + entityCount + ",\"route_edge\":" + routeCount;
         catalogCounts += "}";
         string sessionData = "{\"driver_pid\":" + CurrentDriverPidJson() + ",\"control_state\":" + telemetry.J(StateName(_state))
             + ",\"watchdog_age_ms\":" + watchdogAge + ",\"estop\":" + telemetry.B(_state == STATE_ESTOP) + ",\"catalog_rev\":" + catalogRevision
@@ -1016,6 +1088,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (cmd == CMD_GOTO_XZ) return !enableGoto || !navmesh;
         if (cmd == CMD_GOTO_ANCHOR) return !enableGoto || !enableAnchors || !enableWorldMap || !enableSemanticNavigation || !navmesh;
         if (cmd == CMD_ORBIT_ENTITY) return !enableGoto || !enableWorldMap || !enableSemanticNavigation || !navmesh;
+        if (cmd == CMD_MOVE_RELATIVE || cmd == CMD_EXPLORE_REGION)
+            return !enableGoto || !enableWorldMap || !enableSemanticNavigation || !enableLocalNavigation || !navmesh;
         if (cmd == CMD_SET_MODE && p3 == 1) return !enableFollow || !navmesh;
         if (cmd == CMD_SET_MODE && p3 == 2) return !enableGoto || !navmesh;
         if (cmd == CMD_SET_MODE && p3 == 3) return !enableWander || !navmesh || !locomotion.HasWanderWaypoints();
@@ -1039,6 +1113,16 @@ public class NekoMidiRouter : UdonSharpBehaviour
         {
             if (p1 != 0 || p2 != 0 || (p5 & 112) != 0) return "reserved_bits";
             if (p0 < 250 || p0 > 5000 || p3 > 126 || ((p5 >> 1) & 3) > 2) return "invalid_param";
+        }
+        if (cmd == CMD_MOVE_RELATIVE)
+        {
+            if (p1 != 0 || p3 != 0 || (p5 & 124) != 0) return "reserved_bits";
+            if (p0 < 250 || p0 > 10000) return "invalid_param";
+        }
+        if (cmd == CMD_EXPLORE_REGION)
+        {
+            if (p1 != 0 || p2 != 0 || (p5 & 126) != 0) return "reserved_bits";
+            if (p0 < 10 || p0 > 6000 || p3 > 126 || p5 > 1) return "invalid_param";
         }
         if (cmd == CMD_SET_SPEED && (p0 != 0 || p1 != 0 || p2 != 0 || p4 != 0 || p5 != 0)) return "reserved_bits";
         if (cmd == CMD_TURN_TO && (p1 != 0 || p2 != 0 || p3 != 0 || p4 != 0 || p5 != 0)) return "reserved_bits";
@@ -1147,6 +1231,93 @@ public class NekoMidiRouter : UdonSharpBehaviour
     public bool IsSocialEnabled() { return enableSocialSignals && _session > 0; }
     public int GetActionDurationMs(int id) { return actionDurationMs != null && id >= 0 && id < actionDurationMs.Length ? actionDurationMs[id] : 0; }
     public int GetActionLayerIndex(int id) { return actionLayers != null && id >= 0 && id < actionLayers.Length && actionLayers[id] == "full_body" ? 2 : 1; }
+    public bool IsPointInsideActivityBounds(Vector3 point) { return InsideActivityBounds(point); }
+    public bool IsRegionExplorable(int regionId)
+    {
+        return regionExplorable != null && regionId >= 0 && regionId < regionExplorable.Length && regionExplorable[regionId];
+    }
+
+    public bool AnchorBelongsToRegion(int anchorId, int regionId)
+    {
+        return anchorId >= 0 && anchorTransforms != null && anchorId < anchorTransforms.Length
+            && anchorRegionKeys != null && anchorId < anchorRegionKeys.Length
+            && regionSemanticKeys != null && regionId >= 0 && regionId < regionSemanticKeys.Length
+            && anchorRegionKeys[anchorId] == regionSemanticKeys[regionId];
+    }
+
+    public bool PointInsideRegion(Vector3 point, int regionId)
+    {
+        if (regionVolumeTransforms == null || regionVolumeRegionIds == null) return false;
+        for (int i = 0; i < regionVolumeTransforms.Length; i++)
+        {
+            if (i >= regionVolumeRegionIds.Length || regionVolumeRegionIds[i] != regionId) continue;
+            Transform volume = regionVolumeTransforms[i];
+            if (volume != null && VolumeContains(volume, point)) return true;
+        }
+        return false;
+    }
+
+    private bool VolumeContains(Transform volume, Vector3 point)
+    {
+        Vector3 local = volume.InverseTransformPoint(point);
+        return Mathf.Abs(local.x) <= 0.5001f && Mathf.Abs(local.y) <= 0.5001f && Mathf.Abs(local.z) <= 0.5001f;
+    }
+
+    private int LocalizedRegion(Vector3 point)
+    {
+        if (!enableRegionLocalization || regionVolumeTransforms == null) return -1;
+        int bestRegion = -1;
+        int bestPriority = int.MinValue;
+        float bestVolume = float.MaxValue;
+        for (int i = 0; i < regionVolumeTransforms.Length; i++)
+        {
+            Transform volume = regionVolumeTransforms[i];
+            if (volume == null || !VolumeContains(volume, point)) continue;
+            int regionId = regionVolumeRegionIds[i];
+            int priority = regionVolumePriorities[i];
+            Vector3 scale = volume.lossyScale;
+            float size = Mathf.Abs(scale.x * scale.y * scale.z);
+            bool better = priority > bestPriority
+                || (priority == bestPriority && size < bestVolume - 0.0001f)
+                || (priority == bestPriority && Mathf.Abs(size - bestVolume) <= 0.0001f && regionId < bestRegion);
+            if (!better) continue;
+            bestRegion = regionId;
+            bestPriority = priority;
+            bestVolume = size;
+        }
+        return bestRegion;
+    }
+
+    public string BuildLocationJson(Vector3 point, float yaw)
+    {
+        int regionId = LocalizedRegion(point);
+        int nearest = -1;
+        float nearestDistance = float.MaxValue;
+        float nearestBearing = 0f;
+        if (anchorTransforms != null)
+        {
+            for (int i = 0; i < anchorTransforms.Length; i++)
+            {
+                if (anchorTransforms[i] == null) continue;
+                Vector3 delta = anchorTransforms[i].position - point;
+                delta.y = 0f;
+                float distance = delta.magnitude;
+                if (distance >= nearestDistance) continue;
+                nearest = i;
+                nearestDistance = distance;
+                float worldBearing = Mathf.Atan2(delta.x, delta.z) * Mathf.Rad2Deg;
+                nearestBearing = Mathf.DeltaAngle(yaw, worldBearing);
+            }
+        }
+        string nearestJson = "null";
+        if (nearest >= 0 && anchorSemanticKeys != null && nearest < anchorSemanticKeys.Length)
+            nearestJson = "{\"semantic_key\":" + telemetry.J(anchorSemanticKeys[nearest])
+                + ",\"d\":" + telemetry.F1(nearestDistance) + ",\"brg\":" + telemetry.F1(nearestBearing) + "}";
+        return "{\"localized\":" + telemetry.B(regionId >= 0)
+            + ",\"region_key\":" + (regionId >= 0 ? telemetry.J(regionSemanticKeys[regionId]) : "null")
+            + ",\"floor_label\":" + (regionId >= 0 ? telemetry.J(regionFloorLabels[regionId]) : "null")
+            + ",\"nearest_anchor\":" + nearestJson + "}";
+    }
 
     public string ActiveOpsJson()
     {
@@ -1198,6 +1369,19 @@ public class NekoMidiRouter : UdonSharpBehaviour
                 + ",\"elapsed_ms\":" + elapsed + ",\"reason\":" + telemetry.J(reason));
     }
 
+    private void FailOperation(int lane, string error, string detail)
+    {
+        if (_opId[lane] == null) return;
+        string opId = _opId[lane]; string kind = _opKind[lane]; int seq = _opSeq[lane]; int hash = _opHash[lane];
+        int elapsed = Mathf.Max(0, Mathf.RoundToInt((Time.timeSinceLevelLoad - _opStartedAt[lane]) * 1000f));
+        ClearOperation(lane);
+        if (enableOperationLifecycle)
+            telemetry.Emit("npc.operation_failed", "\"op_id\":" + telemetry.J(opId) + ",\"kind\":" + telemetry.J(kind)
+                + ",\"request_seq\":" + seq + ",\"request_hash\":" + telemetry.J(Hex4(hash))
+                + ",\"elapsed_ms\":" + elapsed + ",\"err\":" + telemetry.J(error)
+                + ",\"detail\":" + (detail == null ? "null" : telemetry.J(detail)));
+    }
+
     private void ClearOperation(int lane)
     {
         _opId[lane] = null; _opKind[lane] = null; _opSeq[lane] = 0; _opHash[lane] = 0; _opStartedAt[lane] = 0f;
@@ -1232,7 +1416,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
     {
         if (_opId[LaneMovement] != null && _opKind[LaneMovement] == "goto")
         {
-            string semantic = telemetry.specVersion == "1.2" && _movementSemanticKey != null
+            string semantic = IsSpecV12Plus() && _movementSemanticKey != null
                 ? ",\"semantic_key\":" + telemetry.J(_movementSemanticKey) : "";
             telemetry.Emit("npc.arrived", "\"op_id\":" + telemetry.J(_opId[LaneMovement]) + ",\"request_seq\":" + _opSeq[LaneMovement]
                 + ",\"request_hash\":" + telemetry.J(Hex4(_opHash[LaneMovement])) + ",\"pos\":" + telemetry.Vec3(locomotion.npcRoot.position)
@@ -1258,6 +1442,34 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (_state == STATE_MOVING) SetState(StateAfterMovement());
     }
 
+    public void OnRelativeCompleted(float requestedDistance, float actualDistance, float bearing)
+    {
+        if (_opId[LaneMovement] != null && _opKind[LaneMovement] == "move_relative")
+        {
+            telemetry.Emit("npc.arrived", "\"op_id\":" + telemetry.J(_opId[LaneMovement]) + ",\"request_seq\":" + _opSeq[LaneMovement]
+                + ",\"request_hash\":" + telemetry.J(Hex4(_opHash[LaneMovement])) + ",\"pos\":" + telemetry.Vec3(locomotion.npcRoot.position)
+                + ",\"yaw\":" + telemetry.F1(locomotion.CurrentYaw()) + ",\"error_m\":0,\"final\":true,\"waypoint_index\":null"
+                + ",\"requested_distance_m\":" + telemetry.F2(requestedDistance) + ",\"actual_distance_m\":" + telemetry.F2(actualDistance)
+                + ",\"bearing_deg\":" + telemetry.F1(bearing));
+            CompleteOperation(LaneMovement, "arrived");
+        }
+        if (_state == STATE_MOVING) SetState(StateAfterMovement());
+    }
+
+    public void OnExploreCompleted(int regionId, int targetsVisited)
+    {
+        if (_opId[LaneMovement] != null && _opKind[LaneMovement] == "explore")
+        {
+            telemetry.Emit("npc.arrived", "\"op_id\":" + telemetry.J(_opId[LaneMovement]) + ",\"request_seq\":" + _opSeq[LaneMovement]
+                + ",\"request_hash\":" + telemetry.J(Hex4(_opHash[LaneMovement])) + ",\"pos\":" + telemetry.Vec3(locomotion.npcRoot.position)
+                + ",\"yaw\":" + telemetry.F1(locomotion.CurrentYaw()) + ",\"error_m\":0,\"final\":true,\"waypoint_index\":null"
+                + ",\"semantic_key\":" + telemetry.J(regionSemanticKeys[regionId]) + ",\"targets_visited\":" + targetsVisited);
+            CompleteOperation(LaneMovement, "duration_elapsed");
+        }
+        _movementSemanticKey = null;
+        if (_state == STATE_MOVING) SetState(StateAfterMovement());
+    }
+
     public void OnWanderWaypoint(int index, float errorMeters)
     {
         if (_opId[LaneMovement] == null || _opKind[LaneMovement] != "wander") return;
@@ -1273,8 +1485,14 @@ public class NekoMidiRouter : UdonSharpBehaviour
         string hash = _opId[LaneMovement] == null ? "null" : telemetry.J(Hex4(_opHash[LaneMovement]));
         telemetry.Emit("npc.blocked", "\"op_id\":" + opId + ",\"request_seq\":" + seq + ",\"request_hash\":" + hash
             + ",\"pos\":" + telemetry.Vec3(locomotion.npcRoot.position) + ",\"reason\":" + telemetry.J(blockedReason) + ",\"target\":" + telemetry.Vec3(target)
-            + (telemetry.specVersion == "1.2" && _movementSemanticKey != null ? ",\"semantic_key\":" + telemetry.J(_movementSemanticKey) : ""));
-        CancelOperation(LaneMovement, cancelReason);
+            + (IsSpecV12Plus() && _movementSemanticKey != null ? ",\"semantic_key\":" + telemetry.J(_movementSemanticKey) : ""));
+        if (blockedReason == "target_left") CancelOperation(LaneMovement, cancelReason);
+        else
+        {
+            string operationError = blockedReason == "target_not_on_navmesh" || blockedReason == "target_out_of_bounds"
+                ? blockedReason : "no_path";
+            FailOperation(LaneMovement, operationError, blockedReason);
+        }
         _movementSemanticKey = null;
         if (_state == STATE_MOVING) SetState(StateAfterMovement());
     }
@@ -1388,7 +1606,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         return hex.Substring((value >> 12) & 15, 1) + hex.Substring((value >> 8) & 15, 1) + hex.Substring((value >> 4) & 15, 1) + hex.Substring(value & 15, 1);
     }
 
-    private bool IsKnownCommand(int cmd) { return (cmd >= 1 && cmd <= 24) || cmd == CMD_ESTOP; }
+    private bool IsKnownCommand(int cmd) { return (cmd >= 1 && cmd <= 26) || cmd == CMD_ESTOP; }
 
     private string CommandName(int cmd)
     {
@@ -1398,7 +1616,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (cmd == 13) return "CLEAR_ESTOP"; if (cmd == 14) return "STOP_ACTION"; if (cmd == 15) return "SNAPSHOT_REQUEST"; if (cmd == 16) return "SET_TARGET";
         if (cmd == 17) return "LOOK_AT_XYZ"; if (cmd == 18) return "SET_EXPRESSION"; if (cmd == 19) return "TEXT_BEGIN"; if (cmd == 20) return "TEXT_COMMIT";
         if (cmd == 21) return "SPEECH_CUE"; if (cmd == 22) return "SET_CONTROL_MODE"; if (cmd == 23) return "GOTO_ANCHOR";
-        if (cmd == 24) return "ORBIT_ENTITY"; if (cmd == 127) return "ESTOP"; return "UNKNOWN";
+        if (cmd == 24) return "ORBIT_ENTITY"; if (cmd == 25) return "MOVE_RELATIVE"; if (cmd == 26) return "EXPLORE_REGION";
+        if (cmd == 127) return "ESTOP"; return "UNKNOWN";
     }
 
     public string StateName(int state)
@@ -1418,6 +1637,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (enableRayScan) bits += 1 << 8; if (enableTouch) bits += 1 << 9; if (enablePlayerPose) bits += 1 << 10; if (enableSnapshot) bits += 1 << 12;
         if (HasNavmeshCapability()) bits += 1 << 13; if (enableSocialSignals) bits += 1 << 14; if (enableAnchors) bits += 1 << 15; if (enableOperationLifecycle) bits += 1 << 16;
         if (enableWorldMap) bits += 1 << 17; if (enableSemanticNavigation) bits += 1 << 18;
+        if (enableRegionLocalization) bits += 1 << 19; if (enableLocalNavigation) bits += 1 << 20;
         return bits;
     }
 
@@ -1440,9 +1660,14 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (enableAnchors) { if (comma) result += ","; result += "\"anchors\""; comma = true; }
         if (enableOperationLifecycle) { if (comma) result += ","; result += "\"operation_lifecycle\""; comma = true; }
         if (enableWorldMap) { if (comma) result += ","; result += "\"world_map\""; comma = true; }
-        if (enableSemanticNavigation) { if (comma) result += ","; result += "\"semantic_navigation\""; }
+        if (enableSemanticNavigation) { if (comma) result += ","; result += "\"semantic_navigation\""; comma = true; }
+        if (enableRegionLocalization) { if (comma) result += ","; result += "\"region_localization\""; comma = true; }
+        if (enableLocalNavigation) { if (comma) result += ","; result += "\"local_navigation\""; }
         return result + "]";
     }
+
+    private bool IsSpecV12Plus() { return telemetry != null && (telemetry.specVersion == "1.2" || telemetry.specVersion == "1.3"); }
+    private bool IsSpecV13() { return telemetry != null && telemetry.specVersion == "1.3"; }
 
     private string CurrentDriverPidJson()
     {

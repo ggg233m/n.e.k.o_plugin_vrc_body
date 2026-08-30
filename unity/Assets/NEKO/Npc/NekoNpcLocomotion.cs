@@ -1,5 +1,5 @@
 /*
- * NekoNpcLocomotion —— YUI NPC v1.1/v1.2 NavMesh、注视、动作与表情执行器（UdonSharp）
+ * NekoNpcLocomotion —— YUI NPC v1.1/v1.2/v1.3 NavMesh、注视、动作与表情执行器（UdonSharp）
  *
  * 只有当前 driver 且持有 NPC 根 ownership 的客户端执行 NavMesh/Animator；其他客户端
  * 只由 NekoNpcSync 投影同步状态。本脚本不接收 MIDI，所有协议校验和生命周期均由
@@ -58,6 +58,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public const int MODE_WANDER = 3;
     public const int MODE_ESTOP = 4;
     public const int MODE_ORBIT = 5;
+    public const int MODE_RELATIVE = 6;
+    public const int MODE_EXPLORE = 7;
 
     private int _mode = MODE_IDLE;
     private float _cruise;
@@ -89,6 +91,26 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private float _orbitRequiredTravelMeters;
     private bool _orbitRecoveryUsed;
     private float _orbitStuckGraceUntil = -1f;
+
+    // v1.3 MOVE_RELATIVE 保持命令接收时的严格相对方位，只允许缩短距离。
+    private float _relativeRequestedDistance;
+    private float _relativeActualDistance;
+    private float _relativeBearing;
+    private bool _relativeFaceTravel;
+
+    // v1.3 EXPLORE_REGION 在一个 operation 内连续切换目标。
+    private int _exploreRegionId = -1;
+    private bool _explorePatrol;
+    private float _exploreUntil = -1f;
+    private int _explorePatrolCursor;
+    private int _exploreCandidateSeed;
+    private int _exploreFailedRounds;
+    private int _exploreTargetsVisited;
+    private Vector3[] _exploreHistory = new Vector3[8];
+    private int _exploreHistoryCount;
+    private int _exploreHistoryCursor;
+    private bool _explorePendingStart;
+    private const float ExploreSwitchDistance = 0.4f;
 
     private int _lookSlot = -1;
     private Vector3 _lookPoint;
@@ -253,6 +275,187 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         return null;
     }
 
+    public string StartRelative(float distance, float bearing, bool faceTravel, bool allowShorter, float speed)
+    {
+        if (_mode == MODE_ESTOP) return "estop_latched";
+        if (navAgent == null || router == null) return "unsupported_capability";
+        float requested = Mathf.Clamp(distance, 0.25f, 10f);
+        float normalizedBearing = Mathf.Repeat(bearing, 360f);
+        float worldYaw = Mathf.Repeat(CurrentYaw() + normalizedBearing, 360f);
+        Vector3 direction = Quaternion.Euler(0f, worldYaw, 0f) * Vector3.forward;
+        Vector3 origin = npcRoot.position;
+        int attempts = allowShorter ? 5 : 1;
+        string lastError = "no_path";
+        bool found = false;
+        for (int i = 0; i < attempts; i++)
+        {
+            float candidateDistance = requested * (1f - i * 0.2f);
+            if (candidateDistance < 0.25f) continue;
+            string err = ValidateStrictRelativeTarget(origin, direction, candidateDistance);
+            if (err == null) { found = true; break; }
+            lastError = err;
+        }
+        if (!found) return lastError;
+        _relativeRequestedDistance = requested;
+        _relativeActualDistance = FlatDistance(origin, _validatedTarget);
+        _relativeBearing = normalizedBearing;
+        _relativeFaceTravel = faceTravel;
+        _arrivalDistance = stopDistance;
+        PrepareMovementTarget(_validatedTarget, -1f, speed, MODE_RELATIVE);
+        if (!StartAgentForCurrentTarget(MODE_RELATIVE)) { ClearRelative(); return "no_path"; }
+        navAgent.autoBraking = false;
+        navAgent.updateRotation = faceTravel;
+        return null;
+    }
+
+    private string ValidateStrictRelativeTarget(Vector3 origin, Vector3 direction, float distance)
+    {
+        Vector3 requested = origin + direction * distance;
+        if (!router.IsPointInsideActivityBounds(requested)) return "target_out_of_bounds";
+        NavMeshHit targetHit;
+        if (!NavMesh.SamplePosition(requested, out targetHit, 0.2f, NavMesh.AllAreas)) return "target_not_on_navmesh";
+        Vector3 offset = targetHit.position - origin;
+        offset.y = 0f;
+        float forward = Vector3.Dot(offset, direction);
+        float lateral = (offset - direction * forward).magnitude;
+        if (forward <= 0f || Mathf.Abs(forward - distance) > 0.2f || lateral > 0.08f) return "no_path";
+        if (!router.IsPointInsideActivityBounds(targetHit.position)) return "target_out_of_bounds";
+        NavMeshHit startHit;
+        if (!NavMesh.SamplePosition(origin, out startHit, 0.5f, NavMesh.AllAreas)) return "no_path";
+        NavMeshPath path = new NavMeshPath();
+        if (!NavMesh.CalculatePath(startHit.position, targetHit.position, NavMesh.AllAreas, path)
+            || path.status != NavMeshPathStatus.PathComplete) return "no_path";
+        _validatedTarget = targetHit.position;
+        return null;
+    }
+
+    public string StartExplore(int regionId, float durationSeconds, bool patrol, float speed)
+    {
+        if (_mode == MODE_ESTOP) return "estop_latched";
+        if (navAgent == null || router == null) return "unsupported_capability";
+        if (!router.IsRegionExplorable(regionId)) return "target_missing";
+        // 首次候选与完整路径计算放到 ACK 后的下一帧。这样 MIDI 线程只做常量级
+        // 校验，稳定连接能快速回 ACK；若没有候选，则由已创建的 operation
+        // 明确进入 failed/no_path，而不是在 ACK 前吞掉生命周期证据。
+        DisableAgent();
+        ClearOrbit();
+        ClearRelative();
+        ClearExplore();
+        _exploreRegionId = regionId;
+        _explorePatrol = patrol;
+        _exploreUntil = Time.timeSinceLevelLoad + Mathf.Clamp(durationSeconds, 1f, 600f);
+        _explorePatrolCursor = 0;
+        _exploreCandidateSeed = Mathf.Abs((router.GetSession() % 65536) + regionId * 997 + 17) % 65536;
+        _exploreFailedRounds = 0;
+        _exploreTargetsVisited = 0;
+        _exploreHistoryCount = 0;
+        _exploreHistoryCursor = 0;
+        _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
+        _arrivalDistance = stopDistance;
+        _hasTarget = false;
+        _mode = MODE_EXPLORE;
+        _speed = 0f;
+        _explorePendingStart = true;
+        ResetStuck();
+        return null;
+    }
+
+    private void BeginExploreMovement()
+    {
+        _explorePendingStart = false;
+        string err = SelectNextExploreTarget();
+        if (err != null) { BlockMovement("no_path", "no_path"); return; }
+        _target = _validatedTarget;
+        _targetYaw = -1f;
+        _hasTarget = true;
+        if (!StartAgentForCurrentTarget(MODE_EXPLORE)) { BlockMovement("no_path", "no_path"); return; }
+        navAgent.stoppingDistance = Mathf.Min(0.05f, stopDistance);
+        navAgent.autoBraking = false;
+    }
+
+    private string SelectNextExploreTarget()
+    {
+        if (_explorePatrol) return SelectPatrolTarget();
+        for (int round = 0; round < 3; round++)
+        {
+            if (SelectUnvisitedTarget()) { _exploreFailedRounds = 0; return null; }
+            _exploreFailedRounds++;
+        }
+        return "no_path";
+    }
+
+    private string SelectPatrolTarget()
+    {
+        if (router.anchorTransforms == null || router.anchorTransforms.Length == 0) return "target_missing";
+        int count = router.anchorTransforms.Length;
+        for (int attempt = 0; attempt < count; attempt++)
+        {
+            int index = (_explorePatrolCursor + attempt) % count;
+            Transform anchor = router.anchorTransforms[index];
+            if (anchor == null || !router.AnchorBelongsToRegion(index, _exploreRegionId)) continue;
+            if (FlatDistance(npcRoot.position, anchor.position) < 0.5f) continue;
+            string err = ValidatePathTarget(anchor.position);
+            if (err != null || !router.PointInsideRegion(_validatedTarget, _exploreRegionId)) continue;
+            _explorePatrolCursor = (index + 1) % count;
+            RememberExploreTarget(_validatedTarget);
+            return null;
+        }
+        return "no_path";
+    }
+
+    private bool SelectUnvisitedTarget()
+    {
+        Transform[] volumes = router.regionVolumeTransforms;
+        int[] ids = router.regionVolumeRegionIds;
+        if (volumes == null || ids == null || volumes.Length == 0) return false;
+        bool found = false;
+        float bestScore = -1f;
+        Vector3 best = npcRoot.position;
+        int generated = 0;
+        int maximumAttempts = Mathf.Min(96, volumes.Length * 16);
+        for (int attempt = 0; attempt < maximumAttempts && generated < 12; attempt++)
+        {
+            int volumeIndex = attempt % volumes.Length;
+            if (volumeIndex >= ids.Length || ids[volumeIndex] != _exploreRegionId || volumes[volumeIndex] == null) continue;
+            Transform volume = volumes[volumeIndex];
+            float x = NextExploreUnit() * 0.9f - 0.45f;
+            float z = NextExploreUnit() * 0.9f - 0.45f;
+            Vector3 requested = volume.TransformPoint(new Vector3(x, 0f, z));
+            generated++;
+            NavMeshHit hit;
+            float sampleRadius = Mathf.Clamp(Mathf.Abs(volume.lossyScale.y) * 0.55f, 0.5f, 2.5f);
+            if (!NavMesh.SamplePosition(requested, out hit, sampleRadius, NavMesh.AllAreas)) continue;
+            if (!router.PointInsideRegion(hit.position, _exploreRegionId) || !router.IsPointInsideActivityBounds(hit.position)) continue;
+            if (FlatDistance(npcRoot.position, hit.position) < 0.6f) continue;
+            NavMeshHit startHit;
+            if (!NavMesh.SamplePosition(npcRoot.position, out startHit, 0.5f, NavMesh.AllAreas)) continue;
+            NavMeshPath path = new NavMeshPath();
+            if (!NavMesh.CalculatePath(startHit.position, hit.position, NavMesh.AllAreas, path)
+                || path.status != NavMeshPathStatus.PathComplete) continue;
+            float score = _exploreHistoryCount == 0 ? FlatDistance(npcRoot.position, hit.position) : 100000f;
+            for (int h = 0; h < _exploreHistoryCount; h++) score = Mathf.Min(score, FlatDistance(_exploreHistory[h], hit.position));
+            if (!found || score > bestScore) { found = true; bestScore = score; best = hit.position; }
+        }
+        if (!found) return false;
+        _validatedTarget = best;
+        RememberExploreTarget(best);
+        return true;
+    }
+
+    private float NextExploreUnit()
+    {
+        // 16-bit LCG 避免 Udon 不暴露 long 取模，同时保持跨客户端确定性。
+        _exploreCandidateSeed = (_exploreCandidateSeed * 25173 + 13849) % 65536;
+        return (_exploreCandidateSeed % 10000) / 9999f;
+    }
+
+    private void RememberExploreTarget(Vector3 target)
+    {
+        _exploreHistory[_exploreHistoryCursor] = target;
+        _exploreHistoryCursor = (_exploreHistoryCursor + 1) % _exploreHistory.Length;
+        if (_exploreHistoryCount < _exploreHistory.Length) _exploreHistoryCount++;
+    }
+
     private bool CanRetargetActiveGoto()
     {
         return _mode == MODE_GOTO && _hasTarget && !_finishingGotoYaw
@@ -314,6 +517,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     {
         DisableAgent();
         if (mode != MODE_ORBIT) ClearOrbit();
+        if (mode != MODE_RELATIVE) ClearRelative();
+        if (mode != MODE_EXPLORE) ClearExplore();
         _target = sampled;
         _targetYaw = yawOrNeg < 0f ? -1f : Mathf.Repeat(yawOrNeg, 360f);
         _hasTarget = true;
@@ -330,6 +535,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     {
         if (navAgent == null || !navAgent.enabled || !navAgent.isOnNavMesh) return false;
         if (mode != MODE_ORBIT) ClearOrbit();
+        if (mode != MODE_RELATIVE) ClearRelative();
+        if (mode != MODE_EXPLORE) ClearExplore();
         _target = sampled;
         _targetYaw = yawOrNeg < 0f ? -1f : Mathf.Repeat(yawOrNeg, 360f);
         _hasTarget = true;
@@ -338,12 +545,10 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
         _mode = mode;
         navAgent.speed = _cruise;
-        navAgent.stoppingDistance = mode == MODE_FOLLOW
-            ? followDistance
-            : (mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
+        navAgent.stoppingDistance = MovementStoppingDistance(mode);
         // GOTO 先保持巡航；只有进入最终制动距离且没有收到下一点时才启用制动。
         navAgent.autoBraking = mode == MODE_FOLLOW;
-        navAgent.updateRotation = mode != MODE_ORBIT || !_orbitFaceTarget;
+        navAgent.updateRotation = ShouldUpdateRotation(mode);
         navAgent.isStopped = false;
         navAgent.destination = _target;
         ResetStuck();
@@ -363,14 +568,27 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
                 || !navAgent.Warp(startHit.position)) { DisableAgent(); return false; }
         }
         navAgent.speed = _cruise;
-        navAgent.stoppingDistance = mode == MODE_FOLLOW
-            ? followDistance
-            : (mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
+        navAgent.stoppingDistance = MovementStoppingDistance(mode);
         navAgent.autoBraking = mode == MODE_FOLLOW;
-        navAgent.updateRotation = mode != MODE_ORBIT || !_orbitFaceTarget;
+        navAgent.updateRotation = ShouldUpdateRotation(mode);
         navAgent.isStopped = false;
         navAgent.destination = _target;
         _mode = mode;
+        return true;
+    }
+
+    private float MovementStoppingDistance(int mode)
+    {
+        if (mode == MODE_FOLLOW) return followDistance;
+        if (mode == MODE_ORBIT) return _orbitStoppingDistance;
+        if (mode == MODE_EXPLORE) return Mathf.Min(0.05f, stopDistance);
+        return _arrivalDistance;
+    }
+
+    private bool ShouldUpdateRotation(int mode)
+    {
+        if (mode == MODE_ORBIT) return !_orbitFaceTarget;
+        if (mode == MODE_RELATIVE) return _relativeFaceTravel;
         return true;
     }
 
@@ -582,8 +800,10 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
 
     private void Step(float dt, float now)
     {
+        if (_mode == MODE_EXPLORE && _explorePendingStart) BeginExploreMovement();
         if (_mode == MODE_FOLLOW) StepFollow(now);
-        if ((_mode == MODE_GOTO || _mode == MODE_FOLLOW || _mode == MODE_WANDER || _mode == MODE_ORBIT) && _hasTarget)
+        if ((_mode == MODE_GOTO || _mode == MODE_FOLLOW || _mode == MODE_WANDER || _mode == MODE_ORBIT
+            || _mode == MODE_RELATIVE || _mode == MODE_EXPLORE) && _hasTarget)
             StepNavMovement(dt);
 
         StepRotation(dt);
@@ -615,6 +835,14 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void StepNavMovement(float dt)
     {
         if (navAgent == null || !navAgent.enabled || !navAgent.isOnNavMesh) { BlockMovement("no_path", "stuck"); return; }
+        if (_mode == MODE_EXPLORE && Time.timeSinceLevelLoad >= _exploreUntil)
+        {
+            navAgent.isStopped = true;
+            DisableAgent();
+            _hasTarget = false;
+            CompleteExplore();
+            return;
+        }
         navAgent.speed = _cruise;
         if (_mode == MODE_ORBIT)
         {
@@ -627,7 +855,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         float arrival = _mode == MODE_FOLLOW
             ? followDistance
             : (_mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
-        if (_mode == MODE_GOTO && !navAgent.pathPending && !navAgent.autoBraking
+        if ((_mode == MODE_GOTO || _mode == MODE_RELATIVE) && !navAgent.pathPending && !navAgent.autoBraking
             && flatDistance <= GotoBrakeDistance())
             navAgent.autoBraking = true;
         if (_mode == MODE_WANDER && !navAgent.pathPending
@@ -647,6 +875,11 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
             }
             if (finalPoint && !navAgent.autoBraking && flatDistance <= GotoBrakeDistance()) navAgent.autoBraking = true;
         }
+        if (_mode == MODE_EXPLORE && !navAgent.pathPending && flatDistance <= ExploreSwitchDistance)
+        {
+            AdvanceExploreTarget();
+            return;
+        }
         if (!navAgent.pathPending && targetDistance <= arrival && _speed < 0.05f)
         {
             if (_mode == MODE_FOLLOW) { navAgent.isStopped = true; return; }
@@ -655,6 +888,11 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
                 // 被 NavMesh 压近的中间点允许直接跳过；中间点不能进入最终圈长
                 // 取证分支，否则紧接的反向绕行会在启动帧被误报 stuck。
                 AdvanceOrbitWaypoint();
+                return;
+            }
+            if (_mode == MODE_EXPLORE)
+            {
+                AdvanceExploreTarget();
                 return;
             }
             if (_mode == MODE_ORBIT && _orbitTravelMeters < _orbitRequiredTravelMeters)
@@ -680,6 +918,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
             DisableAgent();
             _hasTarget = false;
             if (_mode == MODE_ORBIT) CompleteOrbit();
+            else if (_mode == MODE_RELATIVE) CompleteRelative();
             else if (_targetYaw >= 0f) { _finishingGotoYaw = true; _turnYaw = _targetYaw; }
             else CompleteGoto();
         }
@@ -715,6 +954,20 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _wanderIndex = (_wanderIndex + 1) % wanderWaypoints.Length;
         string err = StartWanderTarget(_wanderIndex);
         if (err != null) BlockMovement(err == "no_path" ? "no_path" : "stuck", "stuck");
+    }
+
+    private void AdvanceExploreTarget()
+    {
+        _exploreTargetsVisited++;
+        string err = SelectNextExploreTarget();
+        if (err != null) { BlockMovement("no_path", "no_path"); return; }
+        _target = _validatedTarget;
+        navAgent.destination = _target;
+        navAgent.stoppingDistance = Mathf.Min(0.05f, stopDistance);
+        navAgent.autoBraking = false;
+        navAgent.isStopped = false;
+        ResetStuck();
+        _localObstacleFrames = 0;
     }
 
     private void StepRotation(float dt)
@@ -804,6 +1057,29 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         if (router != null) router.OnOrbitCompleted(completedPoints);
     }
 
+    private void CompleteRelative()
+    {
+        float requested = _relativeRequestedDistance;
+        float actual = _relativeActualDistance;
+        float bearing = _relativeBearing;
+        _mode = MODE_IDLE;
+        _speed = 0f;
+        ResetStuck();
+        ClearRelative();
+        if (router != null) router.OnRelativeCompleted(requested, actual, bearing);
+    }
+
+    private void CompleteExplore()
+    {
+        int regionId = _exploreRegionId;
+        int visited = _exploreTargetsVisited;
+        _mode = MODE_IDLE;
+        _speed = 0f;
+        ResetStuck();
+        ClearExplore();
+        if (router != null && regionId >= 0) router.OnExploreCompleted(regionId, visited);
+    }
+
     private void BlockMovement(string blockedReason, string cancelReason)
     {
         Vector3 blockedTarget = _target;
@@ -813,6 +1089,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _turnYaw = -1f;
         _followSlot = -1;
         ClearOrbit();
+        ClearRelative();
+        ClearExplore();
         _mode = MODE_IDLE;
         _speed = 0f;
         _localObstacleFrames = 0;
@@ -829,6 +1107,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _turnYaw = -1f;
         _followSlot = -1;
         ClearOrbit();
+        ClearRelative();
+        ClearExplore();
         _speed = 0f;
         _localObstacleFrames = 0;
         ResetStuck();
@@ -851,6 +1131,28 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _orbitRecoveryUsed = false;
         _orbitStuckGraceUntil = -1f;
         if (navAgent != null) navAgent.updateRotation = true;
+    }
+
+    private void ClearRelative()
+    {
+        _relativeRequestedDistance = 0f;
+        _relativeActualDistance = 0f;
+        _relativeBearing = 0f;
+        _relativeFaceTravel = false;
+        if (navAgent != null) navAgent.updateRotation = true;
+    }
+
+    private void ClearExplore()
+    {
+        _exploreRegionId = -1;
+        _explorePatrol = false;
+        _exploreUntil = -1f;
+        _explorePatrolCursor = 0;
+        _exploreFailedRounds = 0;
+        _exploreTargetsVisited = 0;
+        _exploreHistoryCount = 0;
+        _exploreHistoryCursor = 0;
+        _explorePendingStart = false;
     }
 
     private int FirstUsefulOrbitIndex(Vector3 position)
@@ -910,6 +1212,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         if (_mode == MODE_GOTO || _finishingGotoYaw) return "goto";
         if (_mode == MODE_WANDER) return "wander";
         if (_mode == MODE_ORBIT) return "orbit";
+        if (_mode == MODE_RELATIVE) return "move_relative";
+        if (_mode == MODE_EXPLORE) return "explore";
         return "idle";
     }
 
@@ -937,6 +1241,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
             + ",\"expression_id\":" + (_expressionId < 0 ? "null" : _expressionId.ToString())
             + ",\"estop\":" + telemetry.B(estop)
             + ",\"active_ops\":" + activeOps;
+        if (router != null && router.enableRegionLocalization)
+            body += ",\"location\":" + router.BuildLocationJson(npcRoot.position, CurrentYaw());
         if (includeSnapshotExtras)
             body += ",\"target_pos\":" + (_hasTarget || _finishingGotoYaw ? telemetry.Vec3(_target) : "null")
                 + ",\"action_started_at_server_ms\":" + (_actionStartedServerMs > 0 ? _actionStartedServerMs.ToString() : "null")
