@@ -116,6 +116,7 @@ public static class NekoYuiFullNpcBuilder
             || router.entityCenters == null || router.entityCenters.Length != 1
             || router.routeFromAnchorIds == null || router.routeFromAnchorIds.Length != 6)
             throw new InvalidOperationException("v1.2 语义目录数量不符合火柴盒验收基线");
+        ValidateNoLegacyFloorOverlap();
 
         string[] allKeys = router.anchorSemanticKeys.Concat(router.regionSemanticKeys).Concat(router.entitySemanticKeys).ToArray();
         if (allKeys.Any(string.IsNullOrWhiteSpace) || allKeys.Distinct(StringComparer.Ordinal).Count() != allKeys.Length)
@@ -333,7 +334,8 @@ public static class NekoYuiFullNpcBuilder
         if (arena == null) { arena = new GameObject("NekoYuiV12_AcceptanceArena"); Undo.RegisterCreatedObjectUndo(arena, "创建 YUI v1.2 验收场"); }
         arena.transform.position = Vector3.zero;
 
-        EnsureBox(arena.transform, "Ground", new Vector3(0f, -0.1f, 0f), new Vector3(18f, 0.2f, 18f), 0);
+        GameObject ground = EnsureBox(arena.transform, "Ground", new Vector3(0f, -0.1f, 0f), new Vector3(18f, 0.2f, 18f), 0);
+        DisableOverlappingLegacyFloor(ground, arena);
         EnsureBox(arena.transform, "CentralObstacle", new Vector3(0f, 0.75f, 2.2f), new Vector3(1.2f, 1.5f, 1.2f), 11);
         EnsureBox(arena.transform, "UpperPlatform", new Vector3(4.5f, 3f, 3f), new Vector3(4f, 0.2f, 4f), 0);
         Transform stairs = arena.transform.Find("Stairs");
@@ -367,6 +369,86 @@ public static class NekoYuiFullNpcBuilder
         NavMeshHit spawn;
         if (NavMesh.SamplePosition(root.transform.position, out spawn, 2f, NavMesh.AllAreas)) root.transform.position = spawn.position;
         EditorUtility.SetDirty(surface); EditorUtility.SetDirty(arena);
+    }
+
+    static void DisableOverlappingLegacyFloor(GameObject acceptanceGround, GameObject arena)
+    {
+        Collider acceptanceCollider = acceptanceGround.GetComponent<Collider>();
+        if (acceptanceCollider == null) throw new InvalidOperationException("v1.2 验收场 Ground 缺少 Collider");
+        Bounds acceptanceBounds = acceptanceCollider.bounds;
+
+        foreach (GameObject candidate in EditorSceneManager.GetActiveScene().GetRootGameObjects())
+        {
+            if (candidate == null || candidate == arena || candidate.name != "Floor") continue;
+            if (!TryGetCombinedBounds(candidate, out Bounds legacyBounds) || !OverlapsGroundSurface(acceptanceBounds, legacyBounds)) continue;
+
+            // 旧默认 Floor 与 v1.2 Ground 共面时会产生视觉叠层，也会被 PhysicsColliders
+            // 重复采进 NavMesh。保留对象和 Transform，便于撤销；只关闭参与重叠的组件。
+            Renderer[] renderers = candidate.GetComponentsInChildren<Renderer>(true);
+            Collider[] colliders = candidate.GetComponentsInChildren<Collider>(true);
+            Undo.RecordObjects(renderers.Cast<UnityEngine.Object>().Concat(colliders).ToArray(), "禁用重叠的旧 Floor");
+            foreach (Renderer renderer in renderers)
+            {
+                if (renderer == null) continue;
+                renderer.enabled = false;
+                EditorUtility.SetDirty(renderer);
+            }
+            foreach (Collider collider in colliders)
+            {
+                if (collider == null) continue;
+                collider.enabled = false;
+                EditorUtility.SetDirty(collider);
+            }
+            EditorUtility.SetDirty(candidate);
+            Debug.Log("[NEKO] 已禁用与 v1.2 Ground 共面的旧 Floor 渲染和碰撞，避免视觉/NavMesh 重叠。 ");
+        }
+    }
+
+    static void ValidateNoLegacyFloorOverlap()
+    {
+        GameObject arena = GameObject.Find("NekoYuiV12_AcceptanceArena");
+        Transform ground = arena == null ? null : arena.transform.Find("Ground");
+        Collider acceptanceCollider = ground == null ? null : ground.GetComponent<Collider>();
+        if (acceptanceCollider == null) throw new InvalidOperationException("v1.2 验收场 Ground 缺失");
+        Bounds acceptanceBounds = acceptanceCollider.bounds;
+
+        foreach (GameObject candidate in EditorSceneManager.GetActiveScene().GetRootGameObjects())
+        {
+            if (candidate == null || candidate == arena || candidate.name != "Floor") continue;
+            if (!TryGetCombinedBounds(candidate, out Bounds legacyBounds) || !OverlapsGroundSurface(acceptanceBounds, legacyBounds)) continue;
+            if (candidate.GetComponentsInChildren<Renderer>(true).Any(item => item != null && item.enabled)
+                || candidate.GetComponentsInChildren<Collider>(true).Any(item => item != null && item.enabled))
+                throw new InvalidOperationException("旧 Floor 仍与 v1.2 Ground 共面并处于启用状态");
+        }
+    }
+
+    static bool TryGetCombinedBounds(GameObject root, out Bounds bounds)
+    {
+        Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+        Collider[] colliders = root.GetComponentsInChildren<Collider>(true);
+        bool initialized = false;
+        bounds = new Bounds(root.transform.position, Vector3.zero);
+        foreach (Renderer renderer in renderers)
+        {
+            if (renderer == null) continue;
+            if (!initialized) { bounds = renderer.bounds; initialized = true; }
+            else bounds.Encapsulate(renderer.bounds);
+        }
+        foreach (Collider collider in colliders)
+        {
+            if (collider == null) continue;
+            if (!initialized) { bounds = collider.bounds; initialized = true; }
+            else bounds.Encapsulate(collider.bounds);
+        }
+        return initialized;
+    }
+
+    static bool OverlapsGroundSurface(Bounds acceptance, Bounds legacy)
+    {
+        bool overlapsX = acceptance.min.x < legacy.max.x && acceptance.max.x > legacy.min.x;
+        bool overlapsZ = acceptance.min.z < legacy.max.z && acceptance.max.z > legacy.min.z;
+        bool sameSurface = Mathf.Abs(acceptance.max.y - legacy.max.y) <= 0.15f;
+        return overlapsX && overlapsZ && sameSurface;
     }
 
     static GameObject EnsureBox(Transform parent, string name, Vector3 position, Vector3 scale, int layer)
