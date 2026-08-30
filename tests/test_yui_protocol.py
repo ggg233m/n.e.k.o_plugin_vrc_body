@@ -47,6 +47,7 @@ class YuiProtocolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.constants = load_frozen_constants()
+        cls.constants_v12 = load_frozen_constants(spec_version="1.2")
         cls.vector_document = _load_vectors()
         cls.vectors = {
             vector["id"]: vector
@@ -55,16 +56,19 @@ class YuiProtocolTests(unittest.TestCase):
 
     def test_python_constant_tables_match_frozen_json(self) -> None:
         self.assertEqual(
-            {name: item["id"] for name, item in self.constants["commands"].items()},
+            {name: item["id"] for name, item in self.constants_v12["commands"].items()},
             COMMAND_IDS,
         )
-        self.assertEqual(self.constants["capabilities"], CAPABILITY_BITS)
+        self.assertEqual(self.constants_v12["capabilities"], CAPABILITY_BITS)
         self.assertEqual(self.constants["error_codes"], ERROR_CODES)
         self.assertEqual(self.constants["reserved_error_codes"], [2])
+        self.assertNotIn("GOTO_ANCHOR", self.constants["commands"])
+        self.assertNotIn("world_map", self.constants["capabilities"])
 
     def test_yui_modules_are_isolated_from_anydance_and_yolo_runtime(self) -> None:
         """YUI 只能依赖标准库、可选 MIDI 库和同组 yui 模块。"""
         allowed_relative_modules = {
+            "behavior_plan",
             "yui_protocol",
             "yui_session",
             "yui_transport",

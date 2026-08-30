@@ -49,6 +49,19 @@ def _schema_error(value: Any, schema: Mapping[str, Any], path: str = "arguments"
     elif expected == "boolean":
         if not isinstance(value, bool):
             return f"{path} 必须是布尔值"
+    elif expected == "array":
+        if not isinstance(value, list):
+            return f"{path} 必须是数组"
+        if "minItems" in schema and len(value) < int(schema["minItems"]):
+            return f"{path} 项数不能小于 {schema['minItems']}"
+        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+            return f"{path} 项数不能大于 {schema['maxItems']}"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, Mapping):
+            for index, item in enumerate(value):
+                error = _schema_error(item, item_schema, f"{path}[{index}]")
+                if error is not None:
+                    return error
 
     if "enum" in schema and value not in schema["enum"]:
         return f"{path} 不在允许值中"
@@ -136,7 +149,8 @@ class YuiToolSurface:
         definitions = [
             YuiToolDefinition(
                 "npc.observe",
-                "读取 YUI 世界已确认的控制态、能力、NPC、玩家槽位、近期感知与语义目录；不猜测缺失事实。",
+                "读取 YUI 世界已确认的控制态、能力、NPC、玩家槽位、近期感知与语义目录；"
+                "anchors 按距离给出附近锚点的中文描述、标签和相对距离/方位；不猜测缺失事实。",
                 _object_schema(),
                 10.0,
             ),
@@ -150,6 +164,34 @@ class YuiToolSurface:
                 10.0,
             ),
         ]
+        if self.session.world_map_ready:
+            definitions.append(
+                YuiToolDefinition(
+                    "npc.world_query",
+                    "查询地图作者发布的区域、实体、锚点和静态路线；不返回绝对坐标。",
+                    _object_schema(
+                        {
+                            "query": {"type": "string", "maxLength": 80},
+                            "region_key": {"type": "string", "minLength": 1, "maxLength": 32},
+                            "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                            "reachable_from": {"type": "string", "minLength": 1, "maxLength": 32},
+                            "kinds": {"type": "array", "items": {"type": "string", "enum": ["region", "entity", "anchor", "route_edge"]}, "maxItems": 4},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                            "cursor": {"type": "string", "minLength": 1},
+                        }
+                    ),
+                    10.0,
+                )
+            )
+        if self.session.semantic_navigation:
+            definitions.append(
+                YuiToolDefinition(
+                    "npc.plan_status",
+                    "读取后台计划与节点证据；省略 plan_id 时读取当前计划。",
+                    _object_schema({"plan_id": {"type": "string", "minLength": 1}}),
+                    10.0,
+                )
+            )
         if not self.host_arm_authorized or not self.session.host_arm_authorized:
             return definitions
         if self.session.control_state == "safe_idle":
@@ -208,6 +250,95 @@ class YuiToolSurface:
                     normal_timeout,
                 )
             )
+        advanced = operation_tools and self.session.semantic_navigation and {"goto", "navmesh", "anchors", "world_map"} <= caps
+        if advanced:
+            semantic_keys = [
+                str(item.get("semantic_key"))
+                for kind in ("anchor", "entity", "region")
+                for _item_id, item in sorted(self.session.catalogs[kind].items())
+                if isinstance(item.get("semantic_key"), str)
+            ]
+            target_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+            if semantic_keys:
+                target_schema["enum"] = semantic_keys
+            entity_keys = [
+                str(item.get("semantic_key"))
+                for _item_id, item in sorted(self.session.catalogs["entity"].items())
+                if isinstance(item.get("semantic_key"), str) and bool(item.get("orbitable"))
+            ]
+            entity_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+            if entity_keys:
+                entity_schema["enum"] = entity_keys
+            region_keys = [
+                str(item.get("semantic_key"))
+                for _item_id, item in sorted(self.session.catalogs["region"].items())
+                if isinstance(item.get("semantic_key"), str)
+            ]
+            region_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+            if region_keys:
+                region_schema["enum"] = region_keys
+            replace_schema = {"type": "boolean", "default": False}
+            definitions.extend([
+                YuiToolDefinition(
+                    "npc.navigate",
+                    "后台前往精确语义目标；Entity/Region 会解析到作者发布的接近或入口 Anchor。",
+                    _object_schema({"target_key": target_schema, "speed_mps": speed_schema, "replace_active": replace_schema}, required=["target_key"]),
+                    normal_timeout,
+                ),
+                YuiToolDefinition(
+                    "npc.approach",
+                    "后台接近当前 session 的 player_slot，到达指定距离后停止并可面向玩家。",
+                    _object_schema({
+                        "player_slot": {"type": "integer", "minimum": 0, "maximum": 63},
+                        "distance_m": {"type": "number", "minimum": 0.5, "maximum": 5.0},
+                        "speed_mps": speed_schema,
+                        "face_target": {"type": "boolean", "default": True},
+                        "replace_active": replace_schema,
+                    }, required=["player_slot"]),
+                    normal_timeout,
+                ),
+                YuiToolDefinition(
+                    "npc.orbit",
+                    "后台绕作者发布的可绕行实体运行；整圈由 Unity 单 operation 无缝执行。",
+                    _object_schema({
+                        "target_key": entity_schema,
+                        "radius_m": {"type": "number", "minimum": 0.25, "maximum": 5.0},
+                        "laps": {"type": "integer", "minimum": 1, "maximum": 3},
+                        "direction": {"type": "string", "enum": ["cw", "ccw"]},
+                        "speed_mps": speed_schema,
+                        "face_target": {"type": "boolean", "default": True},
+                        "replace_active": replace_schema,
+                    }, required=["target_key"]),
+                    normal_timeout,
+                ),
+                YuiToolDefinition(
+                    "npc.explore",
+                    "后台按语义路线探索指定区域，只访问作者发布的 Anchor。",
+                    _object_schema({
+                        "region_key": region_schema,
+                        "duration_s": {"type": "integer", "minimum": 1, "maximum": 600},
+                        "strategy": {"type": "string", "enum": ["unvisited", "patrol"]},
+                        "speed_mps": speed_schema,
+                        "replace_active": replace_schema,
+                    }, required=["region_key"]),
+                    normal_timeout,
+                ),
+                YuiToolDefinition(
+                    "npc.execute_plan",
+                    "提交受限 v1.2 行为图并由 Python 后台执行；不接受代码或自然语言条件。",
+                    _object_schema({
+                        "graph": {"type": "object"},
+                        "replace_active": replace_schema,
+                    }, required=["graph"]),
+                    normal_timeout,
+                ),
+                YuiToolDefinition(
+                    "npc.plan_cancel",
+                    "取消后台计划并停止该计划占用的控制域。",
+                    _object_schema({"plan_id": {"type": "string", "minLength": 1}}, required=["plan_id"]),
+                    normal_timeout,
+                ),
+            ])
         if operation_tools and {"follow", "navmesh"} <= caps:
             definitions.append(
                 YuiToolDefinition(
@@ -356,12 +487,28 @@ class YuiToolSurface:
             }
         if name == "npc.observe":
             return self.adapter.observe(include_player_names=self.include_player_names)
+        if name == "npc.world_query":
+            return self.adapter.world_query(**values)
         if name == "npc.arm":
             return self.adapter.arm()
         if name == "npc.go_to":
             return self.adapter.go_to(**values)
         if name == "npc.go_to_xyz":
             return self.adapter.go_to_xyz(**values)
+        if name == "npc.navigate":
+            return self.adapter.navigate(**values)
+        if name == "npc.approach":
+            return self.adapter.approach(**values)
+        if name == "npc.orbit":
+            return self.adapter.orbit(**values)
+        if name == "npc.explore":
+            return self.adapter.explore(**values)
+        if name == "npc.execute_plan":
+            return self.adapter.execute_plan(**values)
+        if name == "npc.plan_status":
+            return self.adapter.plan_status(**values)
+        if name == "npc.plan_cancel":
+            return self.adapter.plan_cancel(**values)
         if name == "npc.follow":
             return self.adapter.follow(**values)
         if name == "npc.look_at":

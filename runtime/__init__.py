@@ -2,6 +2,12 @@
 
 from .config import YuiPluginConfig
 from .driver_lock import YuiDriverLease, YuiDriverLeaseError
+from .behavior_plan import (
+    BehaviorGraphCompiler,
+    BehaviorGraphError,
+    BehaviorPlan,
+    BehaviorPlanManager,
+)
 from .yui_adapter import YuiSemanticAdapter
 from .yui_log import YuiOutputLogTailer
 from .host_route import YuiContinuousRouteRunner
@@ -11,6 +17,10 @@ from .tool_surface import YuiToolDefinition, YuiToolSurface
 
 __all__ = [
     "MidoOutputSink",
+    "BehaviorGraphCompiler",
+    "BehaviorGraphError",
+    "BehaviorPlan",
+    "BehaviorPlanManager",
     "YuiDriverLease",
     "YuiDriverLeaseError",
     "YuiOutputLogTailer",

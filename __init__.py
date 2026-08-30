@@ -282,6 +282,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._unregister_yui_tools()
         if self._session is not None:
             self._session.set_host_arm_authorized(False)
+        if self._adapter is not None:
+            self._adapter.close()
         if self._transport is not None:
             self._transport.close()
         if self._driver_lease is not None:

@@ -194,6 +194,32 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         missing = self.adapter.say_preset("not_published")
         self.assertEqual(missing["error"], "text_preset_not_found")
 
+    def test_v12_semantic_tools_fail_locally_when_capability_or_catalog_is_missing(self) -> None:
+        self._ready()
+        self.state.spec_version = "1.2"
+        missing_capability = self.adapter.navigate("upper_observation")
+        self.assertEqual(missing_capability["error"], "unsupported_capability")
+
+        self.state.capabilities += ("world_map", "semantic_navigation")
+        missing_target = self.adapter.navigate("upper_observation")
+        self.assertEqual(missing_target["error"], "target_missing")
+        missing_entity = self.adapter.orbit("central_obstacle")
+        self.assertEqual(missing_entity["error"], "target_missing")
+        missing_region = self.adapter.explore("upper_floor")
+        self.assertEqual(missing_region["error"], "target_missing")
+        missing_player = self.adapter.approach(4)
+        self.assertEqual(missing_player["error"], "slot_unknown")
+        self.assertEqual(self.transport.calls, [])
+
+    def test_v12_semantic_tools_require_operation_lifecycle(self) -> None:
+        self._ready()
+        self.state.spec_version = "1.2"
+        self.state.capabilities += ("world_map", "semantic_navigation")
+        self.state.capabilities = tuple(item for item in self.state.capabilities if item != "operation_lifecycle")
+        result = self.adapter.execute_plan({"entry": "root", "nodes": [{"id": "root", "type": "wait", "duration_ms": 1}]})
+        self.assertEqual(result["error"], "unsupported_capability")
+        self.assertEqual(self.transport.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

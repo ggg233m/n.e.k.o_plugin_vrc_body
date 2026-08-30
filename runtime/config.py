@@ -23,7 +23,7 @@ def _boolean(value: Any, *, name: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class YuiPluginConfig:
-    """只保存 YUI 方案需要的配置，不接收 AnyDance/YOLO 配置。"""
+    """只保存 YUI 世界原生 NPC 方案需要的配置。"""
 
     midi_port: str = "NEKO_MIDI"
     claim_code: int = 0

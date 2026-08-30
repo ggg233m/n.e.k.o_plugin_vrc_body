@@ -1,6 +1,6 @@
 # YUI NPC Controller
 
-独立实现 YUI NPC v1.1 Python 后端、N.E.K.O 插件和 stdio MCP。协议事实只来自
+独立实现 YUI NPC v1.1/v1.2 Python 后端、N.E.K.O 插件和 stdio MCP。v1.1 字节级冻结，v1.2 只在世界明确发布 capability 后增加语义地图和后台行为图。协议事实只来自
 `Docs/Protocols/`，不会导入 AnyDance、YOLO、视觉导航或旧 `BackendService`。
 
 ## 安全边界
@@ -21,6 +21,18 @@ npc.observe  npc.arm  npc.go_to  npc.go_to_xyz  npc.follow
 npc.look_at  npc.act  npc.set_expression  npc.say
 npc.stop     npc.estop  npc.wander（可选）
 ```
+
+v1.2 世界在同时发布 `world_map`、`semantic_navigation` 和
+`operation_lifecycle` 后再动态增加：
+
+```text
+npc.world_query  npc.navigate  npc.approach  npc.orbit  npc.explore
+npc.execute_plan  npc.plan_status  npc.plan_cancel
+```
+
+`npc.execute_plan` 只接受冻结的受限 JSON 图，由 Python 后台执行器持有
+`plan_id` 和 operation 证据；不存在 `npc.plan_step`。`npc.observe` 最多投影
+8 项附近语义事实，v1.2 不向模型返回绝对世界坐标。
 
 其中 `npc.go_to_xyz`、`npc.wander` 和 operation 类工具按配置/capability 动态隐藏。
 冻结的 `LOOK_AT` 玩家命令没有时长寄存器，因此玩家注视只接受
@@ -89,16 +101,28 @@ Copy-Item -LiteralPath (Join-Path $YuiProject "unity\Assets\NEKO.meta") `
 
 模型、材质、Animator 资产、NavMesh 和场景引用仍由目标世界维护，不能用测试场
 场景覆盖。导入后必须让 Unity 完成 UdonSharp 编译，再按协议验收流程测试。
+火柴盒验收场可在 Unity 菜单选择
+`NEKO > YUI NPC > 3 Configure Matchbox v1.2 + Validate`；该操作生成上下层、
+楼梯、中央障碍和语义目录，并静态验证完整 NavMesh 路径与绕行圆周。
 
 ## 连续路线（仅宿主/测试）
 
-`runtime.host_route.YuiContinuousRouteRunner` 用冻结协议内的多条 `GOTO_XZ`
+`runtime.host_route.YuiContinuousRouteRunner` 只是 v1.1 宿主回归工具，用冻结协议内的多条 `GOTO_XZ`
 编排连续坐标路线：NPC 进入中间点预切半径时发送下一点，前一操作必须按规范回报
 `cancelled/replaced`，最后一段才回报 `succeeded`。它会记录每次交接的
 `npc.state.speed`；没有终态证据时返回 `unknown` 并要求快照取证。该接口不注册为
 LLM 工具，且仍受 `free_coordinate_navigation`、activity bounds 和 capability 门控。
+v1.2 `npc.orbit` 不使用该路线器，只发送一条 `ORBIT_ENTITY`，连续切点在 Unity 同一 operation 内完成。
 
 ## 独立 MCP
+
+首次在源码环境中使用标准可编辑安装注册正式包名（不会安装或升级依赖）：
+
+```powershell
+$YuiProject = "<path-to-yui_npc_controller>"
+$Python311 = "<path-to-python-3.11.exe>"
+& $Python311 -m pip install --no-deps -e $YuiProject
+```
 
 不带 `--connect` 启动时只跟随日志且工具列表为空：
 
@@ -128,6 +152,6 @@ Set-Location (Split-Path $YuiProject -Parent)
 & $Python311 -m pytest -q $YuiProject
 ```
 
-测试同时校验冻结常量、82 条向量文档、编码器、日志投影、安全门、动态工具面、
+测试同时校验 v1.1 冻结常量和 82 条向量、v1.2 扩展向量、编码器、日志投影、安全门、行为图、动态工具面、
 MCP 工具隔离和本地单驱动锁。Unity/VRChat 行为仍需使用相同向量做 Editor、
 ClientSim 和真实双客户端验收。

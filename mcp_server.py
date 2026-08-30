@@ -106,6 +106,8 @@ class YuiMcpRuntime:
     def close(self) -> None:
         if self.session is not None:
             self.session.set_host_arm_authorized(False)
+        if self.adapter is not None:
+            self.adapter.close()
         if self.transport is not None:
             self.transport.close()
         if self.lease is not None:
@@ -159,7 +161,7 @@ class StdioMcpServer:
                 {
                     "protocolVersion": requested_version or "2024-11-05",
                     "capabilities": {"tools": {"listChanged": True}},
-                    "serverInfo": {"name": "yui-npc-controller", "version": "0.2.0"},
+                    "serverInfo": {"name": "yui-npc-controller", "version": "0.3.0"},
                     "instructions": "连接、宿主授权和 CLEAR_ESTOP 不属于模型工具；npc.arm 也不会被其他工具自动调用。",
                 },
             )
@@ -221,7 +223,7 @@ class StdioMcpServer:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="YUI NPC v1.1 stdio MCP server")
+    parser = argparse.ArgumentParser(description="YUI NPC v1.1/v1.2 stdio MCP server")
     parser.add_argument("--connect", action="store_true", help="由操作者显式打开 MIDI 并执行 DISCOVER")
     parser.add_argument("--midi", default="NEKO_MIDI")
     parser.add_argument("--claim-code", type=int, default=0)

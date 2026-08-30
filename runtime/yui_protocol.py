@@ -1,4 +1,4 @@
-"""独立 YUI NPC 插件的 v1.1 Python 协议编解码。
+"""独立 YUI NPC 插件的 v1.1/v1.2 Python 协议编解码。
 
 本模块只处理确定性的 wire 事实：MIDI 帧、CRC、量化、UTF-8 载荷和
 ``[NEKO]`` 日志公共头。会话、重试和 LLM 语义适配放在更高一层，避免把
@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 import json
@@ -16,6 +17,8 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 SPEC_VERSION = "1.1"
+CURRENT_SPEC_VERSION = "1.2"
+SUPPORTED_SPEC_VERSIONS = (SPEC_VERSION, CURRENT_SPEC_VERSION)
 WIRE_VERSION = 1
 NPC_ID = "yui"
 MIDI_PORT_NAME = "NEKO_MIDI"
@@ -60,6 +63,8 @@ COMMAND_IDS: dict[str, int] = {
     "TEXT_COMMIT": 0x14,
     "SPEECH_CUE": 0x15,
     "SET_CONTROL_MODE": 0x16,
+    "GOTO_ANCHOR": 0x17,
+    "ORBIT_ENTITY": 0x18,
     "ESTOP": ESTOP_COMMAND_ID,
 }
 COMMAND_NAMES = {command_id: name for name, command_id in COMMAND_IDS.items()}
@@ -82,6 +87,8 @@ CAPABILITY_BITS: dict[str, int] = {
     "social_signals": 14,
     "anchors": 15,
     "operation_lifecycle": 16,
+    "world_map": 17,
+    "semantic_navigation": 18,
 }
 
 ERROR_CODES: dict[str, int] = {
@@ -138,7 +145,7 @@ UPPER_BODY_NEUTRAL_Q = (64, 64, 64, 64, 0, 64, 0, 64)
 
 
 class YuiProtocolError(ValueError):
-    """输入不能表示为冻结的 v1.1 wire 数据。"""
+    """输入不能表示为冻结的 YUI wire 数据。"""
 
 
 class YuiLogDecodeError(YuiProtocolError):
@@ -279,7 +286,7 @@ _PARAMETER_INDEX = {f"P{index}": index for index in range(6)}
 def _frozen_command_constraints() -> Mapping[str, Mapping[str, Any]]:
     """缓存冻结事实源；编码热路径不重复读取 JSON。"""
     try:
-        constants = load_frozen_constants()
+        constants = load_frozen_constants(spec_version=CURRENT_SPEC_VERSION)
     except (OSError, json.JSONDecodeError) as exc:
         raise YuiProtocolError(f"无法加载冻结协议常量: {exc}") from exc
     commands = constants.get("commands")
@@ -311,7 +318,7 @@ def _constraint_range(value: Any, label: str) -> tuple[int, int]:
 
 
 def _validate_conditional_rules(command: str, parameters: tuple[int, ...]) -> None:
-    """执行冻结 v1.1 中三条自然语言条件；未知声明采取失败关闭。"""
+    """执行冻结常量中的少量条件规则；未知声明采取失败关闭。"""
     if command == "GOTO_XZ":
         if parameters[4] == 0 and parameters[2] != 0:
             raise YuiProtocolError("GOTO_XZ 在 P4.has_yaw=0 时 P2 必须为 0")
@@ -321,6 +328,10 @@ def _validate_conditional_rules(command: str, parameters: tuple[int, ...]) -> No
     elif command == "SET_EXPRESSION":
         if parameters[3] == 127 and (parameters[4] != 0 or parameters[5] != 0):
             raise YuiProtocolError("SET_EXPRESSION 清除表情时 P4/P5 必须为 0")
+    elif command == "ORBIT_ENTITY":
+        laps_minus_one = (parameters[5] >> 1) & 0x03
+        if laps_minus_one > 2:
+            raise YuiProtocolError("ORBIT_ENTITY P5.bits1..2 只能编码 1..3 圈")
     else:
         raise YuiProtocolError(f"{command} 含未实现的 conditional_rules，拒绝编码")
 
@@ -683,7 +694,7 @@ def parse_neko_log_line(line: str | bytes, *, allow_compatible_minor: bool = Tru
     if not isinstance(spec, str):
         raise YuiLogDecodeError("spec 必须是字符串")
     if allow_compatible_minor:
-        if spec.split(".", 1)[0] != "1":
+        if spec not in SUPPORTED_SPEC_VERSIONS:
             raise YuiLogDecodeError(f"不兼容的 spec 版本: {spec}")
     elif spec != SPEC_VERSION:
         raise YuiLogDecodeError(f"期望 spec {SPEC_VERSION}，实际为 {spec}")
@@ -701,24 +712,61 @@ def parse_neko_log_line(line: str | bytes, *, allow_compatible_minor: bool = Tru
     return decoded
 
 
-def load_frozen_constants(path: str | Path | None = None) -> dict[str, Any]:
-    """读取仓库内机器事实源，并拒绝错版本或非冻结文件。"""
-    source = (
-        Path(path)
-        if path is not None
-        else Path(__file__).resolve().parents[1]
+def _constants_path(spec_version: str) -> Path:
+    if spec_version not in SUPPORTED_SPEC_VERSIONS:
+        raise YuiProtocolError(f"不支持的冻结常量版本: {spec_version}")
+    return (
+        Path(__file__).resolve().parents[1]
         / "Docs"
         / "Protocols"
-        / "YUI_NPC_ProtocolConstants_v1.1.json"
+        / f"YUI_NPC_ProtocolConstants_v{spec_version}.json"
     )
+
+
+def load_frozen_constants(
+    path: str | Path | None = None,
+    *,
+    spec_version: str = SPEC_VERSION,
+) -> dict[str, Any]:
+    """读取冻结机器事实源；v1.2 以不可变 v1.1 为基线合并扩展。"""
+    source = Path(path) if path is not None else _constants_path(spec_version)
     with source.open("r", encoding="utf-8") as handle:
         decoded = json.load(handle, parse_constant=_reject_json_constant)
     if not isinstance(decoded, dict):
         raise YuiProtocolError("常量 JSON 顶层必须是对象")
-    if decoded.get("wire_version") != WIRE_VERSION or decoded.get("spec") != SPEC_VERSION:
+    actual_spec = decoded.get("spec")
+    if decoded.get("wire_version") != WIRE_VERSION or actual_spec not in SUPPORTED_SPEC_VERSIONS:
         raise YuiProtocolError("常量 JSON 版本与 Python 实现不一致")
+    if path is None and actual_spec != spec_version:
+        raise YuiProtocolError(f"期望常量 spec {spec_version}，实际为 {actual_spec}")
     if decoded.get("status") != "frozen":
         raise YuiProtocolError("只允许加载已冻结的协议常量")
+    if actual_spec == CURRENT_SPEC_VERSION and "commands_add" in decoded:
+        base = load_frozen_constants(spec_version=SPEC_VERSION)
+        merged = deepcopy(base)
+        merged["document"] = decoded.get("document", "YUI NPC Protocol Constants v1.2")
+        merged["spec"] = CURRENT_SPEC_VERSION
+        merged["released_at"] = decoded.get("released_at")
+        for addition_key, target_key in (
+            ("commands_add", "commands"),
+            ("command_states_add", "command_state_permissions"),
+            ("capabilities_add", "capabilities"),
+            ("capability_contracts_add", "capability_contracts"),
+        ):
+            additions = decoded.get(addition_key, {})
+            if not isinstance(additions, Mapping):
+                raise YuiProtocolError(f"v1.2 {addition_key} 必须是对象")
+            target = merged.get(target_key)
+            if not isinstance(target, dict):
+                raise YuiProtocolError(f"v1.1 基线缺少 {target_key}")
+            for key, value in additions.items():
+                if key in target:
+                    raise YuiProtocolError(f"v1.2 不得覆盖 v1.1 {target_key}.{key}")
+                target[key] = deepcopy(value)
+        for key in ("catalog_kinds_add", "behavior_graph", "agent_tools_add", "base_spec", "base_file"):
+            if key in decoded:
+                merged[key] = deepcopy(decoded[key])
+        return merged
     return decoded
 
 
@@ -726,6 +774,7 @@ __all__ = [
     "CAPABILITY_BITS",
     "COMMAND_IDS",
     "COMMAND_NAMES",
+    "CURRENT_SPEC_VERSION",
     "CommandFrame",
     "ERROR_CODES",
     "ESTOP_COMMAND_ID",
@@ -734,6 +783,7 @@ __all__ = [
     "NEKO_LOG_MARKER",
     "NPC_ID",
     "SPEC_VERSION",
+    "SUPPORTED_SPEC_VERSIONS",
     "TextTransaction",
     "UPPER_BODY_NEUTRAL_Q",
     "UPPER_BODY_PARAMETERS",

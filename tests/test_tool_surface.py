@@ -67,6 +67,9 @@ class ToolSurfaceTests(unittest.TestCase):
             enable_wander_tool=True,
         )
 
+    def tearDown(self) -> None:
+        self.adapter.close()
+
     def _names(self) -> set[str]:
         return {definition.name for definition in self.surface.definitions()}
 
@@ -75,12 +78,18 @@ class ToolSurfaceTests(unittest.TestCase):
         self.session.set_host_arm_authorized(True)
         self.session.capabilities = (
             "goto",
+            "navmesh",
             "follow",
             "wander",
             "actions",
             "expressions",
+            "text_preset",
             "text_utf8",
-            "navmesh",
+            "ray_scan",
+            "touch",
+            "player_pose",
+            "snapshot",
+            "social_signals",
             "anchors",
             "operation_lifecycle",
         )
@@ -131,6 +140,22 @@ class ToolSurfaceTests(unittest.TestCase):
         )
         for forbidden in ("connect", "status", "disconnect", "snapshot", "ray_scan", "wait_operation"):
             self.assertTrue(all(forbidden not in name for name in self._names()))
+
+    def test_v12_tools_never_expose_wire_or_coordinate_fields(self) -> None:
+        """v1.2 编排工具只接受语义参数；坐标必须留在确定性代码里。"""
+        self._ready()
+        self.session.spec_version = "1.2"
+        self.session.capabilities += ("world_map", "semantic_navigation")
+        self.session.catalogs["region"][0] = {"id": 0, "semantic_key": "ground", "entry_anchor_id": 0}
+        self.session.catalogs["entity"][0] = {
+            "id": 0, "semantic_key": "pillar", "approach_anchor_id": 0,
+            "orbitable": True, "orbit_min_radius": 1.0, "orbit_max_radius": 3.0,
+        }
+        definitions = {item.name: item for item in self.surface.definitions()}
+        for name in ("npc.navigate", "npc.orbit", "npc.explore", "npc.execute_plan", "npc.plan_cancel"):
+            properties = set(definitions[name].input_schema.get("properties", {}))
+            self.assertEqual(properties & {"x", "y", "z", "yaw", "pos"}, set(), name)
+        self.assertNotIn("npc.plan_step", definitions)
 
     def test_operation_tools_and_free_coordinates_are_strictly_hidden(self) -> None:
         self._ready()

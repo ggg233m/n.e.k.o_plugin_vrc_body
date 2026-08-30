@@ -212,8 +212,10 @@ class YuiReliableTransport:
 
     @staticmethod
     def _operation_kind(frame: CommandFrame) -> str | None:
-        if frame.command == "GOTO_XZ":
+        if frame.command in {"GOTO_XZ", "GOTO_ANCHOR"}:
             return "goto"
+        if frame.command == "ORBIT_ENTITY":
+            return "orbit"
         if frame.command == "TURN_TO":
             return "turn"
         if frame.command in {"LOOK_AT", "LOOK_AT_XYZ"}:

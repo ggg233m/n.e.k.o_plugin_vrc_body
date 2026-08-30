@@ -146,6 +146,30 @@ class YuiSessionTests(unittest.TestCase):
         ))
         self.assertFalse(state.host_arm_authorized)
 
+    def test_initial_session_establishment_clears_pre_authorization(self) -> None:
+        # session 0 → 正数也必须清除；授权只能绑定已经明确建立的当前 session。
+        state = YuiSessionState()
+        self.assertEqual(state.session, 0)
+        state.set_host_arm_authorized(True)
+        state.ingest({
+            **_header(1, "sys.session"),
+            "new_session": 1193046,
+            "driver_pid": 42,
+        })
+        self.assertFalse(state.host_arm_authorized, "初次 session 建立必须清除预授权")
+
+    def test_session_replacement_clears_host_authorization(self) -> None:
+        # 正数 → 不同正数：真实替换，宿主授权必须清除。
+        state = YuiSessionState()
+        state.session = 1193046
+        state.set_host_arm_authorized(True)
+        state.ingest({
+            **_header(1, "sys.session"),
+            "new_session": 9999999,
+            "driver_pid": 42,
+        })
+        self.assertFalse(state.host_arm_authorized, "session 替换应当清除宿主授权")
+
     def test_player_touch_enters_recent_observation_and_notifies_listener(self) -> None:
         state = YuiSessionState()
         received = []
@@ -185,6 +209,33 @@ class YuiSessionTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIsNotNone(result[0])
         self.assertTrue(result[0].replayed)
+
+    def test_wait_for_session_blocks_until_sys_session_after_discover_ack(self) -> None:
+        state = YuiSessionState()
+        result: list[bool] = []
+
+        thread = threading.Thread(
+            target=lambda: result.append(state.wait_for_session(1193046, 0.5))
+        )
+        thread.start()
+        time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        state.ingest(
+            _header(
+                1,
+                "sys.session",
+                session=1193046,
+                previous_session=0,
+                new_session=1193046,
+                driver_pid=7,
+                reset=False,
+                estop_preserved=False,
+            )
+        )
+        thread.join(timeout=1.0)
+        self.assertEqual(result, [True])
+
+        self.assertFalse(state.wait_for_session(7654321, 0.01))
 
     def test_reliable_transport_correlates_ack_and_marks_long_operation_accepted(self) -> None:
         state = YuiSessionState()
@@ -315,6 +366,130 @@ class YuiSessionTests(unittest.TestCase):
         self.assertEqual(completed["lines_read"], 1)
         self.assertEqual(completed["events_read"], 1)
         self.assertEqual(completed["decode_errors"], 0)
+
+
+class AnchorViewTests(unittest.TestCase):
+    """anchor_view 只暴露语义与相对方位；绝对坐标不得进入模型上下文。"""
+
+    def setUp(self) -> None:
+        self.state = YuiSessionState()
+        self.state.session = 1193046
+        self.state.catalogs["anchor"].update({
+            0: {
+                "id": 0,
+                "semantic_key": "stage_center",
+                "description_zh": "舞台中央",
+                "pos": [0.0, 0.0, 10.0],
+                "yaw": 180.0,
+                "has_yaw": True,
+                "tags": ["stage", "social"],
+            },
+            1: {
+                "id": 1,
+                "semantic_key": "bar_seat",
+                "description_zh": "吧台座位",
+                "pos": [3.0, 0.0, 0.0],
+                "yaw": 0.0,
+                "has_yaw": False,
+                "tags": ["bar"],
+            },
+        })
+
+    def _at_origin_facing_north(self) -> None:
+        self.state.npc_state = {"pos": [0.0, 0.0, 0.0], "yaw": 0.0, "active_ops": []}
+
+    def test_absolute_coordinates_never_leak(self) -> None:
+        self._at_origin_facing_north()
+        view = self.state.anchor_view()
+        for anchor in view["anchors"]:
+            self.assertNotIn("pos", anchor)
+            self.assertNotIn("yaw", anchor)
+
+    def test_semantic_fields_are_preserved(self) -> None:
+        self._at_origin_facing_north()
+        anchors = {item["semantic_key"]: item for item in self.state.anchor_view()["anchors"]}
+        self.assertEqual(anchors["stage_center"]["description_zh"], "舞台中央")
+        self.assertEqual(anchors["stage_center"]["tags"], ["stage", "social"])
+
+    def test_sorted_by_distance_with_relative_geometry(self) -> None:
+        self._at_origin_facing_north()
+        view = self.state.anchor_view()
+        self.assertTrue(view["position_known"])
+        self.assertEqual(
+            [item["semantic_key"] for item in view["anchors"]],
+            ["bar_seat", "stage_center"],
+        )
+        self.assertEqual(view["anchors"][0]["d"], 3.0)
+        self.assertEqual(view["anchors"][1]["d"], 10.0)
+
+    def test_bearing_is_right_positive(self) -> None:
+        """协议约定 brg 右正：朝北时正东的锚点必须是 +90。"""
+        self._at_origin_facing_north()
+        anchors = {item["semantic_key"]: item for item in self.state.anchor_view()["anchors"]}
+        self.assertEqual(anchors["bar_seat"]["brg"], 90)
+        self.assertEqual(anchors["stage_center"]["brg"], 0)
+
+    def test_bearing_accounts_for_npc_heading(self) -> None:
+        self.state.npc_state = {"pos": [0.0, 0.0, 0.0], "yaw": 90.0, "active_ops": []}
+        anchors = {item["semantic_key"]: item for item in self.state.anchor_view()["anchors"]}
+        self.assertEqual(anchors["bar_seat"]["brg"], 0)
+        self.assertEqual(anchors["stage_center"]["brg"], -90)
+
+    def test_missing_position_omits_geometry_instead_of_guessing(self) -> None:
+        view = self.state.anchor_view()
+        self.assertFalse(view["position_known"])
+        for anchor in view["anchors"]:
+            self.assertNotIn("d", anchor)
+            self.assertNotIn("brg", anchor)
+
+    def test_limit_reports_omitted_count(self) -> None:
+        for index in range(2, 20):
+            self.state.catalogs["anchor"][index] = {
+                "id": index,
+                "semantic_key": f"spot_{index}",
+                "pos": [float(index), 0.0, 0.0],
+                "has_yaw": False,
+            }
+        self._at_origin_facing_north()
+        view = self.state.anchor_view(limit=5)
+        self.assertEqual(len(view["anchors"]), 5)
+        self.assertEqual(view["total"], 20)
+        self.assertEqual(view["omitted"], 15)
+
+    def test_empty_catalog_is_not_an_error(self) -> None:
+        self.state.catalogs["anchor"].clear()
+        view = self.state.anchor_view()
+        self.assertEqual(view["anchors"], [])
+        self.assertEqual(view["total"], 0)
+        self.assertEqual(view["omitted"], 0)
+
+    def test_v12_observe_hides_absolute_coordinates_but_keeps_relative_facts(self) -> None:
+        self.state.spec_version = "1.2"
+        self.state.capabilities = ("operation_lifecycle",)
+        self.state.npc_state = {
+            "pos": [1.0, 2.0, 3.0],
+            "target_pos": [4.0, 5.0, 6.0],
+            "yaw": 90.0,
+            "active_ops": [{"op_id": "op-1", "target_pos": [4.0, 5.0, 6.0]}],
+        }
+        self.state._recent_events.append({
+            "type": "social.wave",
+            "pos": [7.0, 8.0, 9.0],
+            "d": 1.5,
+            "brg": 30,
+        })
+        observation = self.state.observe()
+        self.assertNotIn("pos", observation["npc"])
+        self.assertNotIn("target_pos", observation["npc"])
+        self.assertNotIn("target_pos", observation["active_ops"][0])
+        self.assertEqual(observation["npc"]["yaw"], 90.0)
+        self.assertNotIn("pos", observation["recent_social_events"][0])
+        self.assertEqual(observation["recent_social_events"][0]["d"], 1.5)
+
+    def test_v11_observe_projection_remains_compatible(self) -> None:
+        self.state.spec_version = "1.1"
+        self.state.npc_state = {"pos": [1.0, 2.0, 3.0], "yaw": 90.0, "active_ops": []}
+        self.assertEqual(self.state.observe()["npc"]["pos"], [1.0, 2.0, 3.0])
 
 
 if __name__ == "__main__":

@@ -1,9 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "neko-yui-npc-controller"
-version = "0.2.0"
+version = "0.3.0"
 description = "N.E.K.O plugin for the YUI world-native NPC protocol"
 requires-python = "==3.11.*"
 dependencies = [
   "mido>=1.3,<2",
   "python-rtmidi>=1.5,<2",
+]
+
+[project.scripts]
+yui-npc-mcp = "yui_npc_controller.mcp_server:main"
+
+[tool.setuptools]
+packages = ["yui_npc_controller", "yui_npc_controller.runtime"]
+
+[tool.setuptools.package-dir]
+yui_npc_controller = "."
+"yui_npc_controller.runtime" = "runtime"
+
+[tool.setuptools.package-data]
+yui_npc_controller = ["Docs/Protocols/*", "config.example.toml"]
+
+[tool.neko.build]
+# N.E.K.O 插件包只携带运行时、协议文档、配置与 vendor 依赖。
+# 测试证据、Unity 验收源和旧工作区临时文件由各自仓库维护。
+exclude_dirs = [
+  "backend",
+  "memory",
+  "tmp",
+  "tests",
+  "unity",
+  "neko_yui_npc_controller.egg-info",
+]
+exclude_files = [
+  ".gitattributes",
+  ".gitignore",
+  "pytest.ini",
+  "run_tests.bat",
+  "run_tests.py",
 ]

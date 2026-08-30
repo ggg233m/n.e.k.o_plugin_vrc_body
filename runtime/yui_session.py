@@ -11,9 +11,9 @@ from dataclasses import dataclass, replace
 import math
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
-from .yui_protocol import COMMAND_NAMES, parse_neko_log_line
+from .yui_protocol import COMMAND_NAMES, normalize_bearing, parse_neko_log_line
 
 
 @dataclass(frozen=True)
@@ -86,12 +86,14 @@ class YuiSessionState:
         self._acks: deque[YuiAck] = deque(maxlen=max(16, int(ack_history_size)))
         self._ack_generation = 0
         self._recent_events: deque[dict[str, Any]] = deque(maxlen=max(16, int(recent_event_size)))
+        self._event_history: deque[tuple[float, dict[str, Any]]] = deque(maxlen=128)
         self._snapshot_parts: dict[tuple[int, int], dict[int, dict[str, Any]]] = {}
         self._snapshot_part_counts: dict[tuple[int, int], int] = {}
         self._catalog_pages: dict[str, set[int]] = {}
         self._catalog_expected_pages: dict[str, int] = {}
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
         self.session = 0
+        self.spec_version: str | None = None
         self.world_id: str | None = None
         self.world_name: str | None = None
         self.driver_pid: int | None = None
@@ -108,6 +110,9 @@ class YuiSessionState:
             "expression": {},
             "text_preset": {},
             "anchor": {},
+            "region": {},
+            "entity": {},
+            "route_edge": {},
         }
         self.players: dict[int, dict[str, Any]] = {}
         self.npc_state: dict[str, Any] = {"active_ops": []}
@@ -145,6 +150,14 @@ class YuiSessionState:
     def active_ops_authoritative(self) -> bool:
         return self.operation_lifecycle
 
+    @property
+    def world_map_ready(self) -> bool:
+        return self.spec_version == "1.2" and "world_map" in self.capabilities
+
+    @property
+    def semantic_navigation(self) -> bool:
+        return self.spec_version == "1.2" and "semantic_navigation" in self.capabilities
+
     def set_host_arm_authorized(self, authorized: bool) -> None:
         with self._condition:
             self.host_arm_authorized = bool(authorized)
@@ -180,6 +193,8 @@ class YuiSessionState:
         self.operations.clear()
         self._snapshot_parts.clear()
         self._snapshot_part_counts.clear()
+
+        # 授权只能绑定已经明确收到的当前 session；首次建联也必须清除预授权。
         self.host_arm_authorized = False
 
     def _track_log_sequence(self, event: Mapping[str, Any]) -> None:
@@ -223,6 +238,9 @@ class YuiSessionState:
         with self._condition:
             self._track_log_sequence(event_copy)
             self.world_id = str(event_copy.get("world_id") or self.world_id or "") or None
+            event_spec = event_copy.get("spec")
+            if isinstance(event_spec, str):
+                self.spec_version = event_spec
 
             if event_type == "npc.ack":
                 self._ack_generation += 1
@@ -323,6 +341,7 @@ class YuiSessionState:
 
             if event_type == "player.touch" or event_type.startswith(("touch.", "social.")):
                 self._recent_events.append(event_copy)
+            self._event_history.append((time.monotonic(), event_copy))
 
             # 宿主诊断等待器依赖状态/操作事件，而不仅是 ACK；所有有效事件均唤醒。
             self._condition.notify_all()
@@ -466,6 +485,22 @@ class YuiSessionState:
                     return None
                 self._condition.wait(remaining)
 
+    def wait_for_session(self, session: int, timeout_s: float) -> bool:
+        """等待 ``sys.session`` 把指定会话投影为当前会话。
+
+        Unity 对 DISCOVER 的日志顺序是先 ``npc.ack``、后 ``sys.session``。宿主授权
+        必须等后者落地，否则新会话的安全重置会立即清掉刚写入的授权。
+        """
+        expected = int(session)
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._condition:
+            while self.session != expected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
     def wait_for_operation(self, operation_id: str, timeout_s: float) -> dict[str, Any] | None:
         """等待宿主诊断操作进入终态；超时返回 None，不臆测成功。"""
         if not isinstance(operation_id, str) or not operation_id:
@@ -519,6 +554,290 @@ class YuiSessionState:
                     return None
                 self._condition.wait(remaining)
 
+    def anchor_view(self, *, limit: int = 8) -> dict[str, Any]:
+        """按距离给出有界的 anchor 语义视图；绝不输出绝对坐标。
+
+        规范 §17.1 要求不得让模型复制 anchor 坐标，因此 pos/yaw 只用于本地
+        计算相对量，不进入返回值。位置未知时省略几何而不是估算。
+        """
+        bound = max(1, int(limit))
+        with self._condition:
+            catalog = self.catalogs.get("anchor", {})
+            total = len(catalog)
+            npc_position = self.npc_state.get("pos")
+            npc_yaw = self.npc_state.get("yaw")
+            position_known = (
+                isinstance(npc_position, list)
+                and len(npc_position) == 3
+                and all(isinstance(item, (int, float)) for item in npc_position)
+                and isinstance(npc_yaw, (int, float))
+            )
+
+            entries: list[tuple[float | None, int, dict[str, Any]]] = []
+            for anchor_id, item in catalog.items():
+                semantic_key = item.get("semantic_key")
+                if not isinstance(semantic_key, str):
+                    continue
+                view: dict[str, Any] = {"semantic_key": semantic_key}
+                description = item.get("description_zh")
+                if isinstance(description, str):
+                    view["description_zh"] = description
+                tags = item.get("tags")
+                if isinstance(tags, list):
+                    view["tags"] = [tag for tag in tags if isinstance(tag, str)]
+
+                distance: float | None = None
+                anchor_position = item.get("pos")
+                if position_known and isinstance(anchor_position, list) and len(anchor_position) == 3:
+                    dx = float(anchor_position[0]) - float(npc_position[0])
+                    dz = float(anchor_position[2]) - float(npc_position[2])
+                    distance = math.hypot(dx, dz)
+                    view["d"] = round(distance, 1)
+                    # 世界方位角按 X 东 / Z 北，减去朝向得相对角；brg 右正。
+                    world_bearing = math.degrees(math.atan2(dx, dz))
+                    view["brg"] = round(normalize_bearing(world_bearing - float(npc_yaw)))
+                entries.append((distance, int(anchor_id), view))
+
+            if position_known:
+                entries.sort(key=lambda entry: (entry[0] is None, entry[0] or 0.0, entry[1]))
+            else:
+                entries.sort(key=lambda entry: entry[1])
+
+            selected = entries[:bound]
+            return {
+                "anchors": [view for _distance, _anchor_id, view in selected],
+                "total": total,
+                "omitted": max(0, total - len(selected)),
+                "position_known": position_known,
+            }
+
+    @staticmethod
+    def _safe_tags(value: Any) -> list[str]:
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    @staticmethod
+    def _safe_relative(
+        position: Any,
+        npc_position: Any,
+        npc_yaw: Any,
+    ) -> tuple[float, int] | None:
+        if not (
+            isinstance(position, list)
+            and len(position) == 3
+            and isinstance(npc_position, list)
+            and len(npc_position) == 3
+            and isinstance(npc_yaw, (int, float))
+        ):
+            return None
+        try:
+            dx = float(position[0]) - float(npc_position[0])
+            dz = float(position[2]) - float(npc_position[2])
+        except (TypeError, ValueError):
+            return None
+        world_bearing = math.degrees(math.atan2(dx, dz))
+        return round(math.hypot(dx, dz), 1), round(normalize_bearing(world_bearing - float(npc_yaw)))
+
+    def _semantic_projection(
+        self,
+        kind: str,
+        item: Mapping[str, Any],
+        *,
+        include_relative: bool,
+    ) -> dict[str, Any]:
+        """投影给模型的目录项；绝不复制 center/pos/yaw 或内部数字 id。"""
+        projected: dict[str, Any] = {
+            "kind": kind,
+            "semantic_key": item.get("semantic_key"),
+        }
+        for key in (
+            "description_zh",
+            "floor_label",
+            "region_key",
+            "traversal",
+            "bidirectional",
+            "orbitable",
+            "orbit_min_radius",
+            "orbit_max_radius",
+        ):
+            if key in item:
+                projected[key] = item[key]
+        tags = self._safe_tags(item.get("tags"))
+        if tags:
+            projected["tags"] = tags
+        if kind == "route_edge":
+            from_id = item.get("from_anchor_id")
+            to_id = item.get("to_anchor_id")
+            from_item = self.catalogs["anchor"].get(from_id) if isinstance(from_id, int) else None
+            to_item = self.catalogs["anchor"].get(to_id) if isinstance(to_id, int) else None
+            if from_item is not None:
+                projected["from_key"] = from_item.get("semantic_key")
+            if to_item is not None:
+                projected["to_key"] = to_item.get("semantic_key")
+        if include_relative:
+            position = item.get("pos") if kind == "anchor" else item.get("center")
+            if kind == "region":
+                entry_id = item.get("entry_anchor_id")
+                entry = self.catalogs["anchor"].get(entry_id) if isinstance(entry_id, int) else None
+                position = None if entry is None else entry.get("pos")
+            relative = self._safe_relative(
+                position,
+                self.npc_state.get("pos"),
+                self.npc_state.get("yaw"),
+            )
+            if relative is not None:
+                projected["d"], projected["brg"] = relative
+        return projected
+
+    def nearby_world(self, *, limit: int = 8) -> dict[str, Any]:
+        """返回 v1.2 附近语义摘要；v1.1 固定为 unavailable。"""
+        bound = min(8, max(1, int(limit)))
+        with self._condition:
+            if not self.world_map_ready:
+                return {"available": False, "items": [], "total": 0, "omitted": 0}
+            candidates: list[tuple[float, str, dict[str, Any]]] = []
+            for kind in ("region", "entity", "anchor"):
+                for item in self.catalogs[kind].values():
+                    projection = self._semantic_projection(kind, item, include_relative=True)
+                    distance = projection.get("d")
+                    candidates.append((float(distance) if isinstance(distance, (int, float)) else math.inf, str(projection.get("semantic_key", "")), projection))
+            candidates.sort(key=lambda value: (value[0], value[1]))
+            selected = [item for _distance, _key, item in candidates[:bound]]
+            return {
+                "available": True,
+                "items": selected,
+                "total": len(candidates),
+                "omitted": max(0, len(candidates) - len(selected)),
+            }
+
+    def _target_anchor_id(self, semantic_key: str) -> int | None:
+        for anchor_id, item in self.catalogs["anchor"].items():
+            if item.get("semantic_key") == semantic_key:
+                return anchor_id
+        for kind, field in (("entity", "approach_anchor_id"), ("region", "entry_anchor_id")):
+            for item in self.catalogs[kind].values():
+                if item.get("semantic_key") == semantic_key and isinstance(item.get(field), int):
+                    return int(item[field])
+        return None
+
+    def _reachable_anchor_ids(self, source_key: str) -> set[int]:
+        source = self._target_anchor_id(source_key)
+        if source is None and source_key == "npc":
+            npc_position = self.npc_state.get("pos")
+            nearest: tuple[float, int] | None = None
+            for anchor_id, item in self.catalogs["anchor"].items():
+                relative = self._safe_relative(item.get("pos"), npc_position, self.npc_state.get("yaw"))
+                if relative is not None and (nearest is None or relative[0] < nearest[0]):
+                    nearest = (relative[0], anchor_id)
+            source = None if nearest is None else nearest[1]
+        if source is None:
+            return set()
+        adjacency: dict[int, set[int]] = {}
+        for edge in self.catalogs["route_edge"].values():
+            start = edge.get("from_anchor_id")
+            end = edge.get("to_anchor_id")
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            adjacency.setdefault(start, set()).add(end)
+            if bool(edge.get("bidirectional")):
+                adjacency.setdefault(end, set()).add(start)
+        reached = {source}
+        frontier = [source]
+        while frontier:
+            current = frontier.pop(0)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in reached:
+                    reached.add(neighbor)
+                    frontier.append(neighbor)
+        return reached
+
+    def world_query(
+        self,
+        *,
+        query: str | None = None,
+        region_key: str | None = None,
+        tags: Iterable[str] | None = None,
+        reachable_from: str | None = None,
+        kinds: Iterable[str] | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """对作者发布的语义地图执行确定性查询，静态可达性只来自 route_edge。"""
+        with self._condition:
+            if not self.world_map_ready:
+                return {"status": "failed", "error": "unsupported_capability", "detail": "世界未发布 v1.2 world_map", "midi_sent": False}
+            allowed_kinds = {"region", "entity", "anchor", "route_edge"}
+            selected_kinds = set(kinds or allowed_kinds)
+            if not selected_kinds or not selected_kinds <= allowed_kinds:
+                return {"status": "failed", "error": "invalid_param", "detail": "kinds 包含未知目录类型", "midi_sent": False}
+            requested_tags = {str(item).casefold() for item in (tags or [])}
+            needle = (query or "").strip().casefold()
+            reachable = self._reachable_anchor_ids(reachable_from) if reachable_from else None
+            results: list[dict[str, Any]] = []
+            for kind in ("region", "entity", "anchor", "route_edge"):
+                if kind not in selected_kinds:
+                    continue
+                for _item_id, item in sorted(self.catalogs[kind].items()):
+                    if region_key and item.get("region_key") != region_key:
+                        continue
+                    item_tags = {tag.casefold() for tag in self._safe_tags(item.get("tags"))}
+                    if requested_tags and not requested_tags <= item_tags:
+                        continue
+                    if needle:
+                        haystack = " ".join((str(item.get("semantic_key", "")), str(item.get("description_zh", "")), *sorted(item_tags))).casefold()
+                        if needle not in haystack:
+                            continue
+                    if reachable is not None:
+                        anchor_id = None
+                        if kind == "anchor":
+                            anchor_id = item.get("id")
+                        elif kind == "entity":
+                            anchor_id = item.get("approach_anchor_id")
+                        elif kind == "region":
+                            anchor_id = item.get("entry_anchor_id")
+                        elif kind == "route_edge":
+                            anchor_id = item.get("from_anchor_id")
+                        if not isinstance(anchor_id, int) or anchor_id not in reachable:
+                            continue
+                    results.append(self._semantic_projection(kind, item, include_relative=True))
+            results.sort(key=lambda item: (str(item.get("kind")), str(item.get("semantic_key", item.get("from_key", "")))))
+            try:
+                offset = int(cursor or "0")
+            except ValueError:
+                return {"status": "failed", "error": "invalid_param", "detail": "cursor 必须是十进制偏移", "midi_sent": False}
+            page_size = min(20, max(1, int(limit)))
+            if offset < 0:
+                return {"status": "failed", "error": "invalid_param", "detail": "cursor 不得为负数", "midi_sent": False}
+            page = results[offset:offset + page_size]
+            next_offset = offset + len(page)
+            return {
+                "status": "succeeded",
+                "items": page,
+                "total": len(results),
+                "next_cursor": str(next_offset) if next_offset < len(results) else None,
+                "static_reachability": reachable_from is not None,
+                "midi_sent": False,
+            }
+
+    def has_recent_event(self, event_type: str, within_ms: int) -> bool:
+        """供行为图白名单条件查询；只做精确 type 匹配。"""
+        threshold = time.monotonic() - max(1, int(within_ms)) / 1000.0
+        with self._condition:
+            return any(arrived >= threshold and event.get("type") == event_type for arrived, event in self._event_history)
+
+    @classmethod
+    def _without_absolute_coordinates(cls, value: Any) -> Any:
+        """v1.2 模型投影移除绝对世界坐标，保留 d/brg/yaw 等相对事实。"""
+        absolute_keys = {"pos", "target", "target_pos", "center", "origin", "hit_pos"}
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._without_absolute_coordinates(item)
+                for key, item in value.items()
+                if key not in absolute_keys
+            }
+        if isinstance(value, list):
+            return [cls._without_absolute_coordinates(item) for item in value]
+        return value
+
     def observe(self, *, include_player_names: bool = False) -> dict[str, Any]:
         """生成 §17.3 的最小观察摘要，默认不暴露真实显示名。"""
         with self._condition:
@@ -527,6 +846,12 @@ class YuiSessionState:
                 active_ops = []
             npc = dict(self.npc_state)
             npc["active_ops"] = list(active_ops)
+            hide_absolute_coordinates = self.spec_version == "1.2"
+            if hide_absolute_coordinates:
+                npc = self._without_absolute_coordinates(npc)
+                active_ops_view = self._without_absolute_coordinates(list(active_ops))
+            else:
+                active_ops_view = list(active_ops)
             players = []
             for slot in sorted(self.players):
                 source = self.players[slot]
@@ -539,6 +864,7 @@ class YuiSessionState:
                     item["name"] = source["name"]
                 players.append(item)
             return {
+                "spec": self.spec_version,
                 "session": self.session,
                 "world_id": self.world_id,
                 "control_state": self.control_state,
@@ -546,11 +872,15 @@ class YuiSessionState:
                 "caps": list(self.capabilities),
                 "operation_lifecycle": self.operation_lifecycle,
                 "active_ops_authoritative": self.active_ops_authoritative,
-                "active_ops": list(active_ops),
+                "active_ops": active_ops_view,
                 "npc": npc,
                 "players": players,
                 "recent_social_events": [
-                    {
+                    self._without_absolute_coordinates({
+                        key: value
+                        for key, value in event.items()
+                        if key not in {"name", "pid"}
+                    }) if hide_absolute_coordinates else {
                         key: value
                         for key, value in event.items()
                         if key not in {"name", "pid"}

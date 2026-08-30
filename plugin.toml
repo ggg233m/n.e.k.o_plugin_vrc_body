@@ -1,10 +1,10 @@
 [plugin]
 id = "yui_npc_controller"
 name = "YUI NPC Controller"
-description = "通过 YUI v1.1 MIDI/VRChat 日志协议，让 N.E.K.O 在人工授权后直接观察和控制世界原生 NPC"
+description = "通过 YUI v1.1/v1.2 MIDI/VRChat 日志协议，让 N.E.K.O 在人工授权后观察世界并编排原生 NPC"
 short_description = "YUI 世界原生 NPC 的独立控制插件"
 keywords = ["yui", "vrchat", "npc", "midi", "llm", "世界原生"]
-version = "0.2.0"
+version = "0.3.0"
 type = "plugin"
 entry = "plugin.plugins.yui_npc_controller:YuiNpcControllerPlugin"
 

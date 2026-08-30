@@ -12,6 +12,7 @@ import threading
 from typing import Any, Mapping
 import uuid
 
+from .behavior_plan import BehaviorPlanManager, single_node_graph
 from .yui_protocol import (
     SESSION_MAX,
     encode_position_q14,
@@ -51,6 +52,7 @@ class YuiSemanticAdapter:
         self._next_action_sequence = 1
         self._next_transfer_sequence = 1
         self._next_speech_sequence = 1
+        self.plan_manager = BehaviorPlanManager(self, session)
 
     @staticmethod
     def _advance_14bit(value: int) -> int:
@@ -159,6 +161,15 @@ class YuiSemanticAdapter:
             if outcome.status == "succeeded":
                 self.transport.set_heartbeat_enabled(True)
                 self.transport.start_heartbeat()
+                # Unity 先写 DISCOVER ACK、再写 sys.session。只有具体会话已经落地，
+                # 宿主后续的 authorize_arm 才不会被新会话安全重置立即清除。
+                session_timeout = float(getattr(self.transport, "command_deadline_s", 5.0))
+                if not self.session.wait_for_session(session_value, session_timeout):
+                    return _local_result(
+                        "session_event_timeout",
+                        "DISCOVER 已 ACK，但未在期限内收到同一会话的 sys.session",
+                        requested_session=session_value,
+                    )
             return self._outcome(outcome, requested_session=session_value)
 
     def authorize_arm(self, authorized: bool) -> dict[str, Any]:
@@ -194,7 +205,14 @@ class YuiSemanticAdapter:
             return self._outcome(outcome, already_external=False)
 
     def observe(self, *, include_player_names: bool = False) -> dict[str, Any]:
-        return self.session.observe(include_player_names=include_player_names)
+        result = self.session.observe(include_player_names=include_player_names)
+        if self.session.world_map_ready:
+            result["world"] = self.session.nearby_world(limit=8)
+        return result
+
+    def world_query(self, **arguments: Any) -> dict[str, Any]:
+        """只读查询作者发布的 v1.2 语义地图。"""
+        return self.session.world_query(**arguments)
 
     def _goto_parameters(
         self,
@@ -230,6 +248,8 @@ class YuiSemanticAdapter:
         blocked = self._require_tool("goto", "navmesh", "anchors", operation=True)
         if blocked is not None:
             return blocked
+        if self.session.semantic_navigation:
+            return self.navigate_wire(anchor_key, speed_mps=speed_mps)
         anchor = next(
             (
                 item
@@ -282,26 +302,255 @@ class YuiSemanticAdapter:
             outcome = self._send_command("GOTO_XZ", parameters)
         return self._outcome(outcome)
 
-    def follow(self, player_slot: int) -> dict[str, Any]:
+    def _semantic_target_anchor(self, target_key: str) -> tuple[dict[str, Any] | None, str | None]:
+        """把 Anchor/Entity/Region 的全局语义键解析为 Anchor 目录项。"""
+        for anchor in self.session.catalogs["anchor"].values():
+            if anchor.get("semantic_key") == target_key:
+                return anchor, "anchor"
+        for kind, field in (("entity", "approach_anchor_id"), ("region", "entry_anchor_id")):
+            for item in self.session.catalogs[kind].values():
+                if item.get("semantic_key") != target_key:
+                    continue
+                anchor_id = item.get(field)
+                if isinstance(anchor_id, int):
+                    return self.session.catalogs["anchor"].get(anchor_id), kind
+                return None, kind
+        return None, None
+
+    def navigate_wire(self, target_key: str, *, speed_mps: float | None = None) -> dict[str, Any]:
+        """v1.2 内部语义导航；目标 id 与速度不暴露给模型。"""
+        blocked = self._require_tool(
+            "goto", "navmesh", "anchors", "world_map", "semantic_navigation", operation=True,
+        )
+        if blocked is not None:
+            return blocked
+        if not isinstance(target_key, str) or not target_key:
+            return _local_result("invalid_param", "target_key 必须是非空字符串")
+        anchor, target_kind = self._semantic_target_anchor(target_key)
+        if anchor is None:
+            return _local_result("target_missing", f"目录中没有可导航目标 {target_key!r}")
+        anchor_id = anchor.get("id")
+        if isinstance(anchor_id, bool) or not isinstance(anchor_id, int) or not 0 <= anchor_id <= 126:
+            return _local_result("catalog_invalid", "目标的 approach/entry anchor id 非法")
+        maximum_speed = self.session.max_speed_mps
+        if maximum_speed is None:
+            return _local_result("not_ready", "尚未收到 max_speed")
+        try:
+            speed = maximum_speed if speed_mps is None else float(speed_mps)
+            speed_q7 = encode_speed_q7(speed, maximum_speed)
+        except (TypeError, ValueError) as exc:
+            return _local_result("invalid_param", str(exc))
+        with self._semantic_lock:
+            outcome = self._send_command("GOTO_ANCHOR", (0, 0, 0, anchor_id, speed_q7, 0))
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(outcome, semantic_key=target_key, target_kind=target_kind)
+
+    def orbit_wire(
+        self,
+        target_key: str,
+        *,
+        radius_m: float = 2.0,
+        laps: int = 1,
+        direction: str = "cw",
+        speed_mps: float | None = None,
+        face_target: bool = True,
+    ) -> dict[str, Any]:
+        """发送单条 ORBIT_ENTITY；圆周执行和无缝切点完全由 Unity 负责。"""
+        blocked = self._require_tool(
+            "goto", "navmesh", "world_map", "semantic_navigation", operation=True,
+        )
+        if blocked is not None:
+            return blocked
+        entity = next(
+            (item for item in self.session.catalogs["entity"].values() if item.get("semantic_key") == target_key),
+            None,
+        )
+        if entity is None or not bool(entity.get("orbitable")):
+            return _local_result("target_missing", f"目录中没有可绕行实体 {target_key!r}")
+        entity_id = entity.get("id")
+        if isinstance(entity_id, bool) or not isinstance(entity_id, int) or not 0 <= entity_id <= 126:
+            return _local_result("catalog_invalid", "entity id 必须是 0..126")
+        if isinstance(laps, bool) or not isinstance(laps, int) or not 1 <= laps <= 3:
+            return _local_result("invalid_param", "laps 必须是 1..3 的整数")
+        if direction not in {"cw", "ccw"}:
+            return _local_result("invalid_param", "direction 必须是 cw|ccw")
+        try:
+            radius = float(radius_m)
+            minimum = max(0.25, float(entity.get("orbit_min_radius", 0.25)))
+            maximum = min(5.0, float(entity.get("orbit_max_radius", 5.0)))
+        except (TypeError, ValueError):
+            return _local_result("catalog_invalid", "entity 绕行半径元数据非法")
+        if not math.isfinite(radius) or not minimum <= radius <= maximum:
+            return _local_result("invalid_param", f"radius_m 必须位于实体发布范围 {minimum}..{maximum}")
+        maximum_speed = self.session.max_speed_mps
+        if maximum_speed is None:
+            return _local_result("not_ready", "尚未收到 max_speed")
+        try:
+            speed_q7 = encode_speed_q7(maximum_speed if speed_mps is None else speed_mps, maximum_speed)
+        except (TypeError, ValueError) as exc:
+            return _local_result("invalid_param", str(exc))
+        flags = (1 if direction == "ccw" else 0) | ((laps - 1) << 1) | (8 if face_target else 0)
+        with self._semantic_lock:
+            outcome = self._send_command(
+                "ORBIT_ENTITY",
+                (int(math.floor(radius * 1000.0 + 0.5)), 0, 0, entity_id, speed_q7, flags),
+            )
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(
+            outcome,
+            semantic_key=target_key,
+            radius_m=radius,
+            laps=laps,
+            direction=direction,
+            face_target=bool(face_target),
+        )
+
+    def navigate(self, target_key: str, *, speed_mps: float | None = None, replace_active: bool = False) -> dict[str, Any]:
+        blocked = self._require_tool("goto", "navmesh", "anchors", "world_map", "semantic_navigation", operation=True)
+        if blocked is not None:
+            return blocked
+        if self._semantic_target_anchor(target_key)[0] is None:
+            return _local_result("target_missing", f"目录中没有可导航目标 {target_key!r}")
+        return self.plan_manager.submit(
+            single_node_graph("navigate", target_key=target_key, **({} if speed_mps is None else {"speed_mps": speed_mps})),
+            replace_active=replace_active,
+        )
+
+    def orbit(
+        self,
+        target_key: str,
+        *,
+        radius_m: float = 2.0,
+        laps: int = 1,
+        direction: str = "cw",
+        speed_mps: float | None = None,
+        face_target: bool = True,
+        replace_active: bool = False,
+    ) -> dict[str, Any]:
+        blocked = self._require_tool("goto", "navmesh", "anchors", "world_map", "semantic_navigation", operation=True)
+        if blocked is not None:
+            return blocked
+        entity = next(
+            (item for item in self.session.catalogs["entity"].values() if item.get("semantic_key") == target_key),
+            None,
+        )
+        if entity is None or not bool(entity.get("orbitable")):
+            return _local_result("target_missing", f"目录中没有可绕行实体 {target_key!r}")
+        arguments: dict[str, Any] = {
+            "target_key": target_key,
+            "radius_m": radius_m,
+            "laps": laps,
+            "direction": direction,
+            "face_target": face_target,
+        }
+        if speed_mps is not None:
+            arguments["speed_mps"] = speed_mps
+        return self.plan_manager.submit(single_node_graph("orbit", **arguments), replace_active=replace_active)
+
+    def approach(
+        self,
+        player_slot: int,
+        *,
+        distance_m: float = 1.5,
+        speed_mps: float | None = None,
+        face_target: bool = True,
+        replace_active: bool = False,
+    ) -> dict[str, Any]:
+        blocked = self._require_tool("follow", "navmesh", "world_map", "semantic_navigation", operation=True)
+        if blocked is not None:
+            return blocked
+        if player_slot not in self.session.players:
+            return _local_result("slot_unknown", f"player_slot {player_slot} 当前未分配")
+        arguments: dict[str, Any] = {
+            "player_slot": player_slot,
+            "distance_m": distance_m,
+            "face_target": face_target,
+        }
+        if speed_mps is not None:
+            arguments["speed_mps"] = speed_mps
+        return self.plan_manager.submit(single_node_graph("approach", **arguments), replace_active=replace_active)
+
+    def explore(
+        self,
+        region_key: str,
+        *,
+        duration_s: int = 60,
+        strategy: str = "unvisited",
+        speed_mps: float | None = None,
+        replace_active: bool = False,
+    ) -> dict[str, Any]:
+        blocked = self._require_tool("goto", "navmesh", "anchors", "world_map", "semantic_navigation", operation=True)
+        if blocked is not None:
+            return blocked
+        if isinstance(duration_s, bool) or not isinstance(duration_s, int):
+            return _local_result("invalid_param", "duration_s 必须是整数")
+        if not 1 <= duration_s <= 600:
+            return _local_result("invalid_param", "duration_s 必须是 1..600 的整数")
+        if not any(item.get("semantic_key") == region_key for item in self.session.catalogs["region"].values()):
+            return _local_result("target_missing", f"目录中没有区域 {region_key!r}")
+        arguments: dict[str, Any] = {
+            "region_key": region_key,
+            "duration_ms": duration_s * 1000,
+            "strategy": strategy,
+        }
+        if speed_mps is not None:
+            arguments["speed_mps"] = speed_mps
+        return self.plan_manager.submit(single_node_graph("explore", **arguments), replace_active=replace_active)
+
+    def execute_plan(self, graph: Mapping[str, Any], *, replace_active: bool = False) -> dict[str, Any]:
+        blocked = self._require_tool("world_map", "semantic_navigation", operation=True)
+        if blocked is not None:
+            return blocked
+        return self.plan_manager.submit(graph, replace_active=replace_active)
+
+    def plan_status(self, plan_id: str | None = None) -> dict[str, Any]:
+        return self.plan_manager.status(plan_id)
+
+    def plan_cancel(self, plan_id: str) -> dict[str, Any]:
+        return self.plan_manager.cancel(plan_id)
+
+    def follow_wire(self, player_slot: int, *, speed_mps: float | None = None) -> dict[str, Any]:
         blocked = self._require_tool("follow", "navmesh", operation=True)
         if blocked is not None:
             return blocked
         if player_slot not in self.session.players:
             return _local_result("slot_unknown", f"player_slot {player_slot} 当前未分配")
         with self._semantic_lock:
+            substeps: list[dict[str, Any]] = []
+            if speed_mps is not None:
+                maximum_speed = self.session.max_speed_mps
+                if maximum_speed is None:
+                    return _local_result("not_ready", "尚未收到 max_speed")
+                try:
+                    speed_q7 = encode_speed_q7(speed_mps, maximum_speed)
+                except (TypeError, ValueError) as exc:
+                    return _local_result("invalid_param", str(exc))
+                speed = self._send_command("SET_SPEED", (0, 0, 0, speed_q7, 0, 0))
+                if isinstance(speed, dict):
+                    return speed
+                substeps.append(speed.as_dict())
+                if speed.status != "succeeded":
+                    return self._outcome(speed, failed_step="SET_SPEED", substeps=substeps)
             target = self._send_command("SET_TARGET", (0, 0, 0, player_slot, 0, 0))
             if isinstance(target, dict):
                 return target
+            substeps.append(target.as_dict())
             if target.status != "succeeded":
-                return self._outcome(target, failed_step="SET_TARGET")
+                return self._outcome(target, failed_step="SET_TARGET", substeps=substeps)
             follow = self._send_command("SET_MODE", (0, 0, 0, 1, 0, 0))
             if isinstance(follow, dict):
                 return follow
+            substeps.append(follow.as_dict())
             return self._outcome(
                 follow,
                 player_slot=player_slot,
-                substeps=[target.as_dict(), follow.as_dict()],
+                substeps=substeps,
             )
+
+    def follow(self, player_slot: int) -> dict[str, Any]:
+        return self.follow_wire(player_slot)
 
     @staticmethod
     def _duration_seconds(duration_ms: Any, *, maximum_ms: int = 127000) -> int:
@@ -383,6 +632,17 @@ class YuiSemanticAdapter:
         if isinstance(outcome, dict):
             return outcome
         return self._outcome(outcome, target={"x": values[0], "y": values[1], "z": values[2]}, duration_ms=duration_ms)
+
+    def clear_look_wire(self) -> dict[str, Any]:
+        """行为执行器的有限注视收尾；LOOK_AT P3=127 是冻结的清除语义。"""
+        blocked = self._require_tool(operation=True)
+        if blocked is not None:
+            return blocked
+        with self._semantic_lock:
+            outcome = self._send_command("LOOK_AT", (0, 0, 0, 127, 0, 0))
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(outcome, cleared=True)
 
     def act(self, action_key: str, *, player_slot: int | None = None, loop: bool = False) -> dict[str, Any]:
         blocked = self._require_tool("actions", operation=True)
@@ -593,7 +853,33 @@ class YuiSemanticAdapter:
                 return outcome
         return self._outcome(outcome, preset_key=preset_key)
 
-    def stop(self, scope: str = "all") -> dict[str, Any]:
+    def request_snapshot_evidence(self) -> dict[str, Any]:
+        """operation 超时时请求一次快照；快照只能补证据，不能改写 unknown。"""
+        if "snapshot" not in self.session.capabilities or self.session.session <= 0:
+            return _local_result("unsupported_capability", "世界未发布 snapshot")
+        with self._semantic_lock:
+            outcome = self._send_command("SNAPSHOT_REQUEST", (0, 0, 0, 0, 0, 0))
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(outcome)
+
+    def _stop_plan_domains(self, domains: frozenset[str] | set[str]) -> bool:
+        """后台计划内部停止路径；不反向触发 plan_manager 取消。"""
+        if not domains:
+            return False
+        if len(domains) > 1 or any(item in domains for item in {"look", "expression", "text"}):
+            command, parameters = "STOP", (0, 0, 0, 0, 0, 0)
+        elif "movement" in domains:
+            command, parameters = "SET_MODE", (0, 0, 0, 0, 0, 0)
+        elif "action" in domains:
+            command, parameters = "STOP_ACTION", (0, 0, 0, 0, 0, 0)
+        else:
+            return False
+        with self._semantic_lock:
+            outcome = self._send_command(command, parameters)
+        return not isinstance(outcome, dict) or bool(outcome.get("midi_sent"))
+
+    def stop(self, scope: str = "all", *, _from_plan: bool = False) -> dict[str, Any]:
         blocked = self._require_tool()
         if blocked is not None and not (
             scope == "all" and self.session.control_state == "safe_idle"
@@ -608,6 +894,8 @@ class YuiSemanticAdapter:
             name, parameters = "STOP_ACTION", (0, 0, 0, 0, 0, 0)
         else:
             return _local_result("invalid_param", "scope 必须是 all|movement|action")
+        if not _from_plan:
+            self.plan_manager.cancel_for_scope(command)
         with self._semantic_lock:
             outcome = self._send_command(name, parameters)
         if isinstance(outcome, dict):
@@ -616,6 +904,7 @@ class YuiSemanticAdapter:
 
     def clear_estop(self) -> dict[str, Any]:
         """仅供宿主安全入口调用；不属于 LLM 工具面。"""
+        self.plan_manager.cancel_all("estop_clear")
         self.session.set_host_arm_authorized(False)
         if self.session.control_state != "estop":
             return _local_result("invalid_state", "当前未锁存 ESTOP")
@@ -626,6 +915,7 @@ class YuiSemanticAdapter:
         return self._outcome(outcome, control_state="safe_idle")
 
     def estop(self, reason: str = "") -> dict[str, Any]:
+        self.plan_manager.cancel_all("estop")
         frame = self.transport.send_estop()
         return {
             "request_id": f"host-{uuid.uuid4()}",
@@ -636,6 +926,9 @@ class YuiSemanticAdapter:
             "midi_sent": True,
             "error": None,
         }
+
+    def close(self) -> None:
+        self.plan_manager.close()
 
 
 __all__ = ["YuiSemanticAdapter"]
