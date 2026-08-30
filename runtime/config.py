@@ -30,13 +30,12 @@ class YuiPluginConfig:
     log_path: str | None = None
     log_directory: str | None = None
     log_from_end: bool = True
-    log_poll_interval_s: float = 0.1
+    log_poll_interval_s: float = 0.05
     ack_timeout_s: float = 2.0
     command_deadline_s: float = 5.0
     heartbeat_interval_s: float = 1.0
     free_coordinate_navigation: bool = False
     include_player_names: bool = False
-    host_arm_authorized: bool = False
     enable_wander_tool: bool = False
 
     @classmethod
@@ -102,10 +101,6 @@ class YuiPluginConfig:
             include_player_names=_boolean(
                 data.get("include_player_names", defaults.include_player_names),
                 name="include_player_names",
-            ),
-            host_arm_authorized=_boolean(
-                data.get("host_arm_authorized", defaults.host_arm_authorized),
-                name="host_arm_authorized",
             ),
             enable_wander_tool=_boolean(
                 data.get("enable_wander_tool", defaults.enable_wander_tool),

@@ -99,17 +99,6 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         self.state.activity_bounds = (-10.0, 0.0, -20.0, 10.0, 4.0, 20.0)
         self.state.max_speed_mps = 2.0
 
-    def test_arm_never_auto_authorizes(self) -> None:
-        self.state.session = 1193046
-        self.state.control_state = "safe_idle"
-        rejected = self.adapter.arm()
-        self.assertEqual(rejected["error"], "arm_not_authorized")
-        self.assertEqual(self.transport.calls, [])
-        self.adapter.authorize_arm(True)
-        accepted = self.adapter.arm()
-        self.assertEqual(accepted["status"], "succeeded")
-        self.assertEqual(self.transport.calls, [("SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0))])
-
     def test_connect_waits_until_declared_catalog_is_complete(self) -> None:
         result: list[dict] = []
         thread = threading.Thread(
@@ -159,7 +148,36 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         })
         thread.join(timeout=1.0)
         self.assertEqual(result[0]["status"], "succeeded")
+        self.assertTrue(result[0]["auto_control"])
         self.assertTrue(self.transport.heartbeat_started)
+
+        # 真实世界会由 SET_CONTROL_MODE ACK 投影到 external；测试传输器在这里补齐。
+        self.state.control_state = "external"
+        repeated = self.adapter.connect(0)
+        self.assertEqual(repeated["status"], "succeeded")
+        self.assertTrue(repeated["already_connected"])
+        self.assertFalse(repeated["midi_sent"])
+        self.assertEqual(
+            [command for command, _parameters in self.transport.calls],
+            ["DISCOVER", "SET_CONTROL_MODE"],
+            "首次连接应自动进入控制态，重复连接不得重放目录或控制命令",
+        )
+
+        self.state.control_state = "safe_idle"
+        recovered = self.adapter.connect(0)
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertTrue(recovered["already_connected"])
+        self.assertFalse(recovered["rediscovered"])
+        self.assertEqual(
+            [command for command, _parameters in self.transport.calls],
+            ["DISCOVER", "SET_CONTROL_MODE", "SET_CONTROL_MODE"],
+            "watchdog 回到 safe_idle 后只恢复控制态，不应重放目录",
+        )
+
+        self.state.control_state = "estop"
+        estop_result = self.adapter.connect(0)
+        self.assertEqual(estop_result["error"], "estop_latched")
+        self.assertEqual(len(self.transport.calls), 3)
 
     def test_go_to_uses_only_published_anchor_and_world_bounds(self) -> None:
         self._ready()

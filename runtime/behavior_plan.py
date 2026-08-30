@@ -369,7 +369,7 @@ class BehaviorPlanManager:
         except BehaviorGraphError as exc:
             return _result("failed", error="invalid_plan", detail=str(exc), midi_sent=False)
         if self.session.session <= 0 or self.session.control_state not in {"external", "moving", "action"}:
-            return _result("failed", error="invalid_state", detail="当前 session 尚未 ARM", midi_sent=False)
+            return _result("failed", error="invalid_state", detail="地图 NPC 尚未进入宿主控制态", midi_sent=False)
         plan = BehaviorPlan(
             plan_id=f"plan-{uuid.uuid4()}",
             graph=normalized,

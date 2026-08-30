@@ -62,7 +62,6 @@ class ToolSurfaceTests(unittest.TestCase):
         self.surface = YuiToolSurface(
             self.adapter,
             self.session,
-            host_arm_authorized=True,
             free_coordinate_navigation=True,
             enable_wander_tool=True,
         )
@@ -75,7 +74,6 @@ class ToolSurfaceTests(unittest.TestCase):
 
     def _ready(self) -> None:
         self.session.control_state = "external"
-        self.session.set_host_arm_authorized(True)
         self.session.capabilities = (
             "goto",
             "navmesh",
@@ -114,10 +112,9 @@ class ToolSurfaceTests(unittest.TestCase):
             "semantic_key": "idle",
         }
 
-    def test_arm_requires_current_session_host_authorization(self) -> None:
+    def test_safe_idle_never_exposes_arm(self) -> None:
         self.assertEqual(self._names(), {"npc.observe", "npc.estop"})
-        self.session.set_host_arm_authorized(True)
-        self.assertEqual(self._names(), {"npc.observe", "npc.estop", "npc.arm"})
+        self.assertNotIn("npc.arm", self._names())
         self.assertNotIn("npc.clear_estop", self._names())
 
     def test_complete_surface_uses_only_frozen_model_tool_names(self) -> None:

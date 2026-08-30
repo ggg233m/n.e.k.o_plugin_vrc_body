@@ -81,6 +81,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._driver_lease: YuiDriverLease | None = None
         self._registered_yui_tools: set[str] = set()
         self._tool_signature = ""
+        self._tool_state_key: tuple[Any, ...] | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_lock = asyncio.Lock()
 
@@ -136,7 +137,6 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._surface = YuiToolSurface(
             adapter,
             self._session,
-            host_arm_authorized=self._config.host_arm_authorized,
             free_coordinate_navigation=self._config.free_coordinate_navigation,
             include_player_names=self._config.include_player_names,
             enable_wander_tool=self._config.enable_wander_tool,
@@ -152,6 +152,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 pass
         self._registered_yui_tools.clear()
         self._tool_signature = ""
+        self._tool_state_key = None
 
     def _make_tool_handler(self, tool_name: str):
         async def handler(**arguments: Any) -> dict[str, Any]:
@@ -169,7 +170,46 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
         return handler
 
+    def _current_tool_state_key(self) -> tuple[Any, ...]:
+        """生成低成本工具可见性键，避免高频状态日志反复重建 schema。"""
+        session = self._session
+        surface = self._surface
+        if session is None or surface is None:
+            return (0,)
+        control_group = (
+            "armed"
+            if session.control_state in {"external", "moving", "action"}
+            else session.control_state
+        )
+        catalog_identity: tuple[Any, ...] = ()
+        if session.discovery_ready:
+            catalog_identity = tuple(
+                (
+                    kind,
+                    tuple(
+                        str(item.get("semantic_key") or item.get("name") or item_id)
+                        for item_id, item in sorted(session.catalogs[kind].items())
+                    ),
+                )
+                for kind in ("action", "expression", "anchor", "region", "entity")
+            )
+        return (
+            session.session,
+            session.discovery_ready,
+            control_group,
+            tuple(session.capabilities),
+            session.catalog_revision,
+            session.max_speed_mps,
+            catalog_identity,
+            surface.free_coordinate_navigation,
+            surface.include_player_names,
+            surface.enable_wander_tool,
+        )
+
     def _refresh_llm_tools(self) -> list[str]:
+        state_key = self._current_tool_state_key()
+        if state_key == self._tool_state_key:
+            return sorted(self._registered_yui_tools)
         definitions = self._surface.definitions() if self._surface is not None else []
         signature = json.dumps(
             [
@@ -186,6 +226,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             separators=(",", ":"),
         )
         if signature == self._tool_signature:
+            self._tool_state_key = state_key
             return sorted(self._registered_yui_tools)
         self._unregister_yui_tools()
         for definition in definitions:
@@ -198,6 +239,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             )
             self._registered_yui_tools.add(definition.name)
         self._tool_signature = signature
+        self._tool_state_key = state_key
         return sorted(self._registered_yui_tools)
 
     @staticmethod
@@ -220,15 +262,18 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
     def _handle_session_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
-        if event_type in {
+        refresh_event = event_type in {
             "sys.session",
-            "sys.hello",
-            "sys.catalog",
             "sys.watchdog",
             "player.leave",
             "npc.state",
             "npc.ack",
-        }:
+        }
+        if event_type in {"sys.hello", "sys.catalog"}:
+            # DISCOVER 的目录按 20 行/s 分批到达。中间页不会形成可用工具面，
+            # 每页都向宿主注销/注册工具会把一次连接放大成数十次 IPC 操作。
+            refresh_event = bool(self._session and self._session.discovery_ready)
+        if refresh_event:
             self._refresh_llm_tools()
         high_salience = (
             event_type == "player.touch"
@@ -267,8 +312,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "midi_open": self._transport is not None,
             "driver_lease": bool(self._driver_lease and self._driver_lease.acquired),
             "log": self._tailer.snapshot() if self._tailer is not None else None,
-            "host_arm_authorized": (
-                self._session.host_arm_authorized if self._session is not None else False
+            "control_ready": bool(
+                self._session is not None
+                and self._session.control_state in {"external", "moving", "action"}
             ),
             "llm_tools": sorted(self._registered_yui_tools),
             "world": (
@@ -280,8 +326,6 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
     def _close_control(self) -> None:
         self._unregister_yui_tools()
-        if self._session is not None:
-            self._session.set_host_arm_authorized(False)
         if self._adapter is not None:
             self._adapter.close()
         if self._transport is not None:
@@ -307,7 +351,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         try:
             self._event_loop = asyncio.get_running_loop()
             self._config = await self._load_config()
-            # 启动只跟随日志；不得打开 MIDI、DISCOVER、授权或 ARM。
+            # 启动只跟随日志；不得打开 MIDI 或 DISCOVER。
             self._start_log_tailer()
             return Ok({"status": "ready", "result": self._status_snapshot()})
         except Exception as exc:
@@ -323,7 +367,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     @plugin_entry(
         id="yui_connect",
         name="连接 YUI 世界 NPC",
-        description="人工打开 MIDI 并发送 DISCOVER；连接不会自动授权或 ARM。",
+        description="人工打开 MIDI，执行 DISCOVER，并由宿主把地图 NPC 切入可控态。",
         input_schema=_object_schema(),
         llm_result_fields=["status", "error", "detail"],
         timeout=15.0,
@@ -334,42 +378,15 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 adapter = self._ensure_control()
                 result = await asyncio.to_thread(adapter.connect, self._config.claim_code)
                 if result.get("status") == "succeeded":
-                    # 这是宿主配置绑定到当前 session，不会调用 npc.arm。
-                    adapter.authorize_arm(self._config.host_arm_authorized)
-                    if self._surface is not None:
-                        self._surface.host_arm_authorized = self._config.host_arm_authorized
                     result["llm_tools"] = self._refresh_llm_tools()
                 return Ok(result)
             except Exception as exc:
                 return Err(f"{type(exc).__name__}: {exc}")
 
     @plugin_entry(
-        id="yui_authorize_arm",
-        name="授权当前 YUI 会话 ARM",
-        description="宿主人工设置当前 session 的 ARM 授权；不会发送 SET_CONTROL_MODE。",
-        input_schema=_object_schema(
-            {"authorized": {"type": "boolean"}},
-            required=["authorized"],
-        ),
-        llm_result_fields=["authorized", "session", "control_state"],
-        timeout=10.0,
-    )
-    async def yui_authorize_arm(self, *, authorized: bool, **_: Any):
-        async with self._runtime_lock:
-            if self._adapter is None or self._session is None or self._session.session <= 0:
-                return Err("尚未完成当前 YUI session 的 DISCOVER")
-            if authorized and self._session.control_state == "estop":
-                return Err("ESTOP 已锁存，必须先由人工安全入口清除")
-            result = self._adapter.authorize_arm(authorized)
-            if self._surface is not None:
-                self._surface.host_arm_authorized = bool(authorized)
-            result["llm_tools"] = self._refresh_llm_tools()
-            return Ok(result)
-
-    @plugin_entry(
         id="yui_clear_estop",
         name="人工清除 YUI ESTOP",
-        description="仅宿主安全入口可用；清除后保持 safe_idle，授权仍为 false。",
+        description="仅宿主安全入口可用；清除后由宿主恢复地图 NPC 控制态。",
         input_schema=_object_schema(),
         llm_result_fields=["status", "error", "detail"],
         timeout=10.0,
@@ -379,8 +396,6 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             if self._adapter is None:
                 return Err("尚未连接 YUI 世界")
             result = await asyncio.to_thread(self._adapter.clear_estop)
-            if self._surface is not None:
-                self._surface.host_arm_authorized = False
             result["llm_tools"] = self._refresh_llm_tools()
             return Ok(result)
 
@@ -420,7 +435,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     @plugin_entry(
         id="yui_reload_config",
         name="重载 YUI 插件配置",
-        description="停止当前控制器并重新读取配置；不会自动连接、授权或 ARM。",
+        description="停止当前控制器并重新读取配置；不会自动连接。",
         input_schema=_object_schema(),
         llm_result_fields=["status"],
         timeout=10.0,

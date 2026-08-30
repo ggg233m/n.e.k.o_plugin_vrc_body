@@ -12,7 +12,7 @@ claim_code = 0
 log_path = ""
 log_directory = ""
 log_from_end = true
-log_poll_interval_s = 0.1
+log_poll_interval_s = 0.05
 
 ack_timeout_s = 2.0
 command_deadline_s = 5.0
@@ -23,10 +23,6 @@ free_coordinate_navigation = false
 
 # 默认不把玩家显示名交给模型，只使用会话级 player_slot。
 include_player_names = false
-
-# 人工安全门。只有宿主配置明确改为 true，连接后才会向 LLM 暴露 arm；
-# ESTOP 会在运行时撤销当前 session 的授权，恢复控制需人工重新加载配置并连接。
-host_arm_authorized = false
 
 # 可选工具；只映射为 SET_MODE wander，不接受任何参数。
 enable_wander_tool = false

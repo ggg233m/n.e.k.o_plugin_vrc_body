@@ -43,6 +43,8 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     private const int MaxJsonUtf8Bytes = 950;
     private const int KeySlots = 48;
     private const int MaxBudget = 20;
+    // 普通目录/状态最多占 16 行；为 ACK、错误和安全事件保留 4 行滑动窗余量。
+    private const int ForcedBudgetReserve = 4;
     private const int NormalQueueSize = 128;
     private const int ForcedQueueSize = 32;
     private const int LogSeqNormalMax = 2147483646;
@@ -88,7 +90,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     {
         FlushQueues();
         // 丢行报告只在队列排空且有预算时创建，避免报告本身挤占协议事件。
-        if (_droppedSinceReport <= 0 || !CanLogHere() || _forcedCount > 0 || _normalCount > 0 || !HasBudget()) return;
+        if (_droppedSinceReport <= 0 || !CanLogHere() || _forcedCount > 0 || _normalCount > 0 || !HasNormalBudget()) return;
         int seq = AllocateLogSeq();
         string body = "\"dropped_since_last_report\":" + _droppedSinceReport
             + ",\"dropped_total\":" + droppedTotal
@@ -130,7 +132,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     {
         if (!CanLogHere()) return;
         if (!FitsEvent(type, body)) { droppedTooLong++; RecordDrop(AllocateLogSeq(), 2); return; }
-        if (_forcedCount == 0 && _normalCount == 0 && HasBudget()) WriteAllocated(AllocateLogSeq(), type, body);
+        if (_forcedCount == 0 && _normalCount == 0 && HasNormalBudget()) WriteAllocated(AllocateLogSeq(), type, body);
         else EnqueueNormal(type, body);
     }
 
@@ -186,6 +188,20 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         return recent < limit;
     }
 
+    private bool HasNormalBudget()
+    {
+        int limit = Mathf.Clamp(logBudgetPerSec, 1, MaxBudget);
+        int reserve = Mathf.Min(ForcedBudgetReserve, Mathf.Max(0, limit - 1));
+        int normalLimit = limit - reserve;
+        float now = Time.timeSinceLevelLoad;
+        int recent = 0;
+        for (int i = 0; i < MaxBudget; i++)
+        {
+            if (now - _lineTimes[i] < 1.0f) recent++;
+        }
+        return recent < normalLimit;
+    }
+
     private void ConsumeBudget()
     {
         _lineTimes[_lineTimeCursor] = Time.timeSinceLevelLoad;
@@ -195,18 +211,20 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     private void FlushQueues()
     {
         if (!CanLogHere()) return;
-        while (HasBudget() && (_forcedCount > 0 || _normalCount > 0))
+        while (_forcedCount > 0 || _normalCount > 0)
         {
             string type;
             string body;
             if (_forcedCount > 0)
             {
+                if (!HasBudget()) return;
                 type = _forcedTypes[_forcedHead]; body = _forcedBodies[_forcedHead];
                 _forcedTypes[_forcedHead] = null; _forcedBodies[_forcedHead] = null;
                 _forcedHead = (_forcedHead + 1) % ForcedQueueSize; _forcedCount--;
             }
             else
             {
+                if (!HasNormalBudget()) return;
                 type = _normalTypes[_normalHead]; body = _normalBodies[_normalHead];
                 _normalTypes[_normalHead] = null; _normalBodies[_normalHead] = null;
                 _normalHead = (_normalHead + 1) % NormalQueueSize; _normalCount--;

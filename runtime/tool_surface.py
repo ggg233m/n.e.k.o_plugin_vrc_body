@@ -127,7 +127,6 @@ class YuiToolSurface:
         adapter: YuiSemanticAdapter,
         session: YuiSessionState,
         *,
-        host_arm_authorized: bool = False,
         free_coordinate_navigation: bool = False,
         include_player_names: bool = False,
         enable_wander_tool: bool = False,
@@ -135,7 +134,6 @@ class YuiToolSurface:
     ) -> None:
         self.adapter = adapter
         self.session = session
-        self.host_arm_authorized = bool(host_arm_authorized)
         self.free_coordinate_navigation = bool(free_coordinate_navigation)
         self.include_player_names = bool(include_player_names)
         self.enable_wander_tool = bool(enable_wander_tool)
@@ -192,18 +190,6 @@ class YuiToolSurface:
                     10.0,
                 )
             )
-        if not self.host_arm_authorized or not self.session.host_arm_authorized:
-            return definitions
-        if self.session.control_state == "safe_idle":
-            definitions.append(
-                YuiToolDefinition(
-                    "npc.arm",
-                    "宿主已授权当前 session 时，将 NPC 从 safe_idle 切入 external；不会由其他工具自动调用。",
-                    _object_schema(),
-                    normal_timeout,
-                )
-            )
-            return definitions
         if self.session.control_state not in {"external", "moving", "action"}:
             return definitions
 
@@ -489,8 +475,6 @@ class YuiToolSurface:
             return self.adapter.observe(include_player_names=self.include_player_names)
         if name == "npc.world_query":
             return self.adapter.world_query(**values)
-        if name == "npc.arm":
-            return self.adapter.arm()
         if name == "npc.go_to":
             return self.adapter.go_to(**values)
         if name == "npc.go_to_xyz":

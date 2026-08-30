@@ -52,6 +52,9 @@ class YuiSemanticAdapter:
         self._next_action_sequence = 1
         self._next_transfer_sequence = 1
         self._next_speech_sequence = 1
+        # 只记录本 Adapter 实例亲自完成的握手。新建宿主控制器不能借用日志中
+        # 残留的旧 session 跳过 DISCOVER，但同一持久实例重复点“连接”应立即返回。
+        self._connected_session = 0
         self.plan_manager = BehaviorPlanManager(self, session)
 
     @staticmethod
@@ -88,7 +91,10 @@ class YuiSemanticAdapter:
                 "世界未发布 operation_lifecycle，不能向 LLM 暴露长操作工具",
             )
         if self.session.control_state == "safe_idle":
-            return _local_result("requires_arm", "当前为 safe_idle，需要先经宿主授权 npc.arm")
+            return _local_result(
+                "control_not_ready",
+                "当前为 safe_idle；地图 NPC 应由宿主重新连接并自动进入 external",
+            )
         if self.session.control_state == "estop":
             return _local_result("estop_latched", "ESTOP 已锁存，只能由人工安全路径清除")
         if self.session.control_state not in {"external", "moving", "action"}:
@@ -109,7 +115,10 @@ class YuiSemanticAdapter:
         """发送普通命令；把本地编码错误转为 _local_result dict 而不是抛出异常。"""
         from .yui_protocol import YuiProtocolError
         try:
-            return self.transport.send_command(command, parameters)
+            outcome = self.transport.send_command(command, parameters)
+            if outcome.error in {"not_owner", "ownership_failed", "session_conflict"}:
+                self._connected_session = 0
+            return outcome
         except YuiProtocolError as exc:
             return _local_result("invalid_param", str(exc))
 
@@ -141,9 +150,50 @@ class YuiSemanticAdapter:
             })()
 
     def connect(self, claim_code: int, *, session: int | None = None) -> dict[str, Any]:
-        """建立或刷新会话；成功 ACK 后启动独立心跳。"""
+        """建立地图 NPC 会话并由宿主自动进入 ``external``。"""
         if isinstance(claim_code, bool) or not isinstance(claim_code, int) or not 0 <= claim_code <= 16383:
             return _local_result("invalid_param", "claim_code 必须是 0..16383 的整数")
+        if (
+            session is None
+            and self._connected_session > 0
+            and self._connected_session == self.session.session
+            and self.session.discovery_ready
+        ):
+            # 宿主是长驻进程；重复连接若再次 DISCOVER，会强制世界重放完整目录，
+            # 不但增加数秒等待，还会让宿主反复重建动态工具。当前实例和 session
+            # 都健康时直接复用；断开会创建新 Adapter，owner 错误也会清除此标记。
+            if self.session.control_state == "estop":
+                return _local_result(
+                    "estop_latched",
+                    "ESTOP 已锁存，只能由人工安全入口清除",
+                    requested_session=self.session.session,
+                    already_connected=True,
+                )
+            if self.session.control_state == "safe_idle":
+                with self._semantic_lock:
+                    control_outcome = self.transport.send_command(
+                        "SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0)
+                    )
+                if control_outcome.status == "succeeded":
+                    self.transport.set_heartbeat_enabled(True)
+                    self.transport.start_heartbeat()
+                return self._outcome(
+                    control_outcome,
+                    requested_session=self.session.session,
+                    already_connected=True,
+                    auto_control=control_outcome.status == "succeeded",
+                    rediscovered=False,
+                )
+            self.transport.set_heartbeat_enabled(True)
+            self.transport.start_heartbeat()
+            return {
+                "request_id": f"host-{uuid.uuid4()}",
+                "status": "succeeded",
+                "already_connected": True,
+                "requested_session": self.session.session,
+                "midi_sent": False,
+                "error": None,
+            }
         session_value = session if session is not None else secrets.randbelow(SESSION_MAX) + 1
         if isinstance(session_value, bool) or not isinstance(session_value, int) or not 1 <= session_value <= SESSION_MAX:
             return _local_result("invalid_param", "session 必须是非零 28-bit 整数")
@@ -157,12 +207,10 @@ class YuiSemanticAdapter:
         )
         with self._semantic_lock:
             self.session.set_host_arm_authorized(False)
-            outcome = self.transport.send_command("DISCOVER", parameters)
-            if outcome.status == "succeeded":
-                self.transport.set_heartbeat_enabled(True)
-                self.transport.start_heartbeat()
+            discover_outcome = self.transport.send_command("DISCOVER", parameters)
+            if discover_outcome.status == "succeeded":
                 # Unity 先写 DISCOVER ACK、再写 sys.session。只有具体会话已经落地，
-                # 宿主后续的 authorize_arm 才不会被新会话安全重置立即清除。
+                # 宿主才能安全继续目录同步和内部控制态切换。
                 session_timeout = float(getattr(self.transport, "command_deadline_s", 5.0))
                 if not self.session.wait_for_session(session_value, session_timeout):
                     return _local_result(
@@ -176,39 +224,39 @@ class YuiSemanticAdapter:
                         "当前会话的 sys.hello 或声明目录未在期限内完整到达",
                         requested_session=session_value,
                     )
-            return self._outcome(outcome, requested_session=session_value)
-
-    def authorize_arm(self, authorized: bool) -> dict[str, Any]:
-        self.session.set_host_arm_authorized(bool(authorized))
-        return {
-            "authorized": self.session.host_arm_authorized,
-            "session": self.session.session,
-            "control_state": self.session.control_state,
-        }
-
-    def arm(self) -> dict[str, Any]:
-        with self._semantic_lock:
-            if self.session.control_state in {"external", "moving", "action"}:
-                return {
-                    "request_id": f"host-{uuid.uuid4()}",
-                    "status": "succeeded",
-                    "already_external": True,
-                    "midi_sent": False,
-                    "error": None,
-                }
-            if (
-                self.session.session <= 0
-                or self.session.control_state == "estop"
-                or not self.session.host_arm_authorized
-            ):
-                return _local_result(
-                    "arm_not_authorized",
-                    "当前 session 未获得宿主人工授权，未发送 SET_CONTROL_MODE",
+                # 地图 NPC 的活动范围和可用目标已由世界 capability、目录、NavMesh
+                # 与 ownership 共同约束，不再把 ARM 作为 LLM 权限门。SET_CONTROL_MODE
+                # 是宿主连接流程的内部可靠步骤，模型工具面从不暴露 npc.arm。
+                control_outcome = self.transport.send_command(
+                    "SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0)
                 )
-            if self.session.control_state != "safe_idle":
-                return _local_result("invalid_state", f"当前状态 {self.session.control_state} 不能 arm")
-            outcome = self.transport.send_command("SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0))
-            return self._outcome(outcome, already_external=False)
+                if control_outcome.status != "succeeded":
+                    return self._outcome(
+                        control_outcome,
+                        requested_session=session_value,
+                        already_connected=False,
+                        auto_control=False,
+                        discover_wire_seq=discover_outcome.wire_sequence,
+                        discover_request_hash=discover_outcome.request_hash,
+                    )
+                self._connected_session = session_value
+                # 完整连接后再启动心跳；首次模型操作不会与目录同步或 ARM 往返竞争。
+                self.transport.set_heartbeat_enabled(True)
+                self.transport.start_heartbeat()
+                return self._outcome(
+                    control_outcome,
+                    requested_session=session_value,
+                    already_connected=False,
+                    auto_control=True,
+                    discover_wire_seq=discover_outcome.wire_sequence,
+                    discover_request_hash=discover_outcome.request_hash,
+                )
+            return self._outcome(
+                discover_outcome,
+                requested_session=session_value,
+                already_connected=False,
+                auto_control=False,
+            )
 
     def observe(self, *, include_player_names: bool = False) -> dict[str, Any]:
         result = self.session.observe(include_player_names=include_player_names)
@@ -909,16 +957,29 @@ class YuiSemanticAdapter:
         return self._outcome(outcome, scope=command)
 
     def clear_estop(self) -> dict[str, Any]:
-        """仅供宿主安全入口调用；不属于 LLM 工具面。"""
+        """仅供宿主安全入口调用；清除后恢复地图 NPC 的宿主控制态。"""
         self.plan_manager.cancel_all("estop_clear")
         self.session.set_host_arm_authorized(False)
         if self.session.control_state != "estop":
             return _local_result("invalid_state", "当前未锁存 ESTOP")
         with self._semantic_lock:
-            outcome = self._send_command("CLEAR_ESTOP", (0, 0, 0, 0, 0, 0))
-        if isinstance(outcome, dict):
-            return outcome
-        return self._outcome(outcome, control_state="safe_idle")
+            clear_outcome = self._send_command("CLEAR_ESTOP", (0, 0, 0, 0, 0, 0))
+            if isinstance(clear_outcome, dict):
+                return clear_outcome
+            if clear_outcome.status != "succeeded":
+                return self._outcome(clear_outcome, control_state="estop")
+            control_outcome = self._send_command(
+                "SET_CONTROL_MODE", (0, 0, 0, 1, 0, 0)
+            )
+        if isinstance(control_outcome, dict):
+            return control_outcome
+        return self._outcome(
+            control_outcome,
+            control_state="external",
+            estop_cleared=True,
+            clear_wire_seq=clear_outcome.wire_sequence,
+            clear_request_hash=clear_outcome.request_hash,
+        )
 
     def estop(self, reason: str = "") -> dict[str, Any]:
         self.plan_manager.cancel_all("estop")
@@ -934,6 +995,7 @@ class YuiSemanticAdapter:
         }
 
     def close(self) -> None:
+        self._connected_session = 0
         self.plan_manager.close()
 
 

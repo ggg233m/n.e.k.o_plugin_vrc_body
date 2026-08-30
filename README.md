@@ -3,13 +3,14 @@
 独立实现 YUI NPC v1.1/v1.2 Python 后端、N.E.K.O 插件和 stdio MCP。v1.1 字节级冻结，v1.2 只在世界明确发布 capability 后增加语义地图和后台行为图。协议事实只来自
 `Docs/Protocols/`，不会导入 AnyDance、YOLO、视觉导航或旧 `BackendService`。
 
-## 安全边界
+## 控制边界
 
-- 启动只跟随 VRChat 日志，不打开 MIDI、不连接、不授权、不 ARM。
-- `DISCOVER` 只建立 session；连接绝不自动调用 `npc.arm`。
-- `host_arm_authorized` 是当前 session 的宿主人工门，LLM 无法修改。
+- 启动只跟随 VRChat 日志，不打开 MIDI、不连接；仍由操作者显式调用宿主连接入口。
+- 这是只在地图 NavMesh/activity bounds 内活动的世界 NPC。连接完成 DISCOVER 后，
+  宿主内部可靠切入 `external`，模型不需要也看不到 `npc.arm`。
 - `CLEAR_ESTOP` 只存在于宿主入口 `yui_clear_estop`，不是 LLM/MCP 工具。
-- session 重建、watchdog、ESTOP、driver 离开或 owner 错误会撤销当前授权。
+- session 重建、watchdog、ESTOP、driver 离开或 owner 错误仍会立即停止控制；恢复时
+  由宿主重新连接，或由操作者执行 `yui_clear_estop`。
 - `free_coordinate_navigation`、玩家姓名和可选 `npc.wander` 均默认关闭。
 - 本地驱动锁会阻止 N.E.K.O 与独立 MCP 同时打开同一个 MIDI 端口；世界端
   session/driver/ownership 仍是最终权威。
@@ -17,7 +18,7 @@
 模型工具名固定为：
 
 ```text
-npc.observe  npc.arm  npc.go_to  npc.go_to_xyz  npc.follow
+npc.observe  npc.go_to  npc.go_to_xyz  npc.follow
 npc.look_at  npc.act  npc.set_expression  npc.say
 npc.stop     npc.estop  npc.wander（可选）
 ```
@@ -77,8 +78,15 @@ Set-Location $NekoProject
 `sync` 只更新插件自身的 `vendor/`，不会把插件安装进 N.E.K.O。必须再执行
 `build` 与 `install`；安装成功时 CLI 会同时验证包内 payload 哈希。
 
-宿主入口为 `yui_connect`、`yui_authorize_arm`、`yui_clear_estop`、
+宿主入口为 `yui_connect`、`yui_clear_estop`、
 `yui_disconnect`、`yui_status` 和 `yui_reload_config`；它们不会注册为 LLM 工具。
+同一宿主进程内重复调用 `yui_connect` 会复用已经完整握手的 session，不重放
+DISCOVER 目录；需要重新声明 ownership 时应先 `yui_disconnect` 再连接。目录只在
+全部页面到齐后重建一次动态工具面，高频 `npc.state`/心跳 ACK 不会重复注册工具。
+
+`npc.navigate`、`npc.orbit`、`npc.explore` 和 `npc.execute_plan` 都只等待命令 ACK，
+随后立即返回 `accepted + plan_id`；长行为在后台继续执行。宿主不得把工具调用本身
+阻塞到动作结束，应通过 `npc.plan_status` 读取终态证据。
 
 ## Unity 源码
 
@@ -133,11 +141,11 @@ Set-Location (Split-Path $YuiProject -Parent)
 & $Python311 -m yui_npc_controller.mcp_server
 ```
 
-操作者明确连接并授权当前 session（仍需 Agent 单独调用 `npc.arm`）：
+操作者明确连接；连接完成后模型可直接操作地图 NPC：
 
 ```powershell
 & $Python311 -m yui_npc_controller.mcp_server `
-  --connect --midi NEKO_MIDI --host-arm-authorized `
+  --connect --midi NEKO_MIDI `
   --free-coordinate-navigation --enable-wander-tool
 ```
 

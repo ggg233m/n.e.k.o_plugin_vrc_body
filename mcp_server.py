@@ -1,7 +1,7 @@
 """不依赖第三方 MCP SDK 的 YUI stdio MCP 服务器。
 
-stdout 只输出一行一个 JSON-RPC 消息；人工连接和授权只能通过进程启动参数完成，
-不会注册为模型工具。
+stdout 只输出一行一个 JSON-RPC 消息；人工连接通过进程启动参数完成，不注册为
+模型工具。连接后由宿主内部把地图 NPC 切入可控态。
 """
 
 from __future__ import annotations
@@ -65,14 +65,11 @@ class YuiMcpRuntime:
             connected = adapter.connect(self.args.claim_code)
             if connected.get("status") != "succeeded":
                 raise RuntimeError(
-                    f"DISCOVER 失败: {connected.get('error') or connected.get('detail') or connected}"
+                    f"连接失败: {connected.get('error') or connected.get('detail') or connected}"
                 )
-            # 只绑定宿主启动参数；这里绝不调用 adapter.arm()。
-            adapter.authorize_arm(self.args.host_arm_authorized)
             surface = YuiToolSurface(
                 adapter,
                 self.session,
-                host_arm_authorized=self.args.host_arm_authorized,
                 free_coordinate_navigation=self.args.free_coordinate_navigation,
                 include_player_names=self.args.include_player_names,
                 enable_wander_tool=self.args.enable_wander_tool,
@@ -104,8 +101,6 @@ class YuiMcpRuntime:
         return self.surface.call(name, arguments)
 
     def close(self) -> None:
-        if self.session is not None:
-            self.session.set_host_arm_authorized(False)
         if self.adapter is not None:
             self.adapter.close()
         if self.transport is not None:
@@ -162,7 +157,7 @@ class StdioMcpServer:
                     "protocolVersion": requested_version or "2024-11-05",
                     "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "yui-npc-controller", "version": "0.3.0"},
-                    "instructions": "连接、宿主授权和 CLEAR_ESTOP 不属于模型工具；npc.arm 也不会被其他工具自动调用。",
+                    "instructions": "连接与 CLEAR_ESTOP 不属于模型工具；地图 NPC 在宿主连接后自动进入可控态，npc.arm 不存在。",
                 },
             )
             return
@@ -227,14 +222,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--connect", action="store_true", help="由操作者显式打开 MIDI 并执行 DISCOVER")
     parser.add_argument("--midi", default="NEKO_MIDI")
     parser.add_argument("--claim-code", type=int, default=0)
-    parser.add_argument("--host-arm-authorized", action="store_true", help="仅授权当前 session；不会 ARM")
     parser.add_argument("--free-coordinate-navigation", action="store_true")
     parser.add_argument("--include-player-names", action="store_true")
     parser.add_argument("--enable-wander-tool", action="store_true")
     parser.add_argument("--log-path")
     parser.add_argument("--log-directory")
     parser.add_argument("--log-from-start", action="store_true")
-    parser.add_argument("--log-poll-interval", type=float, default=0.1)
+    parser.add_argument("--log-poll-interval", type=float, default=0.05)
     parser.add_argument("--ack-timeout", type=float, default=2.0)
     parser.add_argument("--command-deadline", type=float, default=5.0)
     parser.add_argument("--heartbeat-interval", type=float, default=1.0)

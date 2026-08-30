@@ -88,6 +88,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private float _orbitTravelMeters;
     private float _orbitRequiredTravelMeters;
     private bool _orbitRecoveryUsed;
+    private float _orbitStuckGraceUntil = -1f;
 
     private int _lookSlot = -1;
     private Vector3 _lookPoint;
@@ -233,14 +234,17 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         // 圆周点之间只有约 15°。若沿用普通导航的 0.3m stoppingDistance，
         // Agent 可能停在切点阈值外；绕行中间点必须使用更小的停止距离。
         _orbitStoppingDistance = Mathf.Min(0.05f, stopDistance);
-        // NPC 可能已经位于同半径上。首点太近时从下一点起步，避免首帧
-        // 被判为“到达”后进入无位移恢复分支；最后仍会回到闭合点。
-        _orbitIndex = FlatDistance(npcRoot.position, _orbitPoints[0]) <= stopDistance ? 1 : 0;
+        // 方向反转时 NPC 通常正位于上一圈的闭合点。不能只跳过 point[0]：
+        // NavMesh 采样可能把相邻点也压到当前小片区域，随后会在尚未形成速度前
+        // 被旧的“实际路程不足”保护误判为 stuck。直接选取第一个有意义的远点，
+        // 最终闭合点仍保留，因此不会少走一圈。
+        _orbitIndex = FirstUsefulOrbitIndex(npcRoot.position);
         _orbitWaypointStart = npcRoot.position;
         _orbitLastPosition = npcRoot.position;
         _orbitTravelMeters = 0f;
         _orbitRequiredTravelMeters = Mathf.PI * 2f * radius * safeLaps * 0.65f;
         _orbitRecoveryUsed = false;
+        _orbitStuckGraceUntil = Time.timeSinceLevelLoad + 0.5f;
         _arrivalDistance = stopDistance;
         PrepareMovementTarget(_orbitPoints[_orbitIndex], -1f, speed, MODE_ORBIT);
         if (!StartAgentForCurrentTarget(MODE_ORBIT)) { ClearOrbit(); return "no_path"; }
@@ -646,6 +650,13 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         if (!navAgent.pathPending && targetDistance <= arrival && _speed < 0.05f)
         {
             if (_mode == MODE_FOLLOW) { navAgent.isStopped = true; return; }
+            if (_mode == MODE_ORBIT && _orbitIndex < _orbitPointCount - 1)
+            {
+                // 被 NavMesh 压近的中间点允许直接跳过；中间点不能进入最终圈长
+                // 取证分支，否则紧接的反向绕行会在启动帧被误报 stuck。
+                AdvanceOrbitWaypoint();
+                return;
+            }
             if (_mode == MODE_ORBIT && _orbitTravelMeters < _orbitRequiredTravelMeters)
             {
                 // 防止 NavMesh 初次采样把多组圆周点压到同一小片区域后产生假成功。
@@ -653,7 +664,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
                 if (!_orbitRecoveryUsed && _orbitPointCount > 1)
                 {
                     _orbitRecoveryUsed = true;
-                    _orbitIndex = 1;
+                    _orbitIndex = FirstUsefulOrbitIndex(npcRoot.position);
                     _target = _orbitPoints[_orbitIndex];
                     _orbitWaypointStart = npcRoot.position;
                     navAgent.autoBraking = false;
@@ -744,6 +755,9 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void DetectStuck(float dt)
     {
         if (navAgent == null || navAgent.pathPending) { ResetStuck(); return; }
+        // NavMeshAgent 从上一段自然结束的 disabled 状态重新启用时需要一小段
+        // 路径稳定窗口；该窗口只抑制误报，不暂停或降低 Agent 速度。
+        if (_mode == MODE_ORBIT && Time.timeSinceLevelLoad < _orbitStuckGraceUntil) { ResetStuck(); return; }
         bool expectsMotion = navAgent.desiredVelocity.magnitude > 0.1f && FlatDistance(npcRoot.position, _target) > navAgent.stoppingDistance;
         if (!expectsMotion) { ResetStuck(); return; }
         _stuckTimer += dt;
@@ -835,7 +849,19 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _orbitTravelMeters = 0f;
         _orbitRequiredTravelMeters = 0f;
         _orbitRecoveryUsed = false;
+        _orbitStuckGraceUntil = -1f;
         if (navAgent != null) navAgent.updateRotation = true;
+    }
+
+    private int FirstUsefulOrbitIndex(Vector3 position)
+    {
+        float minimumDistance = Mathf.Max(_orbitSwitchDistance, _orbitMinAdvanceDistance) + 0.02f;
+        int last = Mathf.Max(0, _orbitPointCount - 1);
+        for (int i = 0; i < last; i++)
+        {
+            if (FlatDistance(position, _orbitPoints[i]) > minimumDistance) return i;
+        }
+        return last;
     }
 
     private void ClearLookInternal()
