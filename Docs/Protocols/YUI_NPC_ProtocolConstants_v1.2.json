@@ -1,0 +1,82 @@
+{
+  "status": "frozen",
+  "wire_version": 1,
+  "spec": "1.2",
+  "base_spec": "1.1",
+  "base_file": "YUI_NPC_ProtocolConstants_v1.1.json",
+  "commands_add": {
+    "GOTO_ANCHOR": {
+      "id": 23,
+      "hex": "0x17",
+      "params": { "P3": "anchor_id", "P4": "speed_q7" },
+      "range": { "P3": [0, 126], "P4": [0, 127] },
+      "zero": ["P0", "P1", "P2", "P5"]
+    },
+    "ORBIT_ENTITY": {
+      "id": 24,
+      "hex": "0x18",
+      "params": {
+        "P0": "radius_mm",
+        "P3": "entity_id",
+        "P4": "speed_q7",
+        "P5": "bit0=ccw,bits1..2=laps_minus_1,bit3=face_target"
+      },
+      "range": { "P0": [250, 5000], "P3": [0, 126], "P4": [0, 127], "P5": [0, 13] },
+      "allowed_ranges": { "P5": [[0, 11], [12, 13]] },
+      "reserved_zero_mask": { "P5": 112 },
+      "conditional_rules": ["P5.bits1..2 解码值只能是 0..2"],
+      "zero": ["P1", "P2"]
+    }
+  },
+  "command_states_add": {
+    "GOTO_ANCHOR": ["external", "moving", "action"],
+    "ORBIT_ENTITY": ["external", "moving", "action"]
+  },
+  "capabilities_add": {
+    "world_map": 17,
+    "semantic_navigation": 18
+  },
+  "capability_contracts_add": {
+    "world_map": {
+      "bit": 17,
+      "gated_entries": ["region catalog", "entity catalog", "route_edge catalog", "npc.world_query"],
+      "disabled_behavior": "三个目录计数为 0 且目录为空；npc.world_query 不暴露",
+      "disabled_test_vector": "world_map_capability_disabled"
+    },
+    "semantic_navigation": {
+      "bit": 18,
+      "gated_entries": ["GOTO_ANCHOR", "ORBIT_ENTITY", "npc.navigate", "npc.orbit", "npc.explore", "npc.execute_plan"],
+      "disabled_behavior": "wire 命令 ACK unsupported_capability；适配层工具不暴露",
+      "disabled_test_vector": "semantic_navigation_capability_disabled"
+    }
+  },
+  "catalog_kinds_add": {
+    "region": ["id", "semantic_key", "description_zh", "tags", "floor_label", "entry_anchor_id"],
+    "entity": ["id", "semantic_key", "description_zh", "tags", "region_key", "center", "approach_anchor_id", "orbitable", "orbit_min_radius", "orbit_max_radius"],
+    "route_edge": ["id", "from_anchor_id", "to_anchor_id", "bidirectional", "traversal", "region_key"]
+  },
+  "behavior_graph": {
+    "max_nodes": 64,
+    "max_depth": 8,
+    "max_repeat": 10,
+    "max_retry_attempts": 3,
+    "max_parallel_children": 4,
+    "max_wait_ms": 60000,
+    "max_plan_ms": 600000,
+    "history_size": 16,
+    "statuses": ["accepted", "running", "succeeded", "cancelled", "failed", "unknown"],
+    "control_nodes": ["sequence", "selector", "parallel", "repeat", "retry", "timeout", "condition"],
+    "leaf_nodes": ["navigate", "approach", "follow", "orbit", "explore", "look_at", "act", "set_expression", "say", "wait", "stop"],
+    "condition_predicates": ["player_present", "player_distance", "event_seen", "node_status", "control_state", "estop", "elapsed_ms"]
+  },
+  "agent_tools_add": [
+    "npc.world_query",
+    "npc.navigate",
+    "npc.approach",
+    "npc.orbit",
+    "npc.explore",
+    "npc.execute_plan",
+    "npc.plan_status",
+    "npc.plan_cancel"
+  ]
+}

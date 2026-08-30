@@ -1,0 +1,46 @@
+{
+  "document": "YUI NPC v1.2 extension test vectors",
+  "spec": "1.2",
+  "wire_version": 1,
+  "base_vectors": "YUI_NPC_TestVectors_v1.1.json",
+  "vectors": [
+    {
+      "id": "goto_anchor_valid",
+      "command": "GOTO_ANCHOR",
+      "seq": 91,
+      "parameters": [0, 0, 0, 4, 64, 0],
+      "request_hash": "648B"
+    },
+    {
+      "id": "orbit_entity_cw_one_lap",
+      "command": "ORBIT_ENTITY",
+      "seq": 92,
+      "parameters": [2000, 0, 0, 1, 64, 8],
+      "request_hash": "CA8A"
+    },
+    {
+      "id": "orbit_entity_ccw_three_laps",
+      "command": "ORBIT_ENTITY",
+      "seq": 93,
+      "parameters": [1500, 0, 0, 1, 96, 13],
+      "request_hash": "7ED4"
+    }
+  ],
+  "negative_vectors": [
+    { "id": "goto_anchor_reserved", "command": "GOTO_ANCHOR", "parameters": [1, 0, 0, 4, 64, 0], "error": "P0 必须为 0" },
+    { "id": "goto_anchor_id_127", "command": "GOTO_ANCHOR", "parameters": [0, 0, 0, 127, 64, 0], "error": "P3 必须位于 0..126" },
+    { "id": "orbit_radius_small", "command": "ORBIT_ENTITY", "parameters": [249, 0, 0, 1, 64, 8], "error": "P0 必须位于 250..5000" },
+    { "id": "orbit_four_laps_in_range", "command": "ORBIT_ENTITY", "parameters": [2000, 0, 0, 1, 64, 6], "error": "P5.bits1..2" },
+    { "id": "orbit_reserved_bits", "command": "ORBIT_ENTITY", "parameters": [2000, 0, 0, 1, 64, 72], "error": "保留位" }
+  ],
+  "capability_vectors": [
+    { "id": "world_map_capability_disabled", "missing": "world_map", "expected": "empty_catalogs_and_no_tool" },
+    { "id": "semantic_navigation_capability_disabled", "missing": "semantic_navigation", "expected": "unsupported_capability_and_no_tools" }
+  ],
+  "integration_vectors": [
+    { "id": "catalog_target_missing", "precondition": "world_map 目录不含目标 semantic_key", "expected": "target_missing 且不发送 MIDI" },
+    { "id": "upper_floor_path_invalid", "precondition": "stair_bottom 到 stair_top 没有完整 NavMesh 路径", "expected": "operation=failed/no_path，不得变成 succeeded" },
+    { "id": "operation_unknown_propagation", "precondition": "ACK 成功但 operation 无终态", "expected": "请求 snapshot 后计划终态 unknown" },
+    { "id": "orbit_continuity", "precondition": "central_obstacle 的 24 点/圈路径有效", "expected": "中间点不制动，非预期零速不超过 250ms" }
+  ]
+}
