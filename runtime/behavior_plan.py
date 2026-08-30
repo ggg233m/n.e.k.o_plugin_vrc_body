@@ -1,4 +1,4 @@
-"""YUI v1.2 后台行为图执行器。
+"""YUI v1.2/v1.3 后台行为图执行器。
 
 模型只提交受限 JSON 图；本模块在独立线程中编译、调度并等待 Unity operation
 证据。它不解释自然语言、不执行表达式，也不会把 cancelled/failed/unknown
@@ -23,9 +23,9 @@ if TYPE_CHECKING:  # pragma: no cover
 PLAN_STATUSES = ("accepted", "running", "succeeded", "cancelled", "failed", "unknown")
 TERMINAL_STATUSES = frozenset({"succeeded", "cancelled", "failed", "unknown"})
 CONTROL_TYPES = frozenset({"sequence", "selector", "parallel", "repeat", "retry", "timeout", "condition"})
-LEAF_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "look_at", "act", "set_expression", "say", "wait", "stop"})
+LEAF_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "move_relative", "look_at", "act", "set_expression", "say", "wait", "stop"})
 NODE_TYPES = CONTROL_TYPES | LEAF_TYPES
-MOVEMENT_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore"})
+MOVEMENT_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "move_relative"})
 MAX_NODES = 64
 MAX_DEPTH = 8
 MAX_REPEAT = 10
@@ -229,6 +229,7 @@ class BehaviorGraphCompiler:
             "follow": common | {"player_slot", "duration_ms", "speed_mps"},
             "orbit": common | {"target_key", "radius_m", "laps", "direction", "speed_mps", "face_target"},
             "explore": common | {"region_key", "duration_ms", "strategy", "speed_mps"},
+            "move_relative": common | {"bearing_deg", "distance_m", "speed_mps", "face_travel", "allow_shorter"},
             "look_at": common | {"player_slot", "duration_ms"},
             "act": common | {"action_key", "player_slot", "loop"},
             "set_expression": common | {"expression_key", "duration_ms"},
@@ -314,13 +315,22 @@ class BehaviorGraphCompiler:
                 raise BehaviorGraphError(f"节点 {node_id}.direction 必须是 cw|ccw")
             if "face_target" in node and not isinstance(node["face_target"], bool):
                 raise BehaviorGraphError(f"节点 {node_id}.face_target 必须是布尔值")
+        if node_type == "move_relative":
+            _number(node.get("bearing_deg"), f"节点 {node_id}.bearing_deg", -math.inf, math.inf)
+            _number(node.get("distance_m"), f"节点 {node_id}.distance_m", 0.25, 10.0)
+            for field_name in ("face_travel", "allow_shorter"):
+                if field_name in node and not isinstance(node[field_name], bool):
+                    raise BehaviorGraphError(f"节点 {node_id}.{field_name} 必须是布尔值")
         if "speed_mps" in node:
             maximum = self.session.max_speed_mps or 2.0
             _number(node["speed_mps"], f"节点 {node_id}.speed_mps", 0.0, maximum)
         if node_type in {"follow", "look_at", "wait"}:
             _integer(node.get("duration_ms"), f"节点 {node_id}.duration_ms", 1, MAX_WAIT_MS)
         if node_type == "explore":
-            _integer(node.get("duration_ms"), f"节点 {node_id}.duration_ms", 1, int(MAX_PLAN_SECONDS * 1000))
+            minimum_duration = 1000 if self.session.local_navigation else 1
+            _integer(node.get("duration_ms"), f"节点 {node_id}.duration_ms", minimum_duration, int(MAX_PLAN_SECONDS * 1000))
+            if node.get("strategy", "unvisited") not in {"unvisited", "patrol"}:
+                raise BehaviorGraphError(f"节点 {node_id}.strategy 必须是 unvisited|patrol")
         if node_type == "set_expression":
             _integer(node.get("duration_ms", 0), f"节点 {node_id}.duration_ms", 0, MAX_WAIT_MS)
         if node_type == "act" and "action_key" not in node:
@@ -742,6 +752,19 @@ class BehaviorPlanManager:
             return self._await_operation(plan, self.adapter.navigate_wire(str(node["target_key"]), speed_mps=node.get("speed_mps")), deadline, local_cancel)
         if kind == "orbit":
             return self._await_operation(plan, self.adapter.orbit_wire(str(node["target_key"]), radius_m=float(node.get("radius_m", 2.0)), laps=int(node.get("laps", 1)), direction=str(node.get("direction", "cw")), speed_mps=node.get("speed_mps"), face_target=bool(node.get("face_target", True))), deadline, local_cancel)
+        if kind == "move_relative":
+            return self._await_operation(
+                plan,
+                self.adapter.move_relative_wire(
+                    float(node["bearing_deg"]),
+                    float(node["distance_m"]),
+                    speed_mps=node.get("speed_mps"),
+                    face_travel=bool(node.get("face_travel", True)),
+                    allow_shorter=bool(node.get("allow_shorter", True)),
+                ),
+                deadline,
+                local_cancel,
+            )
         if kind == "approach":
             slot = int(node["player_slot"])
             outcome = self.adapter.follow_wire(slot, speed_mps=node.get("speed_mps"))
@@ -808,6 +831,18 @@ class BehaviorPlanManager:
 
     def _explore(self, plan: BehaviorPlan, node: Mapping[str, Any], deadline: float, local_cancel: threading.Event | None) -> dict[str, Any]:
         region_key = str(node["region_key"])
+        if self.session.local_navigation:
+            return self._await_operation(
+                plan,
+                self.adapter.explore_region_wire(
+                    region_key,
+                    duration_ms=int(node.get("duration_ms", 60_000)),
+                    strategy=str(node.get("strategy", "unvisited")),
+                    speed_mps=node.get("speed_mps"),
+                ),
+                deadline,
+                local_cancel,
+            )
         anchors = [
             item for _item_id, item in sorted(self.session.catalogs["anchor"].items())
             if item.get("region_key") == region_key

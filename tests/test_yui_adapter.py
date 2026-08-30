@@ -292,6 +292,46 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         self.assertEqual(result["error"], "unsupported_capability")
         self.assertEqual(self.transport.calls, [])
 
+    def test_v13_relative_move_and_region_explore_encode_once(self) -> None:
+        self._ready()
+        self.state.spec_version = "1.3"
+        self.state.capabilities += (
+            "world_map", "semantic_navigation", "region_localization", "local_navigation",
+        )
+        self.state.catalogs["region"][2] = {
+            "id": 2,
+            "semantic_key": "upper_floor",
+            "entry_anchor_id": 0,
+            "explorable": True,
+        }
+        moved = self.adapter.move_relative_wire(
+            90.0, 2.0, speed_mps=1.0, face_travel=True, allow_shorter=True,
+        )
+        self.assertEqual(moved["status"], "succeeded")
+        self.assertEqual(self.transport.calls[-1], ("MOVE_RELATIVE", (2000, 0, 4096, 0, 64, 3)))
+
+        explored = self.adapter.explore_region_wire(
+            "upper_floor", duration_ms=20_000, strategy="unvisited", speed_mps=1.0,
+        )
+        self.assertEqual(explored["status"], "succeeded")
+        self.assertEqual(self.transport.calls[-1], ("EXPLORE_REGION", (200, 0, 0, 2, 64, 0)))
+
+    def test_v13_rejects_unpublished_or_unexplorable_region_without_midi(self) -> None:
+        self._ready()
+        self.state.spec_version = "1.3"
+        self.state.capabilities += ("world_map", "semantic_navigation", "local_navigation")
+        self.state.catalogs["region"][1] = {
+            "id": 1, "semantic_key": "stairway", "entry_anchor_id": 0, "explorable": False,
+        }
+        result = self.adapter.explore("stairway", duration_s=20)
+        self.assertEqual(result["error"], "target_missing")
+        self.assertEqual(self.transport.calls, [])
+
+        self.state.capabilities = tuple(item for item in self.state.capabilities if item != "local_navigation")
+        missing_capability = self.adapter.move_relative(0.0, 1.0)
+        self.assertEqual(missing_capability["error"], "unsupported_capability")
+        self.assertEqual(self.transport.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

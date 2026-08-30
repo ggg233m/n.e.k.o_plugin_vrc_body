@@ -41,6 +41,17 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(names, {"npc.observe"})
         self.assertFalse(names & {"connect", "disconnect", "status", "clear_estop"})
 
+    def test_initialize_reports_v13_package_version(self) -> None:
+        messages = self._invoke(
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"},
+            }
+        )
+        self.assertEqual(messages[0]["result"]["serverInfo"]["version"], "0.4.0")
+
     def test_tools_call_returns_structured_content(self) -> None:
         messages = self._invoke(
             {

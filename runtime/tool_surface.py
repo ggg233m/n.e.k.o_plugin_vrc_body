@@ -259,6 +259,7 @@ class YuiToolSurface:
                 str(item.get("semantic_key"))
                 for _item_id, item in sorted(self.session.catalogs["region"].items())
                 if isinstance(item.get("semantic_key"), str)
+                and (not self.session.local_navigation or bool(item.get("explorable")))
             ]
             region_schema: dict[str, Any] = {"type": "string", "minLength": 1}
             if region_keys:
@@ -299,7 +300,7 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.explore",
-                    "后台按语义路线探索指定区域，只访问作者发布的 Anchor。",
+                    "后台探索指定区域；v1.3 由 Unity 单 operation 连续 retarget，旧世界按作者发布的 Anchor 行进。",
                     _object_schema({
                         "region_key": region_schema,
                         "duration_s": {"type": "integer", "minimum": 1, "maximum": 600},
@@ -311,7 +312,7 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.execute_plan",
-                    "提交受限 v1.2 行为图并由 Python 后台执行；不接受代码或自然语言条件。",
+                    "提交受限 v1.2/v1.3 行为图并由 Python 后台执行；不接受代码或自然语言条件。",
                     _object_schema({
                         "graph": {"type": "object"},
                         "replace_active": replace_schema,
@@ -325,6 +326,22 @@ class YuiToolSurface:
                     normal_timeout,
                 ),
             ])
+            if self.session.local_navigation:
+                definitions.append(
+                    YuiToolDefinition(
+                        "npc.move_relative",
+                        "按 NPC 当前朝向做严格相对方位移动；0°前、90°右、180°后、270°左，不暴露绝对坐标。",
+                        _object_schema({
+                            "bearing_deg": {"type": "number"},
+                            "distance_m": {"type": "number", "minimum": 0.25, "maximum": 10.0},
+                            "speed_mps": speed_schema,
+                            "face_travel": {"type": "boolean", "default": True},
+                            "allow_shorter": {"type": "boolean", "default": True},
+                            "replace_active": replace_schema,
+                        }, required=["bearing_deg", "distance_m"]),
+                        normal_timeout,
+                    )
+                )
         if operation_tools and {"follow", "navmesh"} <= caps:
             definitions.append(
                 YuiToolDefinition(
@@ -485,6 +502,8 @@ class YuiToolSurface:
             return self.adapter.approach(**values)
         if name == "npc.orbit":
             return self.adapter.orbit(**values)
+        if name == "npc.move_relative":
+            return self.adapter.move_relative(**values)
         if name == "npc.explore":
             return self.adapter.explore(**values)
         if name == "npc.execute_plan":

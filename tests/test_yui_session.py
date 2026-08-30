@@ -128,6 +128,22 @@ class YuiSessionTests(unittest.TestCase):
         self.assertEqual(operation["status"], "cancelled")
         self.assertEqual(operation["reason"], "replaced")
 
+        state.ingest(_header(
+            3,
+            "npc.operation_failed",
+            op_id="1193046:8:DCBA",
+            kind="move_relative",
+            request_seq=8,
+            request_hash="DCBA",
+            elapsed_ms=250,
+            err="no_path",
+            detail="严格方位上没有完整路径",
+        ))
+        failed = state.wait_for_operation("1193046:8:DCBA", 0.0)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error"], "no_path")
+        self.assertEqual(failed["detail"], "严格方位上没有完整路径")
+
     def test_owner_error_clears_host_authorization(self) -> None:
         state = YuiSessionState()
         state.session = 1193046
@@ -544,7 +560,55 @@ class AnchorViewTests(unittest.TestCase):
     def test_v11_observe_projection_remains_compatible(self) -> None:
         self.state.spec_version = "1.1"
         self.state.npc_state = {"pos": [1.0, 2.0, 3.0], "yaw": 90.0, "active_ops": []}
-        self.assertEqual(self.state.observe()["npc"]["pos"], [1.0, 2.0, 3.0])
+        observation = self.state.observe()
+        self.assertEqual(observation["npc"]["pos"], [1.0, 2.0, 3.0])
+        self.assertNotIn("location", observation)
+
+    def test_v13_location_uses_only_unity_confirmed_semantic_facts(self) -> None:
+        self.state.spec_version = "1.3"
+        self.state.capabilities = ("region_localization", "operation_lifecycle")
+        self.state.npc_state = {
+            "pos": [1.0, 2.0, 3.0],
+            "active_ops": [],
+            "location": {
+                "localized": True,
+                "region_key": "upper_floor",
+                "floor_label": "二楼",
+                "center": [99.0, 99.0, 99.0],
+                "nearest_anchor": {
+                    "semantic_key": "upper_observation",
+                    "d": 1.26,
+                    "brg": 370.0,
+                    "pos": [4.0, 3.0, 8.0],
+                },
+            },
+        }
+        observation = self.state.observe()
+        self.assertEqual(observation["location"]["region_key"], "upper_floor")
+        self.assertEqual(observation["location"]["nearest_anchor"], {
+            "semantic_key": "upper_observation", "d": 1.3, "brg": 10,
+        })
+        self.assertNotIn("pos", observation["npc"])
+        self.assertNotIn("center", observation["location"])
+
+    def test_v13_does_not_infer_region_when_unity_reports_outside(self) -> None:
+        self.state.spec_version = "1.3"
+        self.state.capabilities = ("region_localization",)
+        self.state.npc_state = {
+            "pos": [0.0, 0.0, 0.0],
+            "active_ops": [],
+            "location": {
+                "localized": False,
+                "region_key": "ground_floor",
+                "floor_label": "一楼",
+                "nearest_anchor": {"semantic_key": "spawn", "d": 0.2, "brg": 0},
+            },
+        }
+        location = self.state.observe()["location"]
+        self.assertFalse(location["localized"])
+        self.assertIsNone(location["region_key"])
+        self.assertIsNone(location["floor_label"])
+        self.assertEqual(location["nearest_anchor"]["semantic_key"], "spawn")
 
 
 if __name__ == "__main__":

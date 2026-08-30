@@ -156,7 +156,7 @@ class StdioMcpServer:
                 {
                     "protocolVersion": requested_version or "2024-11-05",
                     "capabilities": {"tools": {"listChanged": True}},
-                    "serverInfo": {"name": "yui-npc-controller", "version": "0.3.0"},
+                    "serverInfo": {"name": "yui-npc-controller", "version": "0.4.0"},
                     "instructions": "连接与 CLEAR_ESTOP 不属于模型工具；地图 NPC 在宿主连接后自动进入可控态，npc.arm 不存在。",
                 },
             )
@@ -218,7 +218,7 @@ class StdioMcpServer:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="YUI NPC v1.1/v1.2 stdio MCP server")
+    parser = argparse.ArgumentParser(description="YUI NPC v1.1/v1.2/v1.3 stdio MCP server")
     parser.add_argument("--connect", action="store_true", help="由操作者显式打开 MIDI 并执行 DISCOVER")
     parser.add_argument("--midi", default="NEKO_MIDI")
     parser.add_argument("--claim-code", type=int, default=0)

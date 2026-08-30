@@ -1,0 +1,63 @@
+{
+  "document": "YUI NPC v1.3 extension test vectors",
+  "spec": "1.3",
+  "wire_version": 1,
+  "base_vectors": "YUI_NPC_TestVectors_v1.2.json",
+  "vectors": [
+    {
+      "id": "move_relative_forward_shorter",
+      "command": "MOVE_RELATIVE",
+      "seq": 94,
+      "parameters": [2000, 0, 0, 0, 64, 3],
+      "request_hash": "4A12"
+    },
+    {
+      "id": "move_relative_left_exact",
+      "command": "MOVE_RELATIVE",
+      "seq": 95,
+      "parameters": [5000, 0, 12288, 0, 96, 1],
+      "request_hash": "4192"
+    },
+    {
+      "id": "explore_upper_unvisited_20s",
+      "command": "EXPLORE_REGION",
+      "seq": 96,
+      "parameters": [200, 0, 0, 2, 64, 0],
+      "request_hash": "A89D"
+    },
+    {
+      "id": "explore_ground_patrol_30s",
+      "command": "EXPLORE_REGION",
+      "seq": 97,
+      "parameters": [300, 0, 0, 0, 80, 1],
+      "request_hash": "157B"
+    }
+  ],
+  "negative_vectors": [
+    { "id": "move_distance_small", "command": "MOVE_RELATIVE", "parameters": [249, 0, 0, 0, 64, 3], "error": "P0 必须位于 250..10000" },
+    { "id": "move_distance_large", "command": "MOVE_RELATIVE", "parameters": [10001, 0, 0, 0, 64, 3], "error": "P0 必须位于 250..10000" },
+    { "id": "move_reserved_p1", "command": "MOVE_RELATIVE", "parameters": [1000, 1, 0, 0, 64, 3], "error": "P1 必须为 0" },
+    { "id": "move_reserved_p3", "command": "MOVE_RELATIVE", "parameters": [1000, 0, 0, 1, 64, 3], "error": "P3 必须为 0" },
+    { "id": "move_reserved_flag", "command": "MOVE_RELATIVE", "parameters": [1000, 0, 0, 0, 64, 4], "error": "保留位" },
+    { "id": "explore_duration_short", "command": "EXPLORE_REGION", "parameters": [9, 0, 0, 0, 64, 0], "error": "P0 必须位于 10..6000" },
+    { "id": "explore_duration_long", "command": "EXPLORE_REGION", "parameters": [6001, 0, 0, 0, 64, 0], "error": "P0 必须位于 10..6000" },
+    { "id": "explore_reserved_p2", "command": "EXPLORE_REGION", "parameters": [200, 0, 1, 0, 64, 0], "error": "P2 必须为 0" },
+    { "id": "explore_region_127", "command": "EXPLORE_REGION", "parameters": [200, 0, 0, 127, 64, 0], "error": "P3 必须位于 0..126" },
+    { "id": "explore_strategy_unknown", "command": "EXPLORE_REGION", "parameters": [200, 0, 0, 0, 64, 2], "error": "保留位" }
+  ],
+  "capability_vectors": [
+    { "id": "region_localization_capability_disabled", "missing": "region_localization", "expected": "localized_false_and_no_location_details" },
+    { "id": "local_navigation_capability_disabled", "missing": "local_navigation", "expected": "unsupported_capability_no_move_tool_and_v12_explore" }
+  ],
+  "integration_vectors": [
+    { "id": "region_single_volume", "precondition": "NPC 位于 ground_floor 唯一体积内", "expected": "localized=true,region_key=ground_floor" },
+    { "id": "region_overlap_order", "precondition": "NPC 同时命中多个体积", "expected": "高优先级、较小体积、较小 region id 依次裁决" },
+    { "id": "region_outside", "precondition": "NPC 不在任何 Region 体积内", "expected": "localized=false，不以最近 Anchor 猜测区域" },
+    { "id": "move_strict_bearing_shorter", "precondition": "前方完整距离不可达但 60% 距离可达", "expected": "沿原方位移动 60%，不左右偏转" },
+    { "id": "explore_unexplorable_region", "precondition": "目标 stairway.explorable=false", "expected": "ACK target_missing 或 invalid_param 且不启动 operation" },
+    { "id": "explore_no_path", "precondition": "连续三轮无区域内完整路径候选", "expected": "operation=failed/no_path" },
+    { "id": "explore_continuity", "precondition": "区域内存在连续完整路径候选", "expected": "提前约 0.4m retarget，非预期零速不超过 250ms" },
+    { "id": "operation_unknown_propagation_v13", "precondition": "ACK 成功但 operation 无终态", "expected": "计划终态 unknown，绝不视为 succeeded" },
+    { "id": "projection_has_no_coordinates", "precondition": "observe 包含 location", "expected": "不含 NPC、Region、Anchor 或 NavMesh 绝对坐标" }
+  ]
+}

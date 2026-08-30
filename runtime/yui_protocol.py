@@ -1,4 +1,4 @@
-"""独立 YUI NPC 插件的 v1.1/v1.2 Python 协议编解码。
+"""独立 YUI NPC 插件的 v1.1/v1.2/v1.3 Python 协议编解码。
 
 本模块只处理确定性的 wire 事实：MIDI 帧、CRC、量化、UTF-8 载荷和
 ``[NEKO]`` 日志公共头。会话、重试和 LLM 语义适配放在更高一层，避免把
@@ -17,8 +17,8 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 SPEC_VERSION = "1.1"
-CURRENT_SPEC_VERSION = "1.2"
-SUPPORTED_SPEC_VERSIONS = (SPEC_VERSION, CURRENT_SPEC_VERSION)
+CURRENT_SPEC_VERSION = "1.3"
+SUPPORTED_SPEC_VERSIONS = (SPEC_VERSION, "1.2", CURRENT_SPEC_VERSION)
 WIRE_VERSION = 1
 NPC_ID = "yui"
 MIDI_PORT_NAME = "NEKO_MIDI"
@@ -65,6 +65,8 @@ COMMAND_IDS: dict[str, int] = {
     "SET_CONTROL_MODE": 0x16,
     "GOTO_ANCHOR": 0x17,
     "ORBIT_ENTITY": 0x18,
+    "MOVE_RELATIVE": 0x19,
+    "EXPLORE_REGION": 0x1A,
     "ESTOP": ESTOP_COMMAND_ID,
 }
 COMMAND_NAMES = {command_id: name for name, command_id in COMMAND_IDS.items()}
@@ -89,6 +91,8 @@ CAPABILITY_BITS: dict[str, int] = {
     "operation_lifecycle": 16,
     "world_map": 17,
     "semantic_navigation": 18,
+    "region_localization": 19,
+    "local_navigation": 20,
 }
 
 ERROR_CODES: dict[str, int] = {
@@ -728,7 +732,7 @@ def load_frozen_constants(
     *,
     spec_version: str = SPEC_VERSION,
 ) -> dict[str, Any]:
-    """读取冻结机器事实源；v1.2 以不可变 v1.1 为基线合并扩展。"""
+    """读取冻结机器事实源；扩展版本按 ``base_spec`` 逐级只增不改地合并。"""
     source = Path(path) if path is not None else _constants_path(spec_version)
     with source.open("r", encoding="utf-8") as handle:
         decoded = json.load(handle, parse_constant=_reject_json_constant)
@@ -741,11 +745,14 @@ def load_frozen_constants(
         raise YuiProtocolError(f"期望常量 spec {spec_version}，实际为 {actual_spec}")
     if decoded.get("status") != "frozen":
         raise YuiProtocolError("只允许加载已冻结的协议常量")
-    if actual_spec == CURRENT_SPEC_VERSION and "commands_add" in decoded:
-        base = load_frozen_constants(spec_version=SPEC_VERSION)
+    if actual_spec != SPEC_VERSION and "commands_add" in decoded:
+        base_spec = decoded.get("base_spec")
+        if base_spec not in SUPPORTED_SPEC_VERSIONS or base_spec == actual_spec:
+            raise YuiProtocolError(f"v{actual_spec} base_spec 无效: {base_spec!r}")
+        base = load_frozen_constants(spec_version=str(base_spec))
         merged = deepcopy(base)
-        merged["document"] = decoded.get("document", "YUI NPC Protocol Constants v1.2")
-        merged["spec"] = CURRENT_SPEC_VERSION
+        merged["document"] = decoded.get("document", f"YUI NPC Protocol Constants v{actual_spec}")
+        merged["spec"] = actual_spec
         merged["released_at"] = decoded.get("released_at")
         for addition_key, target_key in (
             ("commands_add", "commands"),
@@ -755,15 +762,81 @@ def load_frozen_constants(
         ):
             additions = decoded.get(addition_key, {})
             if not isinstance(additions, Mapping):
-                raise YuiProtocolError(f"v1.2 {addition_key} 必须是对象")
+                raise YuiProtocolError(f"v{actual_spec} {addition_key} 必须是对象")
             target = merged.get(target_key)
             if not isinstance(target, dict):
-                raise YuiProtocolError(f"v1.1 基线缺少 {target_key}")
+                raise YuiProtocolError(f"v{base_spec} 基线缺少 {target_key}")
             for key, value in additions.items():
                 if key in target:
-                    raise YuiProtocolError(f"v1.2 不得覆盖 v1.1 {target_key}.{key}")
+                    raise YuiProtocolError(f"v{actual_spec} 不得覆盖 v{base_spec} {target_key}.{key}")
                 target[key] = deepcopy(value)
-        for key in ("catalog_kinds_add", "behavior_graph", "agent_tools_add", "base_spec", "base_file"):
+
+        catalog_additions = decoded.get("catalog_kinds_add", {})
+        if catalog_additions:
+            if not isinstance(catalog_additions, Mapping):
+                raise YuiProtocolError(f"v{actual_spec} catalog_kinds_add 必须是对象")
+            target_catalogs = merged.setdefault("catalog_kinds_add", {})
+            for key, value in catalog_additions.items():
+                if key in target_catalogs:
+                    raise YuiProtocolError(f"v{actual_spec} 不得覆盖目录类型 {key}")
+                target_catalogs[key] = deepcopy(value)
+
+        if "behavior_graph" in decoded:
+            if "behavior_graph" in merged:
+                raise YuiProtocolError(f"v{actual_spec} 不得覆盖 v{base_spec} behavior_graph")
+            if not isinstance(decoded["behavior_graph"], Mapping):
+                raise YuiProtocolError(f"v{actual_spec} behavior_graph 必须是对象")
+            merged["behavior_graph"] = deepcopy(decoded["behavior_graph"])
+
+        catalog_fields = decoded.get("catalog_fields_add", {})
+        if catalog_fields:
+            if not isinstance(catalog_fields, Mapping):
+                raise YuiProtocolError(f"v{actual_spec} catalog_fields_add 必须是对象")
+            target_catalogs = merged.setdefault("catalog_kinds_add", {})
+            for kind, raw_fields in catalog_fields.items():
+                target_fields = target_catalogs.get(kind)
+                if not isinstance(target_fields, list) or not isinstance(raw_fields, list):
+                    raise YuiProtocolError(f"v{actual_spec} 目录字段扩展 {kind} 无效")
+                for field in raw_fields:
+                    if field in target_fields:
+                        raise YuiProtocolError(f"v{actual_spec} 目录字段重复: {kind}.{field}")
+                    target_fields.append(deepcopy(field))
+
+        behavior_additions = decoded.get("behavior_graph_add", {})
+        if behavior_additions:
+            if not isinstance(behavior_additions, Mapping):
+                raise YuiProtocolError(f"v{actual_spec} behavior_graph_add 必须是对象")
+            target_graph = merged.get("behavior_graph")
+            if not isinstance(target_graph, dict):
+                raise YuiProtocolError(f"v{base_spec} 基线缺少 behavior_graph")
+            for key, raw_values in behavior_additions.items():
+                target_values = target_graph.get(key)
+                if not isinstance(target_values, list) or not isinstance(raw_values, list):
+                    raise YuiProtocolError(f"v{actual_spec} 行为图字段扩展 {key} 无效")
+                for value in raw_values:
+                    if value in target_values:
+                        raise YuiProtocolError(f"v{actual_spec} 行为图值重复: {key}.{value}")
+                    target_values.append(deepcopy(value))
+
+        tools_additions = decoded.get("agent_tools_add", [])
+        if tools_additions:
+            if not isinstance(tools_additions, list):
+                raise YuiProtocolError(f"v{actual_spec} agent_tools_add 必须是数组")
+            target_tools = merged.setdefault("agent_tools_add", [])
+            for tool in tools_additions:
+                if tool in target_tools:
+                    raise YuiProtocolError(f"v{actual_spec} Agent 工具重复: {tool}")
+                target_tools.append(deepcopy(tool))
+
+        for key in (
+            "base_spec",
+            "base_file",
+            "catalog_fields_add",
+            "behavior_graph_add",
+            "state_projection_add",
+            "event_types_add",
+            "region_volume_rules",
+        ):
             if key in decoded:
                 merged[key] = deepcopy(decoded[key])
         return merged

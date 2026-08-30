@@ -12,6 +12,7 @@ import _bootstrap  # noqa: F401
 from yui_npc_controller.runtime.yui_protocol import (
     CAPABILITY_BITS,
     COMMAND_IDS,
+    CURRENT_SPEC_VERSION,
     ERROR_CODES,
     UPPER_BODY_NEUTRAL_Q,
     YuiLogDecodeError,
@@ -48,6 +49,7 @@ class YuiProtocolTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.constants = load_frozen_constants()
         cls.constants_v12 = load_frozen_constants(spec_version="1.2")
+        cls.constants_current = load_frozen_constants(spec_version=CURRENT_SPEC_VERSION)
         cls.vector_document = _load_vectors()
         cls.vectors = {
             vector["id"]: vector
@@ -56,10 +58,10 @@ class YuiProtocolTests(unittest.TestCase):
 
     def test_python_constant_tables_match_frozen_json(self) -> None:
         self.assertEqual(
-            {name: item["id"] for name, item in self.constants_v12["commands"].items()},
+            {name: item["id"] for name, item in self.constants_current["commands"].items()},
             COMMAND_IDS,
         )
-        self.assertEqual(self.constants_v12["capabilities"], CAPABILITY_BITS)
+        self.assertEqual(self.constants_current["capabilities"], CAPABILITY_BITS)
         self.assertEqual(self.constants["error_codes"], ERROR_CODES)
         self.assertEqual(self.constants["reserved_error_codes"], [2])
         self.assertNotIn("GOTO_ANCHOR", self.constants["commands"])

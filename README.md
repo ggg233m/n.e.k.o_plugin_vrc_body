@@ -1,6 +1,6 @@
 # YUI NPC Controller
 
-独立实现 YUI NPC v1.1/v1.2 Python 后端、N.E.K.O 插件和 stdio MCP。v1.1 字节级冻结，v1.2 只在世界明确发布 capability 后增加语义地图和后台行为图。协议事实只来自
+独立实现 YUI NPC v1.1/v1.2/v1.3 Python 后端、N.E.K.O 插件和 stdio MCP。v1.1、v1.2 保持冻结，v1.3 只在世界明确发布 capability 后增加语义定位、相对移动和连续区域探索。协议事实只来自
 `Docs/Protocols/`，不会导入 AnyDance、YOLO、视觉导航或旧 `BackendService`。
 
 ## 控制边界
@@ -31,9 +31,14 @@ npc.world_query  npc.navigate  npc.approach  npc.orbit  npc.explore
 npc.execute_plan  npc.plan_status  npc.plan_cancel
 ```
 
+v1.3 世界再发布 `region_localization` 与 `local_navigation` 后增加
+`npc.move_relative`；同名 `npc.explore` 自动改用 Unity 单 operation 连续探索。
+模型只看到当前区域、楼层、最近 Anchor 的相对距离/方位，不看到 NPC、Region、
+Anchor 或 NavMesh 的绝对坐标。空闲时不会自行探索。
+
 `npc.execute_plan` 只接受冻结的受限 JSON 图，由 Python 后台执行器持有
 `plan_id` 和 operation 证据；不存在 `npc.plan_step`。`npc.observe` 最多投影
-8 项附近语义事实，v1.2 不向模型返回绝对世界坐标。
+8 项附近语义事实，v1.2/v1.3 均不向模型返回绝对世界坐标。
 
 其中 `npc.go_to_xyz`、`npc.wander` 和 operation 类工具按配置/capability 动态隐藏。
 冻结的 `LOOK_AT` 玩家命令没有时长寄存器，因此玩家注视只接受
@@ -84,7 +89,7 @@ Set-Location $NekoProject
 DISCOVER 目录；需要重新声明 ownership 时应先 `yui_disconnect` 再连接。目录只在
 全部页面到齐后重建一次动态工具面，高频 `npc.state`/心跳 ACK 不会重复注册工具。
 
-`npc.navigate`、`npc.orbit`、`npc.explore` 和 `npc.execute_plan` 都只等待命令 ACK，
+`npc.navigate`、`npc.orbit`、`npc.move_relative`、`npc.explore` 和 `npc.execute_plan` 都只等待命令 ACK，
 随后立即返回 `accepted + plan_id`；长行为在后台继续执行。宿主不得把工具调用本身
 阻塞到动作结束，应通过 `npc.plan_status` 读取终态证据。
 
@@ -110,8 +115,8 @@ Copy-Item -LiteralPath (Join-Path $YuiProject "unity\Assets\NEKO.meta") `
 模型、材质、Animator 资产、NavMesh 和场景引用仍由目标世界维护，不能用测试场
 场景覆盖。导入后必须让 Unity 完成 UdonSharp 编译，再按协议验收流程测试。
 火柴盒验收场可在 Unity 菜单选择
-`NEKO > YUI NPC > 3 Configure Matchbox v1.2 + Validate`；该操作生成上下层、
-楼梯、中央障碍和语义目录，并静态验证完整 NavMesh 路径与绕行圆周。
+`NEKO > YUI NPC > 3 Configure Matchbox v1.3 + Validate`；该操作生成上下层、
+楼梯、中央障碍、三个 Region 定位体积和语义目录，并静态验证完整 NavMesh 路径与绕行圆周。
 
 ## 连续路线（仅宿主/测试）
 
@@ -160,6 +165,6 @@ Set-Location (Split-Path $YuiProject -Parent)
 & $Python311 -m pytest -q $YuiProject
 ```
 
-测试同时校验 v1.1 冻结常量和 82 条向量、v1.2 扩展向量、编码器、日志投影、安全门、行为图、动态工具面、
+测试同时校验 v1.1 冻结常量和 82 条向量、v1.2/v1.3 扩展向量、编码器、日志投影、安全门、行为图、动态工具面、
 MCP 工具隔离和本地单驱动锁。Unity/VRChat 行为仍需使用相同向量做 Editor、
 ClientSim 和真实双客户端验收。

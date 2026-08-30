@@ -154,6 +154,24 @@ class ToolSurfaceTests(unittest.TestCase):
             self.assertEqual(properties & {"x", "y", "z", "yaw", "pos"}, set(), name)
         self.assertNotIn("npc.plan_step", definitions)
 
+    def test_v13_adds_relative_move_only_when_local_navigation_is_published(self) -> None:
+        self._ready()
+        self.session.spec_version = "1.3"
+        self.session.capabilities += ("world_map", "semantic_navigation", "region_localization")
+        self.session.catalogs["region"][0] = {
+            "id": 0, "semantic_key": "ground_floor", "entry_anchor_id": 0, "explorable": True,
+        }
+        self.assertNotIn("npc.move_relative", self._names())
+        self.session.capabilities += ("local_navigation",)
+        definitions = {item.name: item for item in self.surface.definitions()}
+        self.assertIn("npc.move_relative", definitions)
+        properties = set(definitions["npc.move_relative"].input_schema["properties"])
+        self.assertEqual(properties & {"x", "y", "z", "yaw", "pos"}, set())
+        self.assertEqual(
+            {"bearing_deg", "distance_m", "speed_mps", "face_travel", "allow_shorter", "replace_active"},
+            properties,
+        )
+
     def test_operation_tools_and_free_coordinates_are_strictly_hidden(self) -> None:
         self._ready()
         self.surface.free_coordinate_navigation = False

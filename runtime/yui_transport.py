@@ -216,6 +216,10 @@ class YuiReliableTransport:
             return "goto"
         if frame.command == "ORBIT_ENTITY":
             return "orbit"
+        if frame.command == "MOVE_RELATIVE":
+            return "move_relative"
+        if frame.command == "EXPLORE_REGION":
+            return "explore"
         if frame.command == "TURN_TO":
             return "turn"
         if frame.command in {"LOOK_AT", "LOOK_AT_XYZ"}:

@@ -461,6 +461,110 @@ class YuiSemanticAdapter:
             face_target=bool(face_target),
         )
 
+    def move_relative_wire(
+        self,
+        bearing_deg: float,
+        distance_m: float,
+        *,
+        speed_mps: float | None = None,
+        face_travel: bool = True,
+        allow_shorter: bool = True,
+    ) -> dict[str, Any]:
+        """发送单条相对移动命令；路径缩短和严格方位由 Unity 完成。"""
+        blocked = self._require_tool(
+            "goto", "navmesh", "world_map", "semantic_navigation", "local_navigation", operation=True,
+        )
+        if blocked is not None:
+            return blocked
+        if isinstance(distance_m, bool) or isinstance(bearing_deg, bool):
+            return _local_result("invalid_param", "bearing_deg/distance_m 必须是有限数值")
+        if not isinstance(face_travel, bool) or not isinstance(allow_shorter, bool):
+            return _local_result("invalid_param", "face_travel/allow_shorter 必须是布尔值")
+        try:
+            distance = float(distance_m)
+            bearing = float(bearing_deg)
+        except (TypeError, ValueError, OverflowError):
+            return _local_result("invalid_param", "bearing_deg/distance_m 必须是有限数值")
+        if not math.isfinite(distance) or not 0.25 <= distance <= 10.0:
+            return _local_result("invalid_param", "distance_m 必须位于 0.25..10.0")
+        if not math.isfinite(bearing):
+            return _local_result("invalid_param", "bearing_deg 必须是有限数值")
+        maximum_speed = self.session.max_speed_mps
+        if maximum_speed is None:
+            return _local_result("not_ready", "尚未收到 max_speed")
+        try:
+            speed_q7 = encode_speed_q7(maximum_speed if speed_mps is None else speed_mps, maximum_speed)
+            bearing_q14 = encode_yaw_q14(bearing)
+        except (TypeError, ValueError) as exc:
+            return _local_result("invalid_param", str(exc))
+        flags = (1 if face_travel else 0) | (2 if allow_shorter else 0)
+        distance_mm = int(math.floor(distance * 1000.0 + 0.5))
+        with self._semantic_lock:
+            outcome = self._send_command(
+                "MOVE_RELATIVE",
+                (distance_mm, 0, bearing_q14, 0, speed_q7, flags),
+            )
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(
+            outcome,
+            bearing_deg=bearing % 360.0,
+            distance_m=distance,
+            face_travel=face_travel,
+            allow_shorter=allow_shorter,
+        )
+
+    def explore_region_wire(
+        self,
+        region_key: str,
+        *,
+        duration_ms: int,
+        strategy: str = "unvisited",
+        speed_mps: float | None = None,
+    ) -> dict[str, Any]:
+        """v1.3 连续区域探索；整个期限只创建一个 Unity operation。"""
+        blocked = self._require_tool(
+            "goto", "navmesh", "anchors", "world_map", "semantic_navigation", "local_navigation", operation=True,
+        )
+        if blocked is not None:
+            return blocked
+        region = next(
+            (item for item in self.session.catalogs["region"].values() if item.get("semantic_key") == region_key),
+            None,
+        )
+        if region is None:
+            return _local_result("target_missing", f"目录中没有区域 {region_key!r}")
+        if not bool(region.get("explorable")):
+            return _local_result("target_missing", f"区域 {region_key!r} 未发布 explorable=true")
+        region_id = region.get("id")
+        if isinstance(region_id, bool) or not isinstance(region_id, int) or not 0 <= region_id <= 126:
+            return _local_result("catalog_invalid", "region id 必须是 0..126")
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or not 1000 <= duration_ms <= 600_000:
+            return _local_result("invalid_param", "duration_ms 必须是 1000..600000 的整数")
+        if strategy not in {"unvisited", "patrol"}:
+            return _local_result("invalid_param", "strategy 必须是 unvisited|patrol")
+        maximum_speed = self.session.max_speed_mps
+        if maximum_speed is None:
+            return _local_result("not_ready", "尚未收到 max_speed")
+        try:
+            speed_q7 = encode_speed_q7(maximum_speed if speed_mps is None else speed_mps, maximum_speed)
+        except (TypeError, ValueError) as exc:
+            return _local_result("invalid_param", str(exc))
+        duration_deciseconds = (duration_ms + 99) // 100
+        with self._semantic_lock:
+            outcome = self._send_command(
+                "EXPLORE_REGION",
+                (duration_deciseconds, 0, 0, region_id, speed_q7, 0 if strategy == "unvisited" else 1),
+            )
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(
+            outcome,
+            region_key=region_key,
+            duration_ms=duration_deciseconds * 100,
+            strategy=strategy,
+        )
+
     def navigate(self, target_key: str, *, speed_mps: float | None = None, replace_active: bool = False) -> dict[str, Any]:
         blocked = self._require_tool("goto", "navmesh", "anchors", "world_map", "semantic_navigation", operation=True)
         if blocked is not None:
@@ -503,6 +607,34 @@ class YuiSemanticAdapter:
             arguments["speed_mps"] = speed_mps
         return self.plan_manager.submit(single_node_graph("orbit", **arguments), replace_active=replace_active)
 
+    def move_relative(
+        self,
+        bearing_deg: float,
+        distance_m: float,
+        *,
+        speed_mps: float | None = None,
+        face_travel: bool = True,
+        allow_shorter: bool = True,
+        replace_active: bool = False,
+    ) -> dict[str, Any]:
+        blocked = self._require_tool(
+            "goto", "navmesh", "world_map", "semantic_navigation", "local_navigation", operation=True,
+        )
+        if blocked is not None:
+            return blocked
+        arguments: dict[str, Any] = {
+            "bearing_deg": bearing_deg,
+            "distance_m": distance_m,
+            "face_travel": face_travel,
+            "allow_shorter": allow_shorter,
+        }
+        if speed_mps is not None:
+            arguments["speed_mps"] = speed_mps
+        return self.plan_manager.submit(
+            single_node_graph("move_relative", **arguments),
+            replace_active=replace_active,
+        )
+
     def approach(
         self,
         player_slot: int,
@@ -542,8 +674,16 @@ class YuiSemanticAdapter:
             return _local_result("invalid_param", "duration_s 必须是整数")
         if not 1 <= duration_s <= 600:
             return _local_result("invalid_param", "duration_s 必须是 1..600 的整数")
-        if not any(item.get("semantic_key") == region_key for item in self.session.catalogs["region"].values()):
+        region = next(
+            (item for item in self.session.catalogs["region"].values() if item.get("semantic_key") == region_key),
+            None,
+        )
+        if region is None:
             return _local_result("target_missing", f"目录中没有区域 {region_key!r}")
+        if self.session.local_navigation and not bool(region.get("explorable")):
+            return _local_result("target_missing", f"区域 {region_key!r} 未发布 explorable=true")
+        if strategy not in {"unvisited", "patrol"}:
+            return _local_result("invalid_param", "strategy 必须是 unvisited|patrol")
         arguments: dict[str, Any] = {
             "region_key": region_key,
             "duration_ms": duration_s * 1000,

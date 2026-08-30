@@ -31,6 +31,14 @@ class FakeAdapter:
         self.calls.append(("orbit", target_key))
         return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
 
+    def move_relative_wire(self, bearing_deg, distance_m, **kwargs):
+        self.calls.append(("move_relative", (bearing_deg, distance_m, kwargs)))
+        return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
+
+    def explore_region_wire(self, region_key, **kwargs):
+        self.calls.append(("explore_region", (region_key, kwargs)))
+        return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
+
     def follow_wire(self, player_slot, *, speed_mps=None):
         self.calls.append(("follow", player_slot))
         return {"status": "accepted", "op_id": "follow-op", "error": None, "detail": None}
@@ -191,6 +199,34 @@ class BehaviorPlanTests(unittest.TestCase):
                 "id": "root", "type": "condition",
                 "predicate": {"type": "ask_llm", "prompt": "玩家看起来开心吗"},
             }))
+
+    def test_v13_move_relative_and_explore_are_single_wire_operations(self) -> None:
+        self.session.spec_version = "1.3"
+        self.session.capabilities += ("region_localization", "local_navigation")
+        self.session.catalogs["region"][0]["explorable"] = True
+        moved = self.manager.submit(single_node_graph(
+            "move_relative",
+            bearing_deg=270.0,
+            distance_m=2.5,
+            face_travel=False,
+            allow_shorter=True,
+        ))
+        self.assertEqual(self._wait(moved["plan_id"])["status"], "succeeded")
+        explored = self.manager.submit(single_node_graph(
+            "explore", region_key="ground", duration_ms=20_000, strategy="patrol",
+        ))
+        self.assertEqual(self._wait(explored["plan_id"])["status"], "succeeded")
+        self.assertEqual([name for name, _value in self.adapter.calls], ["move_relative", "explore_region"])
+
+    def test_v13_move_relative_rejects_unknown_fields_and_bad_distance(self) -> None:
+        self.session.spec_version = "1.3"
+        self.session.capabilities += ("local_navigation",)
+        for graph in (
+            single_node_graph("move_relative", bearing_deg=0.0, distance_m=0.2),
+            single_node_graph("move_relative", bearing_deg=0.0, distance_m=1.0, x=4.0),
+        ):
+            with self.subTest(graph=graph), self.assertRaises(BehaviorGraphError):
+                BehaviorGraphCompiler(self.session).compile(graph)
 
 
 if __name__ == "__main__":

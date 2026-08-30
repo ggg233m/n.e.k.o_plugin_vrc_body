@@ -16,6 +16,14 @@ from typing import Any, Callable, Iterable, Mapping
 from .yui_protocol import COMMAND_NAMES, normalize_bearing, parse_neko_log_line
 
 
+def _spec_at_least(spec: str | None, minimum_minor: int) -> bool:
+    """只比较冻结的 1.x 小版本；未知格式采取失败关闭。"""
+    if not isinstance(spec, str):
+        return False
+    parts = spec.split(".")
+    return len(parts) == 2 and parts[0] == "1" and parts[1].isdigit() and int(parts[1]) >= minimum_minor
+
+
 @dataclass(frozen=True)
 class YuiAck:
     """一条经过公共头解析的命令 ACK。"""
@@ -154,11 +162,19 @@ class YuiSessionState:
 
     @property
     def world_map_ready(self) -> bool:
-        return self.spec_version == "1.2" and "world_map" in self.capabilities
+        return _spec_at_least(self.spec_version, 2) and "world_map" in self.capabilities
 
     @property
     def semantic_navigation(self) -> bool:
-        return self.spec_version == "1.2" and "semantic_navigation" in self.capabilities
+        return _spec_at_least(self.spec_version, 2) and "semantic_navigation" in self.capabilities
+
+    @property
+    def region_localization(self) -> bool:
+        return _spec_at_least(self.spec_version, 3) and "region_localization" in self.capabilities
+
+    @property
+    def local_navigation(self) -> bool:
+        return _spec_at_least(self.spec_version, 3) and "local_navigation" in self.capabilities
 
     @property
     def discovery_ready(self) -> bool:
@@ -413,6 +429,13 @@ class YuiSessionState:
                 "status": "cancelled",
                 "elapsed_ms": event.get("elapsed_ms"),
                 "reason": event.get("reason"),
+            })
+        elif event_type == "npc.operation_failed":
+            record.update({
+                "status": "failed",
+                "elapsed_ms": event.get("elapsed_ms"),
+                "error": event.get("err"),
+                "detail": event.get("detail"),
             })
         self.operations[op_id] = record
 
@@ -700,6 +723,7 @@ class YuiSessionState:
             "region_key",
             "traversal",
             "bidirectional",
+            "explorable",
             "orbitable",
             "orbit_min_radius",
             "orbit_max_radius",
@@ -871,7 +895,7 @@ class YuiSessionState:
 
     @classmethod
     def _without_absolute_coordinates(cls, value: Any) -> Any:
-        """v1.2 模型投影移除绝对世界坐标，保留 d/brg/yaw 等相对事实。"""
+        """v1.2+ 模型投影移除绝对世界坐标，保留 d/brg/yaw 等相对事实。"""
         absolute_keys = {"pos", "target", "target_pos", "center", "origin", "hit_pos"}
         if isinstance(value, Mapping):
             return {
@@ -883,6 +907,38 @@ class YuiSessionState:
             return [cls._without_absolute_coordinates(item) for item in value]
         return value
 
+    def _location_projection_locked(self) -> dict[str, Any]:
+        """只信任 Unity 发布的 Region 命中事实，不从 Anchor 或坐标反推楼层。"""
+        unavailable = {
+            "localized": False,
+            "region_key": None,
+            "floor_label": None,
+            "nearest_anchor": None,
+        }
+        if not self.region_localization:
+            return unavailable
+        raw = self.npc_state.get("location")
+        if not isinstance(raw, Mapping):
+            return unavailable
+        localized = raw.get("localized") is True
+        projected: dict[str, Any] = {
+            "localized": localized,
+            "region_key": raw.get("region_key") if localized and isinstance(raw.get("region_key"), str) else None,
+            "floor_label": raw.get("floor_label") if localized and isinstance(raw.get("floor_label"), str) else None,
+            "nearest_anchor": None,
+        }
+        nearest = raw.get("nearest_anchor")
+        if isinstance(nearest, Mapping) and isinstance(nearest.get("semantic_key"), str):
+            item: dict[str, Any] = {"semantic_key": nearest["semantic_key"]}
+            distance = nearest.get("d")
+            bearing = nearest.get("brg")
+            if isinstance(distance, (int, float)) and math.isfinite(float(distance)) and float(distance) >= 0.0:
+                item["d"] = round(float(distance), 1)
+            if isinstance(bearing, (int, float)) and math.isfinite(float(bearing)):
+                item["brg"] = round(normalize_bearing(float(bearing)))
+            projected["nearest_anchor"] = item
+        return projected
+
     def observe(self, *, include_player_names: bool = False) -> dict[str, Any]:
         """生成 §17.3 的最小观察摘要，默认不暴露真实显示名。"""
         with self._condition:
@@ -891,7 +947,7 @@ class YuiSessionState:
                 active_ops = []
             npc = dict(self.npc_state)
             npc["active_ops"] = list(active_ops)
-            hide_absolute_coordinates = self.spec_version == "1.2"
+            hide_absolute_coordinates = _spec_at_least(self.spec_version, 2)
             if hide_absolute_coordinates:
                 npc = self._without_absolute_coordinates(npc)
                 active_ops_view = self._without_absolute_coordinates(list(active_ops))
@@ -908,7 +964,7 @@ class YuiSessionState:
                 if include_player_names and "name" in source:
                     item["name"] = source["name"]
                 players.append(item)
-            return {
+            observation = {
                 "spec": self.spec_version,
                 "session": self.session,
                 "world_id": self.world_id,
@@ -946,6 +1002,9 @@ class YuiSessionState:
                 "log_complete": self.log_complete,
                 "log_gaps": list(self.log_gaps),
             }
+            if _spec_at_least(self.spec_version, 3):
+                observation["location"] = self._location_projection_locked()
+            return observation
 
 
 __all__ = ["YuiAck", "YuiSessionState"]

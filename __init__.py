@@ -278,7 +278,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         high_salience = (
             event_type == "player.touch"
             or event_type.startswith("social.")
-            or event_type in {"sys.err", "npc.operation_cancelled"}
+            or event_type in {"sys.err", "npc.operation_cancelled", "npc.operation_failed"}
             or (event_type == "npc.ack" and event.get("ok") is False)
         )
         if not high_salience:
