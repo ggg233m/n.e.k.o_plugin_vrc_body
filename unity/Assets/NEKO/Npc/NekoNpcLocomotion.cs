@@ -1,5 +1,5 @@
 /*
- * NekoNpcLocomotion —— YUI NPC v1.1 NavMesh、注视、动作与表情执行器（UdonSharp）
+ * NekoNpcLocomotion —— YUI NPC v1.1/v1.2 NavMesh、注视、动作与表情执行器（UdonSharp）
  *
  * 只有当前 driver 且持有 NPC 根 ownership 的客户端执行 NavMesh/Animator；其他客户端
  * 只由 NekoNpcSync 投影同步状态。本脚本不接收 MIDI，所有协议校验和生命周期均由
@@ -30,6 +30,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public float followRefreshSec = 0.2f;
     [Tooltip("连续巡逻在到达该距离时预切下一航点，必须大于 stoppingDistance 才能避免逐点停车")]
     public float wanderSwitchDistance = 0.9f;
+    [Tooltip("v1.2 绕行每圈路点数；冻结验收配置使用 24")]
+    public int orbitPointsPerLap = 24;
 
     [Header("Inspector 明确发布的巡逻航点")]
     [Tooltip("发布 wander 时至少两个；严格按数组 0..n-1 循环")]
@@ -39,7 +41,8 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public LayerMask environmentMask = (1 << 0) | (1 << 11);
     public float whiskerLength = 0.6f;
     public float whiskerAngleDeg = 25f;
-    public float whiskerHeight = 0.9f;
+    [Tooltip("射线位于胸口高度，避免把可行走楼梯的低矮踏步误判为墙体")]
+    public float whiskerHeight = 1.4f;
     public float stuckSeconds = 1.5f;
     public float stuckMinMove = 0.05f;
 
@@ -54,6 +57,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public const int MODE_GOTO = 2;
     public const int MODE_WANDER = 3;
     public const int MODE_ESTOP = 4;
+    public const int MODE_ORBIT = 5;
 
     private int _mode = MODE_IDLE;
     private float _cruise;
@@ -68,6 +72,22 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private float _nextFollowRefresh;
     private int _wanderIndex;
     private Vector3 _validatedTarget;
+    private float _arrivalDistance = 0.3f;
+
+    // v1.2 ORBIT_ENTITY 最多三圈；额外一个点用于闭合最后一圈。
+    private Vector3[] _orbitPoints = new Vector3[73];
+    private int _orbitPointCount;
+    private int _orbitIndex;
+    private Vector3 _orbitCenter;
+    private bool _orbitFaceTarget;
+    private float _orbitSwitchDistance;
+    private float _orbitMinAdvanceDistance;
+    private float _orbitStoppingDistance;
+    private Vector3 _orbitWaypointStart;
+    private Vector3 _orbitLastPosition;
+    private float _orbitTravelMeters;
+    private float _orbitRequiredTravelMeters;
+    private bool _orbitRecoveryUsed;
 
     private int _lookSlot = -1;
     private Vector3 _lookPoint;
@@ -149,6 +169,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public string Goto(float x, float z, float yawOrNeg, float speed, int seq)
     {
         if (_mode == MODE_ESTOP) return "estop_latched";
+        _arrivalDistance = stopDistance;
         string err = ValidatePathTarget(new Vector3(x, npcRoot.position.y, z));
         if (err != null) return err;
         // 连续路线会在前一 GOTO 抵达前下发下一点。这里直接更新 destination，
@@ -157,6 +178,75 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
             return RetargetActiveAgent(_validatedTarget, yawOrNeg, speed, MODE_GOTO) ? null : "no_path";
         PrepareMovementTarget(_validatedTarget, yawOrNeg, speed, MODE_GOTO);
         return StartAgentForCurrentTarget(MODE_GOTO) ? null : "no_path";
+    }
+
+    // v1.2 Anchor 使用完整 XYZ 和目录发布的到达半径，不能沿用当前 NPC 的 Y。
+    public string GotoPosition(Vector3 position, float yawOrNeg, float speed, float arrivalRadius)
+    {
+        if (_mode == MODE_ESTOP) return "estop_latched";
+        string err = ValidatePathTarget(position);
+        if (err != null) return err;
+        _arrivalDistance = Mathf.Clamp(arrivalRadius, 0.05f, 2f);
+        if (CanRetargetActiveGoto())
+            return RetargetActiveAgent(_validatedTarget, yawOrNeg, speed, MODE_GOTO) ? null : "no_path";
+        PrepareMovementTarget(_validatedTarget, yawOrNeg, speed, MODE_GOTO);
+        return StartAgentForCurrentTarget(MODE_GOTO) ? null : "no_path";
+    }
+
+    // 整段绕行由 Unity 在同一个 operation 内执行，Python 不展开坐标路点。
+    public string StartOrbit(Vector3 center, float radius, int laps, bool counterClockwise, bool faceTarget, float speed)
+    {
+        if (_mode == MODE_ESTOP) return "estop_latched";
+        if (navAgent == null) return "unsupported_capability";
+        int pointsPerLap = Mathf.Clamp(orbitPointsPerLap, 16, 24);
+        int safeLaps = Mathf.Clamp(laps, 1, 3);
+        int count = safeLaps * pointsPerLap + 1;
+        if (_orbitPoints == null || _orbitPoints.Length < 73) _orbitPoints = new Vector3[73];
+
+        Vector3 fromCenter = npcRoot.position - center;
+        fromCenter.y = 0f;
+        float startAngle = fromCenter.sqrMagnitude > 0.0001f ? Mathf.Atan2(fromCenter.z, fromCenter.x) : 0f;
+        float direction = counterClockwise ? 1f : -1f;
+        Vector3 previous = npcRoot.position;
+        for (int i = 0; i < count; i++)
+        {
+            float angle = startAngle + direction * (Mathf.PI * 2f * i / pointsPerLap);
+            Vector3 requested = new Vector3(center.x + Mathf.Cos(angle) * radius, center.y, center.z + Mathf.Sin(angle) * radius);
+            NavMeshHit hit;
+            if (!NavMesh.SamplePosition(requested, out hit, 0.75f, NavMesh.AllAreas)) return "target_not_on_navmesh";
+            NavMeshPath segment = new NavMeshPath();
+            NavMeshHit previousHit;
+            if (!NavMesh.SamplePosition(previous, out previousHit, 0.75f, NavMesh.AllAreas)
+                || !NavMesh.CalculatePath(previousHit.position, hit.position, NavMesh.AllAreas, segment)
+                || segment.status != NavMeshPathStatus.PathComplete) return "no_path";
+            if (i > 0 && FlatDistance(_orbitPoints[i - 1], hit.position) < Mathf.Max(0.04f, radius * 0.03f))
+                return "no_path";
+            _orbitPoints[i] = hit.position;
+            previous = hit.position;
+        }
+
+        _orbitCenter = center;
+        _orbitFaceTarget = faceTarget;
+        _orbitPointCount = count;
+        _orbitSwitchDistance = Mathf.Clamp(radius * 0.12f, 0.08f, 0.45f);
+        _orbitMinAdvanceDistance = Mathf.Clamp(radius * 0.10f, 0.08f, 0.35f);
+        // 圆周点之间只有约 15°。若沿用普通导航的 0.3m stoppingDistance，
+        // Agent 可能停在切点阈值外；绕行中间点必须使用更小的停止距离。
+        _orbitStoppingDistance = Mathf.Min(0.05f, stopDistance);
+        // NPC 可能已经位于同半径上。首点太近时从下一点起步，避免首帧
+        // 被判为“到达”后进入无位移恢复分支；最后仍会回到闭合点。
+        _orbitIndex = FlatDistance(npcRoot.position, _orbitPoints[0]) <= stopDistance ? 1 : 0;
+        _orbitWaypointStart = npcRoot.position;
+        _orbitLastPosition = npcRoot.position;
+        _orbitTravelMeters = 0f;
+        _orbitRequiredTravelMeters = Mathf.PI * 2f * radius * safeLaps * 0.65f;
+        _orbitRecoveryUsed = false;
+        _arrivalDistance = stopDistance;
+        PrepareMovementTarget(_orbitPoints[_orbitIndex], -1f, speed, MODE_ORBIT);
+        if (!StartAgentForCurrentTarget(MODE_ORBIT)) { ClearOrbit(); return "no_path"; }
+        navAgent.autoBraking = false;
+        navAgent.updateRotation = !faceTarget;
+        return null;
     }
 
     private bool CanRetargetActiveGoto()
@@ -219,6 +309,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void PrepareMovementTarget(Vector3 sampled, float yawOrNeg, float speed, int mode)
     {
         DisableAgent();
+        if (mode != MODE_ORBIT) ClearOrbit();
         _target = sampled;
         _targetYaw = yawOrNeg < 0f ? -1f : Mathf.Repeat(yawOrNeg, 360f);
         _hasTarget = true;
@@ -226,6 +317,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _turnYaw = -1f;
         _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
         _mode = mode;
+        if (mode != MODE_GOTO) _arrivalDistance = stopDistance;
         ResetStuck();
         _localObstacleFrames = 0;
     }
@@ -233,6 +325,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private bool RetargetActiveAgent(Vector3 sampled, float yawOrNeg, float speed, int mode)
     {
         if (navAgent == null || !navAgent.enabled || !navAgent.isOnNavMesh) return false;
+        if (mode != MODE_ORBIT) ClearOrbit();
         _target = sampled;
         _targetYaw = yawOrNeg < 0f ? -1f : Mathf.Repeat(yawOrNeg, 360f);
         _hasTarget = true;
@@ -241,9 +334,12 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
         _mode = mode;
         navAgent.speed = _cruise;
-        navAgent.stoppingDistance = mode == MODE_FOLLOW ? followDistance : stopDistance;
+        navAgent.stoppingDistance = mode == MODE_FOLLOW
+            ? followDistance
+            : (mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
         // GOTO 先保持巡航；只有进入最终制动距离且没有收到下一点时才启用制动。
         navAgent.autoBraking = mode == MODE_FOLLOW;
+        navAgent.updateRotation = mode != MODE_ORBIT || !_orbitFaceTarget;
         navAgent.isStopped = false;
         navAgent.destination = _target;
         ResetStuck();
@@ -263,8 +359,11 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
                 || !navAgent.Warp(startHit.position)) { DisableAgent(); return false; }
         }
         navAgent.speed = _cruise;
-        navAgent.stoppingDistance = mode == MODE_FOLLOW ? followDistance : stopDistance;
+        navAgent.stoppingDistance = mode == MODE_FOLLOW
+            ? followDistance
+            : (mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
         navAgent.autoBraking = mode == MODE_FOLLOW;
+        navAgent.updateRotation = mode != MODE_ORBIT || !_orbitFaceTarget;
         navAgent.isStopped = false;
         navAgent.destination = _target;
         _mode = mode;
@@ -353,6 +452,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public void Estop()
     {
         DisableAgent();
+        ClearOrbit();
         _mode = MODE_ESTOP;
         _hasTarget = false;
         _finishingGotoYaw = false;
@@ -479,7 +579,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void Step(float dt, float now)
     {
         if (_mode == MODE_FOLLOW) StepFollow(now);
-        if ((_mode == MODE_GOTO || _mode == MODE_FOLLOW || _mode == MODE_WANDER) && _hasTarget)
+        if ((_mode == MODE_GOTO || _mode == MODE_FOLLOW || _mode == MODE_WANDER || _mode == MODE_ORBIT) && _hasTarget)
             StepNavMovement(dt);
 
         StepRotation(dt);
@@ -512,9 +612,17 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     {
         if (navAgent == null || !navAgent.enabled || !navAgent.isOnNavMesh) { BlockMovement("no_path", "stuck"); return; }
         navAgent.speed = _cruise;
+        if (_mode == MODE_ORBIT)
+        {
+            _orbitTravelMeters += FlatDistance(npcRoot.position, _orbitLastPosition);
+            _orbitLastPosition = npcRoot.position;
+        }
         float flatDistance = FlatDistance(npcRoot.position, _target);
+        float targetDistance = _mode == MODE_GOTO ? Vector3.Distance(npcRoot.position, _target) : flatDistance;
         _speed = navAgent.velocity.magnitude;
-        float arrival = _mode == MODE_FOLLOW ? followDistance : stopDistance;
+        float arrival = _mode == MODE_FOLLOW
+            ? followDistance
+            : (_mode == MODE_ORBIT ? _orbitStoppingDistance : _arrivalDistance);
         if (_mode == MODE_GOTO && !navAgent.pathPending && !navAgent.autoBraking
             && flatDistance <= GotoBrakeDistance())
             navAgent.autoBraking = true;
@@ -524,21 +632,69 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
             AdvanceWanderWaypoint(flatDistance);
             return;
         }
-        if (!navAgent.pathPending && flatDistance <= arrival && _speed < 0.05f)
+        if (_mode == MODE_ORBIT && !navAgent.pathPending)
+        {
+            bool finalPoint = _orbitIndex >= _orbitPointCount - 1;
+            float waypointTravel = FlatDistance(npcRoot.position, _orbitWaypointStart);
+            if (!finalPoint && flatDistance <= _orbitSwitchDistance && waypointTravel >= _orbitMinAdvanceDistance)
+            {
+                AdvanceOrbitWaypoint();
+                return;
+            }
+            if (finalPoint && !navAgent.autoBraking && flatDistance <= GotoBrakeDistance()) navAgent.autoBraking = true;
+        }
+        if (!navAgent.pathPending && targetDistance <= arrival && _speed < 0.05f)
         {
             if (_mode == MODE_FOLLOW) { navAgent.isStopped = true; return; }
+            if (_mode == MODE_ORBIT && _orbitTravelMeters < _orbitRequiredTravelMeters)
+            {
+                // 防止 NavMesh 初次采样把多组圆周点压到同一小片区域后产生假成功。
+                // 允许从第二个圆周点恢复一次；仍无足够实际路程则按卡住失败。
+                if (!_orbitRecoveryUsed && _orbitPointCount > 1)
+                {
+                    _orbitRecoveryUsed = true;
+                    _orbitIndex = 1;
+                    _target = _orbitPoints[_orbitIndex];
+                    _orbitWaypointStart = npcRoot.position;
+                    navAgent.autoBraking = false;
+                    navAgent.isStopped = false;
+                    navAgent.destination = _target;
+                    ResetStuck();
+                    return;
+                }
+                BlockMovement("stuck", "stuck");
+                return;
+            }
             navAgent.isStopped = true;
             DisableAgent();
             _hasTarget = false;
-            if (_targetYaw >= 0f) { _finishingGotoYaw = true; _turnYaw = _targetYaw; }
+            if (_mode == MODE_ORBIT) CompleteOrbit();
+            else if (_targetYaw >= 0f) { _finishingGotoYaw = true; _turnYaw = _targetYaw; }
             else CompleteGoto();
         }
         else
         {
             if (_mode == MODE_FOLLOW && navAgent.isStopped) navAgent.isStopped = false;
-            DetectLocalObstacle();
+            // GOTO/ORBIT 都在启动前完成 NavMesh 完整路径校验。楼梯踏步以及
+            // 沿实体切向运动会让扇形射线产生假阳性，因此这两类确定性路径
+            // 交给 NavMesh 避障，并继续保留实际位移卡住检测。射线仅用于
+            // follow/wander 这类运行时目标不断变化的模式。
+            if (_mode == MODE_FOLLOW || _mode == MODE_WANDER) DetectLocalObstacle();
             if (_hasTarget) DetectStuck(dt);
         }
+    }
+
+    private void AdvanceOrbitWaypoint()
+    {
+        if (_orbitIndex >= _orbitPointCount - 1) return;
+        _orbitIndex++;
+        _target = _orbitPoints[_orbitIndex];
+        _orbitWaypointStart = npcRoot.position;
+        navAgent.destination = _target;
+        navAgent.autoBraking = false;
+        navAgent.isStopped = false;
+        ResetStuck();
+        _localObstacleFrames = 0;
     }
 
     private void AdvanceWanderWaypoint(float error)
@@ -555,6 +711,11 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         float faceYaw = -1f;
         bool completingTurn = false;
         if (_turnYaw >= 0f) { faceYaw = _turnYaw; completingTurn = true; }
+        else if (_mode == MODE_ORBIT && _orbitFaceTarget)
+        {
+            Vector3 d = _orbitCenter - npcRoot.position; d.y = 0f;
+            if (d.sqrMagnitude > 0.01f) faceYaw = YawOf(d.normalized);
+        }
         else if (_mode == MODE_IDLE && _lookSlot >= 0 && perception != null)
         {
             VRCPlayerApi player = perception.PlayerOfSlot(_lookSlot);
@@ -616,7 +777,17 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _mode = MODE_IDLE;
         _speed = 0f;
         ResetStuck();
-        if (router != null) router.OnGotoArrived(completedTarget, FlatDistance(npcRoot.position, completedTarget));
+        if (router != null) router.OnGotoArrived(completedTarget, Vector3.Distance(npcRoot.position, completedTarget));
+    }
+
+    private void CompleteOrbit()
+    {
+        int completedPoints = _orbitPointCount;
+        _mode = MODE_IDLE;
+        _speed = 0f;
+        ResetStuck();
+        ClearOrbit();
+        if (router != null) router.OnOrbitCompleted(completedPoints);
     }
 
     private void BlockMovement(string blockedReason, string cancelReason)
@@ -627,6 +798,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _finishingGotoYaw = false;
         _turnYaw = -1f;
         _followSlot = -1;
+        ClearOrbit();
         _mode = MODE_IDLE;
         _speed = 0f;
         _localObstacleFrames = 0;
@@ -642,6 +814,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _finishingGotoYaw = false;
         _turnYaw = -1f;
         _followSlot = -1;
+        ClearOrbit();
         _speed = 0f;
         _localObstacleFrames = 0;
         ResetStuck();
@@ -650,6 +823,19 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void DisableAgent()
     {
         if (navAgent != null && navAgent.enabled) { navAgent.isStopped = true; navAgent.enabled = false; }
+    }
+
+    private void ClearOrbit()
+    {
+        _orbitPointCount = 0;
+        _orbitIndex = 0;
+        _orbitFaceTarget = false;
+        _orbitMinAdvanceDistance = 0f;
+        _orbitStoppingDistance = 0f;
+        _orbitTravelMeters = 0f;
+        _orbitRequiredTravelMeters = 0f;
+        _orbitRecoveryUsed = false;
+        if (navAgent != null) navAgent.updateRotation = true;
     }
 
     private void ClearLookInternal()
@@ -697,6 +883,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         if (_mode == MODE_FOLLOW) return "follow";
         if (_mode == MODE_GOTO || _finishingGotoYaw) return "goto";
         if (_mode == MODE_WANDER) return "wander";
+        if (_mode == MODE_ORBIT) return "orbit";
         return "idle";
     }
 

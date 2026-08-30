@@ -1,7 +1,8 @@
-// NekoYuiFullNpcBuilder —— 火柴盒场景的 YUI v1.1 完整 NPC 配置入口。
+// NekoYuiFullNpcBuilder —— 火柴盒场景的 YUI v1.1/v1.2 完整 NPC 配置入口。
 #if UNITY_EDITOR
 using System;
 using System.Linq;
+using Unity.AI.Navigation;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -31,7 +32,7 @@ public static class NekoYuiFullNpcBuilder
         Debug.Log("[NEKO] 已导入 ChiffonLite package。请等待脚本重编译后执行 ConfigureOpenSceneBatch。 ");
     }
 
-    [MenuItem("NEKO/YUI NPC/2 Configure Open Scene Full v1.1")]
+    [MenuItem("NEKO/YUI NPC/2 Configure Open Scene Full v1.2")]
     public static void ConfigureOpenSceneBatch()
     {
         var root = GameObject.Find(RootName);
@@ -49,20 +50,23 @@ public static class NekoYuiFullNpcBuilder
         if (telemetry == null || perception == null || locomotion == null || router == null || nameplate == null || sync == null)
             throw new InvalidOperationException("YUI Rig UdonSharp 组件不完整。 ");
 
-        Undo.RegisterCompleteObjectUndo(new UnityEngine.Object[] { telemetry, perception, locomotion, router, nameplate, sync }, "配置 YUI v1.1 完整 NPC");
+        Undo.RegisterCompleteObjectUndo(new UnityEngine.Object[] { telemetry, perception, locomotion, router, nameplate, sync }, "配置 YUI v1.2 完整 NPC");
+        telemetry.specVersion = "1.2";
         router.worldName = EditorSceneManager.GetActiveScene().name;
-        router.catalogRevision = Mathf.Max(router.catalogRevision, 3);
+        router.catalogRevision = Mathf.Max(router.catalogRevision, 4);
         router.enableGoto = true; router.enableFollow = true; router.enableWander = true;
         router.enableActions = true; router.enableExpressions = true;
         router.enableTextPreset = true; router.enableTextUtf8 = true;
         router.enableRayScan = true; router.enableTouch = true; router.enablePlayerPose = true;
         router.enableSnapshot = true; router.enableSocialSignals = true; router.enableAnchors = true; router.enableOperationLifecycle = true;
+        router.enableWorldMap = true; router.enableSemanticNavigation = true;
         telemetry.logBudgetPerSec = 20;
         EnsureNameplateText(plate, nameplate);
 
         ConfigureExtendedActions(router);
         ConfigureExpressions(router);
-        ConfigureAnchorsAndWander(root, router, locomotion);
+        ConfigureAcceptanceArena(root);
+        ConfigureWorldMapAndWander(root, router, locomotion);
         GameObject model = EnsureChiffonModel(root);
 
         // Animator Builder 会按实际 clip.length 回写目录时长，从而满足 ±20ms 契约。
@@ -78,7 +82,82 @@ public static class NekoYuiFullNpcBuilder
         EditorUtility.SetDirty(router); EditorUtility.SetDirty(nameplate); EditorUtility.SetDirty(sync); EditorUtility.SetDirty(animator);
         EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
         EditorSceneManager.SaveOpenScenes(); AssetDatabase.SaveAssets(); AssetDatabase.Refresh();
-        Debug.Log("[NEKO] 火柴盒 YUI NPC v1.1 完整配置完成：32 action（16 核心 + 16 Chiffon 扩展）、8 expression、4 anchor、2 wander waypoint；upper_body_stream/voice_stream 保持未发布。 ");
+        Debug.Log("[NEKO] 火柴盒 YUI NPC v1.2 完整配置完成：32 action、8 expression、7 anchor、2 region、1 entity、6 route_edge；upper_body_stream/voice_stream 保持未发布。 ");
+    }
+
+    [MenuItem("NEKO/YUI NPC/3 Configure Matchbox v1.2 + Validate")]
+    public static void ConfigureMatchboxV12Batch()
+    {
+        const string scenePath = "Assets/Scenes/VRCDefaultWorldScene.unity";
+        if (AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath) == null)
+            throw new InvalidOperationException("找不到火柴盒场景：" + scenePath);
+        EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Single);
+        ConfigureOpenSceneBatch();
+        ValidateOpenSceneV12Batch();
+    }
+
+    [MenuItem("NEKO/YUI NPC/4 Validate Open Scene v1.2")]
+    public static void ValidateOpenSceneV12Batch()
+    {
+        GameObject root = GameObject.Find(RootName);
+        Transform scripts = root == null ? null : root.transform.Find("Scripts");
+        if (root == null || scripts == null) throw new InvalidOperationException("火柴盒缺少 YUI NPC Rig");
+        NekoNpcTelemetry telemetry = scripts.GetComponent<NekoNpcTelemetry>();
+        NekoNpcLocomotion locomotion = scripts.GetComponent<NekoNpcLocomotion>();
+        NekoMidiRouter router = scripts.GetComponent<NekoMidiRouter>();
+        if (telemetry == null || locomotion == null || router == null) throw new InvalidOperationException("YUI 核心组件不完整");
+        if (telemetry.specVersion != "1.2") throw new InvalidOperationException("Telemetry 未发布 spec 1.2");
+        if (!router.enableWorldMap || !router.enableSemanticNavigation || !router.enableOperationLifecycle)
+            throw new InvalidOperationException("v1.2 capability 未完整启用");
+        if (telemetry.logBudgetPerSec > 20) throw new InvalidOperationException("日志预算超过每滑动秒 20 行");
+        if (locomotion.orbitPointsPerLap != 24) throw new InvalidOperationException("绕行验收必须使用每圈 24 路点");
+        if (router.anchorTransforms == null || router.anchorTransforms.Length != 7
+            || router.regionSemanticKeys == null || router.regionSemanticKeys.Length != 2
+            || router.entityCenters == null || router.entityCenters.Length != 1
+            || router.routeFromAnchorIds == null || router.routeFromAnchorIds.Length != 6)
+            throw new InvalidOperationException("v1.2 语义目录数量不符合火柴盒验收基线");
+
+        string[] allKeys = router.anchorSemanticKeys.Concat(router.regionSemanticKeys).Concat(router.entitySemanticKeys).ToArray();
+        if (allKeys.Any(string.IsNullOrWhiteSpace) || allKeys.Distinct(StringComparer.Ordinal).Count() != allKeys.Length)
+            throw new InvalidOperationException("Anchor/Region/Entity semantic_key 必须全局唯一");
+        for (int i = 0; i < router.anchorTransforms.Length; i++)
+        {
+            if (router.anchorTransforms[i] == null) throw new InvalidOperationException("Anchor " + i + " 未绑定 Transform");
+            NavMeshHit hit;
+            if (!NavMesh.SamplePosition(router.anchorTransforms[i].position, out hit, 0.75f, NavMesh.AllAreas))
+                throw new InvalidOperationException("Anchor " + router.anchorSemanticKeys[i] + " 不在 NavMesh 上");
+        }
+        if (router.anchorTransforms[4].position.y - router.anchorTransforms[3].position.y < 2.5f)
+            throw new InvalidOperationException("stair_top 与 stair_bottom 高差不足，不能验收三维导航");
+        for (int i = 0; i < router.routeFromAnchorIds.Length; i++)
+            RequirePath(router.anchorTransforms[router.routeFromAnchorIds[i]].position, router.anchorTransforms[router.routeToAnchorIds[i]].position, "route_edge " + i);
+
+        Vector3 center = router.entityCenters[0].position;
+        float radius = Mathf.Clamp(1.5f, router.entityOrbitMinRadius[0], router.entityOrbitMaxRadius[0]);
+        Vector3 previous = router.anchorTransforms[2].position;
+        for (int i = 0; i <= 24; i++)
+        {
+            float angle = Mathf.PI * 2f * i / 24f;
+            Vector3 requested = new Vector3(center.x + Mathf.Cos(angle) * radius, center.y, center.z + Mathf.Sin(angle) * radius);
+            NavMeshHit hit;
+            if (!NavMesh.SamplePosition(requested, out hit, 0.75f, NavMesh.AllAreas))
+                throw new InvalidOperationException("central_obstacle 圆周路点 " + i + " 不在 NavMesh 上");
+            RequirePath(previous, hit.position, "central_obstacle orbit segment " + i);
+            previous = hit.position;
+        }
+        Debug.Log("[NEKO] YUI v1.2 火柴盒静态验收通过：完整 XYZ 楼梯路径与 central_obstacle 圆周路径均可达。 ");
+    }
+
+    static void RequirePath(Vector3 from, Vector3 to, string label)
+    {
+        NavMeshHit fromHit; NavMeshHit toHit;
+        if (!NavMesh.SamplePosition(from, out fromHit, 0.75f, NavMesh.AllAreas)
+            || !NavMesh.SamplePosition(to, out toHit, 0.75f, NavMesh.AllAreas))
+            throw new InvalidOperationException(label + " 的端点不在 NavMesh 上");
+        NavMeshPath path = new NavMeshPath();
+        if (!NavMesh.CalculatePath(fromHit.position, toHit.position, NavMesh.AllAreas, path)
+            || path.status != NavMeshPathStatus.PathComplete)
+            throw new InvalidOperationException(label + " 不可达");
     }
 
     static void EnsureNameplateText(Transform plate, NekoNpcNameplate nameplate)
@@ -165,7 +244,7 @@ public static class NekoYuiFullNpcBuilder
         router.expressionFadeMs = new[] { 150, 150, 180, 120, 150, 180, 100, 150 };
     }
 
-    static void ConfigureAnchorsAndWander(GameObject root, NekoMidiRouter router, NekoNpcLocomotion locomotion)
+    static void ConfigureWorldMapAndWander(GameObject root, NekoMidiRouter router, NekoNpcLocomotion locomotion)
     {
         // 根 NPC 本身位于场景顶层时不能用 parent.Find；否则每次运行都会再创建一个同名根。
         Transform holder = null;
@@ -181,18 +260,56 @@ public static class NekoYuiFullNpcBuilder
             if (parent != null) go.transform.SetParent(parent, false); holder = go.transform;
         }
         Vector3 origin = root.transform.position;
-        Vector3[] offsets = { Vector3.zero, new Vector3(0f, 0f, 2f), new Vector3(-2f, 0f, 2f), new Vector3(2f, 0f, 2f) };
-        string[] objectNames = { "Anchor_Spawn", "Anchor_Plaza", "Anchor_Observation", "Anchor_PlayerMeet" };
-        string[] keys = { "spawn_point", "plaza", "observation_point", "player_meeting_point" };
-        string[] descriptions = { "NPC 出生点", "火柴盒广场", "观察世界的位置", "与玩家会面的地点" };
-        string[] tags = { "[\"spawn\",\"safe\"]", "[\"plaza\",\"social\"]", "[\"observation\",\"explore\"]", "[\"meeting\",\"social\"]" };
-        var anchors = new Transform[4];
-        for (int i = 0; i < 4; i++) anchors[i] = EnsurePoint(holder, objectNames[i], origin + offsets[i]);
+        Vector3[] positions = {
+            origin,
+            new Vector3(-3f, 0f, -2f),
+            new Vector3(0f, 0f, 0.3f),
+            new Vector3(4.5f, 0f, -3.1f),
+            new Vector3(4.5f, 3.1f, 1.2f),
+            new Vector3(4.5f, 3.1f, 4.2f),
+            new Vector3(-2f, 0f, 3.8f)
+        };
+        string[] objectNames = { "Anchor_Spawn", "Anchor_GroundPlaza", "Anchor_ObstacleApproach", "Anchor_StairBottom", "Anchor_StairTop", "Anchor_UpperObservation", "Anchor_PlayerMeet" };
+        string[] keys = { "spawn_point", "ground_plaza", "central_obstacle_approach", "stair_bottom", "stair_top", "upper_observation", "player_meeting_point" };
+        string[] descriptions = { "NPC 出生点", "火柴盒地面广场", "中央障碍物接近点", "楼梯下端", "楼梯上端", "楼上远端观察点", "与玩家会面的地点" };
+        string[] tags = { "[\"spawn\",\"safe\"]", "[\"plaza\",\"social\"]", "[\"approach\",\"obstacle\"]", "[\"stairs\",\"ground\"]", "[\"stairs\",\"upper\"]", "[\"observation\",\"explore\",\"upper\"]", "[\"meeting\",\"social\"]" };
+        string[] regionKeys = { "ground_floor", "ground_floor", "ground_floor", "ground_floor", "upper_floor", "upper_floor", "ground_floor" };
+        var anchors = new Transform[positions.Length];
+        for (int i = 0; i < positions.Length; i++) anchors[i] = EnsurePoint(holder, objectNames[i], positions[i]);
         router.anchorTransforms = anchors; router.anchorSemanticKeys = keys; router.anchorDescriptionsZh = descriptions;
-        router.anchorHasYaw = new[] { false, true, true, true }; router.anchorArrivalRadius = new[] { 0.3f, 0.3f, 0.3f, 0.3f }; router.anchorTagsJson = tags;
+        router.anchorHasYaw = new[] { false, true, true, true, true, true, true };
+        router.anchorArrivalRadius = new[] { 0.3f, 0.35f, 0.35f, 0.35f, 0.35f, 0.4f, 0.35f };
+        router.anchorTagsJson = tags; router.anchorRegionKeys = regionKeys;
 
-        locomotion.wanderWaypoints = new[] { EnsurePoint(holder, "Wander_0", origin + new Vector3(-2f, 0f, 0f)), EnsurePoint(holder, "Wander_1", origin + new Vector3(2f, 0f, 0f)) };
+        router.regionSemanticKeys = new[] { "ground_floor", "upper_floor" };
+        router.regionDescriptionsZh = new[] { "火柴盒地面层，包含广场、中央障碍物和楼梯入口", "约三米高的平台层，包含远端观察点" };
+        router.regionTagsJson = new[] { "[\"ground\",\"social\",\"obstacle\"]", "[\"upper\",\"observation\",\"stairs\"]" };
+        router.regionFloorLabels = new[] { "G", "L1" };
+        router.regionEntryAnchorIds = new[] { 1, 4 };
+
+        Transform entityHolder = holder.Find("Entities");
+        if (entityHolder == null) { var go = new GameObject("Entities"); Undo.RegisterCreatedObjectUndo(go, "创建 YUI entities"); go.transform.SetParent(holder, false); entityHolder = go.transform; }
+        Transform obstacleCenter = EnsureRawPoint(entityHolder, "Entity_CentralObstacle", new Vector3(0f, 0f, 2.2f));
+        router.entityCenters = new[] { obstacleCenter };
+        router.entitySemanticKeys = new[] { "central_obstacle" };
+        router.entityDescriptionsZh = new[] { "地面层中央的固定方柱，可用于连续绕行测试" };
+        router.entityTagsJson = new[] { "[\"obstacle\",\"orbitable\",\"landmark\"]" };
+        router.entityRegionKeys = new[] { "ground_floor" };
+        router.entityApproachAnchorIds = new[] { 2 };
+        router.entityOrbitable = new[] { true };
+        router.entityOrbitMinRadius = new[] { 1.0f };
+        router.entityOrbitMaxRadius = new[] { 2.2f };
+
+        router.routeFromAnchorIds = new[] { 0, 1, 1, 3, 4, 1 };
+        router.routeToAnchorIds = new[] { 1, 2, 3, 4, 5, 6 };
+        router.routeBidirectional = new[] { true, true, true, true, true, true };
+        router.routeTraversal = new[] { "walk", "walk", "walk", "stairs", "walk", "walk" };
+        router.routeRegionKeys = new[] { "ground_floor", "ground_floor", "ground_floor", "upper_floor", "upper_floor", "ground_floor" };
+
+        locomotion.wanderWaypoints = new[] { EnsurePoint(holder, "Wander_0", new Vector3(-4f, 0f, 0f)), EnsurePoint(holder, "Wander_1", new Vector3(-2f, 0f, 4.5f)) };
         locomotion.wanderSwitchDistance = 0.9f;
+        locomotion.orbitPointsPerLap = 24;
+        locomotion.whiskerHeight = 1.4f;
     }
 
     static Transform EnsurePoint(Transform parent, string name, Vector3 requested)
@@ -201,6 +318,64 @@ public static class NekoYuiFullNpcBuilder
         if (point == null) { var go = new GameObject(name); Undo.RegisterCreatedObjectUndo(go, "创建 " + name); go.transform.SetParent(parent, true); point = go.transform; }
         NavMeshHit hit; point.position = NavMesh.SamplePosition(requested, out hit, 3f, NavMesh.AllAreas) ? hit.position : requested;
         point.rotation = Quaternion.identity; return point;
+    }
+
+    static Transform EnsureRawPoint(Transform parent, string name, Vector3 position)
+    {
+        Transform point = parent.Find(name);
+        if (point == null) { var go = new GameObject(name); Undo.RegisterCreatedObjectUndo(go, "创建 " + name); go.transform.SetParent(parent, true); point = go.transform; }
+        point.position = position; point.rotation = Quaternion.identity; return point;
+    }
+
+    static void ConfigureAcceptanceArena(GameObject root)
+    {
+        GameObject arena = GameObject.Find("NekoYuiV12_AcceptanceArena");
+        if (arena == null) { arena = new GameObject("NekoYuiV12_AcceptanceArena"); Undo.RegisterCreatedObjectUndo(arena, "创建 YUI v1.2 验收场"); }
+        arena.transform.position = Vector3.zero;
+
+        EnsureBox(arena.transform, "Ground", new Vector3(0f, -0.1f, 0f), new Vector3(18f, 0.2f, 18f), 0);
+        EnsureBox(arena.transform, "CentralObstacle", new Vector3(0f, 0.75f, 2.2f), new Vector3(1.2f, 1.5f, 1.2f), 11);
+        EnsureBox(arena.transform, "UpperPlatform", new Vector3(4.5f, 3f, 3f), new Vector3(4f, 0.2f, 4f), 0);
+        Transform stairs = arena.transform.Find("Stairs");
+        if (stairs == null) { var go = new GameObject("Stairs"); Undo.RegisterCreatedObjectUndo(go, "创建验收楼梯"); go.transform.SetParent(arena.transform, false); stairs = go.transform; }
+        const int steps = 12;
+        for (int i = 0; i < steps; i++)
+        {
+            float top = (i + 1) * 0.25f;
+            EnsureBox(stairs, "Step_" + i.ToString("00"), new Vector3(4.5f, top * 0.5f, -3.05f + i * 0.35f), new Vector3(1.6f, top, 0.4f), 0);
+        }
+
+        NavMeshSurface surface = arena.GetComponent<NavMeshSurface>();
+        if (surface == null) surface = arena.AddComponent<NavMeshSurface>();
+        // 火柴盒旧测试面若与 v1.2 Surface 重叠，SamplePosition 可能把两个 Anchor
+        // 分配到互不连接的数据岛。验收场只保留这一份统一烘焙结果。
+        foreach (NavMeshSurface other in UnityEngine.Object.FindObjectsOfType<NavMeshSurface>())
+        {
+            if (other == null || other == surface) continue;
+            other.RemoveData();
+            other.enabled = false;
+            EditorUtility.SetDirty(other);
+        }
+        surface.agentTypeID = 0;
+        surface.collectObjects = CollectObjects.Volume;
+        surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+        surface.layerMask = ~0;
+        surface.center = new Vector3(0f, 2f, 0f);
+        surface.size = new Vector3(20f, 8f, 20f);
+        surface.BuildNavMesh();
+
+        NavMeshHit spawn;
+        if (NavMesh.SamplePosition(root.transform.position, out spawn, 2f, NavMesh.AllAreas)) root.transform.position = spawn.position;
+        EditorUtility.SetDirty(surface); EditorUtility.SetDirty(arena);
+    }
+
+    static GameObject EnsureBox(Transform parent, string name, Vector3 position, Vector3 scale, int layer)
+    {
+        Transform existing = parent.Find(name);
+        GameObject box = existing == null ? GameObject.CreatePrimitive(PrimitiveType.Cube) : existing.gameObject;
+        if (existing == null) { box.name = name; Undo.RegisterCreatedObjectUndo(box, "创建 " + name); box.transform.SetParent(parent, true); }
+        box.transform.position = position; box.transform.rotation = Quaternion.identity; box.transform.localScale = scale; box.layer = layer;
+        return box;
     }
 
     static GameObject EnsureChiffonModel(GameObject root)
