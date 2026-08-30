@@ -76,7 +76,6 @@ public static class NekoYuiFullNpcBuilder
         animator.applyRootMotion = false; animator.cullingMode = AnimatorCullingMode.CullUpdateTransforms; animator.runtimeAnimatorController = controller;
         locomotion.animator = animator; locomotion.navAgent = root.GetComponent<NavMeshAgent>();
         sync.animator = animator; sync.router = router;
-        FaceNearestWorldSpawn(root);
         PlacePerceptionAnchors(root, animator, perception);
         ConfigureEyeCamPlayerVisibility(root);
 
@@ -137,10 +136,7 @@ public static class NekoYuiFullNpcBuilder
         if (eyeCamera != null)
         {
             if (!NekoEyeCamBuilder.PlayerLayersAreVisible(eyeCamera))
-                throw new InvalidOperationException("EyeCamera 必须显示 Player/PlayerLocal，并排除 UI/MirrorReflection");
-            Transform nearestSpawn = FindNearestWorldSpawn(root.transform.position);
-            if (nearestSpawn != null && !IsFacingTargetHorizontally(eyeCamera.transform, nearestSpawn.position))
-                throw new InvalidOperationException("EyeCamera 未朝向最近的玩家出生点");
+                throw new InvalidOperationException("EyeCamera 必须显示 Player/PlayerLocal/MirrorReflection，并排除 UI");
         }
         for (int i = 0; i < router.routeFromAnchorIds.Length; i++)
             RequirePath(router.anchorTransforms[router.routeFromAnchorIds[i]].position, router.anchorTransforms[router.routeToAnchorIds[i]].position, "route_edge " + i);
@@ -539,51 +535,6 @@ public static class NekoYuiFullNpcBuilder
     static Camera FindEyeCamera(GameObject root)
     {
         return root.GetComponentsInChildren<Camera>(true).FirstOrDefault(item => item != null && item.gameObject.name == "EyeCamera");
-    }
-
-    static void FaceNearestWorldSpawn(GameObject root)
-    {
-        Transform spawn = FindNearestWorldSpawn(root.transform.position);
-        if (spawn == null) return;
-        Vector3 direction = spawn.position - root.transform.position;
-        direction.y = 0f;
-        if (direction.sqrMagnitude <= 0.0001f) return;
-        root.transform.rotation = Quaternion.LookRotation(direction.normalized, Vector3.up);
-        Debug.Log("[NEKO] NPC/EyeCamera 已朝向最近的玩家出生点：" + spawn.name);
-    }
-
-    static Transform FindNearestWorldSpawn(Vector3 origin)
-    {
-        Component descriptor = UnityEngine.Object.FindObjectsOfType<Component>(true)
-            .FirstOrDefault(item => item != null && item.GetType().Name == "VRCSceneDescriptor");
-        if (descriptor == null) return null;
-
-        // 用 SerializedObject 读取 SDK 字段，避免不同 VRCSDK 小版本的程序集类型差异。
-        SerializedObject serialized = new SerializedObject(descriptor);
-        SerializedProperty spawns = serialized.FindProperty("spawns");
-        // VRCSDK/ClientSim 在数组为空时会把 Descriptor 自身作为默认出生点，这里保持一致。
-        if (spawns == null || !spawns.isArray || spawns.arraySize == 0) return descriptor.transform;
-
-        Transform nearest = null;
-        float nearestDistance = float.PositiveInfinity;
-        for (int i = 0; i < spawns.arraySize; i++)
-        {
-            Transform candidate = spawns.GetArrayElementAtIndex(i).objectReferenceValue as Transform;
-            if (candidate == null) continue;
-            float distance = (candidate.position - origin).sqrMagnitude;
-            if (distance >= nearestDistance) continue;
-            nearest = candidate;
-            nearestDistance = distance;
-        }
-        return nearest == null ? descriptor.transform : nearest;
-    }
-
-    static bool IsFacingTargetHorizontally(Transform source, Vector3 target)
-    {
-        Vector3 forward = source.forward; forward.y = 0f;
-        Vector3 direction = target - source.position; direction.y = 0f;
-        if (forward.sqrMagnitude <= 0.0001f || direction.sqrMagnitude <= 0.0001f) return true;
-        return Vector3.Dot(forward.normalized, direction.normalized) > 0.5f;
     }
 
     static T[] Resize<T>(T[] source, int length)

@@ -15,8 +15,8 @@ using VRC.SDKBase;
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class NekoEyeCam : UdonSharpBehaviour
 {
-    private const int PlayerLayersMask = (1 << 9) | (1 << 10);
-    private const int EyeCamExcludedMask = (1 << 5) | (1 << 18);
+    private const int PlayerRenderLayersMask = (1 << 9) | (1 << 10) | (1 << 18);
+    private const int EyeCamExcludedMask = (1 << 5);
 
     [Header("依赖")]
     public NekoNpcTelemetry telemetry;
@@ -68,8 +68,9 @@ public class NekoEyeCam : UdonSharpBehaviour
     private void EnsurePlayerLayersVisible()
     {
         if (eyeCamera == null) return;
-        // Player(9) 是远端玩家，PlayerLocal(10) 是本地玩家；HUD 与镜面层必须继续排除。
-        eyeCamera.cullingMask = (eyeCamera.cullingMask | PlayerLayersMask) & ~EyeCamExcludedMask;
+        // 远端玩家使用 Player(9)。本地玩家根对象在 PlayerLocal(10)，其实际 Avatar
+        // 在 VRChat/ClientSim 中还会使用 MirrorReflection(18)，三层都必须渲染。
+        eyeCamera.cullingMask = (eyeCamera.cullingMask | PlayerRenderLayersMask) & ~EyeCamExcludedMask;
     }
 
     void Update()
