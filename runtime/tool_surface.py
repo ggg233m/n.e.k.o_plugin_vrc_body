@@ -19,6 +19,19 @@ from .yui_adapter import YuiSemanticAdapter
 from .yui_session import YuiSessionState
 
 
+_EXECUTION_CONTRACT = (
+    "用户要求执行此行为时，必须在回复前调用本工具；未取得工具返回不得承诺开始、稍后执行或已经完成。"
+    "只按返回状态陈述，accepted 仅表示已受理。plan_id 与 op_id 只供内部追踪和后续状态查询使用；"
+    "除非用户明确询问编号，否则禁止在面向用户的可朗读回复中输出这些编号或 UUID。"
+)
+
+
+def _execution_description(description: str) -> str:
+    """给所有会改变 NPC 状态的工具附加统一真实性约束。"""
+
+    return _EXECUTION_CONTRACT + description
+
+
 def _schema_error(value: Any, schema: Mapping[str, Any], path: str = "arguments") -> str | None:
     """校验本项目工具使用的 JSON Schema 子集，服务端不能依赖 MCP 客户端代验。"""
 
@@ -458,6 +471,7 @@ class YuiToolSurface:
         definitions = [
             YuiToolDefinition(
                 "npc.observe",
+                "用户询问当前位置、附近对象、玩家或当前状态时，本轮必须先调用本工具。"
                 "读取 YUI 世界已确认的控制态、能力、NPC、玩家槽位、近期感知与语义目录；"
                 "anchors 按距离给出附近锚点的中文描述、标签和相对距离/方位；不猜测缺失事实。",
                 _object_schema(),
@@ -465,7 +479,9 @@ class YuiToolSurface:
             ),
             YuiToolDefinition(
                 "npc.estop",
-                "通过最高优先级 MIDI 通道立即锁存急停。只在危险、失控或明确要求急停时调用。",
+                _execution_description(
+                    "通过最高优先级 MIDI 通道立即锁存急停。只在危险、失控或明确要求急停时调用。"
+                ),
                 _object_schema(
                     {"reason": {"type": "string", "minLength": 1, "maxLength": 160}},
                     required=["reason"],
@@ -477,6 +493,7 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.world_query",
+                    "用户询问更大范围地图、楼层内容或静态路线时，本轮必须调用本工具。"
                     "查询地图作者发布的区域、实体、锚点和静态路线；不返回绝对坐标。",
                     _object_schema(
                         {
@@ -518,7 +535,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.go_to",
-                    "前往 Inspector 明确发布的语义锚点；不得复制或猜测锚点坐标。",
+                    _execution_description(
+                        "前往 Inspector 明确发布的语义锚点；不得复制或猜测锚点坐标。"
+                    ),
                     _object_schema(
                         {"anchor_key": anchor_schema, "speed_mps": speed_schema},
                         required=["anchor_key"],
@@ -534,7 +553,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.go_to_xyz",
-                    "前往宿主明确启用后的世界 X/Z 坐标；发送前严格校验 activity bounds。",
+                    _execution_description(
+                        "前往宿主明确启用后的世界 X/Z 坐标；发送前严格校验 activity bounds。"
+                    ),
                     _object_schema(
                         {
                             "x": {"type": "number"},
@@ -647,13 +668,17 @@ class YuiToolSurface:
             definitions.extend([
                 YuiToolDefinition(
                     "npc.navigate",
-                    "后台前往精确语义目标；Entity/Region 会解析到作者发布的接近或入口 Anchor。",
+                    _execution_description(
+                        "后台前往精确语义目标；Entity/Region 会解析到作者发布的接近或入口 Anchor。"
+                    ),
                     _object_schema({"target_key": target_schema, "speed_mps": speed_schema, "replace_active": replace_schema}, required=["target_key"]),
                     normal_timeout,
                 ),
                 YuiToolDefinition(
                     "npc.approach",
-                    "后台接近当前 session 的 player_slot，到达指定距离后停止并可面向玩家。",
+                    _execution_description(
+                        "后台接近当前 session 的 player_slot，到达指定距离后停止并可面向玩家。"
+                    ),
                     _object_schema({
                         "player_slot": {"type": "integer", "minimum": 0, "maximum": 63},
                         "distance_m": {"type": "number", "minimum": 0.5, "maximum": 5.0},
@@ -665,7 +690,9 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.orbit",
-                    "后台绕作者发布的可绕行实体运行；整圈由 Unity 单 operation 无缝执行。",
+                    _execution_description(
+                        "后台绕作者发布的可绕行实体运行；整圈由 Unity 单 operation 无缝执行。"
+                    ),
                     _object_schema({
                         "target_key": entity_schema,
                         "radius_m": {"type": "number", "minimum": 0.25, "maximum": 5.0},
@@ -679,7 +706,9 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.explore",
-                    "后台探索指定区域；v1.3 由 Unity 单 operation 连续 retarget，旧世界按作者发布的 Anchor 行进。",
+                    _execution_description(
+                        "后台探索指定区域；v1.3 由 Unity 单 operation 连续 retarget，旧世界按作者发布的 Anchor 行进。"
+                    ),
                     _object_schema({
                         "region_key": region_schema,
                         "duration_s": {"type": "integer", "minimum": 1, "maximum": 600},
@@ -691,8 +720,10 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.execute_plan",
-                    "提交受限扁平行为图并后台执行；entry 指向 nodes 中的根 id，控制节点用 children/child 引用。"
-                    f"不接受代码或自然语言条件。当前世界有效 sequence 示例：{graph_example}",
+                    _execution_description(
+                        "提交受限扁平行为图并后台执行；entry 指向 nodes 中的根 id，控制节点用 children/child 引用。"
+                        f"不接受代码或自然语言条件。当前世界有效 sequence 示例：{graph_example}"
+                    ),
                     _object_schema({
                         "graph": graph_schema,
                         "replace_active": replace_schema,
@@ -701,7 +732,7 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.plan_cancel",
-                    "取消后台计划并停止该计划占用的控制域。",
+                    _execution_description("取消后台计划并停止该计划占用的控制域。"),
                     _object_schema({"plan_id": {"type": "string", "minLength": 1}}, required=["plan_id"]),
                     normal_timeout,
                 ),
@@ -710,7 +741,9 @@ class YuiToolSurface:
                 definitions.append(
                     YuiToolDefinition(
                         "npc.move_relative",
-                        "按 NPC 当前朝向做严格相对方位移动；0°前、90°右、180°后、270°左，不暴露绝对坐标。",
+                        _execution_description(
+                            "按 NPC 当前朝向做严格相对方位移动；0°前、90°右、180°后、270°左，不暴露绝对坐标。"
+                        ),
                         _object_schema({
                             "bearing_deg": {"type": "number"},
                             "distance_m": {"type": "number", "minimum": 0.25, "maximum": 10.0},
@@ -726,7 +759,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.follow",
-                    "跟随当前观察结果中的 player_slot；槽位失效时不得改猜其他玩家。",
+                    _execution_description(
+                        "跟随当前观察结果中的 player_slot；槽位失效时不得改猜其他玩家。"
+                    ),
                     _object_schema(
                         {"player_slot": {"type": "integer", "minimum": 0, "maximum": 63}},
                         required=["player_slot"],
@@ -738,7 +773,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.look_at",
-                    "注视一个 player_slot，或注视 activity bounds 内的 XYZ 坐标；两种目标必须二选一。",
+                    _execution_description(
+                        "注视一个 player_slot，或注视 activity bounds 内的 XYZ 坐标；两种目标必须二选一。"
+                    ),
                     _object_schema(
                         {
                             "player_slot": {"type": "integer", "minimum": 0, "maximum": 63},
@@ -764,7 +801,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.act",
-                    "播放世界动作目录中的语义动作；需要目标时使用已观察到的 player_slot。",
+                    _execution_description(
+                        "播放世界动作目录中的语义动作；需要目标时使用已观察到的 player_slot。"
+                    ),
                     _object_schema(
                         {
                             "action_key": action_schema,
@@ -784,7 +823,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.set_expression",
-                    "设置世界表情目录中的语义表情；duration_ms=0 表示持续。",
+                    _execution_description(
+                        "设置世界表情目录中的语义表情；duration_ms=0 表示持续。"
+                    ),
                     _object_schema(
                         {
                             "expression_key": expression_schema,
@@ -810,7 +851,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.say",
-                    "提交 1..384 UTF-8 字节文本；可关联同次确认的动作，只有 voice_stream 发布时才发送语音 cue。",
+                    _execution_description(
+                        "提交 1..384 UTF-8 字节文本；可关联同次确认的动作，只有 voice_stream 发布时才发送语音 cue。"
+                    ),
                     _object_schema(say_properties, required=["text"]),
                     composite_timeout,
                 )
@@ -819,7 +862,9 @@ class YuiToolSurface:
             definitions.append(
                 YuiToolDefinition(
                     "npc.wander",
-                    "启动 Inspector 预配置的 waypoint 循环巡逻；不接受方向、距离或任意坐标参数。",
+                    _execution_description(
+                        "启动 Inspector 预配置的 waypoint 循环巡逻；不接受方向、距离或任意坐标参数。"
+                    ),
                     _object_schema(),
                     normal_timeout,
                 )
@@ -827,7 +872,7 @@ class YuiToolSurface:
         definitions.append(
             YuiToolDefinition(
                 "npc.stop",
-                "停止全部、移动或动作领域；不会解除 ESTOP。",
+                _execution_description("停止全部、移动或动作领域；不会解除 ESTOP。"),
                 _object_schema(
                     {
                         "scope": {

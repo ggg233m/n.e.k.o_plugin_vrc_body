@@ -223,6 +223,18 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertEqual(result["error"], "behavior_graph_invalid")
         self.assertEqual(result["output"], failure)
 
+    def test_neko_handler_rejects_stale_callback_after_disconnect(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._surface = None
+        handler = plugin._make_tool_handler("npc.navigate")
+
+        result = asyncio.run(handler(target_key="upper_observation"))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "not_connected")
+        self.assertFalse(result["midi_sent"])
+        self.assertNotIn("output", result)
+
     def test_passive_world_context_is_private_complete_and_deduplicated(self) -> None:
         plugin = _plugin_class()(None)
         session = YuiSessionState()
@@ -306,6 +318,9 @@ class YuiPluginConfigTests(unittest.TestCase):
         body = message["parts"][0]["text"]
         self.assertTrue(body.startswith("YUI_WORLD_CONTEXT "))
         payload = json.loads(body.removeprefix("YUI_WORLD_CONTEXT "))
+        self.assertEqual(payload["context_revision"], 2)
+        self.assertTrue(payload["connection"]["connected"])
+        self.assertTrue(payload["connection"]["fresh"])
         self.assertEqual(payload["world"]["session"], 77)
         self.assertEqual(payload["world"]["location"]["region_key"], "ground_floor")
         self.assertEqual(payload["world"]["players"][0]["slot"], 0)
@@ -316,6 +331,12 @@ class YuiPluginConfigTests(unittest.TestCase):
             for item in payload["world"]["world"]["items"]
         }
         self.assertIn("central_obstacle", nearby_keys)
+        instructions = "\n".join(payload["instructions"])
+        self.assertIn("本轮必须先调用 npc.observe", instructions)
+        self.assertIn("严禁回复", instructions)
+        self.assertIn("accepted 只表示已受理", instructions)
+        self.assertIn("只供内部追踪", instructions)
+        self.assertIn("禁止在面向用户的可朗读回复中输出", instructions)
         encoded = json.dumps(payload, ensure_ascii=False)
         for private_field in ('"name"', '"pid"', '"pos"', '"center"', '"x"', '"y"', '"z"'):
             self.assertNotIn(private_field, encoded)
@@ -327,6 +348,100 @@ class YuiPluginConfigTests(unittest.TestCase):
         session.npc_state["location"]["floor_label"] = "L1"
         self.assertTrue(plugin._push_context_snapshot())
         self.assertEqual(len(pushed), 2)
+
+    def test_offline_context_expires_stale_world_and_forbids_action_promises(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._registered_yui_tools = {"npc.observe", "npc.navigate"}
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
+
+        self.assertTrue(
+            plugin._push_context_unavailable("plugin_started_disconnected", force=True)
+        )
+        self.assertFalse(plugin._push_context_unavailable("plugin_started_disconnected"))
+
+        self.assertEqual(len(pushed), 1)
+        message = pushed[0]
+        self.assertEqual(message["coalesce_key"], "yui_world_context")
+        self.assertFalse(message["metadata"]["connected"])
+        body = message["parts"][0]["text"]
+        payload = json.loads(body.removeprefix("YUI_WORLD_CONTEXT "))
+        self.assertFalse(payload["connection"]["connected"])
+        self.assertFalse(payload["connection"]["fresh"])
+        self.assertFalse(payload["world"]["available"])
+        self.assertEqual(payload["available_tools"], [])
+        self.assertIsNone(payload["plan"])
+        instructions = "\n".join(payload["instructions"])
+        self.assertIn("此前注入的全部位置", instructions)
+        self.assertIn("不得声称刚刚观察过世界", instructions)
+        self.assertIn("连接成功后必须由用户重新发起", instructions)
+        self.assertIn("YUI 未连接", instructions)
+        self.assertEqual(plugin._context_push_status["state"], "deduplicated")
+
+    def test_close_control_unregisters_tools_and_pushes_offline_context(self) -> None:
+        plugin = _plugin_class()(None)
+        closed = []
+        released = []
+        unregistered = []
+        pushed = []
+
+        class Closable:
+            @staticmethod
+            def close():
+                closed.append(True)
+
+        class Lease:
+            @staticmethod
+            def release():
+                released.append(True)
+
+        plugin._adapter = Closable()
+        plugin._transport = Closable()
+        plugin._surface = object()
+        plugin._driver_lease = Lease()
+        plugin._registered_yui_tools = {"npc.observe", "npc.navigate"}
+        plugin.unregister_llm_tool = lambda name: unregistered.append(name) or True
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
+
+        plugin._close_control(reason="host_disconnected")
+
+        self.assertEqual(unregistered, ["npc.navigate", "npc.observe"])
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(len(released), 1)
+        self.assertIsNone(plugin._adapter)
+        self.assertIsNone(plugin._transport)
+        self.assertIsNone(plugin._surface)
+        self.assertIsNone(plugin._driver_lease)
+        self.assertEqual(plugin._registered_yui_tools, set())
+        self.assertEqual(plugin._context_push_status["state"], "offline_sent")
+        payload = json.loads(
+            pushed[-1]["parts"][0]["text"].removeprefix("YUI_WORLD_CONTEXT ")
+        )
+        self.assertEqual(payload["connection"]["reason"], "host_disconnected")
+
+    def test_startup_announces_disconnected_state_without_registering_tools(self) -> None:
+        plugin = _plugin_class()(None)
+        pushed = []
+
+        async def load_config():
+            return YuiPluginConfig()
+
+        plugin._load_config = load_config
+        plugin._start_log_tailer = lambda: None
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
+
+        result = asyncio.run(plugin.startup())
+
+        self.assertEqual(result.value["status"], "ready")
+        self.assertFalse(result.value["result"]["midi_open"])
+        self.assertEqual(result.value["result"]["llm_tools"], [])
+        payload = json.loads(
+            pushed[-1]["parts"][0]["text"].removeprefix("YUI_WORLD_CONTEXT ")
+        )
+        self.assertFalse(payload["connection"]["connected"])
+        self.assertEqual(
+            payload["connection"]["reason"], "plugin_started_disconnected"
+        )
 
 
 if __name__ == "__main__":

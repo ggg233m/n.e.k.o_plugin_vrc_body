@@ -302,10 +302,18 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
         payload: dict[str, Any] = {
             "context_type": "yui_world_context_v1",
+            "context_revision": 2,
+            "connection": {
+                "connected": True,
+                "fresh": True,
+                "session": session.session,
+            },
             "instructions": [
                 "这些是 Unity 和冻结目录确认的事实，不是视觉推断。",
-                "操作前先使用 npc.observe 刷新状态，只能选择已发布的 semantic_key 或 player_slot。",
-                "operation 的 failed、cancelled、unknown 都不得当作成功。",
+                "用户询问当前位置、附近对象、玩家或当前状态时，本轮必须先调用 npc.observe；需要更大范围地图或路线时调用 npc.world_query。注入快照只能用于选择工具参数，不能冒充本轮实时观察。",
+                "用户要求移动、导航、跟随、探索、注视、动作、表情、说话、停止或急停时，本轮必须在回复前调用匹配的 npc.* 工具；没有工具返回时，严禁回复‘开始’、‘马上’、‘正在执行’或‘已经完成’。",
+                "只能选择当前 available_tools 和目录已发布的 semantic_key 或 player_slot；不可用时明确说明当前无法执行。",
+                "工具返回 accepted 只表示已受理；plan_id 与 op_id 只供内部追踪及后续状态查询使用。除非用户明确询问编号，否则禁止在面向用户的可朗读回复中输出这些编号或 UUID。只有 operation/plan 的 succeeded 才能报告完成，failed、cancelled、unknown 都不得当作成功。",
             ],
             "world": observation,
             "catalog": {
@@ -322,6 +330,38 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         if session.spec_version in {"1.2", "1.3"}:
             payload = session._without_absolute_coordinates(payload)
         return payload
+
+    @staticmethod
+    def _offline_context_payload(reason: str) -> dict[str, Any]:
+        """构建离线失效通知，明确覆盖对话里残留的旧世界快照。"""
+
+        return {
+            "context_type": "yui_world_context_v1",
+            "context_revision": 2,
+            "connection": {
+                "connected": False,
+                "fresh": False,
+                "reason": str(reason or "not_connected"),
+            },
+            "instructions": [
+                "YUI 当前未连接；此前注入的全部位置、附近实体、玩家、目录和计划快照已经失效，不得继续引用。",
+                "不得声称刚刚观察过世界，也不得根据旧快照回答‘我在哪’或‘附近有什么’。",
+                "不得承诺移动、导航、跟随、探索、注视、动作、表情、说话、停止或急停将会执行。",
+                "不得承诺连接后自动执行、稍后补执行或记住当前动作请求；连接成功后必须由用户重新发起。",
+                "用户询问世界或要求控制 NPC 时，应明确回复：YUI 未连接，请先由宿主连接 YUI 世界 NPC。",
+                "只有收到新的 connection.connected=true 上下文，并在本轮取得对应 npc.* 工具返回后，才能陈述实时事实或执行状态。",
+            ],
+            "world": {
+                "available": False,
+                "fresh": False,
+            },
+            "catalog": {
+                "revision": None,
+                "counts": {},
+            },
+            "available_tools": [],
+            "plan": None,
+        }
 
     @staticmethod
     def _context_signature(payload: dict[str, Any]) -> str:
@@ -341,6 +381,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         )
         plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
         stable = {
+            "context_revision": payload.get("context_revision"),
+            "connection": payload.get("connection"),
             "session": world.get("session"),
             "spec": world.get("spec"),
             "control_state": world.get("control_state"),
@@ -379,13 +421,15 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         ok = getattr(receipt, "ok", None)
         return ok is not False
 
-    def _push_context_snapshot(self, *, force: bool = False) -> bool:
-        """向宿主被动注入最新语义快照；相同状态只注入一次。"""
-        if self._adapter is None or self._surface is None:
-            return False
-        payload = self._model_context_payload()
-        if payload is None:
-            return False
+    def _push_context_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        force: bool = False,
+        sent_state: str = "sent",
+    ) -> bool:
+        """把在线或离线上下文写入同一宿主通道，确保新状态覆盖旧语义。"""
+
         signature = self._context_signature(payload)
         if not force and signature == self._last_context_signature:
             self._context_push_status["state"] = "deduplicated"
@@ -406,14 +450,19 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 coalesce_key="yui_world_context",
                 metadata={
                     "context_type": "yui_world_context_v1",
-                    "session": payload["world"].get("session"),
+                    "context_revision": payload.get("context_revision"),
+                    "connected": bool(
+                        isinstance(payload.get("connection"), dict)
+                        and payload["connection"].get("connected") is True
+                    ),
+                    "session": payload.get("world", {}).get("session"),
                 },
             )
             if not self._push_receipt_ok(receipt):
                 raise RuntimeError("宿主拒绝 YUI 上下文消息")
             self._last_context_signature = signature
             self._context_push_status.update({
-                "state": "sent",
+                "state": sent_state,
                 "pushes": int(self._context_push_status.get("pushes", 0)) + 1,
                 "last_error": None,
             })
@@ -430,6 +479,25 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 except Exception:
                     pass
             return False
+
+    def _push_context_snapshot(self, *, force: bool = False) -> bool:
+        """向宿主被动注入最新在线语义快照；相同状态只注入一次。"""
+
+        if self._adapter is None or self._surface is None:
+            return False
+        payload = self._model_context_payload()
+        if payload is None:
+            return False
+        return self._push_context_payload(payload, force=force, sent_state="sent")
+
+    def _push_context_unavailable(self, reason: str, *, force: bool = False) -> bool:
+        """废止宿主对话中残留的在线快照，并禁止离线时假装观察或执行。"""
+
+        return self._push_context_payload(
+            self._offline_context_payload(reason),
+            force=force,
+            sent_state="offline_sent",
+        )
 
     def _on_session_event(self, event: dict[str, Any]) -> None:
         loop = self._event_loop
@@ -509,7 +577,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "world": world,
         }
 
-    def _close_control(self) -> None:
+    def _close_control(self, *, reason: str = "not_connected") -> None:
         self._unregister_yui_tools()
         if self._adapter is not None:
             self._adapter.close()
@@ -522,9 +590,10 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._surface = None
         self._driver_lease = None
         self._last_context_signature = ""
+        self._push_context_unavailable(reason, force=True)
 
-    def _close_runtime(self) -> None:
-        self._close_control()
+    def _close_runtime(self, *, reason: str = "plugin_stopped") -> None:
+        self._close_control(reason=reason)
         if self._tailer is not None:
             self._tailer.close()
         if self._session is not None:
@@ -539,14 +608,15 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             self._config = await self._load_config()
             # 启动只跟随日志；不得打开 MIDI 或 DISCOVER。
             self._start_log_tailer()
+            self._push_context_unavailable("plugin_started_disconnected", force=True)
             return Ok({"status": "ready", "result": self._status_snapshot()})
         except Exception as exc:
-            self._close_runtime()
+            self._close_runtime(reason="startup_failed")
             return Err(f"{type(exc).__name__}: {exc}")
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_: Any):
-        self._close_runtime()
+        self._close_runtime(reason="plugin_shutdown")
         self._event_loop = None
         return Ok({"status": "stopped"})
 
@@ -599,7 +669,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     )
     async def yui_disconnect(self, **_: Any):
         async with self._runtime_lock:
-            self._close_control()
+            self._close_control(reason="host_disconnected")
             return Ok({"status": "disconnected", "result": self._status_snapshot()})
 
     @plugin_entry(
@@ -635,12 +705,12 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     async def yui_reload_config(self, **_: Any):
         async with self._runtime_lock:
             try:
-                self._close_runtime()
+                self._close_runtime(reason="config_reload")
                 self._config = await self._load_config()
                 self._start_log_tailer()
                 return Ok({"status": "reloaded", "result": self._status_snapshot()})
             except Exception as exc:
-                self._close_runtime()
+                self._close_runtime(reason="config_reload_failed")
                 return Err(f"{type(exc).__name__}: {exc}")
 
 

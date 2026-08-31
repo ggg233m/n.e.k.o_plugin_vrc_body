@@ -272,6 +272,33 @@ class ToolSurfaceTests(unittest.TestCase):
         }:
             self.assertNotIn(hidden, self._names())
 
+    def test_realtime_queries_and_execution_tools_forbid_language_only_success(self) -> None:
+        definitions = self._advanced_v13()
+
+        self.assertIn("本轮必须先调用本工具", definitions["npc.observe"].description)
+        self.assertIn("本轮必须调用本工具", definitions["npc.world_query"].description)
+        for name in {
+            "npc.navigate",
+            "npc.approach",
+            "npc.orbit",
+            "npc.explore",
+            "npc.execute_plan",
+            "npc.move_relative",
+            "npc.follow",
+            "npc.look_at",
+            "npc.act",
+            "npc.set_expression",
+            "npc.say",
+            "npc.stop",
+            "npc.estop",
+        }:
+            description = definitions[name].description
+            self.assertIn("必须在回复前调用本工具", description, name)
+            self.assertIn("未取得工具返回不得承诺", description, name)
+            self.assertIn("accepted 仅表示已受理", description, name)
+            self.assertIn("只供内部追踪", description, name)
+            self.assertIn("禁止在面向用户的可朗读回复中输出", description, name)
+
     def test_execute_plan_schema_is_complete_strict_and_compact(self) -> None:
         definition = self._advanced_v13()["npc.execute_plan"]
         graph = definition.input_schema["properties"]["graph"]
