@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ROUTER = ROOT / "unity" / "Assets" / "NEKO" / "Npc" / "NekoMidiRouter.cs"
 LOCOMOTION = ROOT / "unity" / "Assets" / "NEKO" / "Npc" / "NekoNpcLocomotion.cs"
 BUILDER = ROOT / "unity" / "Assets" / "NEKO" / "Editor" / "NekoYuiFullNpcBuilder.cs"
+TELEMETRY = ROOT / "unity" / "Assets" / "NEKO" / "Npc" / "NekoNpcTelemetry.cs"
 
 
 class UnityV13ContractTests(unittest.TestCase):
@@ -18,6 +19,7 @@ class UnityV13ContractTests(unittest.TestCase):
         cls.router = ROUTER.read_text(encoding="utf-8-sig")
         cls.locomotion = LOCOMOTION.read_text(encoding="utf-8-sig")
         cls.builder = BUILDER.read_text(encoding="utf-8-sig")
+        cls.telemetry = TELEMETRY.read_text(encoding="utf-8-sig")
 
     def test_new_commands_and_capabilities_are_published(self) -> None:
         self.assertIn("CMD_MOVE_RELATIVE = 0x19", self.router)
@@ -59,6 +61,15 @@ class UnityV13ContractTests(unittest.TestCase):
         self.assertIn("_explorePendingStart = true", self.locomotion)
         self.assertIn("private void BeginExploreMovement", self.locomotion)
         self.assertIn('telemetry.Emit("npc.operation_failed"', self.router)
+
+    def test_telemetry_rate_limit_has_serialization_boundary_guard(self) -> None:
+        """毫秒日志时间的闭区间统计不能在整秒边界叠加两批目录。"""
+
+        self.assertIn("private const float BudgetWindowSeconds = 1.05f", self.telemetry)
+        self.assertEqual(
+            self.telemetry.count("now - _lineTimes[i] < BudgetWindowSeconds"),
+            2,
+        )
 
     def test_matchbox_publishes_three_regions_and_upper_patrol_points(self) -> None:
         self.assertIn('new[] { "ground_floor", "stairway", "upper_floor" }', self.builder)

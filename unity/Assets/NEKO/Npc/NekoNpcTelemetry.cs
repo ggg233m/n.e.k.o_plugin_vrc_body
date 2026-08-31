@@ -43,6 +43,10 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     private const int MaxJsonUtf8Bytes = 950;
     private const int KeySlots = 48;
     private const int MaxBudget = 20;
+    // 日志时间只保留到毫秒；若正好每 1.000 秒释放一批，接收端按闭区间
+    // 统计 [t-1,t] 时会把前后两批同时计入。增加 50ms 保护带，确保序列化后
+    // 的任意滑动秒也不会跨边界叠加两批，同时只给 DISCOVER 增加极小延迟。
+    private const float BudgetWindowSeconds = 1.05f;
     // 普通目录/状态最多占 16 行；为 ACK、错误和安全事件保留 4 行滑动窗余量。
     private const int ForcedBudgetReserve = 4;
     private const int NormalQueueSize = 128;
@@ -183,7 +187,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         int recent = 0;
         for (int i = 0; i < MaxBudget; i++)
         {
-            if (now - _lineTimes[i] < 1.0f) recent++;
+            if (now - _lineTimes[i] < BudgetWindowSeconds) recent++;
         }
         return recent < limit;
     }
@@ -197,7 +201,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         int recent = 0;
         for (int i = 0; i < MaxBudget; i++)
         {
-            if (now - _lineTimes[i] < 1.0f) recent++;
+            if (now - _lineTimes[i] < BudgetWindowSeconds) recent++;
         }
         return recent < normalLimit;
     }
