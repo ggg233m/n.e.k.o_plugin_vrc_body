@@ -1,5 +1,6 @@
 """插件配置安全门和 manifest 冲突声明测试。"""
 
+import asyncio
 import ast
 import importlib.util
 import json
@@ -10,6 +11,7 @@ import unittest
 
 import _bootstrap  # noqa: F401
 from yui_npc_controller.runtime.config import YuiPluginConfig
+from yui_npc_controller.runtime.tool_surface import YuiToolSurface
 from yui_npc_controller.runtime.yui_session import YuiSessionState
 
 
@@ -142,6 +144,84 @@ class YuiPluginConfigTests(unittest.TestCase):
         session.control_state = "moving"
         plugin._refresh_llm_tools()
         self.assertEqual(surface.calls, 1)
+
+    def test_neko_registration_reuses_mcp_execute_plan_schema(self) -> None:
+        plugin = _plugin_class()(None)
+        session = YuiSessionState()
+        session.spec_version = "1.3"
+        session.session = 7
+        session.control_state = "external"
+        session.capabilities = (
+            "goto",
+            "navmesh",
+            "anchors",
+            "operation_lifecycle",
+            "world_map",
+            "semantic_navigation",
+            "region_localization",
+            "local_navigation",
+        )
+        session.max_speed_mps = 2.0
+        session.catalogs["anchor"][0] = {
+            "id": 0,
+            "semantic_key": "spawn_point",
+            "pos": [0.0, 0.0, 0.0],
+        }
+        session.catalogs["entity"][0] = {
+            "id": 0,
+            "semantic_key": "central_obstacle",
+            "approach_anchor_id": 0,
+            "orbitable": True,
+        }
+        surface = YuiToolSurface(object(), session)  # type: ignore[arg-type]
+        source_definition = next(
+            item for item in surface.definitions() if item.name == "npc.execute_plan"
+        )
+        registered = {}
+        plugin.register_llm_tool = (
+            lambda **kwargs: registered.setdefault(kwargs["name"], kwargs) or True
+        )
+        plugin.unregister_llm_tool = lambda _name: True
+        plugin._session = session
+        plugin._surface = surface
+        plugin._registered_yui_tools = set()
+        plugin._tool_signature = ""
+        plugin._tool_state_key = None
+
+        plugin._refresh_llm_tools()
+
+        projected = registered["npc.execute_plan"]
+        self.assertEqual(projected["parameters"], source_definition.input_schema)
+        self.assertEqual(
+            source_definition.as_mcp_tool()["inputSchema"],
+            projected["parameters"],
+        )
+        self.assertNotIn("npc.plan_step", registered)
+
+    def test_neko_handler_marks_failed_tool_result_as_error(self) -> None:
+        plugin = _plugin_class()(None)
+        failure = {
+            "status": "failed",
+            "error": "behavior_graph_invalid",
+            "detail": "arguments.graph.nodes[0].target_key 为必填字段",
+            "midi_sent": False,
+        }
+
+        class FailedSurface:
+            @staticmethod
+            def call(_name, _arguments):
+                return dict(failure)
+
+        plugin._surface = FailedSurface()
+        plugin._refresh_llm_tools = lambda: []
+        plugin._push_context_snapshot = lambda: False
+        handler = plugin._make_tool_handler("npc.execute_plan")
+
+        result = asyncio.run(handler(graph={"entry": "root", "nodes": []}))
+
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["error"], "behavior_graph_invalid")
+        self.assertEqual(result["output"], failure)
 
     def test_passive_world_context_is_private_complete_and_deduplicated(self) -> None:
         plugin = _plugin_class()(None)

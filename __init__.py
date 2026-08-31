@@ -184,6 +184,12 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             result = await asyncio.to_thread(surface.call, tool_name, arguments)
             self._refresh_llm_tools()
             self._push_context_snapshot()
+            if result.get("status") == "failed":
+                return {
+                    "output": result,
+                    "is_error": True,
+                    "error": str(result.get("error") or "tool_failed"),
+                }
             return result
 
         return handler

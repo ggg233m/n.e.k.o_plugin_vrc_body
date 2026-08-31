@@ -193,12 +193,80 @@ class BehaviorPlanTests(unittest.TestCase):
             with self.subTest(graph=graph), self.assertRaises(BehaviorGraphError):
                 BehaviorGraphCompiler(self.session).compile(graph)
 
+    def test_structural_limits_are_all_enforced_by_compiler(self) -> None:
+        too_many_nodes = _graph(
+            {"id": "root", "type": "sequence", "children": [f"n{i}" for i in range(64)]},
+            *(
+                {"id": f"n{i}", "type": "wait", "duration_ms": 1}
+                for i in range(64)
+            ),
+        )
+        too_deep = _graph(
+            *(
+                {"id": f"n{i}", "type": "timeout", "child": f"n{i + 1}", "timeout_ms": 1}
+                for i in range(8)
+            ),
+            {"id": "n8", "type": "wait", "duration_ms": 1},
+            entry="n0",
+        )
+        too_many_parallel = _graph(
+            {"id": "root", "type": "parallel", "children": [f"n{i}" for i in range(5)]},
+            *(
+                {"id": f"n{i}", "type": "wait", "duration_ms": 1}
+                for i in range(5)
+            ),
+        )
+        bad_retry = _graph(
+            {"id": "root", "type": "retry", "child": "wait", "max_attempts": 4},
+            {"id": "wait", "type": "wait", "duration_ms": 1},
+        )
+        bad_timeout = _graph(
+            {"id": "root", "type": "timeout", "child": "wait", "timeout_ms": 60_001},
+            {"id": "wait", "type": "wait", "duration_ms": 1},
+        )
+        for graph in (
+            too_many_nodes,
+            too_deep,
+            too_many_parallel,
+            bad_retry,
+            bad_timeout,
+        ):
+            with self.subTest(graph=graph), self.assertRaises(BehaviorGraphError):
+                BehaviorGraphCompiler(self.session).compile(graph)
+
+    def test_invalid_graph_uses_model_visible_error_code(self) -> None:
+        result = self.manager.submit(
+            _graph({"id": "root", "type": "navigate"})
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "behavior_graph_invalid")
+        self.assertIn("target_key 为必填", result["detail"])
+
+    def test_v12_rejects_v13_move_relative_node(self) -> None:
+        result = self.manager.submit(single_node_graph(
+            "move_relative",
+            bearing_deg=0.0,
+            distance_m=1.0,
+        ))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "behavior_graph_invalid")
+        self.assertIn("local_navigation capability", result["detail"])
+        self.assertEqual(self.adapter.calls, [])
+
     def test_natural_language_condition_is_rejected(self) -> None:
-        with self.assertRaises(BehaviorGraphError):
-            BehaviorGraphCompiler(self.session).compile(_graph({
-                "id": "root", "type": "condition",
-                "predicate": {"type": "ask_llm", "prompt": "玩家看起来开心吗"},
-            }))
+        for predicate in (
+            {"type": "ask_llm", "prompt": "玩家看起来开心吗"},
+            {
+                "type": "player_present",
+                "player_slot": 0,
+                "prompt": "请自行判断玩家是否开心",
+            },
+        ):
+            with self.subTest(predicate=predicate), self.assertRaises(BehaviorGraphError):
+                BehaviorGraphCompiler(self.session).compile(_graph({
+                    "id": "root", "type": "condition", "predicate": predicate,
+                }))
 
     def test_v13_move_relative_and_explore_are_single_wire_operations(self) -> None:
         self.session.spec_version = "1.3"

@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Mapping
 
+from .behavior_plan import (
+    MAX_NODES,
+    MAX_PARALLEL_CHILDREN,
+    MAX_PLAN_SECONDS,
+    MAX_REPEAT,
+    MAX_RETRY_ATTEMPTS,
+    MAX_WAIT_MS,
+    PLAN_STATUSES,
+)
 from .yui_adapter import YuiSemanticAdapter
 from .yui_session import YuiSessionState
 
@@ -76,10 +86,32 @@ def _schema_error(value: Any, schema: Mapping[str, Any], path: str = "arguments"
         if matches != 1:
             return f"{path} 必须且只能匹配一种目标形式"
     any_of = schema.get("anyOf")
-    if any_of is not None and not any(
-        _schema_error(value, branch, path) is None for branch in any_of
-    ):
-        return f"{path} 不匹配任一允许形式"
+    if any_of is not None:
+        branch_errors = [
+            _schema_error(value, branch, path)
+            for branch in any_of
+        ]
+        if all(error is not None for error in branch_errors):
+            # 行为图节点和 predicate 都用 type 作为判别字段。命中某个
+            # 分支后返回该分支的精确字段错误，避免 fast 模型只看到笼统的
+            # “不匹配任一形式”而再次提交同一份坏图。
+            if isinstance(value, Mapping) and isinstance(value.get("type"), str):
+                discriminator = value["type"]
+                typed_indices = []
+                all_branches_typed = True
+                for index, branch in enumerate(any_of):
+                    type_schema = branch.get("properties", {}).get("type", {})
+                    allowed_types = type_schema.get("enum")
+                    if not isinstance(allowed_types, list):
+                        all_branches_typed = False
+                        continue
+                    if discriminator in allowed_types:
+                        typed_indices.append(index)
+                if len(typed_indices) == 1:
+                    return branch_errors[typed_indices[0]]
+                if all_branches_typed and not typed_indices:
+                    return f"{path}.type 不在允许值中"
+            return f"{path} 不匹配任一允许形式"
     denied = schema.get("not")
     if denied is not None and _schema_error(value, denied, path) is None:
         return f"{path} 包含互斥字段"
@@ -102,6 +134,285 @@ def _object_schema(
     if one_of:
         schema["oneOf"] = one_of
     return schema
+
+
+def _typed_object_schema(
+    node_type: str,
+    properties: dict[str, Any] | None = None,
+    *,
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    """生成一种严格行为节点；type 同时充当 anyOf 判别字段。"""
+
+    node_properties = {
+        "id": {"type": "string", "minLength": 1, "maxLength": 48},
+        "type": {"type": "string", "enum": [node_type]},
+    }
+    node_properties.update(properties or {})
+    return _object_schema(
+        node_properties,
+        required=["id", "type", *(required or [])],
+    )
+
+
+def _behavior_graph_schema(
+    *,
+    target_schema: Mapping[str, Any],
+    entity_schema: Mapping[str, Any],
+    region_schema: Mapping[str, Any],
+    action_schema: Mapping[str, Any],
+    expression_schema: Mapping[str, Any],
+    speed_schema: Mapping[str, Any],
+    local_navigation: bool,
+) -> dict[str, Any]:
+    """构建 MCP/N.E.K.O 共用的紧凑、有限行为图 schema。"""
+
+    reference = {"type": "string", "minLength": 1, "maxLength": 48}
+    player_slot = {"type": "integer", "minimum": 0, "maximum": 63}
+    duration = {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_MS}
+    child_list = {
+        "type": "array",
+        "items": dict(reference),
+        "minItems": 1,
+        "maxItems": MAX_NODES,
+    }
+
+    predicates = [
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["player_present"]},
+                "player_slot": dict(player_slot),
+            },
+            required=["type", "player_slot"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["player_distance"]},
+                "player_slot": dict(player_slot),
+                "op": {"type": "string", "enum": ["lt", "lte", "gt", "gte"]},
+                "value_m": {"type": "number", "minimum": 0, "maximum": 1000},
+            },
+            required=["type", "player_slot", "op", "value_m"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["event_seen"]},
+                "event_type": {"type": "string", "minLength": 1},
+                "within_ms": dict(duration),
+            },
+            required=["type", "event_type"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["node_status"]},
+                "node_id": dict(reference),
+                "status": {"type": "string", "enum": list(PLAN_STATUSES)},
+            },
+            required=["type", "node_id", "status"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["control_state"]},
+                "value": {
+                    "type": "string",
+                    "enum": ["safe_idle", "external", "moving", "action", "estop"],
+                },
+            },
+            required=["type", "value"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["estop"]},
+                "value": {"type": "boolean"},
+            },
+            required=["type", "value"],
+        ),
+        _object_schema(
+            {
+                "type": {"type": "string", "enum": ["elapsed_ms"]},
+                "op": {"type": "string", "enum": ["lt", "lte", "gt", "gte"]},
+                "value": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": int(MAX_PLAN_SECONDS * 1000),
+                },
+            },
+            required=["type", "op", "value"],
+        ),
+    ]
+
+    nodes = [
+        _typed_object_schema("sequence", {"children": dict(child_list)}, required=["children"]),
+        _typed_object_schema("selector", {"children": dict(child_list)}, required=["children"]),
+        _typed_object_schema(
+            "parallel",
+            {
+                "children": {
+                    **child_list,
+                    "maxItems": MAX_PARALLEL_CHILDREN,
+                },
+                "join": {"type": "string", "enum": ["all", "race"], "default": "all"},
+            },
+            required=["children"],
+        ),
+        _typed_object_schema(
+            "repeat",
+            {
+                "child": dict(reference),
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_REPEAT},
+            },
+            required=["child", "count"],
+        ),
+        _typed_object_schema(
+            "retry",
+            {
+                "child": dict(reference),
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_RETRY_ATTEMPTS,
+                },
+                "delay_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+            },
+            required=["child", "max_attempts"],
+        ),
+        _typed_object_schema(
+            "timeout",
+            {"child": dict(reference), "timeout_ms": dict(duration)},
+            required=["child", "timeout_ms"],
+        ),
+        _typed_object_schema(
+            "condition",
+            {"predicate": {"anyOf": predicates}},
+            required=["predicate"],
+        ),
+        _typed_object_schema(
+            "navigate",
+            {"target_key": dict(target_schema), "speed_mps": dict(speed_schema)},
+            required=["target_key"],
+        ),
+        _typed_object_schema(
+            "approach",
+            {
+                "player_slot": dict(player_slot),
+                "distance_m": {"type": "number", "minimum": 0.5, "maximum": 5.0},
+                "speed_mps": dict(speed_schema),
+                "face_target": {"type": "boolean", "default": True},
+            },
+            required=["player_slot"],
+        ),
+        _typed_object_schema(
+            "follow",
+            {
+                "player_slot": dict(player_slot),
+                "duration_ms": dict(duration),
+                "speed_mps": dict(speed_schema),
+            },
+            required=["player_slot", "duration_ms"],
+        ),
+        _typed_object_schema(
+            "orbit",
+            {
+                "target_key": dict(entity_schema),
+                "radius_m": {"type": "number", "minimum": 0.25, "maximum": 5.0},
+                "laps": {"type": "integer", "minimum": 1, "maximum": 3},
+                "direction": {"type": "string", "enum": ["cw", "ccw"]},
+                "speed_mps": dict(speed_schema),
+                "face_target": {"type": "boolean", "default": True},
+            },
+            required=["target_key"],
+        ),
+        _typed_object_schema(
+            "explore",
+            {
+                "region_key": dict(region_schema),
+                "duration_ms": {
+                    "type": "integer",
+                    "minimum": 1000 if local_navigation else 1,
+                    "maximum": int(MAX_PLAN_SECONDS * 1000),
+                },
+                "strategy": {"type": "string", "enum": ["unvisited", "patrol"]},
+                "speed_mps": dict(speed_schema),
+            },
+            required=["region_key", "duration_ms"],
+        ),
+        *(
+            [
+                _typed_object_schema(
+                    "move_relative",
+                    {
+                        "bearing_deg": {"type": "number"},
+                        "distance_m": {
+                            "type": "number",
+                            "minimum": 0.25,
+                            "maximum": 10.0,
+                        },
+                        "speed_mps": dict(speed_schema),
+                        "face_travel": {"type": "boolean", "default": True},
+                        "allow_shorter": {"type": "boolean", "default": True},
+                    },
+                    required=["bearing_deg", "distance_m"],
+                )
+            ]
+            if local_navigation
+            else []
+        ),
+        _typed_object_schema(
+            "look_at",
+            {"player_slot": dict(player_slot), "duration_ms": dict(duration)},
+            required=["player_slot", "duration_ms"],
+        ),
+        _typed_object_schema(
+            "act",
+            {
+                "action_key": dict(action_schema),
+                "player_slot": dict(player_slot),
+                "loop": {"type": "boolean", "default": False},
+            },
+            required=["action_key"],
+        ),
+        _typed_object_schema(
+            "set_expression",
+            {
+                "expression_key": dict(expression_schema),
+                "duration_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WAIT_MS,
+                },
+            },
+            required=["expression_key"],
+        ),
+        _typed_object_schema(
+            "say",
+            {
+                "text": {"type": "string", "minLength": 1, "maxLength": 384},
+                "duration_ms": {"type": "integer", "minimum": 250, "maximum": 31_750},
+                "estimated_delay_ms": {"type": "integer", "minimum": 0, "maximum": 12_700},
+                "action_key": dict(action_schema),
+            },
+            required=["text"],
+        ),
+        _typed_object_schema("wait", {"duration_ms": dict(duration)}, required=["duration_ms"]),
+        _typed_object_schema(
+            "stop",
+            {"scope": {"type": "string", "enum": ["all", "movement", "action"], "default": "all"}},
+        ),
+    ]
+
+    return _object_schema(
+        {
+            "entry": dict(reference),
+            "nodes": {
+                "type": "array",
+                "items": {"anyOf": nodes},
+                "minItems": 1,
+                "maxItems": MAX_NODES,
+                "description": "扁平节点表；children/child 只能引用表内 id，图必须树形展开且深度不超过 8。",
+            },
+        },
+        required=["entry", "nodes"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +575,74 @@ class YuiToolSurface:
             region_schema: dict[str, Any] = {"type": "string", "minLength": 1}
             if region_keys:
                 region_schema["enum"] = region_keys
+            action_keys = [
+                str(item.get("semantic_key"))
+                for _item_id, item in sorted(self.session.catalogs["action"].items())
+                if isinstance(item.get("semantic_key"), str)
+            ]
+            action_node_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+            if action_keys:
+                action_node_schema["enum"] = action_keys
+            expression_keys = [
+                str(item.get("semantic_key"))
+                for _item_id, item in sorted(self.session.catalogs["expression"].items())
+                if isinstance(item.get("semantic_key"), str)
+            ]
+            expression_node_schema: dict[str, Any] = {"type": "string", "minLength": 1}
+            if expression_keys:
+                expression_node_schema["enum"] = expression_keys
+            graph_schema = _behavior_graph_schema(
+                target_schema=target_schema,
+                entity_schema=entity_schema,
+                region_schema=region_schema,
+                action_schema=action_node_schema,
+                expression_schema=expression_node_schema,
+                speed_schema=speed_schema,
+                local_navigation=self.session.local_navigation,
+            )
+            example_children: list[str] = []
+            example_nodes: list[dict[str, Any]] = []
+            if entity_keys:
+                example_children.append("orbit")
+                example_nodes.append({
+                    "id": "orbit",
+                    "type": "orbit",
+                    "target_key": entity_keys[0],
+                    "laps": 1,
+                    "direction": "cw",
+                })
+            for index, target_key in enumerate(semantic_keys[:2], start=1):
+                node_id = f"target{index}"
+                example_children.append(node_id)
+                example_nodes.append({
+                    "id": node_id,
+                    "type": "navigate",
+                    "target_key": target_key,
+                })
+            if not example_children:
+                example_children.append("pause")
+                example_nodes.append({
+                    "id": "pause",
+                    "type": "wait",
+                    "duration_ms": 500,
+                })
+            graph_example = json.dumps(
+                {
+                    "graph": {
+                        "entry": "root",
+                        "nodes": [
+                            {
+                                "id": "root",
+                                "type": "sequence",
+                                "children": example_children,
+                            },
+                            *example_nodes,
+                        ],
+                    }
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             replace_schema = {"type": "boolean", "default": False}
             definitions.extend([
                 YuiToolDefinition(
@@ -312,9 +691,10 @@ class YuiToolSurface:
                 ),
                 YuiToolDefinition(
                     "npc.execute_plan",
-                    "提交受限 v1.2/v1.3 行为图并由 Python 后台执行；不接受代码或自然语言条件。",
+                    "提交受限扁平行为图并后台执行；entry 指向 nodes 中的根 id，控制节点用 children/child 引用。"
+                    f"不接受代码或自然语言条件。当前世界有效 sequence 示例：{graph_example}",
                     _object_schema({
-                        "graph": {"type": "object"},
+                        "graph": graph_schema,
                         "replace_active": replace_schema,
                     }, required=["graph"]),
                     normal_timeout,
@@ -484,7 +864,11 @@ class YuiToolSurface:
         if validation_error is not None:
             return {
                 "status": "failed",
-                "error": "invalid_arguments",
+                "error": (
+                    "behavior_graph_invalid"
+                    if name == "npc.execute_plan"
+                    else "invalid_arguments"
+                ),
                 "detail": validation_error,
                 "midi_sent": False,
             }

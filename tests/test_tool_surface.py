@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -14,6 +15,7 @@ from yui_npc_controller.runtime import (
     YuiSessionState,
     YuiToolSurface,
 )
+from yui_npc_controller.runtime.behavior_plan import NODE_TYPES
 from yui_npc_controller.runtime.yui_transport import YuiCommandOutcome
 
 
@@ -111,6 +113,43 @@ class ToolSurfaceTests(unittest.TestCase):
             "id": 0,
             "semantic_key": "idle",
         }
+
+    def _advanced_v13(self) -> dict[str, object]:
+        self._ready()
+        self.surface.free_coordinate_navigation = False
+        self.surface.enable_wander_tool = False
+        self.session.spec_version = "1.3"
+        self.session.capabilities += (
+            "world_map",
+            "semantic_navigation",
+            "region_localization",
+            "local_navigation",
+        )
+        self.session.catalogs["anchor"][1] = {
+            "id": 1,
+            "semantic_key": "upper_observation",
+            "pos": [0.0, 2.0, 0.0],
+            "has_yaw": False,
+        }
+        self.session.catalogs["anchor"][2] = {
+            "id": 2,
+            "semantic_key": "spawn_point",
+            "pos": [0.0, 0.0, 0.0],
+            "has_yaw": False,
+        }
+        self.session.catalogs["region"][0] = {
+            "id": 0,
+            "semantic_key": "ground_floor",
+            "entry_anchor_id": 2,
+            "explorable": True,
+        }
+        self.session.catalogs["entity"][0] = {
+            "id": 0,
+            "semantic_key": "central_obstacle",
+            "approach_anchor_id": 2,
+            "orbitable": True,
+        }
+        return {item.name: item for item in self.surface.definitions()}
 
     def test_safe_idle_never_exposes_arm(self) -> None:
         self.assertEqual(self._names(), {"npc.observe", "npc.estop"})
@@ -232,6 +271,132 @@ class ToolSurfaceTests(unittest.TestCase):
             "npc.wait_operation",
         }:
             self.assertNotIn(hidden, self._names())
+
+    def test_execute_plan_schema_is_complete_strict_and_compact(self) -> None:
+        definition = self._advanced_v13()["npc.execute_plan"]
+        graph = definition.input_schema["properties"]["graph"]
+        self.assertEqual(graph["required"], ["entry", "nodes"])
+        self.assertFalse(graph["additionalProperties"])
+        self.assertEqual(graph["properties"]["nodes"]["maxItems"], 64)
+        branches = graph["properties"]["nodes"]["items"]["anyOf"]
+        schema_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in branches
+        }
+        self.assertEqual(schema_types, set(NODE_TYPES))
+        self.assertTrue(all(branch["additionalProperties"] is False for branch in branches))
+        self.assertIn('"type":"sequence"', definition.description)
+        self.assertIn('"type":"orbit"', definition.description)
+
+        # 工具定义需要覆盖完整白名单，但不能无界膨胀 fast 模型上下文。
+        encoded = json.dumps(
+            definition.as_mcp_tool(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertLess(len(encoded), 16_000)
+
+    def test_v12_execute_plan_schema_hides_v13_relative_move(self) -> None:
+        self._ready()
+        self.session.spec_version = "1.2"
+        self.session.capabilities += ("world_map", "semantic_navigation")
+        definitions = {item.name: item for item in self.surface.definitions()}
+        graph = definitions["npc.execute_plan"].input_schema["properties"]["graph"]
+        branches = graph["properties"]["nodes"]["items"]["anyOf"]
+        schema_types = {
+            branch["properties"]["type"]["enum"][0]
+            for branch in branches
+        }
+
+        self.assertNotIn("move_relative", schema_types)
+        result = self.surface.call(
+            "npc.execute_plan",
+            {
+                "graph": {
+                    "entry": "move",
+                    "nodes": [
+                        {
+                            "id": "move",
+                            "type": "move_relative",
+                            "bearing_deg": 0.0,
+                            "distance_m": 1.0,
+                        }
+                    ],
+                }
+            },
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "behavior_graph_invalid")
+        self.assertIn("type 不在允许值中", result["detail"])
+
+    def test_execute_plan_accepts_documented_sequence_shape(self) -> None:
+        self._advanced_v13()
+        result = self.surface.call(
+            "npc.execute_plan",
+            {
+                "graph": {
+                    "entry": "root",
+                    "nodes": [
+                        {
+                            "id": "root",
+                            "type": "sequence",
+                            "children": ["orbit", "upper", "home"],
+                        },
+                        {
+                            "id": "orbit",
+                            "type": "orbit",
+                            "target_key": "central_obstacle",
+                            "laps": 1,
+                            "direction": "cw",
+                        },
+                        {
+                            "id": "upper",
+                            "type": "navigate",
+                            "target_key": "upper_observation",
+                        },
+                        {
+                            "id": "home",
+                            "type": "navigate",
+                            "target_key": "spawn_point",
+                        },
+                    ],
+                }
+            },
+        )
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(result["plan_id"].startswith("plan-"))
+
+    def test_execute_plan_reports_discriminated_field_errors(self) -> None:
+        self._advanced_v13()
+        missing_target = self.surface.call(
+            "npc.execute_plan",
+            {
+                "graph": {
+                    "entry": "go",
+                    "nodes": [{"id": "go", "type": "navigate"}],
+                }
+            },
+        )
+        self.assertEqual(missing_target["status"], "failed")
+        self.assertEqual(missing_target["error"], "behavior_graph_invalid")
+        self.assertEqual(
+            missing_target["detail"],
+            "arguments.graph.nodes[0].target_key 为必填字段",
+        )
+
+        bad_reference = self.surface.call(
+            "npc.execute_plan",
+            {
+                "graph": {
+                    "entry": "root",
+                    "nodes": [
+                        {"id": "root", "type": "sequence", "children": ["missing"]}
+                    ],
+                }
+            },
+        )
+        self.assertEqual(bad_reference["error"], "behavior_graph_invalid")
+        self.assertIn("引用了不存在的节点 missing", bad_reference["detail"])
 
     def test_operation_tools_and_free_coordinates_are_strictly_hidden(self) -> None:
         self._ready()

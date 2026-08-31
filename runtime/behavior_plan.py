@@ -268,8 +268,22 @@ class BehaviorGraphCompiler:
         if not isinstance(predicate, Mapping):
             raise BehaviorGraphError(f"节点 {node_id}.predicate 必须是对象")
         kind = predicate.get("type")
-        if kind not in {"player_present", "player_distance", "event_seen", "node_status", "control_state", "estop", "elapsed_ms"}:
+        allowed_fields = {
+            "player_present": {"type", "player_slot"},
+            "player_distance": {"type", "player_slot", "op", "value_m"},
+            "event_seen": {"type", "event_type", "within_ms"},
+            "node_status": {"type", "node_id", "status"},
+            "control_state": {"type", "value"},
+            "estop": {"type", "value"},
+            "elapsed_ms": {"type", "op", "value"},
+        }
+        if kind not in allowed_fields:
             raise BehaviorGraphError(f"节点 {node_id} 使用未授权条件 {kind}")
+        unknown = set(predicate) - allowed_fields[str(kind)]
+        if unknown:
+            raise BehaviorGraphError(
+                f"节点 {node_id}.predicate 包含未知字段: {', '.join(sorted(unknown))}"
+            )
         if kind in {"player_present", "player_distance"}:
             _integer(predicate.get("player_slot"), f"节点 {node_id}.player_slot", 0, 63)
         if kind == "player_distance":
@@ -316,6 +330,10 @@ class BehaviorGraphCompiler:
             if "face_target" in node and not isinstance(node["face_target"], bool):
                 raise BehaviorGraphError(f"节点 {node_id}.face_target 必须是布尔值")
         if node_type == "move_relative":
+            if not self.session.local_navigation:
+                raise BehaviorGraphError(
+                    f"节点 {node_id}.move_relative 需要 local_navigation capability"
+                )
             _number(node.get("bearing_deg"), f"节点 {node_id}.bearing_deg", -math.inf, math.inf)
             _number(node.get("distance_m"), f"节点 {node_id}.distance_m", 0.25, 10.0)
             for field_name in ("face_travel", "allow_shorter"):
@@ -377,7 +395,12 @@ class BehaviorPlanManager:
         try:
             normalized, nodes, entry, domains = BehaviorGraphCompiler(self.session).compile(graph)
         except BehaviorGraphError as exc:
-            return _result("failed", error="invalid_plan", detail=str(exc), midi_sent=False)
+            return _result(
+                "failed",
+                error="behavior_graph_invalid",
+                detail=str(exc),
+                midi_sent=False,
+            )
         if self.session.session <= 0 or self.session.control_state not in {"external", "moving", "action"}:
             return _result("failed", error="invalid_state", detail="地图 NPC 尚未进入宿主控制态", midi_sent=False)
         plan = BehaviorPlan(
