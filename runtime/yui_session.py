@@ -896,7 +896,17 @@ class YuiSessionState:
     @classmethod
     def _without_absolute_coordinates(cls, value: Any) -> Any:
         """v1.2+ 模型投影移除绝对世界坐标，保留 d/brg/yaw 等相对事实。"""
-        absolute_keys = {"pos", "target", "target_pos", "center", "origin", "hit_pos"}
+        absolute_keys = {
+            "pos",
+            "target",
+            "target_pos",
+            "center",
+            "origin",
+            "hit_pos",
+            "x",
+            "y",
+            "z",
+        }
         if isinstance(value, Mapping):
             return {
                 str(key): cls._without_absolute_coordinates(item)
@@ -997,7 +1007,12 @@ class YuiSessionState:
                         if isinstance(item.get("semantic_key"), str)
                     ]
                     for kind, catalog in self.catalogs.items()
-                    if kind in {"action", "expression", "anchor"}
+                    if kind in {"action", "expression", "anchor", "region", "entity"}
+                },
+                "catalog_rev": self.catalog_revision,
+                "catalog_counts": {
+                    kind: len(catalog)
+                    for kind, catalog in self.catalogs.items()
                 },
                 "log_complete": self.log_complete,
                 "log_gaps": list(self.log_gaps),

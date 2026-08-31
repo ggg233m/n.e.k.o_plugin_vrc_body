@@ -172,6 +172,67 @@ class ToolSurfaceTests(unittest.TestCase):
             properties,
         )
 
+    def test_default_full_v13_surface_matches_neko_fast_model_contract(self) -> None:
+        """完整世界只暴露规范工具；宿主入口、恢复入口和坐标工具必须隐藏。"""
+        self._ready()
+        self.surface.free_coordinate_navigation = False
+        self.surface.enable_wander_tool = False
+        self.session.spec_version = "1.3"
+        self.session.capabilities += (
+            "world_map",
+            "semantic_navigation",
+            "region_localization",
+            "local_navigation",
+        )
+        self.session.catalogs["region"][0] = {
+            "id": 0,
+            "semantic_key": "ground_floor",
+            "entry_anchor_id": 0,
+            "explorable": True,
+        }
+        self.session.catalogs["entity"][0] = {
+            "id": 0,
+            "semantic_key": "central_obstacle",
+            "approach_anchor_id": 0,
+            "orbitable": True,
+        }
+        self.assertEqual(
+            self._names(),
+            {
+                "npc.observe",
+                "npc.estop",
+                "npc.world_query",
+                "npc.plan_status",
+                "npc.go_to",
+                "npc.navigate",
+                "npc.approach",
+                "npc.orbit",
+                "npc.explore",
+                "npc.execute_plan",
+                "npc.plan_cancel",
+                "npc.move_relative",
+                "npc.follow",
+                "npc.look_at",
+                "npc.act",
+                "npc.set_expression",
+                "npc.say",
+                "npc.stop",
+            },
+        )
+        for hidden in {
+            "npc.arm",
+            "npc.clear_estop",
+            "npc.go_to_xyz",
+            "npc.wander",
+            "npc.connect",
+            "npc.status",
+            "npc.disconnect",
+            "npc.snapshot",
+            "npc.ray_scan",
+            "npc.wait_operation",
+        }:
+            self.assertNotIn(hidden, self._names())
+
     def test_operation_tools_and_free_coordinates_are_strictly_hidden(self) -> None:
         self._ready()
         self.surface.free_coordinate_navigation = False

@@ -62,6 +62,17 @@ def _object_schema(
     return schema
 
 
+# 这些入口只供宿主菜单和人工安全通道使用。N.E.K.O 的后台 Agent 会在
+# 主对话完成后再次评估普通插件入口；若不显式隐藏，会造成重复控制，甚至
+# 把 CLEAR_ESTOP 暴露给模型。动态 npc.* 工具仍由主对话 LLM 独占。
+_HOST_ONLY_ENTRY_METADATA: dict[str, object] = {
+    "agent_hidden": True,
+    "agent_auto": False,
+    "agent_exposed": False,
+    "llm_exposed": False,
+}
+
+
 @neko_plugin
 class YuiNpcControllerPlugin(NekoPluginBase):
     """只负责 N.E.K.O 集成；协议事实和工具 schema 全部留在 runtime。"""
@@ -82,6 +93,12 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._registered_yui_tools: set[str] = set()
         self._tool_signature = ""
         self._tool_state_key: tuple[Any, ...] | None = None
+        self._last_context_signature = ""
+        self._context_push_status: dict[str, Any] = {
+            "state": "idle",
+            "pushes": 0,
+            "last_error": None,
+        }
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_lock = asyncio.Lock()
 
@@ -166,6 +183,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 }
             result = await asyncio.to_thread(surface.call, tool_name, arguments)
             self._refresh_llm_tools()
+            self._push_context_snapshot()
             return result
 
         return handler
@@ -254,6 +272,159 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             return [YuiNpcControllerPlugin._privacy_safe(item) for item in value]
         return value
 
+    def _model_context_payload(self) -> dict[str, Any] | None:
+        """构建只含世界确认事实的 fast 模型上下文，不携带绝对坐标。"""
+        session = self._session
+        if session is None or session.session <= 0:
+            return None
+        if self._adapter is not None:
+            observation = self._adapter.observe(
+                include_player_names=self._config.include_player_names
+            )
+        else:
+            observation = session.observe(
+                include_player_names=self._config.include_player_names
+            )
+        if session.world_map_ready and "world" not in observation:
+            observation["world"] = session.nearby_world(limit=8)
+
+        plan: dict[str, Any] | None = None
+        if self._adapter is not None:
+            current = self._adapter.plan_status()
+            if current.get("error") != "plan_not_found":
+                plan = current
+
+        payload: dict[str, Any] = {
+            "context_type": "yui_world_context_v1",
+            "instructions": [
+                "这些是 Unity 和冻结目录确认的事实，不是视觉推断。",
+                "操作前先使用 npc.observe 刷新状态，只能选择已发布的 semantic_key 或 player_slot。",
+                "operation 的 failed、cancelled、unknown 都不得当作成功。",
+            ],
+            "world": observation,
+            "catalog": {
+                "revision": session.catalog_revision,
+                "counts": {
+                    kind: len(catalog)
+                    for kind, catalog in session.catalogs.items()
+                },
+            },
+            "available_tools": sorted(self._registered_yui_tools),
+            "plan": plan,
+        }
+        payload = self._privacy_safe(payload)
+        if session.spec_version in {"1.2", "1.3"}:
+            payload = session._without_absolute_coordinates(payload)
+        return payload
+
+    @staticmethod
+    def _context_signature(payload: dict[str, Any]) -> str:
+        """只对语义状态签名，忽略高频距离和朝向变化。"""
+        world = payload.get("world") if isinstance(payload.get("world"), dict) else {}
+        location = world.get("location") if isinstance(world.get("location"), dict) else {}
+        nearest = (
+            location.get("nearest_anchor")
+            if isinstance(location.get("nearest_anchor"), dict)
+            else {}
+        )
+        players = world.get("players") if isinstance(world.get("players"), list) else []
+        active_ops = (
+            world.get("active_ops")
+            if isinstance(world.get("active_ops"), list)
+            else []
+        )
+        plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+        stable = {
+            "session": world.get("session"),
+            "spec": world.get("spec"),
+            "control_state": world.get("control_state"),
+            "estop": world.get("estop"),
+            "caps": world.get("caps"),
+            "catalog_rev": world.get("catalog_rev"),
+            "region_key": location.get("region_key"),
+            "floor_label": location.get("floor_label"),
+            "nearest_anchor": nearest.get("semantic_key"),
+            "player_slots": sorted(
+                item.get("slot")
+                for item in players
+                if isinstance(item, dict) and isinstance(item.get("slot"), int)
+            ),
+            "active_ops": sorted(
+                (
+                    str(item.get("operation_id") or item.get("op_id") or ""),
+                    str(item.get("kind") or ""),
+                    str(item.get("status") or ""),
+                )
+                for item in active_ops
+                if isinstance(item, dict)
+            ),
+            "plan": (
+                plan.get("plan_id"),
+                plan.get("status"),
+            ),
+            "available_tools": payload.get("available_tools"),
+        }
+        return json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _push_receipt_ok(receipt: Any) -> bool:
+        if isinstance(receipt, dict):
+            return receipt.get("ok", True) is not False
+        ok = getattr(receipt, "ok", None)
+        return ok is not False
+
+    def _push_context_snapshot(self, *, force: bool = False) -> bool:
+        """向宿主被动注入最新语义快照；相同状态只注入一次。"""
+        if self._adapter is None or self._surface is None:
+            return False
+        payload = self._model_context_payload()
+        if payload is None:
+            return False
+        signature = self._context_signature(payload)
+        if not force and signature == self._last_context_signature:
+            self._context_push_status["state"] = "deduplicated"
+            return False
+        text = "YUI_WORLD_CONTEXT " + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            receipt = self.push_message(
+                source="yui_npc_controller",
+                visibility=[],
+                ai_behavior="read",
+                parts=[{"type": "text", "text": text}],
+                priority=20,
+                coalesce_key="yui_world_context",
+                metadata={
+                    "context_type": "yui_world_context_v1",
+                    "session": payload["world"].get("session"),
+                },
+            )
+            if not self._push_receipt_ok(receipt):
+                raise RuntimeError("宿主拒绝 YUI 上下文消息")
+            self._last_context_signature = signature
+            self._context_push_status.update({
+                "state": "sent",
+                "pushes": int(self._context_push_status.get("pushes", 0)) + 1,
+                "last_error": None,
+            })
+            return True
+        except Exception as exc:
+            self._context_push_status.update({
+                "state": "failed",
+                "last_error": f"{type(exc).__name__}: {exc}",
+            })
+            logger = self.logger
+            if logger is not None:
+                try:
+                    logger.warning("YUI 世界上下文注入失败: %s", exc)
+                except Exception:
+                    pass
+            return False
+
     def _on_session_event(self, event: dict[str, Any]) -> None:
         loop = self._event_loop
         if loop is None or loop.is_closed():
@@ -275,6 +446,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             refresh_event = bool(self._session and self._session.discovery_ready)
         if refresh_event:
             self._refresh_llm_tools()
+            self._push_context_snapshot()
         high_salience = (
             event_type == "player.touch"
             or event_type.startswith("social.")
@@ -308,6 +480,16 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     pass
 
     def _status_snapshot(self) -> dict[str, Any]:
+        if self._adapter is not None:
+            world = self._adapter.observe(
+                include_player_names=self._config.include_player_names
+            )
+        elif self._session is not None:
+            world = self._session.observe(
+                include_player_names=self._config.include_player_names
+            )
+        else:
+            world = None
         return {
             "midi_open": self._transport is not None,
             "driver_lease": bool(self._driver_lease and self._driver_lease.acquired),
@@ -317,11 +499,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 and self._session.control_state in {"external", "moving", "action"}
             ),
             "llm_tools": sorted(self._registered_yui_tools),
-            "world": (
-                self._session.observe(include_player_names=self._config.include_player_names)
-                if self._session is not None
-                else None
-            ),
+            "context_injection": dict(self._context_push_status),
+            "world": world,
         }
 
     def _close_control(self) -> None:
@@ -336,6 +515,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._adapter = None
         self._surface = None
         self._driver_lease = None
+        self._last_context_signature = ""
 
     def _close_runtime(self) -> None:
         self._close_control()
@@ -371,6 +551,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         input_schema=_object_schema(),
         llm_result_fields=["status", "error", "detail"],
         timeout=15.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
     )
     async def yui_connect(self, **_: Any):
         async with self._runtime_lock:
@@ -379,6 +560,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 result = await asyncio.to_thread(adapter.connect, self._config.claim_code)
                 if result.get("status") == "succeeded":
                     result["llm_tools"] = self._refresh_llm_tools()
+                    result["context_injected"] = self._push_context_snapshot(force=True)
                 return Ok(result)
             except Exception as exc:
                 return Err(f"{type(exc).__name__}: {exc}")
@@ -390,6 +572,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         input_schema=_object_schema(),
         llm_result_fields=["status", "error", "detail"],
         timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
     )
     async def yui_clear_estop(self, **_: Any):
         async with self._runtime_lock:
@@ -406,6 +589,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         input_schema=_object_schema(),
         llm_result_fields=["status"],
         timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
     )
     async def yui_disconnect(self, **_: Any):
         async with self._runtime_lock:
@@ -419,6 +603,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         input_schema=_object_schema(),
         llm_result_fields=["summary"],
         timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
     )
     async def yui_status(self, **_: Any):
         snapshot = self._status_snapshot()
@@ -439,6 +624,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         input_schema=_object_schema(),
         llm_result_fields=["status"],
         timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
     )
     async def yui_reload_config(self, **_: Any):
         async with self._runtime_lock:

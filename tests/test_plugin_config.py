@@ -1,6 +1,8 @@
 """插件配置安全门和 manifest 冲突声明测试。"""
 
+import ast
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tomllib
@@ -65,6 +67,47 @@ class YuiPluginConfigTests(unittest.TestCase):
             yui_manifest = tomllib.load(handle)
         self.assertIn("neko_anyadance_body", _conflicts(yui_manifest))
 
+    def test_host_diagnostic_entries_are_hidden_from_automatic_agent(self) -> None:
+        module = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
+        host_entries = {
+            "yui_connect",
+            "yui_clear_estop",
+            "yui_disconnect",
+            "yui_status",
+            "yui_reload_config",
+        }
+        hidden_entries: set[str] = set()
+        for node in ast.walk(module):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                if not isinstance(decorator.func, ast.Name) or decorator.func.id != "plugin_entry":
+                    continue
+                keywords = {item.arg: item.value for item in decorator.keywords if item.arg}
+                entry_id = keywords.get("id")
+                metadata = keywords.get("metadata")
+                if (
+                    isinstance(entry_id, ast.Constant)
+                    and entry_id.value in host_entries
+                    and isinstance(metadata, ast.Name)
+                    and metadata.id == "_HOST_ONLY_ENTRY_METADATA"
+                ):
+                    hidden_entries.add(str(entry_id.value))
+        self.assertEqual(hidden_entries, host_entries)
+
+        plugin_module = sys.modules[_plugin_class().__module__]
+        self.assertEqual(
+            plugin_module._HOST_ONLY_ENTRY_METADATA,
+            {
+                "agent_hidden": True,
+                "agent_auto": False,
+                "agent_exposed": False,
+                "llm_exposed": False,
+            },
+        )
+
     def test_unchanged_runtime_state_does_not_rebuild_tool_schema(self) -> None:
         plugin = _plugin_class()(None)
         session = YuiSessionState()
@@ -99,6 +142,111 @@ class YuiPluginConfigTests(unittest.TestCase):
         session.control_state = "moving"
         plugin._refresh_llm_tools()
         self.assertEqual(surface.calls, 1)
+
+    def test_passive_world_context_is_private_complete_and_deduplicated(self) -> None:
+        plugin = _plugin_class()(None)
+        session = YuiSessionState()
+        session.spec_version = "1.3"
+        session.session = 77
+        session.control_state = "external"
+        session.catalog_revision = 9
+        session.capabilities = (
+            "operation_lifecycle",
+            "world_map",
+            "semantic_navigation",
+            "region_localization",
+            "local_navigation",
+        )
+        session.npc_state = {
+            "pos": [1.0, 0.0, 2.0],
+            "active_ops": [],
+            "location": {
+                "localized": True,
+                "region_key": "ground_floor",
+                "floor_label": "G",
+                "nearest_anchor": {
+                    "semantic_key": "spawn",
+                    "d": 1.2,
+                    "brg": 20.0,
+                },
+            },
+        }
+        session.players[0] = {
+            "slot": 0,
+            "pid": 123,
+            "name": "不得注入的玩家名",
+            "d": 3.0,
+            "brg": 15.0,
+        }
+        session.catalogs["anchor"][0] = {
+            "id": 0,
+            "semantic_key": "spawn",
+            "pos": [0.0, 0.0, 0.0],
+        }
+        session.catalogs["region"][0] = {
+            "id": 0,
+            "semantic_key": "ground_floor",
+            "description_zh": "一楼",
+            "entry_anchor_id": 0,
+            "explorable": True,
+        }
+        session.catalogs["entity"][0] = {
+            "id": 0,
+            "semantic_key": "central_obstacle",
+            "description_zh": "中央障碍物",
+            "center": [2.0, 0.0, 2.0],
+            "approach_anchor_id": 0,
+            "orbitable": True,
+        }
+
+        class FakeAdapter:
+            def observe(self, *, include_player_names=False):
+                result = session.observe(include_player_names=include_player_names)
+                result["world"] = session.nearby_world(limit=8)
+                return result
+
+            @staticmethod
+            def plan_status():
+                return {"status": "failed", "error": "plan_not_found"}
+
+        plugin._session = session
+        plugin._adapter = FakeAdapter()
+        plugin._surface = object()
+        plugin._registered_yui_tools = {"npc.observe", "npc.move_relative"}
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
+
+        self.assertTrue(plugin._push_context_snapshot(force=True))
+        self.assertFalse(plugin._push_context_snapshot())
+        self.assertEqual(len(pushed), 1)
+        message = pushed[0]
+        self.assertEqual(message["ai_behavior"], "read")
+        self.assertEqual(message["visibility"], [])
+        self.assertEqual(message["coalesce_key"], "yui_world_context")
+        body = message["parts"][0]["text"]
+        self.assertTrue(body.startswith("YUI_WORLD_CONTEXT "))
+        payload = json.loads(body.removeprefix("YUI_WORLD_CONTEXT "))
+        self.assertEqual(payload["world"]["session"], 77)
+        self.assertEqual(payload["world"]["location"]["region_key"], "ground_floor")
+        self.assertEqual(payload["world"]["players"][0]["slot"], 0)
+        self.assertEqual(payload["catalog"]["revision"], 9)
+        self.assertEqual(payload["available_tools"], ["npc.move_relative", "npc.observe"])
+        nearby_keys = {
+            item.get("semantic_key")
+            for item in payload["world"]["world"]["items"]
+        }
+        self.assertIn("central_obstacle", nearby_keys)
+        encoded = json.dumps(payload, ensure_ascii=False)
+        for private_field in ('"name"', '"pid"', '"pos"', '"center"', '"x"', '"y"', '"z"'):
+            self.assertNotIn(private_field, encoded)
+
+        # 玩家距离高频变化不重复注入；楼层/区域变化必须产生新上下文。
+        session.players[0]["d"] = 2.0
+        self.assertFalse(plugin._push_context_snapshot())
+        session.npc_state["location"]["region_key"] = "upper_floor"
+        session.npc_state["location"]["floor_label"] = "L1"
+        self.assertTrue(plugin._push_context_snapshot())
+        self.assertEqual(len(pushed), 2)
 
 
 if __name__ == "__main__":
