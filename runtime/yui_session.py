@@ -1015,7 +1015,9 @@ class YuiSessionState:
                     for kind, catalog in self.catalogs.items()
                 },
                 "log_complete": self.log_complete,
-                "log_gaps": list(self.log_gaps),
+                # N.E.K.O 的 MessagePack 传输层会拒绝 tuple；对外结果必须保持
+                # JSON 原生类型，不能把内部的区间 tuple 直接泄漏给工具调用方。
+                "log_gaps": [[start, end] for start, end in self.log_gaps],
             }
             if _spec_at_least(self.spec_version, 3):
                 observation["location"] = self._location_projection_locked()

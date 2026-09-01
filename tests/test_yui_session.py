@@ -77,7 +77,7 @@ class YuiSessionTests(unittest.TestCase):
                              first_dropped_log_seq=2, last_dropped_log_seq=2, wrap_count=0))
         observation = state.observe()
         self.assertFalse(observation["log_complete"])
-        self.assertEqual(observation["log_gaps"], [(2, 2)])
+        self.assertEqual(observation["log_gaps"], [[2, 2]])
 
     def test_complete_snapshot_replaces_stale_player_set(self) -> None:
         state = YuiSessionState()
