@@ -22,12 +22,31 @@ public static class NekoYuiFullNpcBuilder
         "跳跃动作", "第一种站立姿势", "第二种站立姿势", "第一种坐姿", "第二种坐姿", "蹲伏姿势", "趴伏姿势", "漂浮姿势"
     };
 
+    // [NEKO 2026-09-01] 护栏：菜单 1/2/3 会重烘 NavMesh、导入火柴盒模型并改写 Router 目录，只能在火柴盒/验收场景运行。
+    // 正式世界（Assets/SAVE.unity，或任何已含 YuiSemanticMap 的场景）一律拒绝；正式路线用 NEKO/YUI Formal/*。
+    const string ChiffonPackagePrefKey = "NEKO.ChiffonPackagePath";
+    static string ResolveChiffonPackage()
+    {
+        string custom = EditorPrefs.GetString(ChiffonPackagePrefKey, "");
+        return string.IsNullOrEmpty(custom) ? ChiffonPackage : custom;
+    }
+    static void GuardNotFormalScene(string menu)
+    {
+        var scene = EditorSceneManager.GetActiveScene();
+        bool isSave = string.Equals(scene.path, "Assets/SAVE.unity", System.StringComparison.OrdinalIgnoreCase);
+        bool hasFormalMap = scene.GetRootGameObjects().Any(item => item.name == "YuiSemanticMap");
+        if (isSave || hasFormalMap)
+            throw new InvalidOperationException("[NEKO] " + menu + " 只能在火柴盒/验收场景运行；当前是正式世界（" + scene.path + (hasFormalMap ? "，已含 YuiSemanticMap" : "") + "）。正式路线请用 NEKO/YUI Formal/*。");
+    }
+
     [MenuItem("NEKO/YUI NPC/1 Import ChiffonLite")]
     public static void ImportChiffonBatch()
     {
+        GuardNotFormalScene("NEKO/YUI NPC/1 Import ChiffonLite");
         if (FindChiffonPrefab() != null) { Debug.Log("[NEKO] ChiffonLiteMB_Medium 已导入，跳过 package。 "); return; }
-        if (!System.IO.File.Exists(ChiffonPackage)) throw new System.IO.FileNotFoundException("找不到 Chiffon package", ChiffonPackage);
-        AssetDatabase.ImportPackage(ChiffonPackage, false);
+        string chiffon = ResolveChiffonPackage();
+        if (!System.IO.File.Exists(chiffon)) throw new System.IO.FileNotFoundException("找不到 Chiffon package（可用 EditorPrefs 键 " + ChiffonPackagePrefKey + " 覆盖路径）", chiffon);
+        AssetDatabase.ImportPackage(chiffon, false);
         AssetDatabase.Refresh();
         Debug.Log("[NEKO] 已导入 ChiffonLite package。请等待脚本重编译后执行 ConfigureOpenSceneBatch。 ");
     }
@@ -35,6 +54,7 @@ public static class NekoYuiFullNpcBuilder
     [MenuItem("NEKO/YUI NPC/2 Configure Open Scene Full v1.3")]
     public static void ConfigureOpenSceneBatch()
     {
+        GuardNotFormalScene("NEKO/YUI NPC/2 Configure Open Scene Full v1.3");
         var root = GameObject.Find(RootName);
         if (root == null) throw new InvalidOperationException("当前场景缺少 " + RootName + "；先使用已有火柴盒 Rig 或运行 Build NPC Rig。 ");
         var scripts = root.transform.Find("Scripts");
@@ -90,6 +110,7 @@ public static class NekoYuiFullNpcBuilder
     [MenuItem("NEKO/YUI NPC/3 Configure Matchbox v1.3 + Validate")]
     public static void ConfigureMatchboxV13Batch()
     {
+        GuardNotFormalScene("NEKO/YUI NPC/3 Configure Matchbox v1.3 + Validate");
         const string scenePath = "Assets/Scenes/VRCDefaultWorldScene.unity";
         if (AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath) == null)
             throw new InvalidOperationException("找不到火柴盒场景：" + scenePath);
