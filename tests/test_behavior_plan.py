@@ -35,6 +35,10 @@ class FakeAdapter:
         self.calls.append(("move_relative", (bearing_deg, distance_m, kwargs)))
         return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
 
+    def turn_relative_wire(self, delta_deg):
+        self.calls.append(("turn_relative", delta_deg))
+        return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
+
     def explore_region_wire(self, region_key, **kwargs):
         self.calls.append(("explore_region", (region_key, kwargs)))
         return {"status": "succeeded", "error": None, "detail": None, "op_id": None}
@@ -45,6 +49,10 @@ class FakeAdapter:
 
     def look_at(self, **kwargs):
         self.calls.append(("look_at", kwargs.get("player_slot")))
+        return {"status": "succeeded", "error": None, "detail": None}
+
+    def look_at_semantic_wire(self, target_key):
+        self.calls.append(("look_at_semantic", target_key))
         return {"status": "succeeded", "error": None, "detail": None}
 
     def clear_look_wire(self):
@@ -123,6 +131,20 @@ class BehaviorPlanTests(unittest.TestCase):
         self.assertEqual(done["status"], "succeeded")
         self.assertEqual(self.adapter.calls, [("navigate", "plaza"), ("orbit", "pillar")])
 
+    def test_internal_turn_and_semantic_observe_run_in_sequence(self) -> None:
+        result = self.manager.submit(_graph(
+            {"id": "root", "type": "sequence", "children": ["turn", "look"]},
+            {"id": "turn", "type": "turn_relative", "delta_deg": 45.0},
+            {"id": "look", "type": "look_at_target", "target_key": "pillar", "duration_ms": 1},
+        ), origin="autonomy")
+        done = self._wait(result["plan_id"])
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(self.adapter.calls, [
+            ("turn_relative", 45.0),
+            ("look_at_semantic", "pillar"),
+            ("clear_look", None),
+        ])
+
     def test_retry_is_explicit_and_bounded(self) -> None:
         self.adapter.navigate_results = ["failed", "succeeded"]
         result = self.manager.submit(_graph(
@@ -154,6 +176,33 @@ class BehaviorPlanTests(unittest.TestCase):
         self.assertGreaterEqual(self.adapter.stops, 0)
         self.assertEqual(self._wait(first["plan_id"])["status"], "cancelled")
         self.assertEqual(self._wait(second["plan_id"])["status"], "succeeded")
+
+    def test_explicit_plan_automatically_preempts_autonomy_plan(self) -> None:
+        self.session.players[2] = {"slot": 2, "pid": 2, "d": 5.0}
+        autonomous = self.manager.submit(
+            single_node_graph("follow", player_slot=2, duration_ms=500),
+            origin="autonomy",
+        )
+        time.sleep(0.03)
+        explicit = self.manager.submit(single_node_graph("navigate", target_key="plaza"))
+        self.assertEqual(explicit["status"], "accepted")
+        self.assertEqual(explicit["replaced_plan_id"], autonomous["plan_id"])
+        self.assertEqual(self._wait(autonomous["plan_id"])["status"], "cancelled")
+        self.assertEqual(self._wait(explicit["plan_id"])["status"], "succeeded")
+
+    def test_autonomy_never_preempts_explicit_plan(self) -> None:
+        self.session.players[2] = {"slot": 2, "pid": 2, "d": 5.0}
+        explicit = self.manager.submit(
+            single_node_graph("follow", player_slot=2, duration_ms=300)
+        )
+        time.sleep(0.03)
+        autonomous = self.manager.submit(
+            single_node_graph("navigate", target_key="plaza"),
+            replace_active=True,
+            origin="autonomy",
+        )
+        self.assertEqual(autonomous["error"], "explicit_control_active")
+        self.manager.cancel(explicit["plan_id"])
 
     def test_only_last_sixteen_plan_records_are_retained(self) -> None:
         plan_ids: list[str] = []

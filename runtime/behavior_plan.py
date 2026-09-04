@@ -25,7 +25,9 @@ TERMINAL_STATUSES = frozenset({"succeeded", "cancelled", "failed", "unknown"})
 CONTROL_TYPES = frozenset({"sequence", "selector", "parallel", "repeat", "retry", "timeout", "condition"})
 LEAF_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "move_relative", "look_at", "act", "set_expression", "say", "wait", "stop"})
 NODE_TYPES = CONTROL_TYPES | LEAF_TYPES
-MOVEMENT_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "move_relative"})
+INTERNAL_LEAF_TYPES = frozenset({"turn_relative", "look_at_target"})
+EXECUTION_NODE_TYPES = NODE_TYPES | INTERNAL_LEAF_TYPES
+MOVEMENT_TYPES = frozenset({"navigate", "approach", "follow", "orbit", "explore", "move_relative", "turn_relative"})
 MAX_NODES = 64
 MAX_DEPTH = 8
 MAX_REPEAT = 10
@@ -73,6 +75,7 @@ class BehaviorPlan:
     session_id: int
     catalog_revision: int | None
     driver_pid: int | None
+    origin: str = "explicit"
     status: str = "accepted"
     error: str | None = None
     detail: str | None = None
@@ -95,6 +98,7 @@ class BehaviorPlan:
             "session": self.session_id,
             "catalog_rev": self.catalog_revision,
             "driver_pid": self.driver_pid,
+            "origin": self.origin,
             "elapsed_ms": round(((self.finished_at or now) - (self.started_at or self.created_at)) * 1000),
             "node_status": {key: dict(value) for key, value in self.node_status.items()},
             "evidence": list(self.evidence),
@@ -131,7 +135,7 @@ class BehaviorGraphCompiler:
                 raise BehaviorGraphError(f"nodes[{index}].id 必须是 1..48 字符串")
             if node_id in nodes:
                 raise BehaviorGraphError(f"节点 id 重复: {node_id}")
-            if node_type not in NODE_TYPES:
+            if node_type not in EXECUTION_NODE_TYPES:
                 raise BehaviorGraphError(f"节点 {node_id} type 不受支持: {node_type}")
             self._validate_node(node)
             nodes[node_id] = node
@@ -189,7 +193,7 @@ class BehaviorGraphCompiler:
         node_type = node["type"]
         if node_type in MOVEMENT_TYPES:
             return {"movement"}
-        if node_type == "look_at":
+        if node_type in {"look_at", "look_at_target"}:
             return {"look"}
         if node_type == "act":
             return {"action"}
@@ -230,7 +234,9 @@ class BehaviorGraphCompiler:
             "orbit": common | {"target_key", "radius_m", "laps", "direction", "speed_mps", "face_target"},
             "explore": common | {"region_key", "duration_ms", "strategy", "speed_mps"},
             "move_relative": common | {"bearing_deg", "distance_m", "speed_mps", "face_travel", "allow_shorter"},
+            "turn_relative": common | {"delta_deg"},
             "look_at": common | {"player_slot", "duration_ms"},
+            "look_at_target": common | {"target_key", "duration_ms"},
             "act": common | {"action_key", "player_slot", "loop"},
             "set_expression": common | {"expression_key", "duration_ms"},
             "say": common | {"text", "duration_ms", "estimated_delay_ms", "action_key"},
@@ -339,11 +345,17 @@ class BehaviorGraphCompiler:
             for field_name in ("face_travel", "allow_shorter"):
                 if field_name in node and not isinstance(node[field_name], bool):
                     raise BehaviorGraphError(f"节点 {node_id}.{field_name} 必须是布尔值")
+        if node_type == "turn_relative":
+            delta = _number(node.get("delta_deg"), f"节点 {node_id}.delta_deg", -180.0, 180.0)
+            if abs(delta) < 5.0:
+                raise BehaviorGraphError(f"节点 {node_id}.delta_deg 绝对值必须不小于 5")
         if "speed_mps" in node:
             maximum = self.session.max_speed_mps or 2.0
             _number(node["speed_mps"], f"节点 {node_id}.speed_mps", 0.0, maximum)
-        if node_type in {"follow", "look_at", "wait"}:
+        if node_type in {"follow", "look_at", "look_at_target", "wait"}:
             _integer(node.get("duration_ms"), f"节点 {node_id}.duration_ms", 1, MAX_WAIT_MS)
+        if node_type == "look_at_target" and "target_key" not in node:
+            raise BehaviorGraphError(f"节点 {node_id}.target_key 为必填")
         if node_type == "explore":
             minimum_duration = 1000 if self.session.local_navigation else 1
             _integer(node.get("duration_ms"), f"节点 {node_id}.duration_ms", minimum_duration, int(MAX_PLAN_SECONDS * 1000))
@@ -391,7 +403,20 @@ class BehaviorPlanManager:
         self._worker = threading.Thread(target=self._worker_loop, name="yui-behavior-plan", daemon=True)
         self._worker.start()
 
-    def submit(self, graph: Mapping[str, Any], *, replace_active: bool = False) -> dict[str, Any]:
+    def submit(
+        self,
+        graph: Mapping[str, Any],
+        *,
+        replace_active: bool = False,
+        origin: str = "explicit",
+    ) -> dict[str, Any]:
+        if origin not in {"explicit", "autonomy"}:
+            return _result(
+                "failed",
+                error="invalid_origin",
+                detail="计划来源必须是 explicit|autonomy",
+                midi_sent=False,
+            )
         try:
             normalized, nodes, entry, domains = BehaviorGraphCompiler(self.session).compile(graph)
         except BehaviorGraphError as exc:
@@ -412,6 +437,7 @@ class BehaviorPlanManager:
             session_id=self.session.session,
             catalog_revision=self.session.catalog_revision,
             driver_pid=self.session.driver_pid,
+            origin=origin,
         )
         replaced: BehaviorPlan | None = None
         with self._condition:
@@ -427,7 +453,19 @@ class BehaviorPlanManager:
                 None,
             )
             if current is not None:
-                if not replace_active:
+                # 显式命令天然优先于自主计划；自主计划永远不能抢占显式计划。
+                explicit_preempts_autonomy = (
+                    plan.origin == "explicit" and current.origin == "autonomy"
+                )
+                if current.origin == "explicit" and plan.origin == "autonomy":
+                    return _result(
+                        "failed",
+                        error="explicit_control_active",
+                        detail="显式移动计划仍在运行；自主计划保持等待",
+                        active_plan_id=current.plan_id,
+                        midi_sent=False,
+                    )
+                if not replace_active and not explicit_preempts_autonomy:
                     return _result("failed", error="plan_conflict", detail=f"移动计划 {current.plan_id} 仍在运行；需要 replace_active=true", active_plan_id=current.plan_id, midi_sent=False)
                 replaced = current
                 self._cancel_locked(current, "replaced")
@@ -489,6 +527,20 @@ class BehaviorPlanManager:
             for plan in self._pending:
                 if plan.status not in TERMINAL_STATUSES:
                     self._cancel_locked(plan, reason)
+
+    def cancel_origin(self, origin: str, reason: str, *, stop_domains: bool = True) -> bool:
+        """取消指定来源的全部计划，并按需停止其占用域。"""
+        domains: set[str] = set()
+        with self._condition:
+            candidates = ([self._active] if self._active is not None else []) + list(self._pending)
+            for plan in candidates:
+                if plan.origin != origin or plan.status in TERMINAL_STATUSES:
+                    continue
+                domains.update(plan.domains)
+                self._cancel_locked(plan, reason)
+        if stop_domains and domains:
+            return self.adapter._stop_plan_domains(domains)
+        return False
 
     def close(self) -> None:
         domains: set[str] = set()
@@ -788,6 +840,13 @@ class BehaviorPlanManager:
                 deadline,
                 local_cancel,
             )
+        if kind == "turn_relative":
+            return self._await_operation(
+                plan,
+                self.adapter.turn_relative_wire(float(node["delta_deg"])),
+                deadline,
+                local_cancel,
+            )
         if kind == "approach":
             slot = int(node["player_slot"])
             outcome = self.adapter.follow_wire(slot, speed_mps=node.get("speed_mps"))
@@ -825,6 +884,15 @@ class BehaviorPlanManager:
             return self._explore(plan, node, deadline, local_cancel)
         if kind == "look_at":
             look = self.adapter.look_at(player_slot=int(node["player_slot"]), duration_ms=0)
+            failure = self._accepted_or_failure(look)
+            if failure is not None:
+                return failure
+            if not self._wait(plan, int(node["duration_ms"]), deadline, local_cancel):
+                return _result("cancelled") if self._cancelled(plan, local_cancel) else _result("failed", error="timeout")
+            cleared = self.adapter.clear_look_wire()
+            return _result("succeeded", wire=cleared) if cleared.get("status") in {"succeeded", "accepted"} else _result(str(cleared.get("status", "failed")), error=cleared.get("error"), detail=cleared.get("detail"), wire=cleared)
+        if kind == "look_at_target":
+            look = self.adapter.look_at_semantic_wire(str(node["target_key"]))
             failure = self._accepted_or_failure(look)
             if failure is not None:
                 return failure

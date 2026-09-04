@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Any
 
 
@@ -36,7 +40,12 @@ except ImportError:
     lifecycle = neko_plugin = plugin_entry = _decorator  # type: ignore[assignment]
 
 from .runtime import (
+    AutonomyDirector,
+    AutonomyIntentProvider,
+    MainReplyDisplayBridge,
+    RecentChatContextProvider,
     MidoOutputSink,
+    YuiChatContextConfig,
     YuiDriverLease,
     YuiOutputLogTailer,
     YuiPluginConfig,
@@ -90,6 +99,37 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._adapter: YuiSemanticAdapter | None = None
         self._surface: YuiToolSurface | None = None
         self._driver_lease: YuiDriverLease | None = None
+        self._autonomy: AutonomyDirector | None = None
+        self._intent_provider = AutonomyIntentProvider(
+            self._config.autonomy.intent_model
+        )
+        self._chat_context_provider = RecentChatContextProvider(
+            self._config.autonomy.intent_model.chat_context
+        )
+        self._reply_display: MainReplyDisplayBridge | None = None
+        self._reply_display_send_lock = threading.RLock()
+        self._player_chat_lock = threading.RLock()
+        self._player_chat_seen: dict[tuple[int, int, int], float] = {}
+        self._player_chat_last_by_slot: dict[int, float] = {}
+        self._player_chat_status: dict[str, Any] = {
+            "enabled": self._config.player_chat.enabled,
+            "world_ui_ready": False,
+            "state": "waiting_for_world",
+            "accepted": 0,
+            "rejected": 0,
+            "last_error": None,
+            "last_message_hash": None,
+        }
+        self._intent_request_thread: threading.Thread | None = None
+        self._intent_request_stop = threading.Event()
+        self._intent_request_condition = threading.Condition(threading.RLock())
+        self._intent_request_active = False
+        self._intent_pending_request: dict[str, Any] | None = None
+        self._intent_last_started_at = 0.0
+        self._auto_connect_task: asyncio.Task[Any] | None = None
+        self._auto_connect_thread: threading.Thread | None = None
+        self._auto_connect_stop = threading.Event()
+        self._manual_disconnect = False
         self._registered_yui_tools: set[str] = set()
         self._tool_signature = ""
         self._tool_state_key: tuple[Any, ...] | None = None
@@ -107,6 +147,229 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         root = raw if isinstance(raw, dict) else {}
         section = root.get("yui")
         return YuiPluginConfig.from_mapping(section if isinstance(section, dict) else {})
+
+    def _configure_intent_provider(self) -> None:
+        self._stop_intent_worker()
+        self._intent_provider = AutonomyIntentProvider(
+            self._config.autonomy.intent_model
+        )
+        self._chat_context_provider = RecentChatContextProvider(
+            self._config.autonomy.intent_model.chat_context
+        )
+        self._intent_last_started_at = 0.0
+        self._start_intent_worker()
+
+    def _configure_reply_display(self) -> None:
+        if self._reply_display is not None:
+            self._reply_display.close()
+        bridge_config = self._config.chat_bridge
+        provider = RecentChatContextProvider(
+            YuiChatContextConfig(
+                enabled=bridge_config.enabled,
+                source=bridge_config.source,
+                max_turns=1,
+                max_chars=32_000,
+                poll_interval_s=bridge_config.poll_interval_s,
+                max_file_bytes=bridge_config.max_file_bytes,
+            )
+        )
+        self._reply_display = MainReplyDisplayBridge(
+            provider,
+            bridge_config,
+            self._display_main_reply,
+            conversation_fetcher=self._fetch_proactive_reply_records,
+        )
+        self._reply_display.start()
+
+    def _fetch_proactive_reply_records(self) -> object:
+        """读取宿主已有的主动回复记录，不修改或扩展 conversations 总线。"""
+
+        bus = self.bus
+        conversations = getattr(bus, "conversations", None) if bus is not None else None
+        getter = getattr(conversations, "get", None)
+        if not callable(getter):
+            raise RuntimeError("conversation_bus_unavailable")
+        result = getter(max_count=50, timeout=1.5)
+        if inspect.isawaitable(result):
+            # 此方法只允许由桥接工作线程调用；进入事件循环会导致无法安全同步等待。
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError("conversation_bus_async_result")
+        return result
+
+    def _display_main_reply(self, text: str, display_seconds: int) -> dict[str, Any]:
+        """只显示已存在的主模型输出，不调用 push_message、TTS 或动作模型。"""
+        with self._reply_display_send_lock:
+            adapter = self._adapter
+            if adapter is None:
+                return {"status": "failed", "error": "not_connected"}
+            return adapter.say(text, display_seconds=display_seconds)
+
+    def _reset_player_chat_state(self, *, state: str) -> None:
+        with self._player_chat_lock:
+            self._player_chat_seen.clear()
+            self._player_chat_last_by_slot.clear()
+            self._player_chat_status.update({
+                "enabled": self._config.player_chat.enabled,
+                "world_ui_ready": False,
+                "state": state,
+                "last_error": None,
+                "last_message_hash": None,
+            })
+
+    def _player_chat_status_snapshot(self) -> dict[str, Any]:
+        with self._player_chat_lock:
+            return {
+                **self._player_chat_status,
+                "max_chars": self._config.player_chat.max_chars,
+                "cooldown_s": self._config.player_chat.cooldown_s,
+                "activation": "local_follow_hotkey_T",
+            }
+
+    def _current_host_character(self) -> str | None:
+        """只读磁盘中的当前猫娘，避免多角色会话把消息投递到错误对象。"""
+
+        providers: list[RecentChatContextProvider] = []
+        reply_display = self._reply_display
+        if reply_display is not None:
+            providers.append(reply_display.provider)
+        if all(provider is not self._chat_context_provider for provider in providers):
+            providers.append(self._chat_context_provider)
+
+        for provider in providers:
+            try:
+                provider.poll(force=True)
+                value = provider.status().get("current_character")
+            except Exception:
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _handle_player_chat_submit(self, event: dict[str, Any]) -> None:
+        """只有世界内玩家显式提交能进入宿主 respond 通道。"""
+
+        config = self._config.player_chat
+        if not config.enabled:
+            with self._player_chat_lock:
+                self._player_chat_status.update({"state": "disabled", "last_error": None})
+            return
+
+        session = event.get("session")
+        slot = event.get("slot")
+        pid = event.get("pid")
+        submit_sequence = event.get("submit_seq")
+        text = event.get("text")
+        valid_numbers = all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (session, slot, pid, submit_sequence)
+        )
+        current_session = self._session.session if self._session is not None else 0
+        player = (
+            self._session.players.get(slot)
+            if self._session is not None and isinstance(slot, int)
+            else None
+        )
+        valid_player = bool(
+            isinstance(player, dict)
+            and isinstance(pid, int)
+            and player.get("pid") == pid
+        )
+        normalized = (
+            text.replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+            if isinstance(text, str)
+            else ""
+        )
+        error: str | None = None
+        if not valid_numbers:
+            error = "invalid_identity"
+        elif session <= 0 or session != current_session:
+            error = "stale_session"
+        elif not 0 <= slot <= 63 or pid <= 0 or submit_sequence <= 0:
+            error = "invalid_identity"
+        elif not valid_player:
+            error = "slot_mismatch"
+        elif not normalized:
+            error = "empty_message"
+        elif len(normalized) > config.max_chars or len(normalized.encode("utf-8")) > 576:
+            error = "message_too_long"
+        elif any(ord(character) < 32 for character in normalized):
+            error = "invalid_character"
+
+        now = time.monotonic()
+        key = (
+            int(session or 0),
+            int(pid or 0),
+            int(submit_sequence or 0),
+        )
+        with self._player_chat_lock:
+            if error is None and key in self._player_chat_seen:
+                error = "duplicate"
+            last_at = self._player_chat_last_by_slot.get(int(slot or -1), float("-inf"))
+            if error is None and now - last_at < config.cooldown_s:
+                error = "rate_limited"
+            if error is not None:
+                self._player_chat_status["state"] = "rejected"
+                self._player_chat_status["rejected"] = int(
+                    self._player_chat_status.get("rejected", 0)
+                ) + 1
+                self._player_chat_status["last_error"] = error
+                return
+
+        target_character = self._current_host_character()
+        if target_character is None:
+            with self._player_chat_lock:
+                self._player_chat_status["state"] = "rejected"
+                self._player_chat_status["rejected"] = int(
+                    self._player_chat_status.get("rejected", 0)
+                ) + 1
+                self._player_chat_status["last_error"] = "target_character_unavailable"
+            return
+
+        content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        try:
+            receipt = self.push_message(
+                source="yui_npc_controller.world_chat",
+                visibility=["chat"],
+                ai_behavior="respond",
+                parts=[{
+                    "type": "text",
+                    "text": f"VRChat 世界内玩家（player_slot={slot}）说：{normalized}",
+                }],
+                priority=90,
+                target_lanlan=target_character,
+                metadata={
+                    "event_type": "player.chat_submit",
+                    "session": session,
+                    "player_slot": slot,
+                    "submit_seq": submit_sequence,
+                    "content_sha256": content_hash,
+                },
+            )
+            submitted = self._push_receipt_ok(receipt)
+        except Exception:
+            submitted = False
+
+        with self._player_chat_lock:
+            if submitted:
+                self._player_chat_seen[key] = now
+                self._player_chat_last_by_slot[int(slot)] = now
+                if len(self._player_chat_seen) > 256:
+                    oldest = min(self._player_chat_seen, key=self._player_chat_seen.get)
+                    self._player_chat_seen.pop(oldest, None)
+                self._player_chat_status["state"] = "submitted"
+                self._player_chat_status["accepted"] = int(
+                    self._player_chat_status.get("accepted", 0)
+                ) + 1
+                self._player_chat_status["last_error"] = None
+                self._player_chat_status["last_message_hash"] = content_hash
+            else:
+                self._player_chat_status["state"] = "submission_failed"
+                self._player_chat_status["rejected"] = int(
+                    self._player_chat_status.get("rejected", 0)
+                ) + 1
+                self._player_chat_status["last_error"] = "host_submission_failed"
 
     def _start_log_tailer(self) -> None:
         if self._session is None:
@@ -159,7 +422,39 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             enable_wander_tool=self._config.enable_wander_tool,
             command_deadline_s=self._config.command_deadline_s,
         )
+        self._autonomy = AutonomyDirector(
+            adapter,
+            self._session,
+            self._config.autonomy,
+            inspiration_callback=(
+                self._queue_autonomy_inspiration
+                if self._config.autonomy.intent_model.enabled
+                else None
+            ),
+            telemetry_callback=self._log_autonomy_event,
+            chat_context_provider=self._chat_context_provider,
+        )
         return adapter
+
+    def _log_autonomy_event(self, event: dict[str, Any]) -> None:
+        """写入不含密钥、正文、坐标和玩家姓名的结构化自主日志。"""
+        allowed = {
+            "event", "reason", "status", "error", "latency_ms", "format",
+            "accepted", "mood", "activity_count", "avoid_count", "kind",
+            "interest_count", "targets", "regions", "intent_activity_index",
+            "decision_reason",
+        }
+        safe = {key: value for key, value in event.items() if key in allowed}
+        logger = self.logger
+        if logger is None:
+            return
+        try:
+            logger.info(
+                "YUI_AUTONOMY %s",
+                json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            )
+        except Exception:
+            pass
 
     def _unregister_yui_tools(self) -> None:
         for name in sorted(self._registered_yui_tools):
@@ -181,7 +476,20 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     "detail": "尚未由宿主连接 YUI 世界",
                     "midi_sent": False,
                 }
-            result = await asyncio.to_thread(surface.call, tool_name, arguments)
+            autonomy = self._autonomy
+            if autonomy is not None:
+                autonomy.before_explicit_tool(tool_name)
+            try:
+                result = await asyncio.to_thread(surface.call, tool_name, arguments)
+            except Exception:
+                if autonomy is not None:
+                    autonomy.after_explicit_tool(
+                        tool_name,
+                        {"status": "failed", "error": "tool_exception"},
+                    )
+                raise
+            if autonomy is not None:
+                autonomy.after_explicit_tool(tool_name, result)
             self._refresh_llm_tools()
             self._push_context_snapshot()
             if result.get("status") == "failed":
@@ -193,6 +501,270 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             return result
 
         return handler
+
+    def _queue_autonomy_inspiration(self, request: dict[str, Any]) -> None:
+        """投递给插件自有线程；不依赖宿主生命周期事件循环。"""
+        self._enqueue_intent_request(dict(request))
+
+    def _enqueue_intent_request(self, request: dict[str, Any]) -> None:
+        provider = self._intent_provider
+        if not provider.config.enabled:
+            return
+        token = request.get("request_token")
+        context = request.get("context")
+        if not isinstance(token, str) or not isinstance(context, dict):
+            return
+        # 容量为 1：尚未发出的旧请求直接被最新上下文覆盖。
+        with self._intent_request_condition:
+            # 容量为 1：尚未发送的旧上下文由最新触发覆盖。
+            self._intent_pending_request = {
+                "request_token": token,
+                "context": dict(context),
+                "reason": str(request.get("reason") or "unknown"),
+            }
+            self._intent_request_condition.notify_all()
+
+    def _start_intent_worker(self) -> None:
+        if not self._intent_provider.config.enabled:
+            return
+        thread = self._intent_request_thread
+        if thread is not None and thread.is_alive():
+            return
+        stop_event = threading.Event()
+        self._intent_request_stop = stop_event
+        thread = threading.Thread(
+            target=self._intent_request_worker,
+            args=(stop_event,),
+            name="yui-autonomy-intent",
+            daemon=True,
+        )
+        self._intent_request_thread = thread
+        thread.start()
+
+    def _intent_request_worker(self, stop_event: threading.Event) -> None:
+        """常驻串行请求循环；宿主关闭 asyncio loop 后仍保持有效。"""
+        while not stop_event.is_set():
+            with self._intent_request_condition:
+                while self._intent_pending_request is None and not stop_event.is_set():
+                    self._intent_request_condition.wait(timeout=0.5)
+                if stop_event.is_set():
+                    return
+                request = self._intent_pending_request
+                self._intent_pending_request = None
+            if request is None:
+                continue
+
+            # 限频等待期间继续吸收新触发，只保留最后一个尚未发送的请求。
+            while not stop_event.is_set():
+                wait_s = max(
+                    0.0,
+                    self._intent_provider.config.min_interval_s
+                    - (time.monotonic() - self._intent_last_started_at),
+                )
+                if wait_s <= 0.0:
+                    break
+                stop_event.wait(min(wait_s, 0.25))
+                with self._intent_request_condition:
+                    if self._intent_pending_request is not None:
+                        request = self._intent_pending_request
+                        self._intent_pending_request = None
+            if stop_event.is_set():
+                return
+
+            autonomy = self._autonomy
+            if autonomy is None or not autonomy.status().get("running"):
+                continue
+            provider = self._intent_provider
+            self._intent_last_started_at = time.monotonic()
+            self._log_autonomy_event({
+                "event": "intent_request_started",
+                "reason": request.get("reason"),
+            })
+            with self._intent_request_condition:
+                self._intent_request_active = True
+            try:
+                result = asyncio.run(provider.request(request["context"]))
+            except Exception:
+                result = {"status": "failed", "error": "request_worker_error"}
+            finally:
+                with self._intent_request_condition:
+                    self._intent_request_active = False
+
+            accepted = False
+            if not stop_event.is_set() and result.get("status") == "succeeded":
+                intent = result.get("intent")
+                if isinstance(intent, dict):
+                    accepted = autonomy.offer_intent(intent, request["request_token"])
+            self._log_autonomy_event({
+                "event": "intent_request_finished",
+                "reason": request.get("reason"),
+                "status": result.get("status"),
+                "error": result.get("error"),
+                "latency_ms": result.get("latency_ms"),
+                "format": result.get("format"),
+                "accepted": accepted,
+            })
+
+    def _cancel_intent_requests(self) -> None:
+        with self._intent_request_condition:
+            self._intent_pending_request = None
+            self._intent_request_condition.notify_all()
+
+    def _stop_intent_worker(self) -> None:
+        self._cancel_intent_requests()
+        stop_event = self._intent_request_stop
+        thread = self._intent_request_thread
+        stop_event.set()
+        with self._intent_request_condition:
+            self._intent_request_condition.notify_all()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._intent_request_thread = None
+
+    def _intent_request_status(self) -> dict[str, bool]:
+        with self._intent_request_condition:
+            thread = self._intent_request_thread
+            return {
+                "request_pending": self._intent_pending_request is not None,
+                "worker_running": bool(thread is not None and thread.is_alive()),
+                "request_active": self._intent_request_active,
+            }
+
+    def _cancel_auto_connect_task(self) -> None:
+        stop_event = self._auto_connect_stop
+        stop_event.set()
+        thread = self._auto_connect_thread
+        self._auto_connect_thread = None
+        task = self._auto_connect_task
+        self._auto_connect_task = None
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        if thread is not None and thread is not threading.current_thread():
+            # 未握手世界中的一次 DISCOVER 最长等待约一个 command deadline；
+            # 先让常驻线程退出，再关闭 MIDI/驱动租约，避免迟到连接碰到已释放资源。
+            thread.join(timeout=8.0)
+
+    def _run_auto_connect_thread(self, stop_event: threading.Event) -> None:
+        """在插件自有事件循环中运行自动连接，不依赖宿主生命周期 loop。"""
+        try:
+            if (
+                not self._manual_disconnect
+                and not stop_event.is_set()
+                and self._session is not None
+                and self._session.session == 0
+                and self._adapter is not None
+            ):
+                # 世界已重启，但宿主进程仍持有旧 Adapter、心跳和自主计划。
+                # 先完整释放旧控制链路，再以新 DISCOVER 建立全新会话。
+                self._close_control(reason="world_restarted")
+            asyncio.run(self._auto_connect_loop(stop_event=stop_event))
+        except Exception as exc:
+            logger = self.logger
+            if logger is not None:
+                try:
+                    logger.info("YUI 自动连接线程结束: %s", type(exc).__name__)
+                except Exception:
+                    pass
+
+    def _schedule_auto_connect(self) -> None:
+        self._cancel_auto_connect_task()
+        if not (self._config.autonomy.enabled and self._config.autonomy.auto_connect):
+            return
+        stop_event = threading.Event()
+        self._auto_connect_stop = stop_event
+        thread = threading.Thread(
+            target=self._run_auto_connect_thread,
+            args=(stop_event,),
+            name="yui-autonomy-auto-connect",
+            daemon=True,
+        )
+        self._auto_connect_thread = thread
+        thread.start()
+
+    def _ensure_auto_connect_worker(self) -> bool:
+        """按需恢复已结束的自动连接线程；高频失败 ACK 不重复创建线程。"""
+
+        if (
+            self._manual_disconnect
+            or not self._config.autonomy.enabled
+            or not self._config.autonomy.auto_connect
+        ):
+            return False
+        thread = self._auto_connect_thread
+        if thread is not None and thread.is_alive():
+            return False
+        self._schedule_auto_connect()
+        return True
+
+    def _start_autonomy_after_connect(self) -> dict[str, Any] | None:
+        """首次连接自动启动；STOP/ESTOP/人工暂停不会被重复连接解除。"""
+        autonomy = self._autonomy
+        if autonomy is None or not self._config.autonomy.enabled:
+            return None
+        status = autonomy.status()
+        if status.get("running"):
+            return status
+        if status.get("pause_reason") in {None, "not_started"}:
+            return autonomy.start()
+        return status
+
+    def _start_autonomy_for_ready_session(self) -> dict[str, Any] | None:
+        """在世界真实进入可控态后补齐异步握手与工具注册之间的启动竞态。"""
+        session = self._session
+        if (
+            self._manual_disconnect
+            or not self._config.autonomy.auto_connect
+            or session is None
+            or not session.discovery_ready
+            or session.control_state not in {"external", "moving", "action"}
+            or session.npc_state.get("state") not in {"external", "moving", "action"}
+        ):
+            return None
+        return self._start_autonomy_after_connect()
+
+    async def _auto_connect_loop(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        """等待兼容世界出现并自动连接；人工断开后不再重试。"""
+        while not self._manual_disconnect and not (
+            stop_event is not None and stop_event.is_set()
+        ):
+            try:
+                adapter = self._ensure_control()
+                result = await asyncio.to_thread(adapter.connect, self._config.claim_code)
+                if self._manual_disconnect or (
+                    stop_event is not None and stop_event.is_set()
+                ):
+                    return
+                if result.get("status") == "succeeded":
+                    # Director 先启动并自行等待 _control_ready；握手阶段短暂的
+                    # safe_idle 由 Director 的有界宽限处理，不能让 LLM IPC
+                    # 成为规则自主的启动依赖。
+                    self._start_autonomy_after_connect()
+                    # LLM 工具注册和上下文 IPC 可能受宿主忙碌影响；规则自主
+                    # 已先行启动，不能被这些可选集成步骤阻塞。
+                    self._refresh_llm_tools()
+                    self._push_context_snapshot(force=True)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger = self.logger
+                if logger is not None:
+                    try:
+                        logger.info("YUI 自主等待兼容世界: %s", exc)
+                    except Exception:
+                        pass
+            if stop_event is None:
+                await asyncio.sleep(2.0)
+            else:
+                await asyncio.to_thread(stop_event.wait, 2.0)
 
     def _current_tool_state_key(self) -> tuple[Any, ...]:
         """生成低成本工具可见性键，避免高频状态日志反复重建 schema。"""
@@ -417,6 +989,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     @staticmethod
     def _push_receipt_ok(receipt: Any) -> bool:
         if isinstance(receipt, dict):
+            if "submitted" in receipt:
+                return receipt.get("submitted") is True
             return receipt.get("ok", True) is not False
         ok = getattr(receipt, "ok", None)
         return ok is not False
@@ -500,13 +1074,63 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         )
 
     def _on_session_event(self, event: dict[str, Any]) -> None:
+        event_copy = dict(event)
+        event_type = str(event_copy.get("type") or "")
+        world_restarted = (
+            event_type == "sys.boot"
+            and event_copy.get("session") == 0
+        ) or (
+            event_type == "npc.ack"
+            and event_copy.get("session") == 0
+            and event_copy.get("ok") is False
+            and event_copy.get("err") == "not_handshaken"
+        )
+        if world_restarted:
+            # 日志状态已先由 YuiSessionState 清成 session=0。这里不能依赖宿主
+            # lifecycle loop；直接从常驻尾读线程唤起一次去重的后台重连。
+            self._reset_player_chat_state(state="waiting_for_world")
+            self._ensure_auto_connect_worker()
+        if event_type == "player.chat_submit":
+            # startup 生命周期回调返回后，宿主提供的 asyncio loop 可能已经不再
+            # 运行。玩家提交是低频显式事件，直接在常驻日志线程校验并转发，
+            # 避免消息只排进失活 loop 后永远无人处理。
+            self._handle_player_chat_submit(event_copy)
+            return
+        if event_type == "sys.chat_input_ready":
+            # 就绪状态同样必须独立于宿主生命周期 loop，供人工状态入口读取。
+            with self._player_chat_lock:
+                self._player_chat_status.update({
+                    "world_ui_ready": bool(event_copy.get("ready")),
+                    "state": "ready" if event_copy.get("ready") else "unavailable",
+                    "last_error": None,
+                })
+            return
+        if (
+            event_type == "npc.state"
+            and event_copy.get("state") in {"external", "moving", "action"}
+        ):
+            # 日志尾读线程已经完成 session 投影。规则自主在这里直接、线程安全
+            # 地启动，不依赖可能被宿主 IPC 阻塞的 asyncio 事件循环。
+            self._start_autonomy_for_ready_session()
         loop = self._event_loop
         if loop is None or loop.is_closed():
             return
-        loop.call_soon_threadsafe(self._handle_session_event, dict(event))
+        loop.call_soon_threadsafe(self._handle_session_event, event_copy)
 
     def _handle_session_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
+        if event_type == "sys.session":
+            self._reset_player_chat_state(state="waiting_for_world")
+        elif event_type == "sys.chat_input_ready":
+            with self._player_chat_lock:
+                self._player_chat_status.update({
+                    "world_ui_ready": bool(event.get("ready")),
+                    "state": "ready" if event.get("ready") else "unavailable",
+                    "last_error": None,
+                })
+        elif event_type == "player.chat_submit":
+            self._handle_player_chat_submit(event)
+            return
         refresh_event = event_type in {
             "sys.session",
             "sys.watchdog",
@@ -521,16 +1145,20 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         if refresh_event:
             self._refresh_llm_tools()
             self._push_context_snapshot()
-        high_salience = (
-            event_type == "player.touch"
-            or event_type.startswith("social.")
-            or event_type in {"sys.err", "npc.operation_cancelled", "npc.operation_failed"}
+        if event_type in {"sys.hello", "npc.state", "npc.ack"}:
+            # DISCOVER、SET_CONTROL_MODE、工具注册分别在不同线程完成。把首次
+            # 自主启动最终绑定到日志确认的可控态，避免连接已成功却留在
+            # not_started；已被 STOP、ESTOP 或人工暂停的状态不会被这里解除。
+            self._start_autonomy_for_ready_session()
+        # 社交事件由 Director 触发独立意图 API；这里不再启动宿主主动对话。
+        failure_event = (
+            event_type in {"sys.err", "npc.operation_failed"}
             or (event_type == "npc.ack" and event.get("ok") is False)
         )
-        if not high_salience:
+        if not failure_event:
             return
         safe_event = self._privacy_safe(event)
-        text = "YUI NPC 发生需要关注的事件：" + json.dumps(
+        text = "YUI NPC 控制异常：" + json.dumps(
             safe_event,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -538,8 +1166,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         try:
             self.push_message(
                 source="yui_npc_controller",
-                visibility=[],
-                ai_behavior="respond",
+                visibility=["hud"],
+                ai_behavior="blind",
                 parts=[{"type": "text", "text": text}],
                 priority=80,
                 coalesce_key=f"yui:{event_type}",
@@ -574,26 +1202,68 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             ),
             "llm_tools": sorted(self._registered_yui_tools),
             "context_injection": dict(self._context_push_status),
+            "auto_connect": {
+                "enabled": bool(
+                    self._config.autonomy.enabled
+                    and self._config.autonomy.auto_connect
+                ),
+                "worker_running": bool(
+                    self._auto_connect_thread is not None
+                    and self._auto_connect_thread.is_alive()
+                ),
+                "manual_disconnect": self._manual_disconnect,
+            },
+            "autonomy": self._autonomy.status() if self._autonomy is not None else {
+                "enabled": self._config.autonomy.enabled,
+                "running": False,
+                "state": "not_initialized",
+            },
+            "intent_model": {
+                **self._intent_provider.status(),
+                **self._intent_request_status(),
+            },
+            "chat_context": self._chat_context_provider.status(),
+            "chat_bridge": (
+                self._reply_display.status()
+                if self._reply_display is not None
+                else {
+                    "enabled": self._config.chat_bridge.enabled,
+                    "worker_running": False,
+                    "last_result": "not_initialized",
+                }
+            ),
+            "player_chat": self._player_chat_status_snapshot(),
             "world": world,
         }
 
     def _close_control(self, *, reason: str = "not_connected") -> None:
+        self._cancel_intent_requests()
         self._unregister_yui_tools()
-        if self._adapter is not None:
-            self._adapter.close()
-        if self._transport is not None:
-            self._transport.close()
+        if self._autonomy is not None:
+            self._autonomy.close()
+        with self._reply_display_send_lock:
+            if self._adapter is not None:
+                self._adapter.close()
+            if self._transport is not None:
+                self._transport.close()
         if self._driver_lease is not None:
             self._driver_lease.release()
         self._transport = None
         self._adapter = None
         self._surface = None
         self._driver_lease = None
+        self._autonomy = None
         self._last_context_signature = ""
         self._push_context_unavailable(reason, force=True)
 
     def _close_runtime(self, *, reason: str = "plugin_stopped") -> None:
+        self._reset_player_chat_state(state=reason)
+        self._cancel_auto_connect_task()
+        if self._reply_display is not None:
+            self._reply_display.close()
+            self._reply_display = None
         self._close_control(reason=reason)
+        self._stop_intent_worker()
         if self._tailer is not None:
             self._tailer.close()
         if self._session is not None:
@@ -606,9 +1276,13 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         try:
             self._event_loop = asyncio.get_running_loop()
             self._config = await self._load_config()
-            # 启动只跟随日志；不得打开 MIDI 或 DISCOVER。
+            self._configure_intent_provider()
+            self._configure_reply_display()
+            self._manual_disconnect = False
+            # 通用配置仍只跟随日志；仅显式 autonomy.auto_connect 才打开 MIDI。
             self._start_log_tailer()
             self._push_context_unavailable("plugin_started_disconnected", force=True)
+            self._schedule_auto_connect()
             return Ok({"status": "ready", "result": self._status_snapshot()})
         except Exception as exc:
             self._close_runtime(reason="startup_failed")
@@ -616,6 +1290,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_: Any):
+        self._manual_disconnect = True
         self._close_runtime(reason="plugin_shutdown")
         self._event_loop = None
         return Ok({"status": "stopped"})
@@ -632,11 +1307,15 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     async def yui_connect(self, **_: Any):
         async with self._runtime_lock:
             try:
+                self._manual_disconnect = False
                 adapter = self._ensure_control()
                 result = await asyncio.to_thread(adapter.connect, self._config.claim_code)
                 if result.get("status") == "succeeded":
+                    autonomy = self._start_autonomy_after_connect()
                     result["llm_tools"] = self._refresh_llm_tools()
                     result["context_injected"] = self._push_context_snapshot(force=True)
+                    if autonomy is not None:
+                        result["autonomy"] = autonomy
                 return Ok(result)
             except Exception as exc:
                 return Err(f"{type(exc).__name__}: {exc}")
@@ -669,6 +1348,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     )
     async def yui_disconnect(self, **_: Any):
         async with self._runtime_lock:
+            self._manual_disconnect = True
+            self._cancel_auto_connect_task()
             self._close_control(reason="host_disconnected")
             return Ok({"status": "disconnected", "result": self._status_snapshot()})
 
@@ -694,9 +1375,117 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         return Ok(snapshot)
 
     @plugin_entry(
+        id="yui_autonomy_start",
+        name="启动 YUI NPC 自主行为",
+        description="人工启动或恢复宿主规则自主；ESTOP 未清除时不会启动。",
+        input_schema=_object_schema(),
+        llm_result_fields=["state", "pause_reason"],
+        timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_autonomy_start(self, **_: Any):
+        if self._autonomy is None:
+            return Err("尚未连接 YUI 世界")
+        return Ok(self._autonomy.start())
+
+    @plugin_entry(
+        id="yui_autonomy_pause",
+        name="暂停 YUI NPC 自主行为",
+        description="人工持久暂停规则自主并停止当前自主计划。",
+        input_schema=_object_schema(),
+        llm_result_fields=["state", "pause_reason"],
+        timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_autonomy_pause(self, **_: Any):
+        if self._autonomy is None:
+            return Err("尚未连接 YUI 世界")
+        return Ok(await asyncio.to_thread(self._autonomy.pause, "manual_pause"))
+
+    @plugin_entry(
+        id="yui_autonomy_status",
+        name="查询 YUI NPC 自主状态",
+        description="读取自主循环、移动占比、访问历史、失败退避和当前计划诊断。",
+        input_schema=_object_schema(),
+        llm_result_fields=["state", "pause_reason", "movement_ratio"],
+        timeout=10.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_autonomy_status(self, **_: Any):
+        intent_model = {
+            **self._intent_provider.status(),
+            **self._intent_request_status(),
+        }
+        chat_context = self._chat_context_provider.status()
+        if self._autonomy is None:
+            return Ok({
+                "enabled": self._config.autonomy.enabled,
+                "running": False,
+                "state": "not_initialized",
+                "intent_model": intent_model,
+                "chat_context": chat_context,
+            })
+        result = self._autonomy.status()
+        result["intent_model"] = intent_model
+        result["chat_context"] = chat_context
+        return Ok(result)
+
+    @plugin_entry(
+        id="yui_chat_bridge_status",
+        name="查看 YUI 主对话头顶显示状态",
+        description="查看 recent.json 到 NPC 头顶文本的只读桥接状态，不显示聊天正文。",
+        input_schema=_object_schema(),
+        llm_result_fields=["enabled", "worker_running", "last_result", "last_error"],
+        timeout=5.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_chat_bridge_status(self, **_: Any):
+        if self._reply_display is None:
+            return Ok({
+                "enabled": self._config.chat_bridge.enabled,
+                "worker_running": False,
+                "last_result": "not_initialized",
+            })
+        return Ok(self._reply_display.status())
+
+    @plugin_entry(
+        id="yui_player_chat_status",
+        name="查看 YUI 世界内聊天输入状态",
+        description="查看跟随式输入 UI、限频和宿主提交状态，不显示玩家正文。",
+        input_schema=_object_schema(),
+        llm_result_fields=["enabled", "world_ui_ready", "state", "last_error"],
+        timeout=5.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_player_chat_status(self, **_: Any):
+        return Ok(self._player_chat_status_snapshot())
+
+    @plugin_entry(
+        id="yui_autonomy_intent_probe",
+        name="探测 YUI NPC 独立意图模型",
+        description="验证 TEST_API、接口认证、模型和结构化响应；结果不会应用为 NPC 行为。",
+        input_schema=_object_schema(),
+        llm_result_fields=["status", "error", "latency_ms", "schema_valid"],
+        timeout=30.0,
+        metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_autonomy_intent_probe(self, **_: Any):
+        request_state = self._intent_request_status()
+        if request_state["request_pending"] or request_state["request_active"]:
+            return Ok({
+                "status": "failed",
+                "error": "intent_request_busy",
+                "schema_valid": False,
+            })
+        await asyncio.to_thread(self._chat_context_provider.poll, force=True)
+        result = await self._intent_provider.probe()
+        result["chat_context"] = self._chat_context_provider.status()
+        return Ok(result)
+
+    @plugin_entry(
         id="yui_reload_config",
         name="重载 YUI 插件配置",
-        description="停止当前控制器并重新读取配置；不会自动连接。",
+        description="停止当前控制器并重新读取配置；仅在 autonomy.auto_connect 开启时自动连接。",
         input_schema=_object_schema(),
         llm_result_fields=["status"],
         timeout=10.0,
@@ -707,7 +1496,11 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             try:
                 self._close_runtime(reason="config_reload")
                 self._config = await self._load_config()
+                self._configure_intent_provider()
+                self._configure_reply_display()
+                self._manual_disconnect = False
                 self._start_log_tailer()
+                self._schedule_auto_connect()
                 return Ok({"status": "reloaded", "result": self._status_snapshot()})
             except Exception as exc:
                 self._close_runtime(reason="config_reload_failed")

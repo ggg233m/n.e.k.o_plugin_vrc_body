@@ -1,0 +1,59 @@
+[yui]
+heartbeat_interval_s = 1
+enable_wander_tool = false
+midi_port = "NEKO_MIDI"
+log_poll_interval_s = 0.05
+ack_timeout_s = 2
+claim_code = 4321
+log_from_end = true
+command_deadline_s = 5
+log_path = "H:\\Unity\\neko-home-world\\Temp\\YuiClientSim.log"
+include_player_names = false
+free_coordinate_navigation = false
+log_directory = ""
+
+[yui.chat_bridge]
+enabled = true
+source = "recent_file"
+poll_interval_s = 0.5
+display_seconds = 15
+max_pages = 4
+max_file_bytes = 2097152
+
+[yui.player_chat]
+enabled = true
+max_chars = 144
+cooldown_s = 2.0
+
+[yui.autonomy]
+enabled = true
+auto_connect = true
+decision_interval_s = 1
+resume_delay_s = 8
+walk_speed_mps = 1.0
+dwell_range_s = [8, 20]
+explore_range_s = [15, 35]
+social_cooldown_s = 60
+llm_inspiration_range_s = [180, 360]
+
+[yui.autonomy.intent_model]
+enabled = true
+endpoint = ""
+model = "gemini-3.7-flash"
+api_key_env = "TEST_API"
+timeout_s = 20
+min_interval_s = 30
+temperature = 0.7
+max_output_tokens = 700
+
+[yui.autonomy.intent_model.chat_context]
+enabled = true
+source = "recent_file"
+max_turns = 6
+max_chars = 6000
+poll_interval_s = 1
+max_file_bytes = 2097152
+
+[plugin_runtime]
+enabled = true
+auto_start = true

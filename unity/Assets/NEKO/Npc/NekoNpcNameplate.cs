@@ -18,8 +18,13 @@ public class NekoNpcNameplate : UdonSharpBehaviour
     [Header("显示")]
     public TextMeshPro nameText;
     public TextMeshPro bubbleText;
+    public Transform nameBillboard;
+    public Transform bubbleBillboard;
+    public Transform headAnchor;
     public string displayName = "YUI";
     public float visibleRange = 12f;
+    public float nameHeadOffset = 0.20f;
+    public float bubbleHeadOffset = 0.36f;
 
     [UdonSynced] private string _syncText = "";
     [UdonSynced] private int _syncTransferSeq;
@@ -120,6 +125,9 @@ public class NekoNpcNameplate : UdonSharpBehaviour
 
     public int CurrentTransferSeq() { return _currentTransferSeq; }
 
+    // 供 NekoNpcLife 在所有客户端判断“她正在说话”（气泡可见），驱动说话小动作。
+    public bool IsBubbleVisible() { return _currentBubble != null && _currentBubble.Length > 0; }
+
     public string BuildSnapshotText()
     {
         return "{\"transfer_seq\":" + (_currentTransferSeq > 0 ? _currentTransferSeq.ToString() : "null")
@@ -160,9 +168,29 @@ public class NekoNpcNameplate : UdonSharpBehaviour
         VRCPlayerApi local = Networking.LocalPlayer;
         if (local == null) return;
         Vector3 head = local.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).position;
-        bool near = Vector3.Distance(transform.position, head) <= visibleRange;
-        transform.rotation = Quaternion.LookRotation(transform.position - head, Vector3.up);
+        Vector3 anchor = headAnchor == null ? transform.position : headAnchor.position;
+        bool near = Vector3.Distance(anchor, head) <= visibleRange;
+
+        // 锚点只跟随 NPC 头部；朝向分别绕各自文字枢轴更新，不能再旋转整个
+        // Nameplate 根节点，否则带高度偏移的子物体会绕根节点画弧并随玩家视角漂移。
+        if (headAnchor != null)
+        {
+            if (nameBillboard != null)
+                nameBillboard.position = headAnchor.position + Vector3.up * nameHeadOffset;
+            if (bubbleBillboard != null)
+                bubbleBillboard.position = headAnchor.position + Vector3.up * bubbleHeadOffset;
+        }
+        FaceTextToViewer(nameBillboard, head);
+        FaceTextToViewer(bubbleBillboard, head);
         if (nameText != null && nameText.gameObject.activeSelf != near) nameText.gameObject.SetActive(near);
         if (bubbleText != null && bubbleText.gameObject.activeSelf != near) bubbleText.gameObject.SetActive(near);
+    }
+
+    private void FaceTextToViewer(Transform target, Vector3 viewerHead)
+    {
+        if (target == null) return;
+        Vector3 direction = target.position - viewerHead;
+        if (direction.sqrMagnitude > 0.0001f)
+            target.rotation = Quaternion.LookRotation(direction, Vector3.up);
     }
 }

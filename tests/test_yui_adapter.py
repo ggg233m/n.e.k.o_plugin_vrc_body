@@ -100,6 +100,7 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         self.state.max_speed_mps = 2.0
 
     def test_connect_waits_until_declared_catalog_is_complete(self) -> None:
+        self.transport.command_deadline_s = 0.05
         result: list[dict] = []
         thread = threading.Thread(
             target=lambda: result.append(self.adapter.connect(0, session=1193046))
@@ -136,6 +137,9 @@ class YuiSemanticAdapterTests(unittest.TestCase):
             "max_speed": 2.0,
         })
         time.sleep(0.02)
+        self.assertTrue(thread.is_alive())
+        # 目录分批写入可能晚于普通命令 deadline；此时不得换 session 重放 DISCOVER。
+        time.sleep(0.06)
         self.assertTrue(thread.is_alive())
         self.state.ingest({
             **base,
@@ -266,6 +270,13 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         missing = self.adapter.say_preset("not_published")
         self.assertEqual(missing["error"], "text_preset_not_found")
 
+    def test_dynamic_text_rejects_invalid_display_seconds_before_midi(self) -> None:
+        self._ready()
+        result = self.adapter.say("测试", display_seconds=128)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "invalid_param")
+        self.assertEqual(self.transport.calls, [])
+
     def test_v12_semantic_tools_fail_locally_when_capability_or_catalog_is_missing(self) -> None:
         self._ready()
         self.state.spec_version = "1.2"
@@ -282,6 +293,36 @@ class YuiSemanticAdapterTests(unittest.TestCase):
         missing_player = self.adapter.approach(4)
         self.assertEqual(missing_player["error"], "slot_unknown")
         self.assertEqual(self.transport.calls, [])
+
+    def test_host_internal_turn_and_semantic_look_use_existing_wire_commands(self) -> None:
+        self._ready()
+        self.state.npc_state["yaw"] = 90.0
+        self.state.catalogs["anchor"][0] = {
+            "id": 0,
+            "semantic_key": "window",
+            "pos": [1.0, 1.5, 2.0],
+        }
+
+        turned = self.adapter.turn_relative_wire(45.0)
+        looked = self.adapter.look_at_semantic_wire("window")
+
+        self.assertIn(turned["status"], {"accepted", "succeeded"})
+        self.assertIn(looked["status"], {"accepted", "succeeded"})
+        self.assertEqual(self.transport.calls[-2][0], "TURN_TO")
+        self.assertEqual(self.transport.calls[-1][0], "LOOK_AT_XYZ")
+        self.assertEqual(self.transport.calls[-1][1][3], 127)
+
+    def test_semantic_look_rejects_unpublished_or_positionless_target(self) -> None:
+        self._ready()
+        self.state.catalogs["entity"][0] = {"id": 0, "semantic_key": "unknown_shape"}
+        self.assertEqual(
+            self.adapter.look_at_semantic_wire("missing")["error"],
+            "target_missing",
+        )
+        self.assertEqual(
+            self.adapter.look_at_semantic_wire("unknown_shape")["error"],
+            "target_missing",
+        )
 
     def test_v12_semantic_tools_require_operation_lifecycle(self) -> None:
         self._ready()

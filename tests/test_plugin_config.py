@@ -6,11 +6,12 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 import tomllib
 import unittest
 
 import _bootstrap  # noqa: F401
-from yui_npc_controller.runtime.config import YuiPluginConfig
+from yui_npc_controller.runtime.config import YuiAutonomyConfig, YuiPluginConfig
 from yui_npc_controller.runtime.tool_surface import YuiToolSurface
 from yui_npc_controller.runtime.yui_session import YuiSessionState
 
@@ -51,6 +52,106 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertFalse(config.free_coordinate_navigation)
         self.assertFalse(config.include_player_names)
         self.assertFalse(config.enable_wander_tool)
+        self.assertTrue(config.chat_bridge.enabled)
+        self.assertEqual(config.chat_bridge.display_seconds, 15)
+        self.assertTrue(config.player_chat.enabled)
+        self.assertEqual(config.player_chat.max_chars, 144)
+        self.assertEqual(config.player_chat.cooldown_s, 2.0)
+        self.assertFalse(config.autonomy.enabled)
+        self.assertFalse(config.autonomy.auto_connect)
+        self.assertFalse(config.autonomy.intent_model.enabled)
+        self.assertEqual(config.autonomy.intent_model.api_key_env, "TEST_API")
+        self.assertEqual(config.autonomy.intent_model.endpoint, "")
+        self.assertFalse(config.autonomy.intent_model.chat_context.enabled)
+
+    def test_autonomy_configuration_is_nested_and_strict(self) -> None:
+        config = YuiPluginConfig.from_mapping({
+            "chat_bridge": {
+                "enabled": True,
+                "source": "recent_file",
+                "poll_interval_s": 0.5,
+                "display_seconds": 8,
+                "max_pages": 4,
+                "max_file_bytes": 2097152,
+            },
+            "player_chat": {
+                "enabled": True,
+                "max_chars": 144,
+                "cooldown_s": 2.0,
+            },
+            "autonomy": {
+                "enabled": True,
+                "auto_connect": True,
+                "decision_interval_s": 0.5,
+                "resume_delay_s": 8,
+                "walk_speed_mps": 1.0,
+                "dwell_range_s": [8, 20],
+                "explore_range_s": [15, 35],
+                "social_cooldown_s": 60,
+                "llm_inspiration_range_s": [180, 360],
+                "intent_model": {
+                    "enabled": True,
+                    "endpoint": "https://relay.example.com/v1/chat/completions",
+                    "model": "gemini-3.7-flash",
+                    "api_key_env": "TEST_API",
+                    "timeout_s": 20,
+                    "min_interval_s": 30,
+                    "temperature": 0.7,
+                    "max_output_tokens": 700,
+                    "chat_context": {
+                        "enabled": True,
+                        "source": "recent_file",
+                        "max_turns": 6,
+                        "max_chars": 6000,
+                        "poll_interval_s": 1,
+                        "max_file_bytes": 2097152,
+                    },
+                },
+            }
+        })
+        self.assertTrue(config.chat_bridge.enabled)
+        self.assertEqual(config.chat_bridge.max_pages, 4)
+        self.assertTrue(config.player_chat.enabled)
+        self.assertTrue(config.autonomy.enabled)
+        self.assertTrue(config.autonomy.auto_connect)
+        self.assertEqual(config.autonomy.walk_speed_mps, 1.0)
+        self.assertEqual(config.autonomy.dwell_range_s, (8.0, 20.0))
+        self.assertTrue(config.autonomy.intent_model.enabled)
+        self.assertEqual(
+            config.autonomy.intent_model.endpoint,
+            "https://relay.example.com/v1/chat/completions",
+        )
+        self.assertEqual(config.autonomy.intent_model.temperature, 0.7)
+        self.assertTrue(config.autonomy.intent_model.chat_context.enabled)
+        self.assertEqual(config.autonomy.intent_model.chat_context.max_turns, 6)
+        with self.assertRaisesRegex(ValueError, "dwell_range_s"):
+            YuiPluginConfig.from_mapping({"autonomy": {"dwell_range_s": [20, 8]}})
+        with self.assertRaisesRegex(ValueError, "walk_speed_mps"):
+            YuiPluginConfig.from_mapping({"autonomy": {"walk_speed_mps": 0}})
+        with self.assertRaisesRegex(ValueError, "chat_context.source"):
+            YuiPluginConfig.from_mapping({
+                "autonomy": {"intent_model": {"chat_context": {"source": "conversation_bus"}}}
+            })
+        with self.assertRaisesRegex(ValueError, "chat_bridge.source"):
+            YuiPluginConfig.from_mapping({
+                "chat_bridge": {"source": "conversation_bus"}
+            })
+        with self.assertRaisesRegex(ValueError, "player_chat.max_chars"):
+            YuiPluginConfig.from_mapping({"player_chat": {"max_chars": 145}})
+
+    def test_intent_model_endpoint_is_empty_until_configured(self) -> None:
+        for value in ("", "   "):
+            with self.subTest(endpoint=value):
+                config = YuiPluginConfig.from_mapping({
+                    "autonomy": {"intent_model": {"enabled": True, "endpoint": value}}
+                })
+                self.assertEqual(config.autonomy.intent_model.endpoint, "")
+        omitted = YuiPluginConfig.from_mapping({"autonomy": {"intent_model": {}}})
+        self.assertEqual(omitted.autonomy.intent_model.endpoint, "")
+        with self.assertRaisesRegex(ValueError, "intent_model.endpoint"):
+            YuiPluginConfig.from_mapping({
+                "autonomy": {"intent_model": {"endpoint": "http://relay.example.com/v1/chat/completions"}}
+            })
 
     def test_boolean_security_fields_reject_string_coercion(self) -> None:
         with self.assertRaisesRegex(ValueError, "enable_wander_tool"):
@@ -77,6 +178,12 @@ class YuiPluginConfigTests(unittest.TestCase):
             "yui_disconnect",
             "yui_status",
             "yui_reload_config",
+            "yui_autonomy_start",
+            "yui_autonomy_pause",
+            "yui_autonomy_status",
+            "yui_autonomy_intent_probe",
+            "yui_chat_bridge_status",
+            "yui_player_chat_status",
         }
         hidden_entries: set[str] = set()
         for node in ast.walk(module):
@@ -349,6 +456,83 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertTrue(plugin._push_context_snapshot())
         self.assertEqual(len(pushed), 2)
 
+    def test_autonomy_and_social_events_never_start_host_chat(self) -> None:
+        source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count('ai_behavior="respond"'), 1)
+
+        plugin = _plugin_class()(None)
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
+        plugin._handle_session_event({"type": "social.wave", "slot": 2})
+        plugin._handle_session_event({"type": "player.touch", "slot": 2})
+        self.assertEqual(pushed, [])
+
+        plugin._handle_session_event({"type": "sys.err", "code": "test_failure"})
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0]["visibility"], ["hud"])
+        self.assertEqual(pushed[0]["ai_behavior"], "blind")
+        self.assertNotIn("respond", json.dumps(pushed[0], ensure_ascii=False))
+
+    def test_only_explicit_world_chat_submit_starts_host_reply(self) -> None:
+        plugin = _plugin_class()(None)
+        session = YuiSessionState()
+        session.session = 31
+        session.players[2] = {"slot": 2, "pid": 90210, "name": "不应上传的名字"}
+        plugin._session = session
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"submitted": True}
+
+        class _CurrentCharacterProvider:
+            def poll(self, *, force=False):
+                self.forced = force
+
+            @staticmethod
+            def status():
+                return {"current_character": "测试猫娘"}
+
+        class _ReplyDisplay:
+            provider = _CurrentCharacterProvider()
+
+        plugin._reply_display = _ReplyDisplay()
+
+        plugin._handle_session_event({"type": "sys.chat_input_ready", "ready": True})
+        plugin._handle_session_event({
+            "type": "player.chat_submit",
+            "session": 31,
+            "slot": 2,
+            "pid": 90210,
+            "submit_seq": 7,
+            "text": "今天去看看照片吧",
+        })
+
+        self.assertEqual(len(pushed), 1)
+        message = pushed[0]
+        self.assertEqual(message["visibility"], ["chat"])
+        self.assertEqual(message["ai_behavior"], "respond")
+        self.assertEqual(message["source"], "yui_npc_controller.world_chat")
+        self.assertEqual(message["target_lanlan"], "测试猫娘")
+        self.assertIn("今天去看看照片吧", message["parts"][0]["text"])
+        self.assertNotIn("不应上传的名字", json.dumps(message, ensure_ascii=False))
+        self.assertNotIn("text", message["metadata"])
+
+        # 相同提交、伪造槽位和冷却期内的新提交均不得再次触发。
+        plugin._handle_session_event({
+            "type": "player.chat_submit", "session": 31, "slot": 2,
+            "pid": 90210, "submit_seq": 7, "text": "重复",
+        })
+        plugin._handle_session_event({
+            "type": "player.chat_submit", "session": 31, "slot": 2,
+            "pid": 123, "submit_seq": 8, "text": "伪造",
+        })
+        plugin._handle_session_event({
+            "type": "player.chat_submit", "session": 31, "slot": 2,
+            "pid": 90210, "submit_seq": 8, "text": "太快",
+        })
+        self.assertEqual(len(pushed), 1)
+        status = plugin._player_chat_status_snapshot()
+        self.assertTrue(status["world_ui_ready"])
+        self.assertNotIn("今天去看看照片吧", json.dumps(status, ensure_ascii=False))
+
     def test_offline_context_expires_stale_world_and_forbids_action_promises(self) -> None:
         plugin = _plugin_class()(None)
         plugin._registered_yui_tools = {"npc.observe", "npc.navigate"}
@@ -427,6 +611,7 @@ class YuiPluginConfigTests(unittest.TestCase):
             return YuiPluginConfig()
 
         plugin._load_config = load_config
+        plugin._configure_reply_display = lambda: None
         plugin._start_log_tailer = lambda: None
         plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
 
@@ -442,6 +627,300 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertEqual(
             payload["connection"]["reason"], "plugin_started_disconnected"
         )
+
+    def test_auto_connect_starts_autonomy_after_successful_handshake(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._manual_disconnect = False
+        plugin._session = type(
+            "Session",
+            (),
+            {
+                "discovery_ready": True,
+                "control_state": "external",
+                "npc_state": {"state": "external"},
+            },
+        )()
+        started = []
+        order = []
+
+        class Adapter:
+            @staticmethod
+            def connect(_claim_code):
+                return {"status": "succeeded"}
+
+        class Autonomy:
+            @staticmethod
+            def status():
+                return {"running": False, "pause_reason": "not_started"}
+
+            @staticmethod
+            def start():
+                started.append(True)
+                order.append("autonomy")
+                return {"state": "ready", "running": True, "pause_reason": None}
+
+        plugin._ensure_control = lambda: Adapter()
+        plugin._autonomy = Autonomy()
+        plugin._refresh_llm_tools = lambda: order.append("tools") or []
+        plugin._push_context_snapshot = lambda **_kwargs: order.append("context") or True
+
+        asyncio.run(plugin._auto_connect_loop())
+        self.assertEqual(started, [True])
+        self.assertEqual(order, ["autonomy", "tools", "context"])
+
+    def test_auto_connect_worker_survives_lifecycle_loop_and_retries(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._manual_disconnect = False
+        first_attempt = threading.Event()
+        connected = threading.Event()
+        started = threading.Event()
+        attempts = []
+
+        class Adapter:
+            @staticmethod
+            def connect(_claim_code):
+                attempts.append(len(attempts) + 1)
+                if len(attempts) == 1:
+                    first_attempt.set()
+                    return {"status": "failed", "error": "no_world"}
+                connected.set()
+                return {"status": "succeeded"}
+
+        class Autonomy:
+            running = False
+
+            def status(self):
+                return {
+                    "running": self.running,
+                    "pause_reason": None if self.running else "not_started",
+                }
+
+            def start(self):
+                self.running = True
+                started.set()
+                return self.status()
+
+        plugin._ensure_control = lambda: Adapter()
+        plugin._autonomy = Autonomy()
+        plugin._refresh_llm_tools = lambda: []
+        plugin._push_context_snapshot = lambda **_kwargs: True
+
+        try:
+            # 调度发生在一个马上销毁的 lifecycle loop 内；连接线程仍须存活并重试。
+            async def schedule_from_lifecycle_loop():
+                plugin._schedule_auto_connect()
+
+            asyncio.run(schedule_from_lifecycle_loop())
+            self.assertTrue(first_attempt.wait(1.0))
+            self.assertTrue(plugin._auto_connect_thread.is_alive())
+            self.assertTrue(connected.wait(3.5))
+            self.assertTrue(started.wait(1.0))
+            self.assertEqual(attempts, [1, 2])
+        finally:
+            plugin._cancel_auto_connect_task()
+
+    def test_ready_session_event_recovers_autonomy_startup_race(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._manual_disconnect = False
+        plugin._session = type(
+            "Session",
+            (),
+            {
+                "discovery_ready": True,
+                "control_state": "external",
+                "npc_state": {"state": "safe_idle"},
+            },
+        )()
+        started = []
+
+        class Autonomy:
+            @staticmethod
+            def status():
+                return {"running": False, "pause_reason": "not_started"}
+
+            @staticmethod
+            def start():
+                started.append(True)
+                return {"state": "ready"}
+
+        plugin._autonomy = Autonomy()
+        plugin._refresh_llm_tools = lambda: []
+        plugin._push_context_snapshot = lambda **_kwargs: True
+
+        # ACK 已切换 control_state，但积压遥测仍是 safe_idle 时不能抢跑。
+        plugin._handle_session_event({"type": "npc.ack"})
+        self.assertEqual(started, [])
+
+        plugin._session.npc_state["state"] = "external"
+        plugin._handle_session_event({"type": "npc.state"})
+        self.assertEqual(started, [True])
+
+        # 人工暂停不能被后续高频 npc.state 自动解除。
+        plugin._autonomy.status = lambda: {
+            "running": False,
+            "pause_reason": "manual_pause",
+        }
+        plugin._handle_session_event({"type": "npc.state"})
+        self.assertEqual(started, [True])
+
+    def test_tailer_thread_starts_autonomy_without_event_loop(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._manual_disconnect = False
+        plugin._event_loop = None
+        plugin._session = type(
+            "Session",
+            (),
+            {
+                "discovery_ready": True,
+                "control_state": "external",
+                "npc_state": {"state": "external"},
+            },
+        )()
+        started = []
+
+        class Autonomy:
+            running = False
+
+            def status(self):
+                return {
+                    "running": self.running,
+                    "pause_reason": None if self.running else "not_started",
+                }
+
+            def start(self):
+                self.running = True
+                started.append(True)
+                return self.status()
+
+        plugin._autonomy = Autonomy()
+        plugin._on_session_event({"type": "npc.state", "state": "external"})
+        plugin._on_session_event({"type": "npc.state", "state": "external"})
+        self.assertEqual(started, [True])
+
+    def test_world_restart_recovers_auto_connect_without_lifecycle_loop(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._manual_disconnect = False
+        plugin._event_loop = None
+        plugin._session = type("Session", (), {"session": 0})()
+        scheduled = []
+        plugin._schedule_auto_connect = lambda: scheduled.append(True)
+
+        plugin._on_session_event({"type": "sys.boot", "session": 0})
+
+        self.assertEqual(scheduled, [True])
+        self.assertEqual(
+            plugin._player_chat_status_snapshot()["state"],
+            "waiting_for_world",
+        )
+
+    def test_world_restart_does_not_duplicate_or_override_manual_disconnect(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        plugin._event_loop = None
+        plugin._session = type("Session", (), {"session": 0})()
+        scheduled = []
+        plugin._schedule_auto_connect = lambda: scheduled.append(True)
+        plugin._auto_connect_thread = type("Thread", (), {"is_alive": lambda _self: True})()
+
+        plugin._on_session_event({
+            "type": "npc.ack",
+            "session": 0,
+            "ok": False,
+            "err": "not_handshaken",
+        })
+        self.assertEqual(scheduled, [])
+
+        plugin._auto_connect_thread = None
+        plugin._manual_disconnect = True
+        plugin._on_session_event({"type": "sys.boot", "session": 0})
+        self.assertEqual(scheduled, [])
+
+    def test_tailer_thread_forwards_explicit_player_chat_without_event_loop(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._event_loop = None
+        session = YuiSessionState()
+        session.session = 31
+        session.players[2] = {"slot": 2, "pid": 90210}
+        plugin._session = session
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"submitted": True}
+        plugin._current_host_character = lambda: "测试猫娘"
+
+        plugin._on_session_event({"type": "sys.chat_input_ready", "ready": True})
+        plugin._on_session_event({
+            "type": "player.chat_submit",
+            "session": 31,
+            "slot": 2,
+            "pid": 90210,
+            "submit_seq": 9,
+            "text": "常驻日志线程提交测试",
+        })
+
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0]["source"], "yui_npc_controller.world_chat")
+        self.assertEqual(pushed[0]["ai_behavior"], "respond")
+        self.assertEqual(pushed[0]["target_lanlan"], "测试猫娘")
+        status = plugin._player_chat_status_snapshot()
+        self.assertTrue(status["world_ui_ready"])
+        self.assertEqual(status["state"], "submitted")
+
+    def test_intent_worker_survives_without_host_event_loop(self) -> None:
+        plugin = _plugin_class()(None)
+        delivered = threading.Event()
+
+        class Provider:
+            config = type("Config", (), {"enabled": True, "min_interval_s": 0.0})()
+
+            @staticmethod
+            async def request(_context):
+                return {
+                    "status": "succeeded",
+                    "intent": {"motivation": "测试"},
+                    "latency_ms": 1,
+                    "format": "json_schema",
+                }
+
+        class Autonomy:
+            @staticmethod
+            def status():
+                return {"running": True}
+
+            @staticmethod
+            def offer_intent(intent, token):
+                if intent["motivation"] == "测试" and token == "1:1":
+                    delivered.set()
+                return True
+
+        plugin._event_loop = None
+        plugin._intent_provider = Provider()
+        plugin._autonomy = Autonomy()
+        plugin._start_intent_worker()
+        try:
+            plugin._queue_autonomy_inspiration({
+                "request_token": "1:1",
+                "reason": "startup",
+                "context": {"catalog": {}},
+            })
+            self.assertTrue(delivered.wait(timeout=1.0))
+        finally:
+            plugin._stop_intent_worker()
 
 
 if __name__ == "__main__":

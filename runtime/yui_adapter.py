@@ -218,7 +218,12 @@ class YuiSemanticAdapter:
                         "DISCOVER 已 ACK，但未在期限内收到同一会话的 sys.session",
                         requested_session=session_value,
                     )
-                if not self.session.wait_for_discovery(session_value, session_timeout):
+                # DISCOVER 目录由世界限速分批写入；正式 NEKO Home 的目录总量
+                # 会稳定超过普通命令的 5 秒 deadline。ACK/session 仍使用命令
+                # deadline，但完整目录必须给出独立宽限，避免自动连接不断换
+                # session、让上一轮目录永远收不齐。
+                discovery_timeout = max(session_timeout, 12.0)
+                if not self.session.wait_for_discovery(session_value, discovery_timeout):
                     return _local_result(
                         "discovery_timeout",
                         "当前会话的 sys.hello 或声明目录未在期限内完整到达",
@@ -512,6 +517,33 @@ class YuiSemanticAdapter:
             distance_m=distance,
             face_travel=face_travel,
             allow_shorter=allow_shorter,
+        )
+
+    def turn_relative_wire(self, delta_deg: float) -> dict[str, Any]:
+        """按当前世界 yaw 做有限相对转身；角度由宿主生成，不暴露给模型。"""
+        blocked = self._require_tool(operation=True)
+        if blocked is not None:
+            return blocked
+        if isinstance(delta_deg, bool) or not isinstance(delta_deg, (int, float)):
+            return _local_result("invalid_param", "delta_deg 必须是有限数值")
+        delta = float(delta_deg)
+        yaw = self.session.npc_state.get("yaw")
+        if not math.isfinite(delta) or not -180.0 <= delta <= 180.0 or abs(delta) < 5.0:
+            return _local_result("invalid_param", "delta_deg 必须位于 -180..180 且绝对值不小于 5")
+        if isinstance(yaw, bool) or not isinstance(yaw, (int, float)) or not math.isfinite(float(yaw)):
+            return _local_result("not_ready", "尚未收到 NPC yaw")
+        target_yaw = (float(yaw) + delta) % 360.0
+        with self._semantic_lock:
+            outcome = self._send_command(
+                "TURN_TO",
+                (encode_yaw_q14(target_yaw), 0, 0, 0, 0, 0),
+            )
+        if isinstance(outcome, dict):
+            return outcome
+        return self._outcome(
+            outcome,
+            delta_deg=delta,
+            target_yaw=target_yaw,
         )
 
     def explore_region_wire(
@@ -827,6 +859,50 @@ class YuiSemanticAdapter:
             return outcome
         return self._outcome(outcome, target={"x": values[0], "y": values[1], "z": values[2]}, duration_ms=duration_ms)
 
+    def look_at_semantic_wire(self, target_key: str) -> dict[str, Any]:
+        """把语义目标解析为 Unity 已发布位置并持续注视，调用方负责清除。"""
+        if not isinstance(target_key, str) or not target_key:
+            return _local_result("invalid_param", "target_key 必须是非空字符串")
+        position: Any = None
+        for item in self.session.catalogs["anchor"].values():
+            if item.get("semantic_key") == target_key:
+                position = item.get("pos")
+                break
+        if position is None:
+            for item in self.session.catalogs["entity"].values():
+                if item.get("semantic_key") != target_key:
+                    continue
+                position = item.get("center")
+                if not isinstance(position, list) or len(position) != 3:
+                    anchor_id = item.get("approach_anchor_id")
+                    anchor = (
+                        self.session.catalogs["anchor"].get(anchor_id)
+                        if isinstance(anchor_id, int)
+                        else None
+                    )
+                    position = None if anchor is None else anchor.get("pos")
+                break
+        if position is None:
+            for item in self.session.catalogs["region"].values():
+                if item.get("semantic_key") != target_key:
+                    continue
+                anchor_id = item.get("entry_anchor_id")
+                anchor = (
+                    self.session.catalogs["anchor"].get(anchor_id)
+                    if isinstance(anchor_id, int)
+                    else None
+                )
+                position = None if anchor is None else anchor.get("pos")
+                break
+        if not isinstance(position, list) or len(position) != 3:
+            return _local_result("target_missing", "语义目标没有可用注视位置")
+        return self.look_at(
+            x=position[0],
+            y=position[1],
+            z=position[2],
+            duration_ms=0,
+        )
+
     def clear_look_wire(self) -> dict[str, Any]:
         """行为执行器的有限注视收尾；LOOK_AT P3=127 是冻结的清除语义。"""
         blocked = self._require_tool(operation=True)
@@ -941,10 +1017,17 @@ class YuiSemanticAdapter:
         action_key: str | None = None,
         estimated_delay_ms: int | None = None,
         duration_ms: int | None = None,
+        display_seconds: int = 0,
     ) -> dict[str, Any]:
         blocked = self._require_tool("text_utf8")
         if blocked is not None:
             return blocked
+        if (
+            isinstance(display_seconds, bool)
+            or not isinstance(display_seconds, int)
+            or not 0 <= display_seconds <= 127
+        ):
+            return _local_result("invalid_param", "display_seconds 必须是 0..127 的整数")
         action_result: dict[str, Any] | None = None
         action_sequence = 0
         if action_key is not None:
@@ -959,8 +1042,10 @@ class YuiSemanticAdapter:
             result = self._send_text(
                 text,
                 transfer_sequence=transfer_sequence,
-                display_seconds=0,
+                display_seconds=display_seconds,
             )
+        if isinstance(result, dict):
+            return result
         transaction = result.transaction
         response: dict[str, Any] = {
             "request_id": f"host-{uuid.uuid4()}",

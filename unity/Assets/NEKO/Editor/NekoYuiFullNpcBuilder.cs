@@ -267,11 +267,15 @@ public static class NekoYuiFullNpcBuilder
         }
         bubbleObject.localPosition = new Vector3(0f, 2.2f, 0f);
         bubble.text = "";
-        bubble.fontSize = 2f;
-        bubble.alignment = TMPro.TextAlignmentOptions.Center;
-        bubble.enableWordWrapping = false;
-        bubble.color = Color.white;
+        NekoNpcRigBuilder.ConfigureBubbleText(bubble);
         nameplate.bubbleText = bubble;
+        nameplate.nameBillboard = nameplate.nameText == null ? null : nameplate.nameText.transform;
+        nameplate.bubbleBillboard = bubble.transform;
+        var animator = nameplate.transform.root.GetComponentInChildren<Animator>(true);
+        if (animator != null && animator.isHuman)
+            nameplate.headAnchor = animator.GetBoneTransform(HumanBodyBones.Head);
+        nameplate.nameHeadOffset = 0.20f;
+        nameplate.bubbleHeadOffset = 0.36f;
     }
 
     static void ConfigureExtendedActions(NekoMidiRouter router)

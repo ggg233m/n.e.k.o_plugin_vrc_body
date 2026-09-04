@@ -79,6 +79,66 @@ class YuiSessionTests(unittest.TestCase):
         self.assertFalse(observation["log_complete"])
         self.assertEqual(observation["log_gaps"], [[2, 2]])
 
+    def test_world_boot_invalidates_stale_session_and_starts_new_log_generation(self) -> None:
+        state = YuiSessionState()
+        state.session = 1193046
+        state.spec_version = "1.3"
+        state.world_name = "旧世界实例"
+        state.driver_pid = 42
+        state.control_state = "external"
+        state.capabilities = ("world_map", "semantic_navigation")
+        state.catalog_revision = 9
+        state.catalogs["anchor"][0] = {"id": 0, "semantic_key": "旧目标"}
+        state.players[1] = {"slot": 1, "pid": 99}
+        state.operations["old-op"] = {"status": "running"}
+        state.last_log_sequence = 500
+        state.log_complete = False
+        state.log_gaps.append((20, 21))
+        state.set_host_arm_authorized(True)
+
+        state.ingest({
+            **_header(1, "sys.boot", ready=True),
+            "session": 0,
+        })
+
+        self.assertEqual(state.session, 0)
+        self.assertEqual(state.control_state, "unhandshaken")
+        self.assertIsNone(state.driver_pid)
+        self.assertIsNone(state.world_name)
+        self.assertFalse(state.discovery_ready)
+        self.assertFalse(state.host_arm_authorized)
+        self.assertEqual(state.catalogs["anchor"], {})
+        self.assertEqual(state.players, {})
+        self.assertEqual(state.operations, {})
+        self.assertEqual(state.last_log_sequence, 1)
+        self.assertTrue(state.log_complete)
+        self.assertEqual(state.log_gaps, [])
+
+    def test_unhandshaken_ack_recovers_when_boot_event_was_missed(self) -> None:
+        state = YuiSessionState()
+        state.session = 1193046
+        state.control_state = "external"
+        state.capabilities = ("world_map",)
+        state.catalogs["anchor"][0] = {"id": 0, "semantic_key": "旧目标"}
+
+        state.ingest({
+            **_header(501, "npc.ack"),
+            "session": 0,
+            "seq": 1,
+            "cmd_id": 11,
+            "cmd": "HEARTBEAT",
+            "request_hash": "ABCD",
+            "ok": False,
+            "replayed": False,
+            "state": "unhandshaken",
+            "err": "not_handshaken",
+        })
+
+        self.assertEqual(state.session, 0)
+        self.assertEqual(state.control_state, "unhandshaken")
+        self.assertFalse(state.discovery_ready)
+        self.assertEqual(state.catalogs["anchor"], {})
+
     def test_complete_snapshot_replaces_stale_player_set(self) -> None:
         state = YuiSessionState()
         state.ingest(_header(1, "player.join", slot=1, pid=9, name="旧玩家"))

@@ -1,6 +1,21 @@
 """YUI NPC 插件的确定性 Python 运行时。"""
 
-from .config import YuiPluginConfig
+from .config import (
+    YuiAutonomyConfig,
+    YuiChatBridgeConfig,
+    YuiChatContextConfig,
+    YuiIntentModelConfig,
+    YuiPlayerChatConfig,
+    YuiPluginConfig,
+)
+from .chat_context import ChatContextUpdate, RecentChatContextProvider
+from .reply_display import MainReplyDisplayBridge
+from .autonomy import (
+    AutonomyDirector,
+    AutonomyStimulusProvider,
+    NoopAutonomyStimulusProvider,
+)
+from .intent import AutonomyIntentProvider, IntentModelError, validate_intent
 from .driver_lock import YuiDriverLease, YuiDriverLeaseError
 from .behavior_plan import (
     BehaviorGraphCompiler,
@@ -21,9 +36,19 @@ __all__ = [
     "BehaviorGraphError",
     "BehaviorPlan",
     "BehaviorPlanManager",
+    "AutonomyDirector",
+    "AutonomyIntentProvider",
+    "AutonomyStimulusProvider",
+    "IntentModelError",
+    "NoopAutonomyStimulusProvider",
     "YuiDriverLease",
     "YuiDriverLeaseError",
     "YuiOutputLogTailer",
+    "YuiAutonomyConfig",
+    "YuiChatBridgeConfig",
+    "YuiChatContextConfig",
+    "YuiIntentModelConfig",
+    "YuiPlayerChatConfig",
     "YuiContinuousRouteRunner",
     "YuiPluginConfig",
     "YuiReliableTransport",
@@ -31,4 +56,8 @@ __all__ = [
     "YuiSessionState",
     "YuiToolDefinition",
     "YuiToolSurface",
+    "ChatContextUpdate",
+    "RecentChatContextProvider",
+    "MainReplyDisplayBridge",
+    "validate_intent",
 ]

@@ -223,6 +223,37 @@ class YuiSessionState:
         # 授权只能绑定已经明确收到的当前 session；首次建联也必须清除预授权。
         self.host_arm_authorized = False
 
+    def _reset_for_world_restart(self, *, reset_log_sequence: bool) -> None:
+        """世界实例重启后清除全部会话事实，避免宿主继续复用旧连接。"""
+
+        self._reset_for_new_session(0)
+        self.control_state = "unhandshaken"
+        self.driver_pid = None
+        self.world_id = None
+        self.world_name = None
+        self.voice_state = {
+            "state": "disabled",
+            "error_code": None,
+            "url_loaded": False,
+            "last_speech_seq": None,
+        }
+        self.text_state = {
+            "transfer_seq": None,
+            "utf8_bytes": 0,
+            "crc16": None,
+            "display_until_server_ms": None,
+            "text": None,
+        }
+        self._acks.clear()
+        self._recent_events.clear()
+        if reset_log_sequence:
+            # sys.boot 是新日志世代的第一条事实，不能把 log_seq=1 误报为倒退缺口。
+            self.last_log_sequence = None
+            self.log_wrap_count = 0
+            self.log_gaps.clear()
+            self.log_complete = True
+            self._expect_log_sequence_one = False
+
     def _track_log_sequence(self, event: Mapping[str, Any]) -> None:
         sequence = int(event["log_seq"])
         event_type = event["type"]
@@ -262,6 +293,19 @@ class YuiSessionState:
         if not isinstance(event_type, str):
             raise ValueError("event.type 必须是字符串")
         with self._condition:
+            event_session = event_copy.get("session")
+            world_boot = event_type == "sys.boot" and event_session == 0
+            stale_heartbeat = (
+                event_type == "npc.ack"
+                and event_session == 0
+                and event_copy.get("ok") is False
+                and event_copy.get("err") == "not_handshaken"
+                and self.session != 0
+            )
+            if world_boot or stale_heartbeat:
+                # ClientSim/VRChat 可以在宿主进程不重启的情况下重载世界。旧的
+                # 正数 session 此时已永久失效，必须先清空再通知插件自动重连。
+                self._reset_for_world_restart(reset_log_sequence=world_boot)
             self._track_log_sequence(event_copy)
             self.world_id = str(event_copy.get("world_id") or self.world_id or "") or None
             event_spec = event_copy.get("spec")

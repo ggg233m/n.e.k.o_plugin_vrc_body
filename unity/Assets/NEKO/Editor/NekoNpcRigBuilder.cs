@@ -19,6 +19,7 @@
 using System;
 using System.Reflection;
 using TMPro;
+using UnityEngine.TextCore.LowLevel;
 using Unity.AI.Navigation;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -29,6 +30,8 @@ using UnityEngine.SceneManagement;
 public static class NekoNpcRigBuilder
 {
     const string RootName = "NekoNpc_YUI";
+    const string ChineseFontSourcePath = "Assets/NEKO/Fonts/NotoSansSC-Regular.otf";
+    const string ChineseDynamicFontPath = "Assets/NEKO/Fonts/NotoSansSC-Dynamic SDF.asset";
 
     [MenuItem("NEKO/Build NPC Rig (YUI)")]
     public static void Build()
@@ -91,6 +94,7 @@ public static class NekoNpcRigBuilder
         plate.transform.localPosition = new Vector3(0f, 0f, 0f);
         var nameText = Text(plate, "NameText", new Vector3(0f, 1.95f, 0f), "YUI", 2.5f);
         var bubbleText = Text(plate, "BubbleText", new Vector3(0f, 2.2f, 0f), "", 2f);
+        ConfigureBubbleText(bubbleText);
 
         var scripts = new GameObject("Scripts");
         scripts.transform.SetParent(root.transform, false);
@@ -120,6 +124,8 @@ public static class NekoNpcRigBuilder
             router.telemetry = tel; router.locomotion = loco; router.perception = per; router.nameplate = np;
             sync.telemetry = tel; sync.locomotion = loco;
             np.nameText = nameText; np.bubbleText = bubbleText;
+            np.nameBillboard = nameText.transform; np.bubbleBillboard = bubbleText.transform;
+            np.headAnchor = eye.transform;
             Wire(tHead, tel, per, "head"); Wire(tCheek, tel, per, "cheek");
             Wire(tHandL, tel, per, "handL"); Wire(tHandR, tel, per, "handR"); Wire(tTorso, tel, per, "torso");
             MarkDirty(tel); MarkDirty(per); MarkDirty(loco); MarkDirty(router); MarkDirty(sync); MarkDirty(np);
@@ -350,6 +356,103 @@ public static class NekoNpcRigBuilder
         tm.fontSize = size;           // TMP 3D：fontSize ≈ 字高(米)×10
         tm.color = Color.white;
         return tm;
+    }
+
+    public static void ConfigureBubbleText(TextMeshPro bubble)
+    {
+        if (bubble == null) return;
+
+        // 接近 VRChat 原生聊天气泡的紧凑阅读宽度：固定横向边界，中文按字符换行。
+        // 底部锚定在头顶上方，让多行回答只向上增长，不覆盖 NPC 身体。
+        RectTransform rect = bubble.rectTransform;
+        rect.sizeDelta = new Vector2(2.8f, 1.8f);
+        rect.pivot = new Vector2(0.5f, 0f);
+        bubble.font = RequireChineseBubbleFont();
+        bubble.fontSize = 1.45f;
+        bubble.alignment = TextAlignmentOptions.Bottom;
+        bubble.enableWordWrapping = true;
+        bubble.overflowMode = TextOverflowModes.Overflow;
+        bubble.margin = new Vector4(0.18f, 0.12f, 0.18f, 0.12f);
+        bubble.raycastTarget = false;
+        bubble.color = Color.white;
+    }
+
+    [MenuItem("NEKO/YUI Formal/Nameplate/Install Or Update")]
+    public static void InstallOrUpdateExistingNameplate()
+    {
+        GameObject root = GameObject.Find(RootName);
+        if (root == null) throw new InvalidOperationException("当前场景缺少 " + RootName);
+        Transform plate = root.transform.Find("Nameplate");
+        NekoNpcNameplate nameplate = plate == null ? null : plate.GetComponent<NekoNpcNameplate>();
+        if (nameplate == null) throw new InvalidOperationException("YUI NPC 缺少 NekoNpcNameplate");
+
+        TextMeshPro bubble = nameplate.bubbleText;
+        if (bubble == null && plate != null)
+            bubble = plate.Find("BubbleText") == null ? null : plate.Find("BubbleText").GetComponent<TextMeshPro>();
+        if (bubble == null) throw new InvalidOperationException("YUI NPC 缺少 BubbleText");
+
+        Animator animator = root.GetComponentInChildren<Animator>(true);
+        Transform head = animator != null && animator.isHuman
+            ? animator.GetBoneTransform(HumanBodyBones.Head)
+            : null;
+        if (head == null) throw new InvalidOperationException("YUI NPC 无法取得 Humanoid Head 骨");
+
+        Undo.RecordObjects(new UnityEngine.Object[] { plate, nameplate, bubble }, "更新 YUI 头顶气泡");
+        plate.localRotation = Quaternion.identity;
+        ConfigureBubbleText(bubble);
+        nameplate.bubbleText = bubble;
+        nameplate.nameBillboard = nameplate.nameText == null ? null : nameplate.nameText.transform;
+        nameplate.bubbleBillboard = bubble.transform;
+        nameplate.headAnchor = head;
+        nameplate.nameHeadOffset = 0.20f;
+        nameplate.bubbleHeadOffset = 0.36f;
+        if (nameplate.nameText != null)
+            nameplate.nameText.transform.position = head.position + Vector3.up * nameplate.nameHeadOffset;
+        bubble.transform.position = head.position + Vector3.up * nameplate.bubbleHeadOffset;
+
+        MarkDirty(nameplate);
+        EditorUtility.SetDirty(bubble);
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        EditorSceneManager.SaveOpenScenes();
+        AssetDatabase.SaveAssets();
+        Debug.Log("[NEKO] YUI 头顶气泡已更新：中文动态字体、头骨锚定、子节点独立朝向。");
+    }
+
+    static TMP_FontAsset RequireChineseBubbleFont()
+    {
+        TMP_FontAsset asset = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(ChineseDynamicFontPath);
+        if (asset != null) return asset;
+
+        Font source = AssetDatabase.LoadAssetAtPath<Font>(ChineseFontSourcePath);
+        if (source == null)
+            throw new InvalidOperationException("缺少头顶气泡中文字体源：" + ChineseFontSourcePath);
+        asset = TMP_FontAsset.CreateFontAsset(
+            source,
+            48,
+            6,
+            GlyphRenderMode.SDFAA,
+            2048,
+            2048,
+            AtlasPopulationMode.Dynamic,
+            true
+        );
+        if (asset == null) throw new InvalidOperationException("无法创建中文动态 TMP 字体");
+        asset.name = "NotoSansSC-Dynamic SDF";
+        asset.atlasPopulationMode = AtlasPopulationMode.Dynamic;
+        asset.isMultiAtlasTexturesEnabled = true;
+        AssetDatabase.CreateAsset(asset, ChineseDynamicFontPath);
+        if (asset.material != null && string.IsNullOrEmpty(AssetDatabase.GetAssetPath(asset.material)))
+            AssetDatabase.AddObjectToAsset(asset.material, asset);
+        if (asset.atlasTextures != null)
+        {
+            foreach (Texture2D atlas in asset.atlasTextures)
+                if (atlas != null && string.IsNullOrEmpty(AssetDatabase.GetAssetPath(atlas)))
+                    AssetDatabase.AddObjectToAsset(atlas, asset);
+        }
+        EditorUtility.SetDirty(asset);
+        AssetDatabase.SaveAssets();
+        AssetDatabase.ImportAsset(ChineseDynamicFontPath, ImportAssetOptions.ForceUpdate);
+        return asset;
     }
 
     static void Wire(NekoNpcTouch t, NekoNpcTelemetry tel, NekoNpcPerception per, string part)

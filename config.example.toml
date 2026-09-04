@@ -26,3 +26,59 @@ include_player_names = false
 
 # 可选工具；只映射为 SET_MODE wander，不接受任何参数。
 enable_wander_tool = false
+
+# 本插件只面向 NEKO Home/YUI 世界，默认把主 LLM 已完成的回答显示到 NPC 头顶。
+# 普通回合只读 current character 的 recent.json；世界输入产生的主动回合只读补充
+# 宿主已有 proactive_reply 记录。不扩展协议，也不回写任何聊天存储。
+[yui.chat_bridge]
+enabled = true
+source = "recent_file"
+poll_interval_s = 0.5
+# 每页至少保留 15 秒；长文字会按阅读量自动延长，最多 30 秒。
+display_seconds = 15
+max_pages = 4
+max_file_bytes = 2097152
+
+# 世界内本地跟随式输入 UI。只有玩家点击发送产生的 player.chat_submit 才会触发
+# 宿主主 LLM；自主、社交和失败事件仍不会触发聊天或 TTS。
+[yui.player_chat]
+enabled = true
+max_chars = 144
+cooldown_s = 2.0
+
+[yui.autonomy]
+# 仅为已验收语义地图和 operation lifecycle 的配置档显式开启。
+enabled = true
+auto_connect = true
+decision_interval_s = 1
+resume_delay_s = 8
+# 自主移动的日常步行速度；正式世界 Walk 动画区间不超过 1.2m/s。
+walk_speed_mps = 1.0
+dwell_range_s = [8, 20]
+explore_range_s = [15, 35]
+social_cooldown_s = 60
+llm_inspiration_range_s = [180, 360]
+
+# 独立意图模型不使用宿主回复/TTS 通道。通用配置默认关闭；密钥只从指定环境变量
+# 读取，绝不能写入本文件。可选聊天上下文仅从落盘 recent.json 只读取得。
+[yui.autonomy.intent_model]
+enabled = true
+# 留空表示不配置中转站，意图模型不会启用。要接入 OpenAI 兼容中转站，
+# 填写完整的 https chat/completions 地址，例如
+# "https://example.com/v1/chat/completions"。
+endpoint = ""
+model = "gemini-3.7-flash"
+api_key_env = "TEST_API"
+persona_prompt = "你是友好、好奇且会自然安排生活片段的世界 NPC。"
+timeout_s = 20
+min_interval_s = 30
+max_output_tokens = 700
+
+# 只读 N.E.K.O 当前角色的 memory/<角色>/recent.json；不订阅 conversations 总线。
+[yui.autonomy.intent_model.chat_context]
+enabled = true
+source = "recent_file"
+max_turns = 6
+max_chars = 6000
+poll_interval_s = 1
+max_file_bytes = 2097152

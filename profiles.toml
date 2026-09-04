@@ -1,0 +1,5 @@
+[config_profiles]
+active = "test"
+
+[config_profiles.files]
+test = "profiles/test.toml"

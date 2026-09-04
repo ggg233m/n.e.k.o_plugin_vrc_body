@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neko-yui-npc-controller"
-version = "0.4.2"
+version = "0.5.10"
 description = "N.E.K.O plugin for the YUI world-native NPC protocol"
 requires-python = "==3.11.*"
 dependencies = [
@@ -29,6 +29,7 @@ yui_npc_controller = ["Docs/Protocols/*", "config.example.toml"]
 # N.E.K.O 插件包只携带运行时、协议文档、配置与 vendor 依赖。
 # 测试证据、Unity 验收源和旧工作区临时文件由各自仓库维护。
 exclude_dirs = [
+  ".tmp",
   "backend",
   "memory",
   "tmp",
