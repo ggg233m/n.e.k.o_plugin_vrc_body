@@ -50,7 +50,7 @@ class McpServerTests(unittest.TestCase):
                 "params": {"protocolVersion": "2024-11-05"},
             }
         )
-        self.assertEqual(messages[0]["result"]["serverInfo"]["version"], "0.5.10")
+        self.assertEqual(messages[0]["result"]["serverInfo"]["version"], "0.5.13")
 
     def test_tools_call_returns_structured_content(self) -> None:
         messages = self._invoke(

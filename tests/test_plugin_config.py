@@ -479,6 +479,9 @@ class YuiPluginConfigTests(unittest.TestCase):
         session.session = 31
         session.players[2] = {"slot": 2, "pid": 90210, "name": "不应上传的名字"}
         plugin._session = session
+        plugin._registered_yui_tools = {
+            "npc.approach", "npc.follow", "npc.observe",
+        }
         pushed = []
         plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"submitted": True}
 
@@ -502,16 +505,29 @@ class YuiPluginConfigTests(unittest.TestCase):
             "slot": 2,
             "pid": 90210,
             "submit_seq": 7,
-            "text": "今天去看看照片吧",
+            "text": "过来",
         })
 
         self.assertEqual(len(pushed), 1)
         message = pushed[0]
-        self.assertEqual(message["visibility"], ["chat"])
+        self.assertEqual(message["visibility"], [])
         self.assertEqual(message["ai_behavior"], "respond")
         self.assertEqual(message["source"], "yui_npc_controller.world_chat")
         self.assertEqual(message["target_lanlan"], "测试猫娘")
-        self.assertIn("今天去看看照片吧", message["parts"][0]["text"])
+        request_text = message["parts"][0]["text"]
+        self.assertTrue(request_text.startswith("YUI_WORLD_CHAT_REQUEST "))
+        request = json.loads(request_text.removeprefix("YUI_WORLD_CHAT_REQUEST "))
+        self.assertEqual(request["player_slot"], 2)
+        self.assertEqual(request["player_text"], "过来")
+        self.assertTrue(request["world_context"]["connection"]["connected"])
+        self.assertIn("npc.approach", request["world_context"]["available_tools"])
+        self.assertTrue(any(
+            "npc.approach" in item for item in request["turn_contract"]
+        ))
+        self.assertTrue(any(
+            "npc.observe" in item for item in request["turn_contract"]
+        ))
+        self.assertEqual(message["metadata"]["projection"], "model_context")
         self.assertNotIn("不应上传的名字", json.dumps(message, ensure_ascii=False))
         self.assertNotIn("text", message["metadata"])
 
@@ -603,6 +619,104 @@ class YuiPluginConfigTests(unittest.TestCase):
         )
         self.assertEqual(payload["connection"]["reason"], "host_disconnected")
 
+    def test_session_rebuild_preserves_physical_midi_sink(self) -> None:
+        plugin = _plugin_class()(None)
+        adapter_closed = []
+        heartbeat_stopped = []
+        transport_closed = []
+        sink_closed = []
+
+        class Adapter:
+            @staticmethod
+            def close():
+                adapter_closed.append(True)
+
+        class Transport:
+            @staticmethod
+            def stop_heartbeat():
+                heartbeat_stopped.append(True)
+
+            @staticmethod
+            def close():
+                transport_closed.append(True)
+
+        class Sink:
+            @staticmethod
+            def close():
+                sink_closed.append(True)
+
+        sink = Sink()
+        plugin._adapter = Adapter()
+        plugin._transport = Transport()
+        plugin._midi_sink = sink
+        plugin._push_context_unavailable = lambda *_args, **_kwargs: True
+
+        plugin._close_control(reason="connect_ack_timeout", preserve_midi=True)
+
+        self.assertEqual(adapter_closed, [True])
+        self.assertEqual(heartbeat_stopped, [True])
+        self.assertEqual(transport_closed, [])
+        self.assertEqual(sink_closed, [])
+        self.assertIs(plugin._midi_sink, sink)
+        self.assertIsNone(plugin._transport)
+
+    def test_ack_timeout_rebuild_requests_make_before_break_midi_refresh(self) -> None:
+        plugin = _plugin_class()(None)
+        closed = []
+        plugin._close_control = lambda **kwargs: closed.append(kwargs)
+
+        rebuilt = plugin._rebuild_failed_connection({
+            "status": "unknown",
+            "error": "ack_timeout",
+            "session_rebuild_required": True,
+        })
+
+        self.assertTrue(rebuilt)
+        self.assertTrue(plugin._midi_refresh_required)
+        self.assertEqual(closed, [{
+            "reason": "connect_ack_timeout",
+            "preserve_midi": True,
+        }])
+
+    def test_midi_refresh_opens_new_sink_before_closing_stale_sink(self) -> None:
+        plugin_class = _plugin_class()
+        module = sys.modules[plugin_class.__module__]
+        plugin = plugin_class(None)
+        events = []
+
+        class Sink:
+            def __init__(self, name):
+                self.name = name
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                events.append(f"close:{self.name}")
+
+        stale = Sink("stale")
+        fresh = Sink("fresh")
+        plugin._midi_sink = stale
+        plugin._midi_refresh_required = True
+        original_factory = module.MidoOutputSink
+
+        def open_fresh(port_name):
+            self.assertEqual(port_name, "NEKO_MIDI")
+            self.assertFalse(stale.closed)
+            events.append("open:fresh")
+            return fresh
+
+        module.MidoOutputSink = open_fresh
+        try:
+            sink, replaced = plugin._acquire_midi_sink()
+        finally:
+            module.MidoOutputSink = original_factory
+
+        self.assertTrue(replaced)
+        self.assertIs(sink, fresh)
+        self.assertIs(plugin._midi_sink, fresh)
+        self.assertFalse(plugin._midi_refresh_required)
+        self.assertEqual(events, ["open:fresh", "close:stale"])
+
     def test_startup_announces_disconnected_state_without_registering_tools(self) -> None:
         plugin = _plugin_class()(None)
         pushed = []
@@ -681,14 +795,23 @@ class YuiPluginConfigTests(unittest.TestCase):
         connected = threading.Event()
         started = threading.Event()
         attempts = []
+        rebuilt = []
 
-        class Adapter:
+        class FailedAdapter:
             @staticmethod
             def connect(_claim_code):
                 attempts.append(len(attempts) + 1)
-                if len(attempts) == 1:
-                    first_attempt.set()
-                    return {"status": "failed", "error": "no_world"}
+                first_attempt.set()
+                return {
+                    "status": "unknown",
+                    "error": "ack_timeout",
+                    "session_rebuild_required": True,
+                }
+
+        class ConnectedAdapter:
+            @staticmethod
+            def connect(_claim_code):
+                attempts.append(len(attempts) + 1)
                 connected.set()
                 return {"status": "succeeded"}
 
@@ -706,7 +829,9 @@ class YuiPluginConfigTests(unittest.TestCase):
                 started.set()
                 return self.status()
 
-        plugin._ensure_control = lambda: Adapter()
+        adapters = iter((FailedAdapter(), ConnectedAdapter()))
+        plugin._ensure_control = lambda: next(adapters)
+        plugin._close_control = lambda *, reason, **_kwargs: rebuilt.append(reason)
         plugin._autonomy = Autonomy()
         plugin._refresh_llm_tools = lambda: []
         plugin._push_context_snapshot = lambda **_kwargs: True
@@ -722,8 +847,44 @@ class YuiPluginConfigTests(unittest.TestCase):
             self.assertTrue(connected.wait(3.5))
             self.assertTrue(started.wait(1.0))
             self.assertEqual(attempts, [1, 2])
+            self.assertEqual(rebuilt, ["connect_ack_timeout"])
+            self.assertEqual(plugin._connect_rebuilds, 1)
+            self.assertIsNone(plugin._last_connect_error)
         finally:
             plugin._cancel_auto_connect_task()
+
+    def test_manual_connect_rebuilds_failed_chain_and_resumes_auto_connect(self) -> None:
+        plugin = _plugin_class()(None)
+        plugin._config = YuiPluginConfig(
+            autonomy=YuiAutonomyConfig(enabled=True, auto_connect=True)
+        )
+        cancelled = []
+        rebuilt = []
+        scheduled = []
+
+        class Adapter:
+            @staticmethod
+            def connect(_claim_code):
+                return {
+                    "status": "unknown",
+                    "error": "ack_timeout",
+                    "session_rebuild_required": True,
+                }
+
+        plugin._cancel_auto_connect_task = lambda: cancelled.append(True)
+        plugin._ensure_control = lambda: Adapter()
+        plugin._close_control = lambda *, reason, **_kwargs: rebuilt.append(reason)
+        plugin._ensure_auto_connect_worker = lambda: scheduled.append(True) or True
+
+        response = asyncio.run(plugin.yui_connect())
+
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(rebuilt, ["connect_ack_timeout"])
+        self.assertEqual(scheduled, [True])
+        self.assertEqual(response.value["status"], "unknown")
+        self.assertTrue(response.value["reconnect_scheduled"])
+        self.assertEqual(plugin._connect_rebuilds, 1)
+        self.assertEqual(plugin._last_connect_error, "ack_timeout")
 
     def test_ready_session_event_recovers_autonomy_startup_race(self) -> None:
         plugin = _plugin_class()(None)
@@ -823,6 +984,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         plugin._on_session_event({"type": "sys.boot", "session": 0})
 
         self.assertEqual(scheduled, [True])
+        self.assertTrue(plugin._midi_refresh_required)
         self.assertEqual(
             plugin._player_chat_status_snapshot()["state"],
             "waiting_for_world",
@@ -874,8 +1036,11 @@ class YuiPluginConfigTests(unittest.TestCase):
         })
 
         self.assertEqual(len(pushed), 1)
-        self.assertEqual(pushed[0]["source"], "yui_npc_controller.world_chat")
+        self.assertEqual(pushed[0]["visibility"], [])
         self.assertEqual(pushed[0]["ai_behavior"], "respond")
+        self.assertIn("YUI_WORLD_CHAT_REQUEST", pushed[0]["parts"][0]["text"])
+        self.assertEqual(pushed[0]["source"], "yui_npc_controller.world_chat")
+        self.assertIn("常驻日志线程提交测试", pushed[0]["parts"][0]["text"])
         self.assertEqual(pushed[0]["target_lanlan"], "测试猫娘")
         status = plugin._player_chat_status_snapshot()
         self.assertTrue(status["world_ui_ready"])

@@ -8,7 +8,7 @@
 //   ├── Model              占位胶囊（无碰撞体，换成 humanoid 后删掉占位）
 //   ├── EyeAnchor          眼位空物体（Stream 相机手动钉此处）
 //   ├── TouchZones         Head / Cheek / HandL / HandR / Torso（isTrigger + NekoNpcTouch）
-//   ├── Nameplate          名牌 + 气泡（TextMeshPro + NekoNpcNameplate）
+//   ├── Nameplate          角色环绕对白（TextMeshPro + NekoNpcNameplate）
 //   └── Scripts            Telemetry / MidiRouter / Locomotion / Perception
 //
 // U# 组件通过反射调用 UdonSharpEditor.UdonSharpUndo.AddComponent<T> 添加并自动连线；
@@ -32,6 +32,8 @@ public static class NekoNpcRigBuilder
     const string RootName = "NekoNpc_YUI";
     const string ChineseFontSourcePath = "Assets/NEKO/Fonts/NotoSansSC-Regular.otf";
     const string ChineseDynamicFontPath = "Assets/NEKO/Fonts/NotoSansSC-Dynamic SDF.asset";
+    const string DialogueMaterialPath = "Assets/NEKO/Fonts/NotoSansSC-Dialogue.mat";
+    const string EmojiSpriteAssetPath = "Assets/TextMesh Pro/Resources/Sprite Assets/EmojiOne.asset";
 
     [MenuItem("NEKO/Build NPC Rig (YUI)")]
     public static void Build()
@@ -92,8 +94,7 @@ public static class NekoNpcRigBuilder
         var plate = new GameObject("Nameplate");
         plate.transform.SetParent(root.transform, false);
         plate.transform.localPosition = new Vector3(0f, 0f, 0f);
-        var nameText = Text(plate, "NameText", new Vector3(0f, 1.95f, 0f), "YUI", 2.5f);
-        var bubbleText = Text(plate, "BubbleText", new Vector3(0f, 2.2f, 0f), "", 2f);
+        var bubbleText = Text(plate, "BubbleText", new Vector3(0f, 0.98f, 0.55f), "", 2f);
         ConfigureBubbleText(bubbleText);
 
         var scripts = new GameObject("Scripts");
@@ -123,9 +124,11 @@ public static class NekoNpcRigBuilder
             loco.telemetry = tel; loco.perception = per; loco.router = router; loco.npcRoot = root.transform; loco.navAgent = agent;
             router.telemetry = tel; router.locomotion = loco; router.perception = per; router.nameplate = np;
             sync.telemetry = tel; sync.locomotion = loco;
-            np.nameText = nameText; np.bubbleText = bubbleText;
-            np.nameBillboard = nameText.transform; np.bubbleBillboard = bubbleText.transform;
+            np.nameText = null; np.bubbleText = bubbleText;
+            np.nameBillboard = null; np.bubbleBillboard = bubbleText.transform;
             np.headAnchor = eye.transform;
+            np.bodyAnchor = root.transform;
+            ApplyDialogueDefaults(np);
             Wire(tHead, tel, per, "head"); Wire(tCheek, tel, per, "cheek");
             Wire(tHandL, tel, per, "handL"); Wire(tHandR, tel, per, "handR"); Wire(tTorso, tel, per, "torso");
             MarkDirty(tel); MarkDirty(per); MarkDirty(loco); MarkDirty(router); MarkDirty(sync); MarkDirty(np);
@@ -181,8 +184,15 @@ public static class NekoNpcRigBuilder
         if (np != null && plate != null)
         {
             var nt = plate.Find("NameText"); var bt = plate.Find("BubbleText");
-            if (nt != null) np.nameText = nt.GetComponent<TextMeshPro>();
-            if (bt != null) np.bubbleText = bt.GetComponent<TextMeshPro>();
+            np.nameText = null;
+            np.nameBillboard = null;
+            if (nt != null) Undo.DestroyObjectImmediate(nt.gameObject);
+            if (bt != null)
+            {
+                np.bubbleText = bt.GetComponent<TextMeshPro>();
+                ConfigureBubbleText(np.bubbleText);
+                np.bubbleBillboard = bt;
+            }
         }
         int touches = 0;
         if (zones != null)
@@ -201,7 +211,19 @@ public static class NekoNpcRigBuilder
 
         // Animator（若模型已就位）
         var anim = root.GetComponentInChildren<Animator>();
-        if (anim != null) { loco.animator = anim; if (sync != null) sync.animator = anim; MarkDirty(loco); if (sync != null) MarkDirty(sync); }
+        if (anim != null)
+        {
+            loco.animator = anim;
+            if (sync != null) sync.animator = anim;
+            if (np != null)
+            {
+                np.bodyAnchor = anim.transform;
+                if (anim.isHuman) np.headAnchor = anim.GetBoneTransform(HumanBodyBones.Head);
+                ApplyDialogueDefaults(np);
+            }
+            MarkDirty(loco);
+            if (sync != null) MarkDirty(sync);
+        }
 
         // 同场景的 NekoEyeCamDolly（N4 实验）：telemetry / eyeAnchor 一并校正（反射，Experimental 可能不在）
         int dollyFixed = 0;
@@ -362,19 +384,72 @@ public static class NekoNpcRigBuilder
     {
         if (bubble == null) return;
 
-        // 接近 VRChat 原生聊天气泡的紧凑阅读宽度：固定横向边界，中文按字符换行。
-        // 底部锚定在头顶上方，让多行回答只向上增长，不覆盖 NPC 身体。
+        // 《米塔》式角色前置对白：无底板、居中浮空白字，以描边和轻微 underlay 保证复杂背景可读。
         RectTransform rect = bubble.rectTransform;
-        rect.sizeDelta = new Vector2(2.8f, 1.8f);
-        rect.pivot = new Vector2(0.5f, 0f);
-        bubble.font = RequireChineseBubbleFont();
-        bubble.fontSize = 1.45f;
-        bubble.alignment = TextAlignmentOptions.Bottom;
+        rect.sizeDelta = new Vector2(1.6f, 0.9f);
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        TMP_FontAsset dialogueFont = RequireChineseBubbleFont();
+        bubble.font = dialogueFont;
+        bubble.fontSharedMaterial = RequireDialogueMaterial(dialogueFont);
+        bubble.spriteAsset = RequireEmojiSpriteAsset();
+        bubble.fontSize = 0.72f;
+        bubble.enableAutoSizing = false;
+        bubble.alignment = TextAlignmentOptions.Center;
         bubble.enableWordWrapping = true;
         bubble.overflowMode = TextOverflowModes.Overflow;
-        bubble.margin = new Vector4(0.18f, 0.12f, 0.18f, 0.12f);
+        bubble.margin = new Vector4(0.06f, 0.04f, 0.06f, 0.04f);
         bubble.raycastTarget = false;
-        bubble.color = Color.white;
+        bubble.richText = true;
+        bubble.color = new Color32(255, 252, 255, 255);
+    }
+
+    public static void ApplyDialogueDefaults(NekoNpcNameplate nameplate)
+    {
+        if (nameplate == null) return;
+        nameplate.dialogueOrbitRadius = 0.55f;
+        nameplate.dialogueAnchorHeight = 0.98f;
+        nameplate.dialogueOrbitFollowSpeed = 12f;
+        nameplate.dialogueRotationFollowSpeed = 16f;
+        nameplate.dialoguePositionDeadZone = 0.003f;
+        nameplate.dialogueRotationDeadZoneDegrees = 0.2f;
+        nameplate.revealLeadInMs = 100;
+        nameplate.revealCharacterIntervalMs = 70;
+        nameplate.revealShortPunctuationPauseMs = 120;
+        nameplate.revealLongPunctuationPauseMs = 240;
+        nameplate.minimumFullTextHoldSeconds = 4f;
+    }
+
+    static Material RequireDialogueMaterial(TMP_FontAsset font)
+    {
+        if (font == null || font.material == null)
+            throw new InvalidOperationException("角色对白字体没有可用的基础材质");
+
+        Material material = AssetDatabase.LoadAssetAtPath<Material>(DialogueMaterialPath);
+        if (material == null)
+        {
+            material = new Material(font.material) { name = "NotoSansSC-Dialogue" };
+            AssetDatabase.CreateAsset(material, DialogueMaterialPath);
+        }
+
+        material.EnableKeyword("OUTLINE_ON");
+        material.EnableKeyword("UNDERLAY_ON");
+        if (material.HasProperty("_OutlineColor")) material.SetColor("_OutlineColor", new Color32(5, 10, 18, 230));
+        if (material.HasProperty("_OutlineWidth")) material.SetFloat("_OutlineWidth", 0.16f);
+        if (material.HasProperty("_UnderlayColor")) material.SetColor("_UnderlayColor", new Color32(0, 0, 0, 120));
+        if (material.HasProperty("_UnderlayOffsetX")) material.SetFloat("_UnderlayOffsetX", 0.30f);
+        if (material.HasProperty("_UnderlayOffsetY")) material.SetFloat("_UnderlayOffsetY", -0.30f);
+        if (material.HasProperty("_UnderlayDilate")) material.SetFloat("_UnderlayDilate", 0.10f);
+        if (material.HasProperty("_UnderlaySoftness")) material.SetFloat("_UnderlaySoftness", 0.18f);
+        EditorUtility.SetDirty(material);
+        return material;
+    }
+
+    static TMP_SpriteAsset RequireEmojiSpriteAsset()
+    {
+        TMP_SpriteAsset asset = AssetDatabase.LoadAssetAtPath<TMP_SpriteAsset>(EmojiSpriteAssetPath);
+        if (asset == null)
+            throw new InvalidOperationException("缺少 TextMesh Pro EmojiOne sprite 资产：" + EmojiSpriteAssetPath);
+        return asset;
     }
 
     [MenuItem("NEKO/YUI Formal/Nameplate/Install Or Update")]
@@ -397,25 +472,33 @@ public static class NekoNpcRigBuilder
             : null;
         if (head == null) throw new InvalidOperationException("YUI NPC 无法取得 Humanoid Head 骨");
 
-        Undo.RecordObjects(new UnityEngine.Object[] { plate, nameplate, bubble }, "更新 YUI 头顶气泡");
+        Undo.RecordObjects(new UnityEngine.Object[] { plate, nameplate, bubble }, "更新 YUI 角色前置对白");
         plate.localRotation = Quaternion.identity;
+        Transform obsoleteNameObject = plate.Find("NameText");
+        TextMeshPro obsoleteNameText = nameplate.nameText;
+        nameplate.nameText = null;
+        nameplate.nameBillboard = null;
+        if (obsoleteNameObject != null && obsoleteNameObject != bubble.transform)
+            Undo.DestroyObjectImmediate(obsoleteNameObject.gameObject);
+        if (obsoleteNameText != null && obsoleteNameText != bubble
+            && obsoleteNameText.transform != obsoleteNameObject && obsoleteNameText.transform.IsChildOf(plate))
+            Undo.DestroyObjectImmediate(obsoleteNameText.gameObject);
         ConfigureBubbleText(bubble);
         nameplate.bubbleText = bubble;
-        nameplate.nameBillboard = nameplate.nameText == null ? null : nameplate.nameText.transform;
         nameplate.bubbleBillboard = bubble.transform;
         nameplate.headAnchor = head;
-        nameplate.nameHeadOffset = 0.20f;
-        nameplate.bubbleHeadOffset = 0.36f;
-        if (nameplate.nameText != null)
-            nameplate.nameText.transform.position = head.position + Vector3.up * nameplate.nameHeadOffset;
-        bubble.transform.position = head.position + Vector3.up * nameplate.bubbleHeadOffset;
+        nameplate.bodyAnchor = animator.transform;
+        ApplyDialogueDefaults(nameplate);
+        bubble.transform.position = animator.transform.position
+            + Vector3.up * nameplate.dialogueAnchorHeight
+            + animator.transform.forward * nameplate.dialogueOrbitRadius;
 
         MarkDirty(nameplate);
         EditorUtility.SetDirty(bubble);
         EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
         EditorSceneManager.SaveOpenScenes();
         AssetDatabase.SaveAssets();
-        Debug.Log("[NEKO] YUI 头顶气泡已更新：中文动态字体、头骨锚定、子节点独立朝向。");
+        Debug.Log("[NEKO] YUI 角色环绕对白已更新：已移除头顶名牌，对白始终位于 NPC 朝玩家的一面。");
     }
 
     static TMP_FontAsset RequireChineseBubbleFont()
@@ -425,7 +508,7 @@ public static class NekoNpcRigBuilder
 
         Font source = AssetDatabase.LoadAssetAtPath<Font>(ChineseFontSourcePath);
         if (source == null)
-            throw new InvalidOperationException("缺少头顶气泡中文字体源：" + ChineseFontSourcePath);
+            throw new InvalidOperationException("缺少角色对白中文字体源：" + ChineseFontSourcePath);
         asset = TMP_FontAsset.CreateFontAsset(
             source,
             48,

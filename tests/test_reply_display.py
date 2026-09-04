@@ -27,6 +27,8 @@ class FakeProvider:
         self.updates = deque()
         self.turns: list[dict[str, str]] = []
         self.character = "然然"
+        self.assistant_key: str | None = None
+        self.assistant_text: str | None = None
 
     def poll(self):
         return self.updates.popleft()
@@ -40,6 +42,16 @@ class FakeProvider:
             "turn_count": len(self.turns),
             "current_character": self.character,
         }
+
+    def latest_assistant_message(self):
+        if self.assistant_key is None or self.assistant_text is None:
+            return None
+        return {"key": self.assistant_key, "text": self.assistant_text}
+
+    def set_reply(self, *, key: str, user: str, assistant: str) -> None:
+        self.turns = [{"user": user, "assistant": assistant}]
+        self.assistant_key = key
+        self.assistant_text = assistant
 
 
 class MainReplyDisplayBridgeTests(unittest.TestCase):
@@ -59,12 +71,12 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
         return {"status": "succeeded", "error": None}
 
     def test_first_snapshot_is_baseline_and_new_reply_is_displayed(self) -> None:
-        self.provider.turns = [{"user": "旧问题", "assistant": "旧回答"}]
+        self.provider.set_reply(key="a1", user="旧问题", assistant="旧回答")
         self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
         self.bridge.tick()
         self.assertEqual(self.sent, [])
 
-        self.provider.turns = [{"user": "新问题", "assistant": "新回答"}]
+        self.provider.set_reply(key="a2", user="新问题", assistant="新回答")
         self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
         self.bridge.tick()
         self.assertEqual(self.sent, [("新回答", 15)])
@@ -82,6 +94,51 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
         self.assertEqual(len(pages), 4)
         self.assertTrue(pages[-1].endswith("…"))
         self.assertTrue(all(len(page.encode("utf-8")) <= 384 for page in pages))
+        self.assertTrue(all(not page.startswith("(") for page in pages))
+
+    def test_only_latest_ai_entry_is_displayed_without_storage_timestamp(self) -> None:
+        self.provider.set_reply(key="old", user="摸摸头", assistant="旧回答")
+        self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
+        self.bridge.tick()
+
+        self.provider.turns = [{
+            "user": "摸摸头",
+            "assistant": "旧回答\n更旧的主动回答\n最新回答",
+        }]
+        self.provider.assistant_key = "latest"
+        self.provider.assistant_text = "[20260904 Fri 18:59]最新回答"
+        self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
+        self.bridge.tick()
+
+        self.assertEqual(self.sent, [("最新回答", 15)])
+
+    def test_latest_ai_key_triggers_even_when_complete_turn_revision_is_unchanged(self) -> None:
+        self.provider.set_reply(key="old", user="", assistant="旧主动回答")
+        self.provider.updates.append(ChatContextUpdate(True, False, "same"))
+        self.bridge.tick()
+        self.provider.assistant_key = "new"
+        self.provider.assistant_text = "[20260904 Fri 19:01]新主动回答"
+        self.provider.updates.append(ChatContextUpdate(False, False, "same"))
+
+        self.bridge.tick()
+
+        self.assertEqual(self.sent, [("新主动回答", 15)])
+
+    def test_new_reply_replaces_pending_old_pages(self) -> None:
+        self.provider.set_reply(key="old", user="旧", assistant="旧回答")
+        self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
+        self.bridge.tick()
+        self.provider.set_reply(key="long", user="长", assistant="猫" * 500)
+        self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
+        self.bridge.tick()
+        self.assertGreater(self.bridge.status()["queued_pages"], 0)
+
+        self.provider.set_reply(key="new", user="新", assistant="当前回答")
+        self.provider.updates.append(ChatContextUpdate(True, False, "r3"))
+        self.bridge.tick()
+
+        self.assertEqual(self.sent[-1], ("当前回答", 15))
+        self.assertEqual(self.bridge.status()["queued_pages"], 0)
 
     def test_failed_send_is_retried_without_losing_page(self) -> None:
         attempts = []
@@ -98,10 +155,10 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
             fail_once,
             clock=self.clock,
         )
-        self.provider.turns = [{"user": "旧", "assistant": "旧"}]
+        self.provider.set_reply(key="old", user="旧", assistant="旧")
         self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
         bridge.tick()
-        self.provider.turns = [{"user": "新", "assistant": "待显示"}]
+        self.provider.set_reply(key="new", user="新", assistant="待显示")
         self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
         bridge.tick()
         self.assertEqual(bridge.status()["queued_pages"], 1)
@@ -112,10 +169,10 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
         self.assertEqual(bridge.status()["queued_pages"], 0)
 
     def test_character_switch_does_not_replay_history(self) -> None:
-        self.provider.turns = [{"user": "甲", "assistant": "回答甲"}]
+        self.provider.set_reply(key="a", user="甲", assistant="回答甲")
         self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
         self.bridge.tick()
-        self.provider.turns = [{"user": "乙", "assistant": "角色乙旧回答"}]
+        self.provider.set_reply(key="b", user="乙", assistant="角色乙旧回答")
         self.provider.updates.append(ChatContextUpdate(True, True, "r2"))
         self.bridge.tick()
         self.assertEqual(self.sent, [])
@@ -210,10 +267,10 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
             clock=self.clock,
             wall_clock=self.clock,
         )
-        self.provider.turns = [{"user": "旧", "assistant": "旧"}]
+        self.provider.set_reply(key="old", user="旧", assistant="旧")
         self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
         bridge.tick()
-        self.provider.turns = [{"user": "新", "assistant": "磁盘回答"}]
+        self.provider.set_reply(key="new", user="新", assistant="磁盘回答")
         self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
         bridge.tick()
 

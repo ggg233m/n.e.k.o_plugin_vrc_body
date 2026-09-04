@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import math
+import re
 import threading
 import time
 from typing import Any
@@ -30,6 +31,9 @@ class MainReplyDisplayBridge:
     _READING_CHARS_PER_SECOND = 6
     _POST_READ_SECONDS = 6
     _MAX_ADAPTIVE_DISPLAY_SECONDS = 30
+    _STORAGE_TIMESTAMP = re.compile(
+        r"^\[\d{8}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\]\s*",
+    )
 
     def __init__(
         self,
@@ -52,6 +56,7 @@ class MainReplyDisplayBridge:
         self._thread: threading.Thread | None = None
         self._baseline_ready = False
         self._seen_revision: str | None = None
+        self._seen_assistant_key: str | None = None
         self._pending_pages: list[tuple[str, bool]] = []
         self._next_page_at = 0.0
         self._displayed_replies = 0
@@ -96,10 +101,30 @@ class MainReplyDisplayBridge:
                 bodies[-1], cls._PAGE_BODY_BYTES - len("…".encode("utf-8")),
             )
             bodies[-1] = body.rstrip() + "…"
-        if len(bodies) <= 1:
-            return bodies
-        total = len(bodies)
-        return [f"({index}/{total}) {body}" for index, body in enumerate(bodies, 1)]
+        # 分页是传输细节，不把 (1/4) 之类技术标记展示给玩家。
+        return bodies
+
+    @classmethod
+    def _visible_reply_text(cls, text: str) -> str:
+        """移除 N.E.K.O 落盘时添加的时间戳，只保留角色实际回答。"""
+
+        return cls._STORAGE_TIMESTAMP.sub("", text.strip(), count=1).strip()
+
+    def _latest_file_reply(self) -> tuple[str | None, str | None]:
+        getter = getattr(self.provider, "latest_assistant_message", None)
+        if callable(getter):
+            snapshot = getter()
+            if isinstance(snapshot, Mapping):
+                key = snapshot.get("key")
+                text = snapshot.get("text")
+                if isinstance(key, str) and key and isinstance(text, str):
+                    return key, text
+        # 兼容旧测试替身或第三方 Provider；正式 Provider 始终走独立 AI 条目。
+        context = self.provider.context()
+        turns = context.get("turns") if isinstance(context, Mapping) else None
+        latest = turns[-1] if isinstance(turns, list) and turns else None
+        assistant = latest.get("assistant") if isinstance(latest, Mapping) else None
+        return None, assistant if isinstance(assistant, str) else None
 
     @classmethod
     def display_duration(cls, text: str, minimum_seconds: int) -> int:
@@ -211,6 +236,9 @@ class MainReplyDisplayBridge:
         return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
     def _queue_reply(self, text: str, *, source: str) -> bool:
+        text = self._visible_reply_text(text)
+        if not text:
+            return False
         now = self._wall_clock()
         # 主动回复可能在下一次普通回合结算时才补进 recent.json。仅在短窗口内
         # 去掉这类跨源重复，不妨碍玩家稍后再次得到相同的简短回答。
@@ -227,12 +255,12 @@ class MainReplyDisplayBridge:
         if not pages:
             return False
         self._recent_content_hashes[digest] = now
-        self._pending_pages.extend(
+        # 玩家只看到最新回复：新回答立即覆盖尚未播放的旧页，不能积压历史对白。
+        self._pending_pages = [
             (page, index == len(pages) - 1)
             for index, page in enumerate(pages)
-        )
-        if len(self._pending_pages) == len(pages):
-            self._next_page_at = self._clock()
+        ]
+        self._next_page_at = self._clock()
         self._last_result = f"queued_{source}"
         self._last_error = None
         return True
@@ -244,10 +272,7 @@ class MainReplyDisplayBridge:
 
     def tick(self) -> None:
         update = self.provider.poll()
-        context = self.provider.context()
-        turns = context.get("turns")
-        latest = turns[-1] if isinstance(turns, list) and turns else None
-        assistant = latest.get("assistant") if isinstance(latest, Mapping) else None
+        assistant_key, assistant = self._latest_file_reply()
         provider_status = self.provider.status()
         current_character = provider_status.get("current_character")
         if not isinstance(current_character, str) or not current_character.strip():
@@ -265,8 +290,11 @@ class MainReplyDisplayBridge:
 
         with self._lock:
             if not self._baseline_ready or update.character_changed:
-                self._baseline_ready = update.revision is not None
+                self._baseline_ready = (
+                    update.revision is not None or assistant_key is not None
+                )
                 self._seen_revision = update.revision
+                self._seen_assistant_key = assistant_key
                 self._pending_pages.clear()
                 self._recent_content_hashes.clear()
                 if update.character_changed:
@@ -300,13 +328,24 @@ class MainReplyDisplayBridge:
                         if timestamp is not None:
                             self._bus_last_timestamp = timestamp
                 self._bus_last_error = None
-            if update.revision is not None and update.revision != self._seen_revision:
+            assistant_changed = (
+                assistant_key is not None
+                and assistant_key != self._seen_assistant_key
+            )
+            legacy_revision_changed = (
+                assistant_key is None
+                and update.revision is not None
+                and update.revision != self._seen_revision
+            )
+            if assistant_changed or legacy_revision_changed:
                 self._seen_revision = update.revision
                 queued = (
                     self._queue_reply(assistant, source="recent_file")
                     if isinstance(assistant, str)
+                    and (assistant_key is None or assistant_changed)
                     else False
                 )
+                self._seen_assistant_key = assistant_key
                 if not queued and not self._pending_pages:
                     self._last_result = "empty"
             if not self._pending_pages or self._clock() < self._next_page_at:

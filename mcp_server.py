@@ -156,7 +156,7 @@ class StdioMcpServer:
                 {
                     "protocolVersion": requested_version or "2024-11-05",
                     "capabilities": {"tools": {"listChanged": True}},
-                    "serverInfo": {"name": "yui-npc-controller", "version": "0.5.10"},
+                    "serverInfo": {"name": "yui-npc-controller", "version": "0.5.13"},
                     "instructions": "连接与 CLEAR_ESTOP 不属于模型工具；地图 NPC 在宿主连接后自动进入可控态，npc.arm 不存在。",
                 },
             )

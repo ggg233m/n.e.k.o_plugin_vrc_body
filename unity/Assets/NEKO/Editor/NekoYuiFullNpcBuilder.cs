@@ -232,50 +232,43 @@ public static class NekoYuiFullNpcBuilder
 
     static void EnsureNameplateText(Transform plate, NekoNpcNameplate nameplate)
     {
-        // 旧火柴盒 Rig 可能只有名牌；文本组件缺失时 Router 会按规范撤销 text capability。
+        // 0.5.11 起只保留角色环绕对白，清理旧场景与旧 Builder 生成的头顶名称。
         var nameObject = plate.Find("NameText");
-        if (nameplate.nameText == null && nameObject != null) nameplate.nameText = nameObject.GetComponent<TMPro.TextMeshPro>();
-        if (nameplate.nameText == null)
-        {
-            nameplate.nameText = plate.GetComponentsInChildren<TMPro.TextMeshPro>(true)
-                .FirstOrDefault(item => item != null && item.font != null && item.gameObject.name != "BubbleText");
-        }
+        var referencedName = nameplate.nameText;
+        nameplate.nameText = null;
+        nameplate.nameBillboard = null;
+        if (nameObject != null) Undo.DestroyObjectImmediate(nameObject.gameObject);
+        if (referencedName != null && referencedName.transform != nameObject
+            && referencedName.transform.IsChildOf(plate) && referencedName.gameObject.name != "BubbleText")
+            Undo.DestroyObjectImmediate(referencedName.gameObject);
         var legacyName = plate.GetComponentInChildren<TextMesh>(true);
-        if (legacyName != null && nameplate.nameText != null)
-        {
-            // 火柴盒旧 Rig 已有可用 TextMesh 名牌时，不再叠加第二个 TMP 名牌。
-            var duplicate = nameplate.nameText.gameObject;
-            nameplate.nameText = null;
-            Undo.DestroyObjectImmediate(duplicate);
-        }
+        if (legacyName != null && legacyName.gameObject.name != "BubbleText")
+            Undo.DestroyObjectImmediate(legacyName.gameObject);
         var bubbleObject = plate.Find("BubbleText");
         var bubble = bubbleObject == null ? null : bubbleObject.GetComponent<TMPro.TextMeshPro>();
         if (bubble == null || bubble.font == null)
         {
             if (bubbleObject != null) Undo.DestroyObjectImmediate(bubbleObject.gameObject);
-            var source = plate.GetComponentsInChildren<TMPro.TextMeshPro>(true)
-                .FirstOrDefault(item => item != null && item.font != null && item.gameObject.name != "BubbleText");
-            var go = source == null
-                ? new GameObject("BubbleText")
-                : UnityEngine.Object.Instantiate(source.gameObject, plate, false);
-            Undo.RegisterCreatedObjectUndo(go, "创建 YUI 文本气泡");
+            var go = new GameObject("BubbleText");
+            Undo.RegisterCreatedObjectUndo(go, "创建 YUI 角色前置对白");
             go.name = "BubbleText";
-            if (source == null) go.transform.SetParent(plate, false);
+            go.transform.SetParent(plate, false);
             bubbleObject = go.transform;
             bubble = go.GetComponent<TMPro.TextMeshPro>();
             if (bubble == null) bubble = go.AddComponent<TMPro.TextMeshPro>();
         }
-        bubbleObject.localPosition = new Vector3(0f, 2.2f, 0f);
+        bubbleObject.localPosition = new Vector3(0f, 1.32f, 0.38f);
         bubble.text = "";
         NekoNpcRigBuilder.ConfigureBubbleText(bubble);
         nameplate.bubbleText = bubble;
-        nameplate.nameBillboard = nameplate.nameText == null ? null : nameplate.nameText.transform;
         nameplate.bubbleBillboard = bubble.transform;
         var animator = nameplate.transform.root.GetComponentInChildren<Animator>(true);
         if (animator != null && animator.isHuman)
+        {
             nameplate.headAnchor = animator.GetBoneTransform(HumanBodyBones.Head);
-        nameplate.nameHeadOffset = 0.20f;
-        nameplate.bubbleHeadOffset = 0.36f;
+            nameplate.bodyAnchor = animator.transform;
+        }
+        NekoNpcRigBuilder.ApplyDialogueDefaults(nameplate);
     }
 
     static void ConfigureExtendedActions(NekoMidiRouter router)

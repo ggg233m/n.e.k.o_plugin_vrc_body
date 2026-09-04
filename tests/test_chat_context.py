@@ -126,6 +126,40 @@ class RecentChatContextTests(unittest.TestCase):
             "assistant": "好呀。",
         }])
 
+    def test_latest_assistant_message_keeps_ai_only_entries_separate(self) -> None:
+        rows = [
+            {"type": "human", "data": {"content": "摸摸头"}},
+            {"type": "ai", "data": {"content": "[20260903 Thu 23:34]第一条"}},
+            {"type": "ai", "data": {"content": [{
+                "type": "text",
+                "text": "[20260904 Fri 04:09]第二条",
+            }]}},
+        ]
+        recent = _write_runtime(self.root, "然然", rows)
+        provider = RecentChatContextProvider(self.config, runtime_root=self.root)
+        provider.poll(force=True)
+
+        self.assertEqual(provider.context()["turns"][0]["assistant"], (
+            "[20260903 Thu 23:34]第一条\n[20260904 Fri 04:09]第二条"
+        ))
+        first = provider.latest_assistant_message()
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(first["text"], "[20260904 Fri 04:09]第二条")
+
+        recent.write_text(
+            json.dumps(rows + [{
+                "type": "ai",
+                "data": {"content": "[20260904 Fri 04:10]第二条"},
+            }], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        provider.poll(force=True)
+        second = provider.latest_assistant_message()
+        self.assertIsNotNone(second)
+        assert second is not None
+        self.assertNotEqual(first["key"], second["key"])
+
     def test_invalid_rewrite_preserves_last_valid_snapshot(self) -> None:
         recent = _write_runtime(self.root, "然然", [
             {"type": "human", "data": {"content": "喜欢窗边"}},

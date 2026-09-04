@@ -118,6 +118,8 @@ class RecentChatContextProvider:
         self._last_poll_at = float("-inf")
         self._character: str | None = None
         self._turns: tuple[dict[str, str], ...] = ()
+        self._latest_assistant_text: str | None = None
+        self._latest_assistant_key: str | None = None
         self._revision: str | None = None
         self._modified_at: float | None = None
         self._last_refresh_at: float | None = None
@@ -228,6 +230,50 @@ class RecentChatContextProvider:
         finish()
         return turns
 
+    @classmethod
+    def _latest_assistant_entry(
+        cls,
+        payload: Any,
+        *,
+        character: str,
+    ) -> tuple[str | None, str | None]:
+        """返回最后一条独立 AI 消息，供对白显示桥使用。
+
+        动作模型仍使用 ``_complete_turns`` 合并同一用户消息后的连续 AI 文本；
+        角色对白不能复用该结果，否则 AI-only 主动回复会被拼成整段历史。
+        ``assistant_count`` 让内容完全相同的新消息也拥有不同键，同时不会因只追加
+        一条尚未回答的 human 消息而重放旧回答。
+        """
+
+        if not isinstance(payload, list):
+            raise ValueError("invalid_root")
+        assistant_count = 0
+        latest: str | None = None
+        for row in payload:
+            if not isinstance(row, Mapping) or row.get("type") != "ai":
+                continue
+            data = row.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            text = cls._text_content(data.get("content"))
+            if not text:
+                continue
+            assistant_count += 1
+            latest = text
+        if latest is None:
+            return None, None
+        key_body = json.dumps(
+            {
+                "character": character,
+                "assistant_count": assistant_count,
+                "text": latest,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return latest, hashlib.sha256(key_body).hexdigest()
+
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
         if len(text) <= limit:
@@ -314,6 +360,10 @@ class RecentChatContextProvider:
             )
             decoded = json.loads(raw_recent.decode("utf-8-sig"))
             complete_turns = self._complete_turns(decoded)
+            latest_assistant_text, latest_assistant_key = self._latest_assistant_entry(
+                decoded,
+                character=character,
+            )
             turns = self._bounded_turns(complete_turns)
             # 修订必须覆盖文件内的完整规范化轮次，而不能只覆盖准备注入的末尾
             # N 轮。否则用户连续发送相同内容、模型返回相同回答时，截断后的
@@ -332,6 +382,8 @@ class RecentChatContextProvider:
                 if candidate_character is not None:
                     self._character = candidate_character
                     self._turns = ()
+                    self._latest_assistant_text = None
+                    self._latest_assistant_key = None
                     self._revision = None
                     self._modified_at = None
                 self._file_state = "missing"
@@ -359,6 +411,8 @@ class RecentChatContextProvider:
                 with self._lock:
                     self._character = candidate_character
                     self._turns = ()
+                    self._latest_assistant_text = None
+                    self._latest_assistant_key = None
                     self._revision = None
                     self._modified_at = None
             self._set_error("unreadable", code)
@@ -373,6 +427,8 @@ class RecentChatContextProvider:
         with self._lock:
             self._character = character
             self._turns = turns
+            self._latest_assistant_text = latest_assistant_text
+            self._latest_assistant_key = latest_assistant_key
             self._revision = revision
             self._modified_at = recent_stat.st_mtime
             self._last_refresh_at = self._wall_clock()
@@ -386,6 +442,17 @@ class RecentChatContextProvider:
                 "source": "recent_file",
                 "untrusted": True,
                 "turns": [dict(item) for item in self._turns],
+            }
+
+    def latest_assistant_message(self) -> dict[str, str] | None:
+        """返回对白显示专用快照；状态与日志绝不包含正文。"""
+
+        with self._lock:
+            if self._latest_assistant_text is None or self._latest_assistant_key is None:
+                return None
+            return {
+                "key": self._latest_assistant_key,
+                "text": self._latest_assistant_text,
             }
 
     @staticmethod
