@@ -2,6 +2,7 @@
 
 from .config import (
     YuiAutonomyConfig,
+    YuiChatEngagementConfig,
     YuiChatBridgeConfig,
     YuiChatContextConfig,
     YuiIntentModelConfig,
@@ -45,6 +46,7 @@ __all__ = [
     "YuiDriverLeaseError",
     "YuiOutputLogTailer",
     "YuiAutonomyConfig",
+    "YuiChatEngagementConfig",
     "YuiChatBridgeConfig",
     "YuiChatContextConfig",
     "YuiIntentModelConfig",

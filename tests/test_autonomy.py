@@ -133,6 +133,16 @@ class FakePlanManager:
 class FakeAdapter:
     def __init__(self) -> None:
         self.plan_manager = FakePlanManager()
+        self.look_calls = []
+        self.clear_look_calls = 0
+
+    def look_at(self, **kwargs):
+        self.look_calls.append(dict(kwargs))
+        return {"status": "succeeded", "error": None}
+
+    def clear_look_wire(self):
+        self.clear_look_calls += 1
+        return {"status": "succeeded", "error": None}
 
 
 class FakeChatContextProvider:
@@ -330,6 +340,216 @@ class AutonomyTests(unittest.TestCase):
         self.assertEqual(latest["replace_active"], True)
         self.assertTrue(any(node.get("type") == "approach" for node in latest["graph"]["nodes"]))
         self.assertEqual(self.director.status()["social_queue"], 0)
+
+    def test_chat_engagement_immediately_cancels_autonomy_and_suppresses_social(self) -> None:
+        self.clock.advance(1.1)
+        self.director._tick()
+        self.assertIsNotNone(self.director.status()["active_plan_id"])
+
+        self.assertTrue(self.director.begin_chat_engagement(2, reply_baseline_serial=4))
+
+        status = self.director.status()
+        self.assertEqual(status["state"], "chat_engaged")
+        self.assertIsNone(status["active_plan_id"])
+        self.assertEqual(status["chat_engagement"]["player_slot"], 2)
+        self.assertIn(
+            ("autonomy", "chat_engagement", True),
+            self.adapter.plan_manager.cancelled,
+        )
+        self.session.emit({"type": "social.wave", "slot": 2})
+        self.assertEqual(self.director.status()["social_queue"], 0)
+
+    def test_chat_engagement_uses_distance_hysteresis_and_walks_when_far(self) -> None:
+        self.session.players[2]["d"] = 2.4
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director._tick()
+        self.assertEqual(self.director.status()["chat_engagement"]["distance_band"], "near")
+        self.assertEqual(len(self.adapter.plan_manager.submissions), 0)
+        self.assertEqual(self.adapter.look_calls[-1]["player_slot"], 2)
+
+        self.session.players[2]["d"] = 2.8
+        self.clock.advance(1.1)
+        self.director._tick()
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["distance_band"],
+            "hysteresis",
+        )
+        self.assertEqual(len(self.adapter.plan_manager.submissions), 0)
+
+        self.session.players[2]["d"] = 3.1
+        self.clock.advance(1.1)
+        self.director._tick()
+        submission = self.adapter.plan_manager.submissions[-1]
+        approach = submission["graph"]["nodes"][0]
+        self.assertEqual(approach["type"], "approach")
+        self.assertEqual(approach["distance_m"], 1.5)
+        self.assertEqual(approach["speed_mps"], 1.0)
+        self.assertEqual(self.director.status()["active_kind"], "chat_engagement")
+
+        self.adapter.plan_manager.statuses[submission["plan_id"]] = "succeeded"
+        self.session.players[2]["d"] = 1.5
+        self.clock.advance(1.1)
+        self.director._tick()
+        self.assertIsNone(self.director.status()["active_plan_id"])
+        self.assertTrue(self.director._chat_engagement.look_owned)  # type: ignore[union-attr]
+
+    def test_final_reply_clear_starts_full_post_reply_hold(self) -> None:
+        self.assertTrue(self.director.begin_chat_engagement(2, reply_baseline_serial=3))
+        self.assertFalse(self.director.note_reply_page({
+            "reply_serial": 3,
+            "reply_end": True,
+            "display_seconds": 15,
+            "transfer_sequence": 8,
+        }))
+        self.assertTrue(self.director.note_reply_page({
+            "reply_serial": 4,
+            "reply_end": False,
+            "display_seconds": 15,
+            "transfer_sequence": 9,
+        }))
+        self.assertTrue(self.director.note_reply_page({
+            "reply_serial": 4,
+            "reply_end": True,
+            "display_seconds": 20,
+            "transfer_sequence": 10,
+        }))
+        self.session.emit({
+            "type": "npc.text_cleared",
+            "transfer_seq": 9,
+            "reason": "expired",
+        })
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["phase"],
+            "final_reply_displaying",
+        )
+        self.session.emit({
+            "type": "npc.text_cleared",
+            "transfer_seq": 10,
+            "reason": "replaced",
+        })
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["phase"],
+            "final_reply_displaying",
+        )
+        self.session.emit({
+            "type": "npc.text_cleared",
+            "transfer_seq": 10,
+            "reason": "expired",
+        })
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["phase"],
+            "post_reply_hold",
+        )
+        self.clock.advance(14.9)
+        self.director._tick()
+        self.assertTrue(self.director.status()["chat_engagement"]["active"])
+        self.clock.advance(0.2)
+        self.director._tick()
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["last_outcome"],
+            "post_reply_hold_complete",
+        )
+
+    def test_chat_engagement_has_bounded_fallbacks(self) -> None:
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.clock.advance(90.1)
+        self.director._tick()
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["last_outcome"],
+            "no_reply_timeout",
+        )
+
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.assertTrue(self.director.note_reply_page({
+            "reply_serial": 1,
+            "reply_end": True,
+            "display_seconds": 20,
+            "transfer_sequence": 11,
+        }))
+        self.clock.advance(34.9)
+        self.director._tick()
+        self.assertTrue(self.director.status()["chat_engagement"]["active"])
+        self.clock.advance(0.2)
+        self.director._tick()
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["last_outcome"],
+            "reply_clear_fallback",
+        )
+
+    def test_chat_timeout_cancels_an_in_flight_chat_approach(self) -> None:
+        self.session.players[2]["d"] = 4.0
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director._tick()
+        self.assertEqual(self.director.status()["active_kind"], "chat_engagement")
+
+        self.clock.advance(90.1)
+        self.director._tick()
+
+        self.assertIsNone(self.director.status()["active_plan_id"])
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertIn(
+            ("autonomy", "chat_engagement_no_reply_timeout", True),
+            self.adapter.plan_manager.cancelled,
+        )
+        self.assertEqual(self.adapter.clear_look_calls, 1)
+
+    def test_explicit_movement_ends_chat_but_same_player_approach_keeps_it(self) -> None:
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director.before_explicit_tool("npc.approach", {"player_slot": 2})
+        self.assertTrue(self.director.status()["chat_engagement"]["active"])
+
+        self.director.after_explicit_tool("npc.approach", {"status": "succeeded"})
+        self.clock.advance(8.1)
+        self.director._tick()
+        self.assertTrue(self.director.status()["chat_engagement"]["active"])
+
+        self.director.before_explicit_tool("npc.navigate", {"target_key": "b0"})
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(
+            self.director.status()["chat_engagement"]["last_outcome"],
+            "explicit_movement",
+        )
+
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director.before_explicit_tool("npc.execute_plan", {
+            "graph": {
+                "entry": "look",
+                "nodes": [{
+                    "id": "look",
+                    "type": "look_at",
+                    "player_slot": 2,
+                    "duration_ms": 1000,
+                }],
+            },
+        })
+        self.assertTrue(self.director.status()["chat_engagement"]["active"])
+
+        self.director.before_explicit_tool("npc.execute_plan", {
+            "graph": {
+                "entry": "go",
+                "nodes": [{"id": "go", "type": "navigate", "target_key": "b0"}],
+            },
+        })
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+
+    def test_player_leave_and_pause_clear_chat_engagement_and_owned_look(self) -> None:
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director._tick()
+        self.assertTrue(self.director._chat_engagement.look_owned)  # type: ignore[union-attr]
+        self.session.players.pop(2)
+        self.session.emit({"type": "player.leave", "slot": 2})
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(self.adapter.clear_look_calls, 1)
+
+        self.session.players[2] = {"slot": 2, "d": 2.0}
+        self.assertTrue(self.director.begin_chat_engagement(2))
+        self.director._tick()
+        self.director.pause("manual_pause")
+        self.assertFalse(self.director.status()["chat_engagement"]["active"])
+        self.assertEqual(self.adapter.clear_look_calls, 2)
 
     def test_failed_target_enters_bounded_backoff(self) -> None:
         self.director._movement_seconds = 0.0

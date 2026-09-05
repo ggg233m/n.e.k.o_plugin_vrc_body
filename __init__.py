@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 
 # 独立插件把第三方依赖同步到自身 vendor；不污染宿主解释器。
@@ -39,6 +39,7 @@ except ImportError:
 
     lifecycle = neko_plugin = plugin_entry = _decorator  # type: ignore[assignment]
 
+from .runtime.diagnostics import PipelineDiagnostics
 from .runtime import (
     AutonomyDirector,
     AutonomyIntentProvider,
@@ -92,6 +93,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             self.logger = self.enable_file_logging(log_level="INFO")
         except Exception:
             self.logger = getattr(ctx, "logger", None)
+        self._diagnostics = PipelineDiagnostics(self.logger)
+        self._diagnostics.emit("runtime.created")
         self._config = YuiPluginConfig()
         self._session: YuiSessionState | None = None
         self._tailer: YuiOutputLogTailer | None = None
@@ -182,8 +185,19 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             bridge_config,
             self._display_main_reply,
             conversation_fetcher=self._fetch_proactive_reply_records,
+            page_displayed_callback=self._on_reply_page_displayed,
+            diagnostic_callback=self._diagnostics.emit,
         )
         self._reply_display.start()
+
+    def _on_reply_page_displayed(self, event: Mapping[str, Any]) -> None:
+        """把脱敏的对白分页终态交给对话陪伴状态机。"""
+
+        autonomy = self._autonomy
+        applied = autonomy.note_reply_page(event) if autonomy is not None else False
+        self._diagnostics.emit(
+            "reply.engagement_notified", **event, engagement_applied=bool(applied),
+        )
 
     def _fetch_proactive_reply_records(self) -> object:
         """读取宿主已有的主动回复记录，不修改或扩展 conversations 总线。"""
@@ -255,7 +269,16 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         """只有世界内玩家显式提交能进入宿主 respond 通道。"""
 
         config = self._config.player_chat
+        diagnostic_fields = {
+            "event_session": event.get("session"),
+            "session": self._session.session if self._session is not None else 0,
+            "player_slot": event.get("slot"),
+            "submit_seq": event.get("submit_seq"),
+            "log_seq": event.get("log_seq"),
+        }
+        self._diagnostics.emit("chat.received", **diagnostic_fields)
         if not config.enabled:
+            self._diagnostics.emit("chat.rejected", **diagnostic_fields, reason="disabled")
             with self._player_chat_lock:
                 self._player_chat_status.update({"state": "disabled", "last_error": None})
             return
@@ -319,6 +342,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     self._player_chat_status.get("rejected", 0)
                 ) + 1
                 self._player_chat_status["last_error"] = error
+                self._diagnostics.emit("chat.rejected", **diagnostic_fields, reason=error)
                 return
 
         target_character = self._current_host_character()
@@ -329,7 +353,23 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     self._player_chat_status.get("rejected", 0)
                 ) + 1
                 self._player_chat_status["last_error"] = "target_character_unavailable"
+            self._diagnostics.emit(
+                "chat.rejected", **diagnostic_fields, reason="target_character_unavailable",
+            )
             return
+
+        self._diagnostics.emit("chat.validated", **diagnostic_fields, chars=len(normalized))
+        autonomy = self._autonomy
+        reply_display = self._reply_display
+        if autonomy is not None:
+            watermark_reader = getattr(reply_display, "reply_watermark", None)
+            reply_watermark = (
+                watermark_reader() if callable(watermark_reader) else 0
+            )
+            autonomy.begin_chat_engagement(
+                int(slot),
+                reply_baseline_serial=reply_watermark,
+            )
 
         content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
         world_context = self._model_context_payload()
@@ -360,6 +400,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "submit_seq": submit_sequence,
             "content_sha256": content_hash,
         }
+        started = time.monotonic()
+        submission_error = "host_receipt_rejected"
+        self._diagnostics.emit("chat.host_submit_started", **diagnostic_fields)
         try:
             # 完整控制契约直接触发唯一一次回答，但不把插件原文显示到聊天区。
             # 工具约束和触发位于同一回合，不依赖被动 read 消息的入队时序。
@@ -376,8 +419,17 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 metadata={**message_metadata, "projection": "model_context"},
             )
             submitted = self._push_receipt_ok(receipt)
-        except Exception:
+        except Exception as exc:
             submitted = False
+            submission_error = type(exc).__name__
+
+        # 宿主入队成功不代表主模型已经完成；后续 reply.queued 才表示读到回复。
+        self._diagnostics.emit(
+            "chat.host_submit_result", **diagnostic_fields,
+            status="accepted" if submitted else "failed",
+            error="none" if submitted else submission_error,
+            latency_ms=round((time.monotonic() - started) * 1000),
+        )
 
         with self._player_chat_lock:
             if submitted:
@@ -528,7 +580,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 }
             autonomy = self._autonomy
             if autonomy is not None:
-                autonomy.before_explicit_tool(tool_name)
+                autonomy.before_explicit_tool(tool_name, arguments)
             try:
                 result = await asyncio.to_thread(surface.call, tool_name, arguments)
             except Exception:
@@ -809,6 +861,11 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         while not self._manual_disconnect and not (
             stop_event is not None and stop_event.is_set()
         ):
+            self._diagnostics.emit(
+                "connection.attempt", deduplicate=True,
+                session=getattr(self._session, "session", 0),
+                midi_open=self._midi_sink is not None,
+            )
             try:
                 adapter = self._ensure_control()
                 result = await asyncio.to_thread(adapter.connect, self._config.claim_code)
@@ -816,6 +873,10 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 raise
             except Exception as exc:
                 self._last_connect_error = type(exc).__name__
+                self._diagnostics.emit(
+                    "connection.result", deduplicate=True,
+                    status="failed", error=type(exc).__name__,
+                )
                 # 打开/写入 MIDI 时抛出的异常可能已让端口句柄失效；下一轮必须
                 # 从驱动租约、输出端口到 transport 全部重建。
                 self._connect_rebuilds += 1
@@ -827,6 +888,11 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     except Exception:
                         pass
             else:
+                self._diagnostics.emit(
+                    "connection.result", deduplicate=True,
+                    session=getattr(self._session, "session", 0),
+                    status=result.get("status"), error=result.get("error") or "none",
+                )
                 if self._manual_disconnect or (
                     stop_event is not None and stop_event.is_set()
                 ):
@@ -1174,6 +1240,33 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     def _on_session_event(self, event: dict[str, Any]) -> None:
         event_copy = dict(event)
         event_type = str(event_copy.get("type") or "")
+        if event_type == "npc.ack" and event_copy.get("ok") is False:
+            self._diagnostics.emit(
+                "connection.ack_failed", deduplicate=True,
+                session=getattr(self._session, "session", 0),
+                event_session=event_copy.get("session"),
+                source=event_copy.get("cmd"), error=event_copy.get("err"),
+            )
+        if event_type in {
+            "sys.boot", "sys.session", "sys.hello", "sys.chat_input_ready",
+            "sys.watchdog", "sys.err", "npc.text_cleared",
+        }:
+            self._diagnostics.emit(
+                "world.event", source=event_type,
+                session=getattr(self._session, "session", 0),
+                event_session=event_copy.get("session"), log_seq=event_copy.get("log_seq"),
+                reason=event_copy.get("reason"), error=event_copy.get("err"),
+                ready=event_copy.get("ready"), transfer_sequence=event_copy.get("transfer_seq"),
+            )
+        if event_type == "npc.state":
+            self._diagnostics.emit(
+                "connection.world_state", deduplicate=True,
+                session=getattr(self._session, "session", 0),
+                event_session=event_copy.get("session"),
+                control_state=("armed" if event_copy.get("state") in {
+                    "external", "moving", "action",
+                } else event_copy.get("state")),
+            )
         world_restarted = (
             event_type == "sys.boot"
             and event_copy.get("session") == 0
@@ -1337,6 +1430,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 }
             ),
             "player_chat": self._player_chat_status_snapshot(),
+            "diagnostics": self._diagnostics.snapshot(),
             "world": world,
         }
 
@@ -1361,6 +1455,11 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         preserve_midi: bool = False,
         midi_handoff_s: float = 0.0,
     ) -> None:
+        self._diagnostics.emit(
+            "connection.closed", deduplicate=True, reason=reason,
+            session=getattr(self._session, "session", 0),
+            preserve_midi=preserve_midi,
+        )
         self._cancel_intent_requests()
         self._unregister_yui_tools()
         if self._autonomy is not None:

@@ -55,20 +55,41 @@ class FakeProvider:
 
 
 class MainReplyDisplayBridgeTests(unittest.TestCase):
+    def test_reply_diagnostics_expose_stages_without_body(self):
+        from yui_npc_controller.runtime.diagnostics import PipelineDiagnostics
+
+        diag = PipelineDiagnostics(None)
+        self.bridge._diagnostic_callback = diag.emit
+        self.provider.updates.append(ChatContextUpdate(True, False, "baseline"))
+        self.bridge.tick()
+        self.provider.set_reply(key="fresh", user="问题", assistant="私密回复正文")
+        self.provider.updates.append(ChatContextUpdate(True, False, "fresh"))
+        self.bridge.tick()
+        events = diag.snapshot()
+        self.assertIn("reply.queued", [event["event"] for event in events])
+        self.assertIn("reply.display_result", [event["event"] for event in events])
+        self.assertNotIn("私密回复正文", str(events))
+
     def setUp(self) -> None:
         self.clock = FakeClock()
         self.provider = FakeProvider()
         self.sent: list[tuple[str, int]] = []
+        self.page_events: list[dict[str, object]] = []
         self.bridge = MainReplyDisplayBridge(
             self.provider,  # type: ignore[arg-type]
             YuiChatBridgeConfig(enabled=True, display_seconds=15, max_pages=4),
             self._display,
+            page_displayed_callback=lambda event: self.page_events.append(dict(event)),
             clock=self.clock,
         )
 
     def _display(self, text: str, seconds: int):
         self.sent.append((text, seconds))
-        return {"status": "succeeded", "error": None}
+        return {
+            "status": "succeeded",
+            "error": None,
+            "transfer_sequence": len(self.sent),
+        }
 
     def test_first_snapshot_is_baseline_and_new_reply_is_displayed(self) -> None:
         self.provider.set_reply(key="a1", user="旧问题", assistant="旧回答")
@@ -83,6 +104,33 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
         status = self.bridge.status()
         self.assertEqual(status["displayed_replies"], 1)
         self.assertNotIn("新回答", str(status))
+        self.assertEqual(self.bridge.reply_watermark(), 1)
+        self.assertEqual(self.page_events, [{
+            "reply_serial": 1,
+            "reply_end": True,
+            "display_seconds": 15,
+            "transfer_sequence": 1,
+            "source": "recent_file",
+        }])
+
+    def test_all_pages_share_reply_serial_and_only_last_page_marks_end(self) -> None:
+        self.provider.set_reply(key="old", user="旧", assistant="旧回答")
+        self.provider.updates.append(ChatContextUpdate(True, False, "r1"))
+        self.bridge.tick()
+        self.provider.set_reply(key="new", user="新", assistant="猫" * 500)
+        self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
+        self.bridge.tick()
+        while self.bridge.status()["queued_pages"]:
+            self.clock.advance(30.0)
+            self.provider.updates.append(ChatContextUpdate(False, False, "r2"))
+            self.bridge.tick()
+
+        self.assertGreater(len(self.page_events), 1)
+        self.assertEqual({event["reply_serial"] for event in self.page_events}, {1})
+        self.assertTrue(all(
+            event["reply_end"] is False for event in self.page_events[:-1]
+        ))
+        self.assertTrue(self.page_events[-1]["reply_end"])
 
     def test_display_duration_keeps_short_text_and_extends_long_text(self) -> None:
         self.assertEqual(MainReplyDisplayBridge.display_duration("短回答", 15), 15)

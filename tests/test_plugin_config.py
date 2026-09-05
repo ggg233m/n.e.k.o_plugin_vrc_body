@@ -59,6 +59,8 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertEqual(config.player_chat.cooldown_s, 2.0)
         self.assertFalse(config.autonomy.enabled)
         self.assertFalse(config.autonomy.auto_connect)
+        self.assertTrue(config.autonomy.chat_engagement.enabled)
+        self.assertEqual(config.autonomy.chat_engagement.follow_trigger_m, 3.0)
         self.assertFalse(config.autonomy.intent_model.enabled)
         self.assertEqual(config.autonomy.intent_model.api_key_env, "TEST_API")
         self.assertEqual(config.autonomy.intent_model.endpoint, "")
@@ -89,6 +91,15 @@ class YuiPluginConfigTests(unittest.TestCase):
                 "explore_range_s": [15, 35],
                 "social_cooldown_s": 60,
                 "llm_inspiration_range_s": [180, 360],
+                "chat_engagement": {
+                    "enabled": True,
+                    "near_distance_m": 2.5,
+                    "follow_trigger_m": 3.0,
+                    "approach_distance_m": 1.5,
+                    "post_reply_hold_s": 15,
+                    "no_reply_timeout_s": 90,
+                    "approach_retry_s": 10,
+                },
                 "intent_model": {
                     "enabled": True,
                     "endpoint": "https://relay.example.com/v1/chat/completions",
@@ -116,6 +127,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertTrue(config.autonomy.auto_connect)
         self.assertEqual(config.autonomy.walk_speed_mps, 1.0)
         self.assertEqual(config.autonomy.dwell_range_s, (8.0, 20.0))
+        self.assertEqual(config.autonomy.chat_engagement.approach_distance_m, 1.5)
         self.assertTrue(config.autonomy.intent_model.enabled)
         self.assertEqual(
             config.autonomy.intent_model.endpoint,
@@ -128,6 +140,15 @@ class YuiPluginConfigTests(unittest.TestCase):
             YuiPluginConfig.from_mapping({"autonomy": {"dwell_range_s": [20, 8]}})
         with self.assertRaisesRegex(ValueError, "walk_speed_mps"):
             YuiPluginConfig.from_mapping({"autonomy": {"walk_speed_mps": 0}})
+        with self.assertRaisesRegex(ValueError, "距离必须满足"):
+            YuiPluginConfig.from_mapping({
+                "autonomy": {
+                    "chat_engagement": {
+                        "approach_distance_m": 2.5,
+                        "near_distance_m": 2.5,
+                    }
+                }
+            })
         with self.assertRaisesRegex(ValueError, "chat_context.source"):
             YuiPluginConfig.from_mapping({
                 "autonomy": {"intent_model": {"chat_context": {"source": "conversation_bus"}}}
@@ -496,7 +517,24 @@ class YuiPluginConfigTests(unittest.TestCase):
         class _ReplyDisplay:
             provider = _CurrentCharacterProvider()
 
+            @staticmethod
+            def reply_watermark():
+                return 37
+
+        class _Autonomy:
+            def __init__(self):
+                self.engagements = []
+
+            def begin_chat_engagement(self, player_slot, *, reply_baseline_serial=0):
+                self.engagements.append((player_slot, reply_baseline_serial))
+                return True
+
+            def note_reply_page(self, event):
+                self.reply_page = dict(event)
+                return True
+
         plugin._reply_display = _ReplyDisplay()
+        plugin._autonomy = _Autonomy()
 
         plugin._handle_session_event({"type": "sys.chat_input_ready", "ready": True})
         plugin._handle_session_event({
@@ -530,6 +568,15 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertEqual(message["metadata"]["projection"], "model_context")
         self.assertNotIn("不应上传的名字", json.dumps(message, ensure_ascii=False))
         self.assertNotIn("text", message["metadata"])
+        self.assertEqual(plugin._autonomy.engagements, [(2, 37)])
+
+        plugin._on_reply_page_displayed({
+            "reply_serial": 38,
+            "reply_end": True,
+            "display_seconds": 15,
+            "transfer_sequence": 9,
+        })
+        self.assertEqual(plugin._autonomy.reply_page["reply_serial"], 38)
 
         # 相同提交、伪造槽位和冷却期内的新提交均不得再次触发。
         plugin._handle_session_event({
@@ -545,6 +592,7 @@ class YuiPluginConfigTests(unittest.TestCase):
             "pid": 90210, "submit_seq": 8, "text": "太快",
         })
         self.assertEqual(len(pushed), 1)
+        self.assertEqual(plugin._autonomy.engagements, [(2, 37)])
         status = plugin._player_chat_status_snapshot()
         self.assertTrue(status["world_ui_ready"])
         self.assertNotIn("今天去看看照片吧", json.dumps(status, ensure_ascii=False))
@@ -1045,6 +1093,29 @@ class YuiPluginConfigTests(unittest.TestCase):
         status = plugin._player_chat_status_snapshot()
         self.assertTrue(status["world_ui_ready"])
         self.assertEqual(status["state"], "submitted")
+
+        events = plugin._diagnostics.snapshot()
+        stages = [item["event"] for item in events]
+        self.assertIn("chat.received", stages)
+        self.assertIn("chat.validated", stages)
+        self.assertIn("chat.host_submit_started", stages)
+        self.assertIn("chat.host_submit_result", stages)
+        self.assertNotIn("常驻日志线程提交测试", json.dumps(events, ensure_ascii=False))
+
+    def test_stale_chat_diagnostic_explains_session_mismatch_without_respond(self):
+        plugin = _plugin_class()(None)
+        plugin._session = YuiSessionState()
+        pushed = []
+        plugin.push_message = lambda **kwargs: pushed.append(kwargs)
+        plugin._handle_player_chat_submit({
+            "session": 61, "slot": 0, "pid": 1, "submit_seq": 7,
+            "text": "不要记录这段私密消息",
+        })
+        event = plugin._diagnostics.snapshot()[-1]
+        self.assertEqual(event["event"], "chat.rejected")
+        self.assertEqual(event["reason"], "stale_session")
+        self.assertEqual((event["session"], event["event_session"]), (0, 61))
+        self.assertEqual(pushed, [])
 
     def test_intent_worker_survives_without_host_event_loop(self) -> None:
         plugin = _plugin_class()(None)

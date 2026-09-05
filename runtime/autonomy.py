@@ -74,11 +74,41 @@ class _IntentFragment:
     cross_region_count: int = 0
 
 
+@dataclass(slots=True)
+class _ChatEngagement:
+    player_slot: int
+    reply_baseline_serial: int
+    started_at: float
+    deadline_at: float
+    phase: str = "waiting_reply"
+    reply_serial: int | None = None
+    final_transfer_sequence: int | None = None
+    fallback_release_at: float | None = None
+    release_at: float | None = None
+    retry_at: float = 0.0
+    distance_band: str = "unknown"
+    look_owned: bool = False
+    intent_refresh_needed: bool = True
+
+
 class AutonomyDirector:
     """以一秒级频率维持规则自主，同时让显式控制和安全态绝对优先。"""
 
     _READ_ONLY_TOOLS = frozenset({"npc.observe", "npc.world_query", "npc.plan_status"})
     _PERSISTENT_PAUSE_TOOLS = frozenset({"npc.stop", "npc.estop"})
+    _CHAT_EXIT_MOVEMENT_TOOLS = frozenset({
+        "npc.go_to",
+        "npc.go_to_xyz",
+        "npc.navigate",
+        "npc.orbit",
+        "npc.explore",
+        "npc.move_relative",
+        "npc.follow",
+        "npc.wander",
+    })
+    _GRAPH_MOVEMENT_TYPES = frozenset({
+        "navigate", "approach", "follow", "orbit", "explore", "move_relative",
+    })
 
     def __init__(
         self,
@@ -139,6 +169,8 @@ class AutonomyDirector:
         self._fallback_active = True
         self._last_cross_region_at = float("-inf")
         self._last_movement_at = self._clock()
+        self._chat_engagement: _ChatEngagement | None = None
+        self._last_chat_engagement_outcome: str | None = None
         self.session.add_event_listener(self._on_session_event)
 
     def _emit_telemetry(self, event: str, **fields: Any) -> None:
@@ -181,13 +213,26 @@ class AutonomyDirector:
 
     def pause(self, reason: str = "manual_pause") -> dict[str, Any]:
         """持久暂停并立即取消自主来源计划。"""
+        clear_look = False
         with self._condition:
             self._desired_running = False
             self._pause_reason = str(reason or "manual_pause")
             self._explicit_plan_id = None
             self._explicit_operation_id = None
             self._clear_intent_locked("paused")
+            if self._chat_engagement is not None:
+                clear_look = bool(
+                    self._chat_engagement.look_owned
+                    or (
+                        self._active is not None
+                        and self._active.kind == "chat_engagement"
+                    )
+                )
+                self._last_chat_engagement_outcome = self._pause_reason
+                self._chat_engagement = None
         self.adapter.plan_manager.cancel_origin("autonomy", self._pause_reason)
+        if clear_look:
+            self._clear_owned_look()
         return self.status()
 
     def close(self) -> None:
@@ -200,12 +245,235 @@ class AutonomyDirector:
             thread.join(timeout=max(2.0, self.config.decision_interval_s * 2.0))
         self.session.remove_event_listener(self._on_session_event)
 
-    def before_explicit_tool(self, tool_name: str) -> None:
+    def _clear_owned_look(self) -> None:
+        """只清理 Director 自己建立的对话注视；失败不影响状态机。"""
+
+        try:
+            self.adapter.clear_look_wire()
+        except Exception:
+            pass
+
+    def begin_chat_engagement(
+        self,
+        player_slot: int,
+        *,
+        reply_baseline_serial: int = 0,
+    ) -> bool:
+        """有效世界聊天提交后立即抢占自主移动并聚焦最后发言者。"""
+
+        config = self.config.chat_engagement
+        if (
+            not config.enabled
+            or isinstance(player_slot, bool)
+            or not isinstance(player_slot, int)
+            or not 0 <= player_slot <= 63
+        ):
+            return False
+        now = self._clock()
+        clear_look = False
+        with self._condition:
+            if not self._desired_running or player_slot not in self.session.players:
+                return False
+            previous = self._chat_engagement
+            clear_look = bool(
+                previous
+                and (
+                    previous.look_owned
+                    or (
+                        self._active is not None
+                        and self._active.kind == "chat_engagement"
+                    )
+                )
+            )
+            if self._active is not None:
+                self._record_elapsed(
+                    self._active,
+                    now,
+                    include_planned_dwell=False,
+                )
+                self._active = None
+            self._clear_intent_locked("chat_engaged")
+            self._social_queue.clear()
+            self._chat_engagement = _ChatEngagement(
+                player_slot=player_slot,
+                reply_baseline_serial=max(0, int(reply_baseline_serial)),
+                started_at=now,
+                deadline_at=now + config.no_reply_timeout_s,
+                retry_at=now,
+            )
+            self._pause_reason = "chat_engaged"
+            self._last_chat_engagement_outcome = "started"
+            self._condition.notify_all()
+        self.adapter.plan_manager.cancel_origin("autonomy", "chat_engagement")
+        if clear_look:
+            self._clear_owned_look()
+        self._emit_telemetry(
+            "chat_engagement_started",
+            player_slot=player_slot,
+            reply_baseline_serial=max(0, int(reply_baseline_serial)),
+        )
+        return True
+
+    def note_reply_page(self, event: Mapping[str, Any]) -> bool:
+        """关联提交后真正显示的回复页，不接触或记录回复正文。"""
+
+        reply_serial = event.get("reply_serial")
+        display_seconds = event.get("display_seconds")
+        reply_end = event.get("reply_end")
+        transfer_sequence = event.get("transfer_sequence")
+        if (
+            isinstance(reply_serial, bool)
+            or not isinstance(reply_serial, int)
+            or isinstance(display_seconds, bool)
+            or not isinstance(display_seconds, (int, float))
+            or not isinstance(reply_end, bool)
+        ):
+            return False
+        now = self._clock()
+        with self._condition:
+            engagement = self._chat_engagement
+            if (
+                engagement is None
+                or reply_serial <= engagement.reply_baseline_serial
+                or (
+                    engagement.reply_serial is not None
+                    and reply_serial < engagement.reply_serial
+                )
+            ):
+                return False
+            if engagement.reply_serial != reply_serial:
+                engagement.final_transfer_sequence = None
+                engagement.fallback_release_at = None
+                engagement.release_at = None
+            engagement.reply_serial = reply_serial
+            engagement.phase = "reply_displaying"
+            engagement.deadline_at = (
+                now
+                + max(0.0, float(display_seconds))
+                + self.config.chat_engagement.no_reply_timeout_s
+            )
+            if reply_end:
+                engagement.final_transfer_sequence = (
+                    transfer_sequence
+                    if isinstance(transfer_sequence, int)
+                    and not isinstance(transfer_sequence, bool)
+                    else None
+                )
+                engagement.fallback_release_at = (
+                    now
+                    + max(0.0, float(display_seconds))
+                    + self.config.chat_engagement.post_reply_hold_s
+                )
+                engagement.phase = "final_reply_displaying"
+            self._condition.notify_all()
+        self._emit_telemetry(
+            "chat_reply_page_displayed",
+            reply_serial=reply_serial,
+            reply_end=reply_end,
+        )
+        return True
+
+    def _finish_chat_engagement(
+        self,
+        reason: str,
+        *,
+        request_intent: bool,
+    ) -> bool:
+        clear_look = False
+        cancel_chat_plan = False
+        now = self._clock()
+        with self._condition:
+            engagement = self._chat_engagement
+            if engagement is None:
+                return False
+            cancel_chat_plan = bool(
+                self._active is not None
+                and self._active.kind == "chat_engagement"
+            )
+            clear_look = engagement.look_owned or cancel_chat_plan
+            if cancel_chat_plan and self._active is not None:
+                self._record_elapsed(
+                    self._active,
+                    now,
+                    include_planned_dwell=False,
+                )
+                self._active = None
+            self._clear_intent_locked(reason)
+            self._chat_engagement = None
+            self._last_chat_engagement_outcome = reason
+            if self._pause_reason == "chat_engaged":
+                self._pause_reason = ""
+            self._condition.notify_all()
+        if cancel_chat_plan:
+            self.adapter.plan_manager.cancel_origin(
+                "autonomy",
+                f"chat_engagement_{reason}",
+            )
+        if clear_look:
+            self._clear_owned_look()
+        self._emit_telemetry("chat_engagement_finished", reason=reason)
+        if request_intent:
+            self._request_intent("chat_engagement_completed")
+        return True
+
+    def _explicit_ends_chat_locked(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        engagement = self._chat_engagement
+        if engagement is None:
+            return False
+        if tool_name in self._CHAT_EXIT_MOVEMENT_TOOLS:
+            return True
+        if tool_name == "npc.approach":
+            return arguments.get("player_slot") != engagement.player_slot
+        if tool_name != "npc.execute_plan":
+            return False
+        graph = arguments.get("graph")
+        nodes = graph.get("nodes") if isinstance(graph, Mapping) else None
+        if not isinstance(nodes, list):
+            return True
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                return True
+            node_type = node.get("type")
+            if node_type not in self._GRAPH_MOVEMENT_TYPES:
+                continue
+            if (
+                node_type == "approach"
+                and node.get("player_slot") == engagement.player_slot
+            ):
+                continue
+            return True
+        return False
+
+    def before_explicit_tool(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None = None,
+    ) -> None:
         """显式执行工具调用前抢占自主计划；只读工具不影响自主。"""
         if tool_name in self._READ_ONLY_TOOLS:
             return
         now = self._clock()
+        clear_look = False
         with self._condition:
+            engagement = self._chat_engagement
+            if engagement is not None:
+                clear_look = bool(
+                    engagement.look_owned
+                    or (
+                        self._active is not None
+                        and self._active.kind == "chat_engagement"
+                    )
+                )
+                if self._explicit_ends_chat_locked(tool_name, dict(arguments or {})):
+                    self._chat_engagement = None
+                    self._last_chat_engagement_outcome = "explicit_movement"
+                else:
+                    engagement.look_owned = False
+                    engagement.intent_refresh_needed = True
             self._explicit_plan_id = None
             self._explicit_operation_id = None
             self._explicit_started_at = now
@@ -214,6 +482,8 @@ class AutonomyDirector:
             self._clear_intent_locked("explicit_control")
             self._request_after_explicit = True
         self.adapter.plan_manager.cancel_origin("autonomy", "explicit_control")
+        if clear_look:
+            self._clear_owned_look()
 
     def after_explicit_tool(self, tool_name: str, result: Mapping[str, Any]) -> None:
         """普通命令在真实终态后延迟恢复；STOP/ESTOP 始终保持暂停。"""
@@ -245,6 +515,8 @@ class AutonomyDirector:
                 state = "paused"
             elif self._explicit_plan_id or self._explicit_operation_id or now < self._resume_at:
                 state = "explicit_control"
+            elif self._chat_engagement is not None:
+                state = "chat_engaged"
             elif self._active is not None:
                 state = "executing"
             elif not self._control_ready():
@@ -253,6 +525,21 @@ class AutonomyDirector:
                 state = "ready"
             intent = self._intent
             pending = self._pending_intent
+            chat_engagement = self._chat_engagement
+            chat_remaining = None
+            chat_retry_remaining = None
+            if chat_engagement is not None:
+                if chat_engagement.release_at is not None:
+                    chat_deadline = chat_engagement.release_at
+                elif chat_engagement.fallback_release_at is not None:
+                    chat_deadline = chat_engagement.fallback_release_at
+                else:
+                    chat_deadline = chat_engagement.deadline_at
+                chat_remaining = round(max(0.0, chat_deadline - now), 1)
+                chat_retry_remaining = round(
+                    max(0.0, chat_engagement.retry_at - now),
+                    1,
+                )
             return {
                 "enabled": self.config.enabled,
                 "running": self._desired_running,
@@ -282,6 +569,23 @@ class AutonomyDirector:
                     if until > now
                 },
                 "social_queue": len(self._social_queue),
+                "chat_engagement": {
+                    "enabled": self.config.chat_engagement.enabled,
+                    "active": chat_engagement is not None,
+                    "player_slot": (
+                        None if chat_engagement is None else chat_engagement.player_slot
+                    ),
+                    "phase": None if chat_engagement is None else chat_engagement.phase,
+                    "remaining_s": chat_remaining,
+                    "distance_band": (
+                        None if chat_engagement is None else chat_engagement.distance_band
+                    ),
+                    "reply_serial": (
+                        None if chat_engagement is None else chat_engagement.reply_serial
+                    ),
+                    "retry_in_s": chat_retry_remaining,
+                    "last_outcome": self._last_chat_engagement_outcome,
+                },
                 "current_intent": None if intent is None else {
                     "motivation": intent.motivation,
                     "mood": intent.mood,
@@ -318,6 +622,7 @@ class AutonomyDirector:
         with self._condition:
             if (
                 not self._desired_running
+                or self._chat_engagement is not None
                 or request_token != self._latest_intent_token
                 or not isinstance(value.get("motivation"), str)
                 or not isinstance(value.get("mood"), str)
@@ -427,6 +732,8 @@ class AutonomyDirector:
                 return
         if self._active is not None:
             self._update_active(now)
+        if self._service_chat_engagement(now):
+            return
         social = self._pop_social()
         if social is not None:
             if self._active is not None:
@@ -463,6 +770,119 @@ class AutonomyDirector:
             return "character_changed"
         return "chat_updated"
 
+    def _service_chat_engagement(self, now: float) -> bool:
+        """维持对话期间的原地注视或有迟滞的近距步行接近。"""
+
+        with self._condition:
+            engagement = self._chat_engagement
+            if engagement is None:
+                return False
+            if engagement.release_at is not None and now >= engagement.release_at:
+                finish_reason = "post_reply_hold_complete"
+            elif (
+                engagement.release_at is None
+                and engagement.fallback_release_at is not None
+                and now >= engagement.fallback_release_at
+            ):
+                finish_reason = "reply_clear_fallback"
+            elif (
+                engagement.fallback_release_at is None
+                and now >= engagement.deadline_at
+            ):
+                finish_reason = (
+                    "no_reply_timeout"
+                    if engagement.reply_serial is None
+                    else "reply_stall_timeout"
+                )
+            else:
+                finish_reason = None
+        if finish_reason is not None:
+            self._finish_chat_engagement(finish_reason, request_intent=True)
+            return True
+
+        with self.session._condition:
+            player = self.session.players.get(engagement.player_slot)
+            distance = player.get("d") if isinstance(player, Mapping) else None
+        if player is None:
+            self._finish_chat_engagement("player_left", request_intent=True)
+            return True
+
+        if self._active is not None:
+            return True
+        if not self._control_ready() or self._has_unowned_active_operation():
+            return True
+
+        numeric_distance = (
+            float(distance)
+            if isinstance(distance, (int, float)) and not isinstance(distance, bool)
+            else None
+        )
+        config = self.config.chat_engagement
+        if numeric_distance is None:
+            distance_band = "unknown"
+        elif numeric_distance <= config.near_distance_m:
+            distance_band = "near"
+        elif numeric_distance <= config.follow_trigger_m:
+            distance_band = "hysteresis"
+        else:
+            distance_band = "far"
+
+        clear_look = False
+        with self._condition:
+            current = self._chat_engagement
+            if current is not engagement:
+                return True
+            current.distance_band = distance_band
+            retry_at = current.retry_at
+            look_owned = current.look_owned
+
+        if distance_band == "far" and now >= retry_at:
+            if look_owned:
+                with self._condition:
+                    if self._chat_engagement is engagement:
+                        engagement.look_owned = False
+                        clear_look = True
+                if clear_look:
+                    self._clear_owned_look()
+            submitted = self._submit(
+                {
+                    "entry": "approach",
+                    "nodes": [{
+                        "id": "approach",
+                        "type": "approach",
+                        "player_slot": engagement.player_slot,
+                        "distance_m": config.approach_distance_m,
+                        "face_target": True,
+                    }],
+                },
+                kind="chat_engagement",
+                targets=(f"player_slot:{engagement.player_slot}",),
+                regions=(),
+                movement=True,
+                now=now,
+                replace_active=True,
+                decision_reason="chat_follow",
+            )
+            if not submitted:
+                with self._condition:
+                    if self._chat_engagement is engagement:
+                        engagement.retry_at = now + config.approach_retry_s
+            return True
+
+        if not look_owned:
+            try:
+                result = self.adapter.look_at(
+                    player_slot=engagement.player_slot,
+                    duration_ms=0,
+                )
+            except Exception:
+                result = {"status": "failed"}
+            if result.get("status") in {"accepted", "succeeded"}:
+                with self._condition:
+                    if self._chat_engagement is engagement:
+                        engagement.look_owned = True
+        return True
+
     def _update_explicit_wait(self, now: float) -> None:
         with self._condition:
             plan_id = self._explicit_plan_id
@@ -491,6 +911,35 @@ class AutonomyDirector:
         result = self.adapter.plan_manager.status(record.plan_id)
         status = result.get("status")
         if status not in TERMINAL_STATUSES:
+            return
+        if record.kind == "chat_engagement":
+            self._record_elapsed(record, now, include_planned_dwell=False)
+            if status == "succeeded":
+                self._plans_completed += 1
+                self._last_movement_at = now
+            elif status != "cancelled":
+                self._plans_failed += 1
+            with self._condition:
+                engagement = self._chat_engagement
+                if engagement is not None:
+                    if status == "succeeded":
+                        engagement.look_owned = True
+                        engagement.distance_band = "near"
+                        engagement.retry_at = now
+                    elif status != "cancelled":
+                        engagement.retry_at = (
+                            now + self.config.chat_engagement.approach_retry_s
+                        )
+                self._active = None
+            self._emit_telemetry(
+                "activity_terminal",
+                status=str(status or "unknown"),
+                kind=record.kind,
+                targets=list(record.targets),
+                regions=[],
+                intent_activity_index=None,
+                decision_reason=record.decision_reason,
+            )
             return
         self._record_elapsed(
             record,
@@ -703,6 +1152,11 @@ class AutonomyDirector:
         with self._condition:
             if not self._desired_running:
                 return
+            if self._chat_engagement is not None:
+                self._chat_engagement.intent_refresh_needed = True
+                self._last_intent_request_reason = reason
+                self._last_intent_outcome = "deferred_for_chat"
+                return
             self._intent_request_serial += 1
             token = f"{self.session.session}:{self._intent_request_serial}"
             self._latest_intent_token = token
@@ -816,6 +1270,44 @@ class AutonomyDirector:
         if event_type == "npc.state" and bool(event.get("estop")):
             self.pause("estop")
             return
+        if event_type == "player.leave":
+            slot = event.get("slot")
+            with self._condition:
+                engagement = self._chat_engagement
+                matches = bool(
+                    engagement is not None
+                    and isinstance(slot, int)
+                    and not isinstance(slot, bool)
+                    and engagement.player_slot == slot
+                )
+            if matches:
+                self._finish_chat_engagement("player_left", request_intent=True)
+            return
+        if event_type == "npc.text_cleared":
+            transfer_sequence = event.get("transfer_seq")
+            reason = event.get("reason")
+            now = self._clock()
+            matched = False
+            with self._condition:
+                engagement = self._chat_engagement
+                if (
+                    engagement is not None
+                    and reason == "expired"
+                    and isinstance(transfer_sequence, int)
+                    and not isinstance(transfer_sequence, bool)
+                    and engagement.final_transfer_sequence == transfer_sequence
+                ):
+                    engagement.phase = "post_reply_hold"
+                    engagement.release_at = (
+                        now + self.config.chat_engagement.post_reply_hold_s
+                    )
+                    engagement.fallback_release_at = engagement.release_at
+                    engagement.deadline_at = engagement.release_at
+                    matched = True
+                    self._condition.notify_all()
+            if matched:
+                self._emit_telemetry("chat_reply_cleared", reason="expired")
+            return
         if event_type not in {"player.touch", "social.wave", "social.gaze", "social.approach"}:
             return
         if event_type == "social.gaze" and event.get("on") is not True:
@@ -827,6 +1319,8 @@ class AutonomyDirector:
         request_intent = False
         with self._condition:
             if not self._desired_running:
+                return
+            if self._chat_engagement is not None:
                 return
             if now - self._social_last_seen.get(slot, float("-inf")) < self.config.social_cooldown_s:
                 return

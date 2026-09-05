@@ -59,6 +59,16 @@ explore_range_s = [15, 35]
 social_cooldown_s = 60
 llm_inspiration_range_s = [180, 360]
 
+# 玩家从世界输入框发言后，NPC 暂停生活片段并留在当前发言者附近。
+[yui.autonomy.chat_engagement]
+enabled = true
+near_distance_m = 2.5
+follow_trigger_m = 3.0
+approach_distance_m = 1.5
+post_reply_hold_s = 15
+no_reply_timeout_s = 90
+approach_retry_s = 10
+
 # 独立意图模型不使用宿主回复/TTS 通道。通用配置默认关闭；密钥只从指定环境变量
 # 读取，绝不能写入本文件。可选聊天上下文仅从落盘 recent.json 只读取得。
 [yui.autonomy.intent_model]

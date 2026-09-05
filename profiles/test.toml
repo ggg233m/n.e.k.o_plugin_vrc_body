@@ -36,9 +36,18 @@ explore_range_s = [15, 35]
 social_cooldown_s = 60
 llm_inspiration_range_s = [180, 360]
 
+[yui.autonomy.chat_engagement]
+enabled = true
+near_distance_m = 2.5
+follow_trigger_m = 3.0
+approach_distance_m = 1.5
+post_reply_hold_s = 15
+no_reply_timeout_s = 90
+approach_retry_s = 10
+
 [yui.autonomy.intent_model]
 enabled = true
-endpoint = ""
+endpoint = "https://new.ai.hinswu.top/v1/chat/completions"
 model = "gemini-3.7-flash"
 api_key_env = "TEST_API"
 timeout_s = 20

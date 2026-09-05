@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 import hashlib
 import math
 import re
@@ -17,6 +18,15 @@ from .config import YuiChatBridgeConfig
 
 DisplayCallback = Callable[[str, int], Mapping[str, Any]]
 ConversationFetcher = Callable[[], object]
+ReplyPageDisplayedCallback = Callable[[Mapping[str, Any]], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPage:
+    text: str
+    reply_end: bool
+    reply_serial: int
+    source: str
 
 
 class MainReplyDisplayBridge:
@@ -42,6 +52,8 @@ class MainReplyDisplayBridge:
         display_callback: DisplayCallback,
         *,
         conversation_fetcher: ConversationFetcher | None = None,
+        page_displayed_callback: ReplyPageDisplayedCallback | None = None,
+        diagnostic_callback: Callable[..., None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -49,6 +61,8 @@ class MainReplyDisplayBridge:
         self.config = config
         self._display_callback = display_callback
         self._conversation_fetcher = conversation_fetcher
+        self._page_displayed_callback = page_displayed_callback
+        self._diagnostic_callback = diagnostic_callback
         self._clock = clock
         self._wall_clock = wall_clock
         self._lock = threading.RLock()
@@ -57,7 +71,8 @@ class MainReplyDisplayBridge:
         self._baseline_ready = False
         self._seen_revision: str | None = None
         self._seen_assistant_key: str | None = None
-        self._pending_pages: list[tuple[str, bool]] = []
+        self._pending_pages: list[_PendingPage] = []
+        self._reply_serial = 0
         self._next_page_at = 0.0
         self._displayed_replies = 0
         self._displayed_pages = 0
@@ -72,6 +87,14 @@ class MainReplyDisplayBridge:
         self._bus_last_timestamp: float | None = None
         self._bus_records_seen = 0
         self._recent_content_hashes: dict[str, float] = {}
+
+    def _diagnose(self, event: str, **fields: Any) -> None:
+        try:
+            if self._diagnostic_callback is not None:
+                self._diagnostic_callback(event, **fields)
+        except Exception:
+            # 诊断旁路失败不能影响读取和显示。
+            pass
 
     @staticmethod
     def _take_utf8_prefix(text: str, maximum_bytes: int) -> tuple[str, str]:
@@ -164,6 +187,12 @@ class MainReplyDisplayBridge:
             self._thread = None
             self._pending_pages.clear()
 
+    def reply_watermark(self) -> int:
+        """返回已发现回复的内部序号；不暴露正文或存储标识。"""
+
+        with self._lock:
+            return self._reply_serial
+
     @staticmethod
     def _field(record: object, name: str) -> object:
         if isinstance(record, Mapping):
@@ -250,19 +279,31 @@ class MainReplyDisplayBridge:
             if now - seen_at <= 30.0
         }
         if previous is not None and now - previous <= 30.0:
+            self._diagnose("reply.skipped", source=source, reason="duplicate")
             return False
         pages = self.paginate(text, self.config.max_pages)
         if not pages:
             return False
         self._recent_content_hashes[digest] = now
+        self._reply_serial += 1
+        reply_serial = self._reply_serial
         # 玩家只看到最新回复：新回答立即覆盖尚未播放的旧页，不能积压历史对白。
         self._pending_pages = [
-            (page, index == len(pages) - 1)
+            _PendingPage(
+                text=page,
+                reply_end=index == len(pages) - 1,
+                reply_serial=reply_serial,
+                source=source,
+            )
             for index, page in enumerate(pages)
         ]
         self._next_page_at = self._clock()
         self._last_result = f"queued_{source}"
         self._last_error = None
+        self._diagnose(
+            "reply.queued", source=source, reply_serial=reply_serial,
+            pages=len(pages), chars=len(text),
+        )
         return True
 
     def _run(self) -> None:
@@ -274,6 +315,10 @@ class MainReplyDisplayBridge:
         update = self.provider.poll()
         assistant_key, assistant = self._latest_file_reply()
         provider_status = self.provider.status()
+        self._diagnose(
+            "reply.memory_state", deduplicate=True,
+            status=provider_status.get("file_state"), error=provider_status.get("last_error") or "none",
+        )
         current_character = provider_status.get("current_character")
         if not isinstance(current_character, str) or not current_character.strip():
             current_character = None
@@ -287,6 +332,13 @@ class MainReplyDisplayBridge:
             except Exception as exc:
                 # 不记录异常正文，防止底层请求把载荷或连接细节带入状态。
                 self._bus_last_error = f"query_{type(exc).__name__}"[:80]
+
+        if self._conversation_fetcher is not None:
+            self._diagnose(
+                "reply.bus_state", deduplicate=True,
+                status="available" if bus_query_ok else "failed",
+                error="none" if bus_query_ok else self._bus_last_error,
+            )
 
         with self._lock:
             if not self._baseline_ready or update.character_changed:
@@ -303,6 +355,11 @@ class MainReplyDisplayBridge:
                     self._bus_seen.clear()
                     self._bus_seen_order.clear()
                 self._last_result = "baseline"
+                self._diagnose(
+                    "reply.baseline", deduplicate=True,
+                    reason="character_changed" if update.character_changed else "initial",
+                    ready=self._baseline_ready,
+                )
             if bus_query_ok and self._conversation_fetcher is not None:
                 replies = self._proactive_replies(
                     bus_snapshot,
@@ -350,21 +407,32 @@ class MainReplyDisplayBridge:
                     self._last_result = "empty"
             if not self._pending_pages or self._clock() < self._next_page_at:
                 return
-            page, reply_end = self._pending_pages[0]
+            pending = self._pending_pages[0]
 
-        display_seconds = self.display_duration(page, self.config.display_seconds)
+        display_seconds = self.display_duration(
+            pending.text,
+            self.config.display_seconds,
+        )
         try:
-            result = self._display_callback(page, display_seconds)
+            self._diagnose(
+                "reply.display_started", deduplicate=True,
+                reply_serial=pending.reply_serial, reply_end=pending.reply_end,
+                display_seconds=display_seconds,
+            )
+            result = self._display_callback(pending.text, display_seconds)
             status = result.get("status") if isinstance(result, Mapping) else None
         except Exception:
             status = None
             result = {"error": "display_callback_failed"}
 
+        displayed_event: dict[str, Any] | None = None
         with self._lock:
             if status in {"accepted", "succeeded"}:
-                self._pending_pages.pop(0)
+                # 新回复可能在发送期间覆盖队列；只移除本次实际发送的页面。
+                if self._pending_pages and self._pending_pages[0] == pending:
+                    self._pending_pages.pop(0)
                 self._displayed_pages += 1
-                if reply_end:
+                if pending.reply_end:
                     self._displayed_replies += 1
                 if not self._pending_pages:
                     self._last_result = "displayed"
@@ -373,11 +441,43 @@ class MainReplyDisplayBridge:
                 self._last_error = None
                 self._last_display_seconds = display_seconds
                 self._next_page_at = self._clock() + display_seconds
+                transfer_sequence = (
+                    result.get("transfer_sequence")
+                    if isinstance(result, Mapping)
+                    else None
+                )
+                displayed_event = {
+                    "reply_serial": pending.reply_serial,
+                    "reply_end": pending.reply_end,
+                    "display_seconds": display_seconds,
+                    "transfer_sequence": (
+                        transfer_sequence
+                        if isinstance(transfer_sequence, int)
+                        and not isinstance(transfer_sequence, bool)
+                        else None
+                    ),
+                    "source": pending.source,
+                }
             else:
                 error = result.get("error") if isinstance(result, Mapping) else None
                 self._last_result = "waiting"
                 self._last_error = str(error or "display_failed")[:80]
                 self._next_page_at = self._clock() + 1.0
+
+        callback = self._page_displayed_callback
+        if displayed_event is not None:
+            self._diagnose("reply.display_result", status=status, **displayed_event)
+        else:
+            self._diagnose(
+                "reply.display_result", deduplicate=True,
+                status="failed", error=self._last_error, reply_serial=pending.reply_serial,
+            )
+        if displayed_event is not None and callback is not None:
+            try:
+                callback(displayed_event)
+            except Exception:
+                # 生命周期旁路不能破坏对白显示线程。
+                pass
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -395,6 +495,7 @@ class MainReplyDisplayBridge:
                 "queued_pages": len(self._pending_pages),
                 "displayed_replies": self._displayed_replies,
                 "displayed_pages": self._displayed_pages,
+                "reply_serial": self._reply_serial,
                 "last_display_seconds": self._last_display_seconds,
                 "last_result": self._last_result,
                 "last_error": self._last_error,

@@ -307,6 +307,76 @@ class YuiIntentModelConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class YuiChatEngagementConfig:
+    """玩家世界聊天期间的近距离陪伴配置。"""
+
+    enabled: bool = True
+    near_distance_m: float = 2.5
+    follow_trigger_m: float = 3.0
+    approach_distance_m: float = 1.5
+    post_reply_hold_s: float = 15.0
+    no_reply_timeout_s: float = 90.0
+    approach_retry_s: float = 10.0
+
+    @classmethod
+    def from_mapping(cls, source: Mapping[str, Any] | None) -> "YuiChatEngagementConfig":
+        defaults = cls()
+        data = dict(source or {})
+        value = cls(
+            enabled=_boolean(
+                data.get("enabled", defaults.enabled),
+                name="autonomy.chat_engagement.enabled",
+            ),
+            near_distance_m=_bounded_number(
+                data.get("near_distance_m", defaults.near_distance_m),
+                name="autonomy.chat_engagement.near_distance_m",
+                minimum=0.5,
+                maximum=8.0,
+            ),
+            follow_trigger_m=_bounded_number(
+                data.get("follow_trigger_m", defaults.follow_trigger_m),
+                name="autonomy.chat_engagement.follow_trigger_m",
+                minimum=0.5,
+                maximum=10.0,
+            ),
+            approach_distance_m=_bounded_number(
+                data.get("approach_distance_m", defaults.approach_distance_m),
+                name="autonomy.chat_engagement.approach_distance_m",
+                minimum=0.5,
+                maximum=5.0,
+            ),
+            post_reply_hold_s=_bounded_number(
+                data.get("post_reply_hold_s", defaults.post_reply_hold_s),
+                name="autonomy.chat_engagement.post_reply_hold_s",
+                minimum=0.0,
+                maximum=300.0,
+            ),
+            no_reply_timeout_s=_bounded_number(
+                data.get("no_reply_timeout_s", defaults.no_reply_timeout_s),
+                name="autonomy.chat_engagement.no_reply_timeout_s",
+                minimum=5.0,
+                maximum=600.0,
+            ),
+            approach_retry_s=_bounded_number(
+                data.get("approach_retry_s", defaults.approach_retry_s),
+                name="autonomy.chat_engagement.approach_retry_s",
+                minimum=1.0,
+                maximum=120.0,
+            ),
+        )
+        if not (
+            value.approach_distance_m
+            < value.near_distance_m
+            <= value.follow_trigger_m
+        ):
+            raise ValueError(
+                "autonomy.chat_engagement 距离必须满足 "
+                "approach_distance_m < near_distance_m <= follow_trigger_m"
+            )
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class YuiAutonomyConfig:
     """宿主常驻自主循环配置；默认关闭，避免改变通用配置行为。"""
 
@@ -320,6 +390,9 @@ class YuiAutonomyConfig:
     explore_range_s: tuple[float, float] = (15.0, 35.0)
     social_cooldown_s: float = 60.0
     llm_inspiration_range_s: tuple[float, float] = (180.0, 360.0)
+    chat_engagement: YuiChatEngagementConfig = field(
+        default_factory=YuiChatEngagementConfig
+    )
     intent_model: YuiIntentModelConfig = field(default_factory=YuiIntentModelConfig)
 
     @classmethod
@@ -369,6 +442,11 @@ class YuiAutonomyConfig:
                 ),
                 name="autonomy.llm_inspiration_range_s",
                 minimum=1.0,
+            ),
+            chat_engagement=YuiChatEngagementConfig.from_mapping(
+                data.get("chat_engagement")
+                if isinstance(data.get("chat_engagement"), Mapping)
+                else {}
             ),
             intent_model=YuiIntentModelConfig.from_mapping(
                 data.get("intent_model")
@@ -484,6 +562,7 @@ class YuiPluginConfig:
 
 __all__ = [
     "YuiAutonomyConfig",
+    "YuiChatEngagementConfig",
     "YuiChatBridgeConfig",
     "YuiChatContextConfig",
     "YuiIntentModelConfig",
