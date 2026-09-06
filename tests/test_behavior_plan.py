@@ -131,6 +131,30 @@ class BehaviorPlanTests(unittest.TestCase):
         self.assertEqual(done["status"], "succeeded")
         self.assertEqual(self.adapter.calls, [("navigate", "plaza"), ("orbit", "pillar")])
 
+    def test_panel_progress_tracks_wait_and_terminal_without_control_nodes(self) -> None:
+        self.assertIsNone(self.manager.panel_progress())
+        result = self.manager.submit(_graph(
+            {"id": "root", "type": "sequence", "children": ["go", "hold"]},
+            {"id": "go", "type": "navigate", "target_key": "plaza"},
+            {"id": "hold", "type": "wait", "duration_ms": 500},
+        ))
+        deadline = time.monotonic() + 1
+        progress = self.manager.panel_progress()
+        while not any(node["kind"] == "wait" for node in progress["active_nodes"]) and time.monotonic() < deadline:
+            time.sleep(0.005)
+            progress = self.manager.panel_progress()
+        self.assertEqual(progress["status"], "running")
+        self.assertEqual(progress["total_nodes"], 2)
+        self.assertEqual(progress["completed_nodes"], 1)
+        self.assertEqual(progress["active_nodes"][0]["kind"], "wait")
+        self.assertGreaterEqual(progress["active_nodes"][0]["remaining_s"], 0)
+        self.assertNotIn("evidence", progress)
+        self._wait(result["plan_id"])
+        progress = self.manager.panel_progress()
+        self.assertEqual(progress["status"], "succeeded")
+        self.assertEqual(progress["active_nodes"], [])
+        self.assertEqual(progress["completed_nodes"], 2)
+
     def test_internal_turn_and_semantic_observe_run_in_sequence(self) -> None:
         result = self.manager.submit(_graph(
             {"id": "root", "type": "sequence", "children": ["turn", "look"]},

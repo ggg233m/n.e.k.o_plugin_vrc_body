@@ -11,6 +11,7 @@
  */
 using UdonSharp;
 using UnityEngine;
+using UnityEngine.AI;
 using VRC.SDKBase;
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
@@ -438,7 +439,19 @@ public class NekoNpcPerception : UdonSharpBehaviour
             items += ",\"d\":" + telemetry.F2(FlatDistance(pos))
                 + ",\"brg\":" + telemetry.F1(BearingTo(pos))
                 + ",\"yaw\":" + yaw
-                + ",\"vr\":" + telemetry.B(player.IsUserInVR()) + "}";
+                + ",\"vr\":" + telemetry.B(player.IsUserInVR());
+            int region = _router == null ? -1 : _router.LocalizedRegion(pos);
+            bool reachable = false;
+            if (region >= 0 && FlatDistance(pos) <= 8f && npcRoot != null)
+            {
+                NavMeshHit hit;
+                NavMeshPath path = new NavMeshPath();
+                reachable = NavMesh.SamplePosition(pos, out hit, 1.5f, NavMesh.AllAreas)
+                    && NavMesh.CalculatePath(npcRoot.position, hit.position, NavMesh.AllAreas, path)
+                    && path.status == NavMeshPathStatus.PathComplete;
+            }
+            items += ",\"region_key\":" + (region >= 0 ? telemetry.J(_router.regionSemanticKeys[region]) : "null")
+                + ",\"reachable\":" + telemetry.B(reachable) + "}";
             added++;
         }
         return items;

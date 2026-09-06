@@ -23,7 +23,7 @@ yui_npc_controller = "."
 "yui_npc_controller.runtime" = "runtime"
 
 [tool.setuptools.package-data]
-yui_npc_controller = ["Docs/Protocols/*", "config.example.toml"]
+yui_npc_controller = ["Docs/Protocols/*", "config.example.toml", "ui/*.tsx", "plugin.toml"]
 
 [tool.neko.build]
 # N.E.K.O 插件包只携带运行时、协议文档、配置与 vendor 依赖。

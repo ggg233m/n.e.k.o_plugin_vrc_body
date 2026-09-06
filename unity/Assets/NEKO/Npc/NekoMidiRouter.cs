@@ -1263,7 +1263,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         return Mathf.Abs(local.x) <= 0.5001f && Mathf.Abs(local.y) <= 0.5001f && Mathf.Abs(local.z) <= 0.5001f;
     }
 
-    private int LocalizedRegion(Vector3 point)
+    public int LocalizedRegion(Vector3 point)
     {
         if (!enableRegionLocalization || regionVolumeTransforms == null) return -1;
         int bestRegion = -1;

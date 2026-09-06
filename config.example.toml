@@ -34,8 +34,8 @@ enable_wander_tool = false
 enabled = true
 source = "recent_file"
 poll_interval_s = 0.5
-# 每页至少保留 15 秒；长文字会按阅读量自动延长，最多 30 秒。
-display_seconds = 15
+# 短句约 10 秒；长文字按每秒 8 字加 6 秒估算，总时长最多 25 秒。
+display_seconds = 10
 max_pages = 4
 max_file_bytes = 2097152
 
@@ -47,6 +47,7 @@ max_chars = 144
 cooldown_s = 2.0
 
 [yui.autonomy]
+proactive_chat_enabled = true
 # 仅为已验收语义地图和 operation lifecycle 的配置档显式开启。
 enabled = true
 auto_connect = true
@@ -65,7 +66,7 @@ enabled = true
 near_distance_m = 2.5
 follow_trigger_m = 3.0
 approach_distance_m = 1.5
-post_reply_hold_s = 15
+post_reply_hold_s = 60
 no_reply_timeout_s = 90
 approach_retry_s = 10
 

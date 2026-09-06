@@ -416,7 +416,7 @@ public static class NekoNpcRigBuilder
         nameplate.revealCharacterIntervalMs = 70;
         nameplate.revealShortPunctuationPauseMs = 120;
         nameplate.revealLongPunctuationPauseMs = 240;
-        nameplate.minimumFullTextHoldSeconds = 4f;
+        nameplate.minimumFullTextHoldSeconds = 6f;
     }
 
     static Material RequireDialogueMaterial(TMP_FontAsset font)

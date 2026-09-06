@@ -197,6 +197,169 @@ class IntentProviderTests(unittest.TestCase):
         self.assertEqual(result["format"], "json_object")
         self.assertEqual(formats, ["json_schema", "json_object"])
         self.assertEqual(provider.status()["schema_fallbacks"], 1)
+        self.assertEqual(provider.panel_status()["requests"], 1)
+        self.assertEqual(provider.panel_status()["http_requests"], 2)
+        self.assertEqual(provider.panel_status()["last_call"]["format"], "json_object")
+
+    def test_panel_records_output_and_failure_without_leaking_to_status(self) -> None:
+        responses = [(200, _envelope(_intent())), (503, b"private server error")]
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: responses.pop(0))
+            asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
+            self.assertEqual(json.loads(panel["last_call"]["output"]), _intent())
+            self.assertEqual(panel["last_call"]["status"], "succeeded")
+            self.assertNotIn("last_call", provider.status())
+            panel["last_call"]["output"] = "changed by caller"
+            self.assertNotEqual(provider.panel_status()["last_call"]["output"], "changed by caller")
+            asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
+        self.assertEqual((panel["requests"], panel["http_requests"], panel["successes"], panel["failures"]), (2, 2, 1, 1))
+        self.assertEqual(panel["last_call"]["number"], 2)
+        self.assertEqual(panel["last_call"]["error"], "http_503")
+        self.assertIsNone(panel["last_call"]["output"])
+        self.assertNotIn("private server error", json.dumps(panel))
+
+    def test_panel_keeps_invalid_output_bounded_and_redacted(self) -> None:
+        raw = "secret" + "x" * 9000
+        body = json.dumps({"choices": [{"message": {"content": raw}}]}).encode()
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: (200, body))
+            asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
+        call = panel["last_call"]
+        self.assertEqual(call["error"], "invalid_json")
+        self.assertTrue(call["truncated"])
+        self.assertEqual(len(call["output"]), 8000)
+        self.assertNotIn("secret", json.dumps(panel))
+        self.assertNotIn("output", provider.status())
+
+    def test_history_is_bounded_and_dispositions_follow_request_token(self) -> None:
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: (200, _envelope(_intent())))
+            for number in range(23):
+                asyncio.run(provider.request(_context(), request_token=f"token-{number}"))
+            provider.record_disposition("token-3", "expired")
+            provider.record_disposition("token-22", "queued")
+            history = provider.panel_status()["history"]
+        self.assertEqual(len(history), 20)
+        self.assertEqual([item["number"] for item in history], list(range(23, 3, -1)))
+        self.assertEqual(history[0]["disposition"], "queued")
+        self.assertEqual(history[-1]["disposition"], "expired")
+        self.assertNotIn("token-", json.dumps(history))
+        history[0]["disposition"] = "changed"
+        self.assertEqual(provider.panel_status()["last_call"]["disposition"], "queued")
+
+    def test_usage_counts_failed_validation_and_preserves_missing_fields(self) -> None:
+        responses = [
+            {"usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}, "choices": [{"message": {"content": "invalid"}}]},
+            {"choices": [{"message": {"content": "invalid again"}}]},
+            json.loads(_envelope(_intent())),
+            {**json.loads(_envelope(_intent())), "usage": {"prompt_tokens": 0, "completion_tokens": True, "total_tokens": -1}},
+        ]
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: (200, json.dumps(responses.pop(0)).encode()))
+            asyncio.run(provider.request(_context()))
+            asyncio.run(provider.request(_context()))
+            missing = provider.panel_status()["last_call"]["usage"]
+            self.assertTrue(all(value is None for value in missing.values()))
+            asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
+        self.assertEqual(panel["usage_totals"], {"input_tokens": 11, "output_tokens": 4, "total_tokens": 15})
+        self.assertEqual(panel["usage_reported_requests"], 2)
+        self.assertEqual(panel["last_call"]["usage"], {"input_tokens": 0, "output_tokens": None, "total_tokens": None})
+        self.assertEqual(panel["history"][-1]["status"], "failed")
+
+    def test_reference_constraints_and_one_correction_keep_strict_validation(self) -> None:
+        invalid = _intent(avoid_targets=["invented-place"])
+        responses = [_envelope(invalid), _envelope(_intent())]
+        bodies = []
+        def post(_endpoint, _headers, body, *_args):
+            bodies.append(json.loads(body))
+            return 200, responses.pop(0)
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=post)
+            result = asyncio.run(provider.request(_context()))
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(provider.status()["requests"], 1)
+        self.assertEqual(provider.status()["http_requests"], 2)
+        self.assertEqual(provider.status()["validation_retries"], 1)
+        schema = bodies[0]["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["properties"]["activities"]["items"]["properties"]["target_key"]["enum"], ["home", "lamp", "spawn", "window"])
+        correction = json.loads(bodies[1]["messages"][1]["content"])
+        self.assertEqual(correction["validation_feedback"]["error"], "unknown_target")
+        self.assertEqual(correction["reference_options"]["explorable_regions"], ["home"])
+        self.assertNotIn("invented-place", json.dumps(correction))
+
+    def test_player_reference_examples_and_targeted_correction(self) -> None:
+        invalid = _intent(activities=[{"kind": "observe", "target_key": "player_slot_2", "duration_s": 10}, {"kind": "linger", "duration_s": 10}])
+        corrected = _intent(activities=[{"kind": "observe", "player_slot": 2, "duration_s": 10}, {"kind": "socialize", "player_slot": 2, "duration_s": 10}])
+        responses = [_envelope(invalid), _envelope(corrected)]
+        bodies = []
+        def post(_endpoint, _headers, body, *_args):
+            bodies.append(json.loads(body))
+            return 200, responses.pop(0)
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=post)
+            result = asyncio.run(provider.request(_context()))
+        self.assertEqual(result["status"], "succeeded")
+        context = json.loads(bodies[1]["messages"][1]["content"])
+        self.assertEqual(context["validation_feedback"]["paths"], ["activities[0].target_key"])
+        self.assertIn("player_slot", context["validation_feedback"]["repair"])
+        self.assertNotIn("player_slot_2", json.dumps(context))
+        for example in context["activity_examples"]:
+            validate_intent(_intent(activities=[example, {"kind": "linger", "duration_s": 10}]), _context())
+
+    def test_player_slot_requires_integer_and_no_players_means_no_player_examples(self) -> None:
+        for slot in (2.0, "2", True):
+            with self.subTest(slot=slot), self.assertRaises(IntentModelError):
+                validate_intent(_intent(activities=[{"kind": "observe", "player_slot": slot, "duration_s": 10}, {"kind": "linger", "duration_s": 10}]), _context())
+        context = _context()
+        context["players"] = []
+        provider = AutonomyIntentProvider(self.config)
+        body = json.loads(provider._request_body(context, response_format="json_object"))
+        examples = json.loads(body["messages"][1]["content"])["activity_examples"]
+        self.assertTrue(all("player_slot" not in example for example in examples))
+
+    def test_schema_fallback_and_correction_share_original_timeout(self) -> None:
+        now = [0.0]
+        timeouts = []
+        responses = [
+            (400, b'{"error":"response_format json_schema unsupported"}'),
+            (200, _envelope(_intent(avoid_targets=["invented-place"]))),
+            (200, _envelope(_intent())),
+        ]
+        def post(_endpoint, _headers, _body, timeout, _limit):
+            timeouts.append(timeout)
+            now[0] += 1.0
+            return responses.pop(0)
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=post, clock=lambda: now[0])
+            result = asyncio.run(provider.request(_context()))
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(timeouts, [self.config.timeout_s - offset for offset in range(3)])
+        self.assertEqual(provider.status()["schema_fallbacks"], 1)
+        self.assertEqual(provider.status()["validation_retries"], 1)
+
+    def test_second_invalid_target_is_not_silently_replaced(self) -> None:
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: (200, _envelope(_intent(avoid_targets=["invented-place"]))))
+            result = asyncio.run(provider.request(_context()))
+        self.assertEqual(result["error"], "unknown_target")
+        self.assertEqual(provider.status()["http_requests"], 2)
+        self.assertNotIn("intent", result)
+
+    def test_usage_includes_schema_retry_response(self) -> None:
+        responses = [
+            (400, json.dumps({"error": "response_format json_schema unsupported", "usage": {"prompt_tokens": 5, "total_tokens": 5}}).encode()),
+            (200, json.dumps({**json.loads(_envelope(_intent())), "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}}).encode()),
+        ]
+        with patch.dict(os.environ, {"TEST_API": "secret"}, clear=False):
+            provider = AutonomyIntentProvider(self.config, http_post=lambda *_: responses.pop(0))
+            asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
+        self.assertEqual(panel["last_call"]["usage"], {"input_tokens": 13, "output_tokens": 2, "total_tokens": 15})
+        self.assertEqual(panel["usage_reported_requests"], 2)
 
     def test_empty_endpoint_stays_unconfigured_without_network_call(self) -> None:
         called = []
@@ -213,6 +376,10 @@ class IntentProviderTests(unittest.TestCase):
         self.assertEqual(result, {"status": "failed", "error": "not_configured"})
         self.assertEqual(called, [])
         self.assertIsNone(status["endpoint_origin"])
+        self.assertEqual(provider.panel_status()["requests"], 0)
+        self.assertEqual(provider.panel_status()["http_requests"], 0)
+        self.assertIsNone(provider.panel_status()["last_call"])
+        self.assertEqual(provider.panel_status()["configuration_error"], "not_configured")
 
     def test_missing_key_fails_without_network_call(self) -> None:
         called = []
@@ -222,10 +389,12 @@ class IntentProviderTests(unittest.TestCase):
                 http_post=lambda *_args: called.append(True) or (200, b"{}"),
             )
             result = asyncio.run(provider.request(_context()))
+            panel = provider.panel_status()
 
         self.assertEqual(result, {"status": "failed", "error": "missing_api_key"})
         self.assertEqual(called, [])
         self.assertEqual(provider.status()["key_state"], "missing")
+        self.assertEqual(panel["configuration_error"], "missing_api_key")
 
     def test_markdown_response_is_rejected_without_returning_body(self) -> None:
         body = json.dumps({

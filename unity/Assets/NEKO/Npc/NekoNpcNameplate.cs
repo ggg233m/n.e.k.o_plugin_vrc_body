@@ -15,6 +15,7 @@ public class NekoNpcNameplate : UdonSharpBehaviour
 {
     [Header("依赖")]
     public NekoNpcTelemetry telemetry;
+    public NekoNpcChatInput chatInput;
 
     [Header("显示")]
     // 仅为兼容旧场景序列化保留；运行时会停用，Builder 会删除旧 NameText。
@@ -38,7 +39,7 @@ public class NekoNpcNameplate : UdonSharpBehaviour
     public int revealCharacterIntervalMs = 70;
     public int revealShortPunctuationPauseMs = 120;
     public int revealLongPunctuationPauseMs = 240;
-    public float minimumFullTextHoldSeconds = 4f;
+    public float minimumFullTextHoldSeconds = 6f;
 
     [UdonSynced] private string _syncText = "";
     [UdonSynced] private int _syncTransferSeq;
@@ -99,7 +100,8 @@ public class NekoNpcNameplate : UdonSharpBehaviour
         _currentCrc16 = crc16;
         int now = Networking.GetServerTimeInMilliseconds();
         int leadInMs = Mathf.Max(0, revealLeadInMs);
-        int minimumHoldMs = Mathf.Max(0, Mathf.RoundToInt(minimumFullTextHoldSeconds * 1000f));
+        // 兼容已发布场景中旧的 4 秒序列化值，完整阅读至少保留 6 秒。
+        int minimumHoldMs = Mathf.Max(6000, Mathf.RoundToInt(minimumFullTextHoldSeconds * 1000f));
         int requestedLifetimeMs = Mathf.Max(1, Mathf.RoundToInt(seconds * 1000f));
         // 动态回复通常已由宿主提供充足阅读时间；这里还保证极短 preset 不会在全文刚出现前消失。
         int minimumLifetimeMs = leadInMs + minimumHoldMs + 250;
@@ -155,6 +157,9 @@ public class NekoNpcNameplate : UdonSharpBehaviour
 
     private void ApplyLocalText()
     {
+        // 兼容旧场景遗漏的引用；只在所属 NPC 层级内寻找本地聊天记录。
+        if (chatInput == null) chatInput = transform.root.GetComponentInChildren<NekoNpcChatInput>(true);
+        if (chatInput != null) chatInput.AppendNpcMessage(_currentBubble, _currentTransferSeq, _revealStartServerMs);
         PrepareRevealProjection();
         RenderDialogueProjection(Networking.GetServerTimeInMilliseconds(), true);
     }
@@ -196,7 +201,7 @@ public class NekoNpcNameplate : UdonSharpBehaviour
         }
 
         // displaySeconds 仍是整页总生命周期；过长内容只压缩逐字时间，不延长宿主翻页时序。
-        int minimumHoldMs = Mathf.Max(0, Mathf.RoundToInt(minimumFullTextHoldSeconds * 1000f));
+        int minimumHoldMs = Mathf.Max(6000, Mathf.RoundToInt(minimumFullTextHoldSeconds * 1000f));
         int availableRevealMs = _displayUntilServerMs - _revealStartServerMs - minimumHoldMs;
         if (availableRevealMs < 1) availableRevealMs = 1;
         int scalePermille = 1000;
@@ -211,7 +216,7 @@ public class NekoNpcNameplate : UdonSharpBehaviour
     private void RenderDialogueProjection(int nowServerMs, bool force)
     {
         if (bubbleText == null) return;
-        if (_renderBubble.Length == 0 || _unitCount <= 0)
+        if (_renderBubble.Length == 0 || _unitCount <= 0 || HasTextExpired(nowServerMs))
         {
             if (force || bubbleText.text.Length > 0) bubbleText.text = "";
             return;
@@ -445,14 +450,22 @@ public class NekoNpcNameplate : UdonSharpBehaviour
     public int CurrentTransferSeq() { return _currentTransferSeq; }
 
     // 供 NekoNpcLife 在所有客户端判断“她正在说话”（气泡可见），驱动说话小动作。
-    public bool IsBubbleVisible() { return _currentBubble != null && _currentBubble.Length > 0; }
+    public bool IsBubbleVisible() { return _currentBubble != null && _currentBubble.Length > 0 && !HasTextExpired(Networking.GetServerTimeInMilliseconds()); }
+
+    private bool HasTextExpired(int nowServerMs)
+    {
+        // 服务器毫秒计数是有符号循环计数，负数和零都是合法时间。
+        // 短生命周期用差值判断，可跨越 int 正负边界；不能用时间正负判断是否存在字幕。
+        return _currentBubble != null && _currentBubble.Length > 0
+            && nowServerMs - _displayUntilServerMs >= 0;
+    }
 
     public string BuildSnapshotText()
     {
         return "{\"transfer_seq\":" + (_currentTransferSeq > 0 ? _currentTransferSeq.ToString() : "null")
             + ",\"utf8_bytes\":" + _currentUtf8Bytes
             + ",\"crc16\":" + (_currentCrc16 >= 0 && telemetry != null ? telemetry.J(Hex4(_currentCrc16)) : "null")
-            + ",\"display_until_server_ms\":" + (_displayUntilServerMs > 0 ? _displayUntilServerMs.ToString() : "null")
+            + ",\"display_until_server_ms\":" + (_currentBubble != null && _currentBubble.Length > 0 ? _displayUntilServerMs.ToString() : "null")
             + ",\"text\":" + (_currentBubble == null || telemetry == null ? "null" : telemetry.J(_currentBubble)) + "}";
     }
 
@@ -480,8 +493,7 @@ public class NekoNpcNameplate : UdonSharpBehaviour
 
     void Update()
     {
-        if (Networking.IsOwner(gameObject) && _displayUntilServerMs > 0
-            && Networking.GetServerTimeInMilliseconds() >= _displayUntilServerMs)
+        if (Networking.IsOwner(gameObject) && HasTextExpired(Networking.GetServerTimeInMilliseconds()))
             ClearBubbleWithReason("expired");
 
         RenderDialogueProjection(Networking.GetServerTimeInMilliseconds(), false);

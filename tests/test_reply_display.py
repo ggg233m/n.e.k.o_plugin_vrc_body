@@ -134,8 +134,10 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
 
     def test_display_duration_keeps_short_text_and_extends_long_text(self) -> None:
         self.assertEqual(MainReplyDisplayBridge.display_duration("短回答", 15), 15)
-        self.assertEqual(MainReplyDisplayBridge.display_duration("猫" * 72, 15), 18)
-        self.assertEqual(MainReplyDisplayBridge.display_duration("猫" * 500, 15), 30)
+        self.assertEqual(MainReplyDisplayBridge.display_duration("短回答", 10), 10)
+        self.assertEqual(MainReplyDisplayBridge.display_duration("猫" * 72, 10), 15)
+        self.assertEqual(MainReplyDisplayBridge.display_duration("猫" * 120, 10), 21)
+        self.assertEqual(MainReplyDisplayBridge.display_duration("猫" * 500, 10), 25)
 
     def test_utf8_pages_stay_inside_wire_limit_and_are_bounded(self) -> None:
         pages = MainReplyDisplayBridge.paginate("猫" * 1000, 4)
@@ -322,7 +324,7 @@ class MainReplyDisplayBridgeTests(unittest.TestCase):
         self.provider.updates.append(ChatContextUpdate(True, False, "r2"))
         bridge.tick()
 
-        self.assertEqual(self.sent, [("磁盘回答", 15)])
+        self.assertEqual(self.sent, [("磁盘回答", 10)])
         status = bridge.status()
         self.assertEqual(status["proactive_bus"]["last_error"], "query_TimeoutError")
         self.assertNotIn("不得进入状态的细节", str(status))

@@ -47,9 +47,15 @@ public static class NekoNpcChatInputBuilder
         chat.perception = perception;
         chat.inputField = input;
         chat.statusText = status;
+        chat.connectionText = panel.Find("Panel/Connection").GetComponent<Text>();
+        chat.historyScroll = panel.Find("Panel/History").GetComponent<ScrollRect>();
+        chat.historyText = panel.Find("Panel/History/Viewport/Content").GetComponent<Text>();
+        // 正式 NPC 的字幕组件在 Nameplate 子对象，不能只查根节点。
+        NekoNpcNameplate nameplate = npc.GetComponentInChildren<NekoNpcNameplate>(true);
+        if (nameplate != null) { nameplate.chatInput = chat; MarkDirtyAndSync(nameplate); }
         chat.panelRoot = panel;
         chat.inputLockStation = inputLockStation;
-        chat.panelHeadOffset = new Vector3(-0.08f, -0.10f, 0.50f);
+        chat.panelHeadOffset = new Vector3(0f, 0f, 0.55f);
         chat.openKey = KeyCode.T;
         chat.maxCharacters = 144;
         chat.submitCooldownSec = 2f;
@@ -74,14 +80,22 @@ public static class NekoNpcChatInputBuilder
         GameObject npc = GameObject.Find(NpcRootName);
         NekoNpcChatInput chat = npc == null ? null : npc.GetComponent<NekoNpcChatInput>();
         GameObject ui = GameObject.Find(UiRootName);
+        NekoNpcNameplate nameplate = npc == null ? null : npc.GetComponentInChildren<NekoNpcNameplate>(true);
         bool ok = chat != null && ui != null && chat.telemetry != null && chat.perception != null
             && chat.inputField != null && chat.statusText != null
+            && chat.historyText != null && chat.historyScroll != null && chat.connectionText != null
+            && nameplate != null && nameplate.chatInput == chat
             && chat.inputLockStation != null
             && chat.panelRoot != null
             && chat.panelRoot.GetComponent<Canvas>() != null
             && chat.inputField.onSubmit.GetPersistentEventCount() > 0
             && chat.inputField.onEndEdit.GetPersistentEventCount() > 0;
-        if (!ok) throw new InvalidOperationException("YUI 玩家聊天 UI 未完整安装或引用缺失");
+        if (!ok) throw new InvalidOperationException("YUI 玩家聊天 UI 未完整安装或引用缺失，请检查子对象 Nameplate 的 chatInput 回复记录绑定");
+        UdonBehaviour nameplateBacking = GetBacking(nameplate);
+        object savedChat;
+        if (nameplateBacking == null || !nameplateBacking.publicVariables.TryGetVariableValue("chatInput", out savedChat)
+            || !ReferenceEquals(savedChat, GetBacking(chat)))
+            throw new InvalidOperationException("Nameplate 的回复记录绑定尚未同步到 Udon，请重新安装聊天 UI");
         Debug.Log("[NEKO] YUI 玩家聊天 UI 校验通过。T 呼出，最大 144 字，每玩家 2 秒限频。 ");
     }
 
@@ -90,29 +104,68 @@ public static class NekoNpcChatInputBuilder
         Transform existing = root.Find("ChatCanvas");
         GameObject go = existing == null ? new GameObject("ChatCanvas", typeof(RectTransform)) : existing.gameObject;
         if (existing == null) go.transform.SetParent(root, false);
-        ConfigureCanvas(go, new Vector2(620f, 124f), 0.00082f);
+        ConfigureCanvas(go, new Vector2(620f, 480f), 0.00082f);
         RectTransform canvasRect = go.GetComponent<RectTransform>();
 
         // 使用 VRChat 接近的深蓝灰半透明底与青蓝高亮，不沿用插件的紫黑配色。
         RectTransform background = EnsureImage(canvasRect, "Panel", new Color(0.025f, 0.105f, 0.145f, 0.96f));
         Stretch(background, 0f, 0f, 0f, 0f);
-        Text title = EnsureText(background, "Title", "和猫娘聊天", 18, TextAnchor.MiddleLeft);
+        Text title = EnsureText(background, "Title", "和猫娘聊天", 24, TextAnchor.MiddleLeft);
         title.color = new Color(0.76f, 0.92f, 0.97f, 1f);
-        Place(title.rectTransform, 16f, -4f, 520f, 28f);
+        Place(title.rectTransform, 22f, -8f, 460f, 36f);
+        Text connection = EnsureText(background, "Connection", "○ 等待 NPC 连接", 16, TextAnchor.MiddleLeft);
+        connection.color = new Color(0.48f, 0.85f, 0.82f, 1f);
+        Place(connection.rectTransform, 22f, -44f, 550f, 24f);
+
+        RectTransform history = EnsureImage(background, "History", new Color(0.018f, 0.058f, 0.08f, 0.98f));
+        Place(history, 18f, -82f, 584f, 286f);
+        RectTransform viewport = EnsureImage(history, "Viewport", Color.clear);
+        Stretch(viewport, 14f, 14f, 12f, 12f);
+        if (viewport.GetComponent<RectMask2D>() == null) viewport.gameObject.AddComponent<RectMask2D>();
+        Text content = EnsureText(viewport, "Content", "还没有聊天记录。\n想聊什么，就从这里开始。", 24, TextAnchor.UpperLeft);
+        content.color = new Color(0.88f, 0.94f, 0.96f, 1f);
+        content.lineSpacing = 1.3f;
+        content.horizontalOverflow = HorizontalWrapMode.Wrap;
+        content.verticalOverflow = VerticalWrapMode.Overflow;
+        RectTransform contentRect = content.rectTransform;
+        contentRect.anchorMin = new Vector2(0f, 1f);
+        contentRect.anchorMax = new Vector2(1f, 1f);
+        contentRect.pivot = new Vector2(0.5f, 1f);
+        contentRect.anchoredPosition = Vector2.zero;
+        contentRect.sizeDelta = Vector2.zero;
+        ContentSizeFitter fitter = content.GetComponent<ContentSizeFitter>();
+        if (fitter == null) fitter = content.gameObject.AddComponent<ContentSizeFitter>();
+        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        ScrollRect scroll = history.GetComponent<ScrollRect>();
+        if (scroll == null) scroll = history.gameObject.AddComponent<ScrollRect>();
+        scroll.viewport = viewport;
+        scroll.content = contentRect;
+        scroll.horizontal = false;
+        scroll.vertical = true;
+        scroll.movementType = ScrollRect.MovementType.Clamped;
+        scroll.scrollSensitivity = 26f;
+        scroll.verticalNormalizedPosition = 0f;
 
         RectTransform closeRect = EnsureButton(background, "CloseButton", "X", new Color(0.055f, 0.22f, 0.28f, 0.98f)).GetComponent<RectTransform>();
-        Place(closeRect, 576f, -4f, 30f, 28f);
+        Place(closeRect, 568f, -12f, 34f, 32f);
+        Text closeLabel = closeRect.Find("Label").GetComponent<Text>();
+        closeLabel.fontSize = 18;
+        Stretch(closeLabel.rectTransform, 2f, 2f, 2f, 2f);
 
         input = EnsureInput(background, "InputField");
-        Place(input.GetComponent<RectTransform>(), 14f, -34f, 470f, 52f);
+        Place(input.GetComponent<RectTransform>(), 18f, -384f, 466f, 50f);
 
         RectTransform sendRect = EnsureButton(background, "SendButton", "发送", new Color(0.00f, 0.58f, 0.72f, 1f)).GetComponent<RectTransform>();
-        Place(sendRect, 492f, -34f, 114f, 52f);
+        Place(sendRect, 496f, -384f, 106f, 50f);
 
         status = EnsureText(background, "Status", "", 16, TextAnchor.MiddleLeft);
         status.color = new Color(0.53f, 0.84f, 0.92f, 1f);
-        Place(status.rectTransform, 16f, -91f, 588f, 22f);
-        SetLayerRecursively(go, 5);
+        Place(status.rectTransform, 22f, -441f, 580f, 28f);
+        status.text = "Enter 发送 · Esc 收起 · 滚轮查看记录";
+        Transform obsoletePointer = background.Find("DesktopPointer");
+        if (obsoletePointer != null) Undo.DestroyObjectImmediate(obsoletePointer.gameObject);
+        // VRChat 的 UI 层只能在菜单打开时交互；世界聊天使用 Default 层。
+        SetLayerRecursively(go, 0);
         return go.transform;
     }
 
@@ -335,7 +388,7 @@ public static class NekoNpcChatInputBuilder
         }
     }
 
-    static UdonBehaviour GetBacking(NekoNpcChatInput chat)
+    static UdonBehaviour GetBacking(Component chat)
     {
         Type utility = FindType("UdonSharpEditor.UdonSharpEditorUtility");
         MethodInfo method = utility == null ? null : utility.GetMethod("GetBackingUdonBehaviour", BindingFlags.Public | BindingFlags.Static);

@@ -440,7 +440,7 @@ class AutonomyTests(unittest.TestCase):
             self.director.status()["chat_engagement"]["phase"],
             "post_reply_hold",
         )
-        self.clock.advance(14.9)
+        self.clock.advance(59.9)
         self.director._tick()
         self.assertTrue(self.director.status()["chat_engagement"]["active"])
         self.clock.advance(0.2)
@@ -468,7 +468,7 @@ class AutonomyTests(unittest.TestCase):
             "display_seconds": 20,
             "transfer_sequence": 11,
         }))
-        self.clock.advance(34.9)
+        self.clock.advance(79.9)
         self.director._tick()
         self.assertTrue(self.director.status()["chat_engagement"]["active"])
         self.clock.advance(0.2)
@@ -563,6 +563,55 @@ class AutonomyTests(unittest.TestCase):
         blacklist = self.director.status()["blacklist"]
         self.assertTrue(blacklist)
         self.assertTrue(all(0.0 < seconds <= 300.0 for seconds in blacklist.values()))
+
+    def test_model_preference_survives_completed_fragment_and_drives_followup(self) -> None:
+        director = self.director
+        director._latest_intent_token = "preference-test"
+        self.assertTrue(director.offer_intent({
+            "motivation": "持续关注窗边", "mood": "quiet",
+            "activities": [{"kind": "linger", "duration_s": 5}, {"kind": "linger", "duration_s": 5}],
+            "interests": [{"target_key": "b0", "strength": 0.9, "ttl_s": 120}],
+            "avoid_targets": ["c0"], "ttl_s": 240,
+        }, "preference-test"))
+        director._activate_pending_intent(self.clock())
+        for _ in range(2):
+            self.assertTrue(director._submit_intent_activity(self.clock()))
+            plan_id = self.adapter.plan_manager.submissions[-1]["plan_id"]
+            self.adapter.plan_manager.statuses[plan_id] = "succeeded"
+            self.clock.advance(6)
+            director._update_active(self.clock())
+        self.assertIsNone(director._intent)
+        self.assertEqual(director._intent_context("fragment_completed")["current_preference"]["motivation"], "持续关注窗边")
+        self.assertTrue(director._submit_preference_activity(self.clock()))
+        self.assertEqual(director._active.kind, "preference_visit")
+        self.assertEqual(director._active.targets, ("b0",))
+        graph = self.adapter.plan_manager.submissions[-1]["graph"]
+        self.assertTrue(any(node.get("target_key") == "b0" for node in graph["nodes"]))
+        self.assertTrue(director._blacklisted("c0", self.clock()))
+        director.pause("manual_pause")
+        self.assertIsNone(director.status()["current_preference"])
+        self.assertFalse(director._submit_preference_activity(self.clock()))
+
+    def test_model_mood_changes_followup_nodes_and_expires(self) -> None:
+        durations = {}
+        for mood in ("quiet", "playful"):
+            director = self.director
+            director._latest_intent_token = mood
+            self.assertTrue(director.offer_intent({
+                "motivation": "测试不同活动节奏", "mood": mood,
+                "activities": [{"kind": "linger", "duration_s": 5}, {"kind": "linger", "duration_s": 5}],
+                "ttl_s": 60,
+            }, mood))
+            director._activate_pending_intent(self.clock())
+            director._intent = None
+            self.assertTrue(director._submit_preference_activity(self.clock()))
+            nodes = self.adapter.plan_manager.submissions[-1]["graph"]["nodes"]
+            durations[mood] = next(node["duration_ms"] for node in nodes if node["type"] == "wait")
+            self.assertEqual(any(node["type"] == "move_relative" for node in nodes), mood == "playful")
+        self.assertEqual(durations, {"quiet": 20000, "playful": 8000})
+        self.clock.advance(61)
+        self.assertFalse(self.director._submit_preference_activity(self.clock()))
+        self.assertIsNone(self.director.status()["current_preference"])
 
     def test_llm_fragment_waits_for_current_terminal_then_drives_exact_target(self) -> None:
         requests = []
@@ -818,6 +867,17 @@ class AutonomyTests(unittest.TestCase):
         events = [item["event"] for item in telemetry]
         self.assertIn("intent_requested", events)
         self.assertIn("intent_queued", events)
+        def dispositions():
+            return [item["disposition"] for item in telemetry if item["event"] == "intent_disposition" and item["request_token"] == token]
+        self.assertEqual(dispositions(), ["queued"])
+        director._activate_pending_intent(self.clock())
+        self.assertEqual(dispositions(), ["queued", "active"])
+        self.clock.advance(241)
+        director._activate_pending_intent(self.clock())
+        self.assertEqual(dispositions(), ["queued", "active", "expired"])
+        director._request_intent("new_request")
+        self.assertFalse(director.offer_intent({"motivation": "旧输出", "mood": "quiet", "activities": []}, token))
+        self.assertEqual(dispositions()[-1], "superseded")
         self.session.remove_event_listener(director._on_session_event)
 
     def test_close_stops_background_thread(self) -> None:

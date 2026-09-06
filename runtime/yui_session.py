@@ -107,6 +107,7 @@ class YuiSessionState:
         self.world_id: str | None = None
         self.world_name: str | None = None
         self.driver_pid: int | None = None
+        self.chat_input_activity_version = 0
         self.control_state = "unhandshaken"
         self.estop = False
         self.capabilities: tuple[str, ...] = ()
@@ -199,6 +200,7 @@ class YuiSessionState:
                 self._event_listeners.remove(listener)
 
     def _reset_for_new_session(self, session: int) -> None:
+        self.chat_input_activity_version = 0
         self.session = session
         self.control_state = "safe_idle"
         self.estop = False
@@ -354,6 +356,8 @@ class YuiSessionState:
                 if isinstance(activity_bounds, list) and len(activity_bounds) == 6:
                     self.activity_bounds = tuple(float(item) for item in activity_bounds)
                 self.max_speed_mps = float(event_copy["max_speed"])
+            elif event_type == "sys.chat_input_ready" and event_session == self.session:
+                self.chat_input_activity_version = 1 if event_copy.get("activity_version") == 1 else 0
             elif event_type == "sys.catalog":
                 self._ingest_catalog(event_copy)
             elif event_type == "player.join":

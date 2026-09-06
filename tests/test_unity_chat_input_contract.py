@@ -133,7 +133,7 @@ class UnityChatInputContractTests(unittest.TestCase):
         self.assertIn('"<sprite=" + spriteIndex + " tint=1>"', self.nameplate)
 
     def test_dialogue_reveal_preserves_total_lifetime_and_reading_hold(self) -> None:
-        self.assertIn("minimumFullTextHoldSeconds = 4f", self.nameplate)
+        self.assertIn("minimumFullTextHoldSeconds = 6f", self.nameplate)
         self.assertIn("availableRevealMs", self.nameplate)
         self.assertIn("scalePermille", self.nameplate)
         self.assertIn("_displayUntilServerMs", self.nameplate)

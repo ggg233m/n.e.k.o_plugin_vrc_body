@@ -39,7 +39,7 @@ class UnityV13ContractTests(unittest.TestCase):
         self.assertNotIn('"center"', method)
 
     def test_region_overlap_order_and_rotation_validation_are_explicit(self) -> None:
-        localized = self.router[self.router.index("private int LocalizedRegion"):]
+        localized = self.router[self.router.index("public int LocalizedRegion"):]
         self.assertIn("priority > bestPriority", localized)
         self.assertIn("size < bestVolume", localized)
         self.assertIn("regionId < bestRegion", localized)

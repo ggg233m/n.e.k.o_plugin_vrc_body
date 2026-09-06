@@ -495,6 +495,42 @@ class BehaviorPlanManager:
             result["midi_sent"] = False
             return result
 
+    def panel_progress(self) -> dict[str, Any] | None:
+        """只投影动作种类和语义目标，不向面板传递对白或原始执行证据。"""
+        with self._condition:
+            plan = self._active
+            if plan is None:
+                plan = next((item for item in self._pending if item.status == "accepted"), None)
+            if plan is None:
+                plan = self._history[-1] if self._history else None
+            if plan is None:
+                return None
+            now = time.monotonic()
+            elapsed_ms = round(((plan.finished_at or now) - (plan.started_at or plan.created_at)) * 1000)
+            nodes = []
+            # 按节点表投影，避免把父控制节点计为一个动作。
+            for node_id, node in plan.nodes.items():
+                if node["type"] in CONTROL_TYPES:
+                    continue
+                state = dict(plan.node_status.get(node_id, {}))
+                remaining_s = None
+                if node["type"] == "wait" and state.get("status") == "running":
+                    remaining_s = round(max(0, node["duration_ms"] - (elapsed_ms - state.get("started_ms", elapsed_ms))) / 1000, 1)
+                nodes.append({
+                    "id": node_id, "kind": node["type"],
+                    "status": state.get("status", "pending"),
+                    "target": node.get("target_key") or node.get("action_key"),
+                    "player_slot": node.get("player_slot"), "remaining_s": remaining_s,
+                })
+            return {
+                "status": plan.status, "origin": plan.origin,
+                "elapsed_s": round(elapsed_ms / 1000, 1),
+                "completed_nodes": sum(item["status"] == "succeeded" for item in nodes),
+                "total_nodes": len(nodes),
+                "active_nodes": [item for item in nodes if item["status"] == "running" and plan.status == "running"],
+                "error": plan.error,
+            }
+
     def cancel(self, plan_id: str) -> dict[str, Any]:
         with self._condition:
             plan = self._plans.get(plan_id)

@@ -142,7 +142,7 @@ class YuiChatBridgeConfig:
     source: str = "recent_file"
     poll_interval_s: float = 0.5
     # 每页的最短保留时间；桥接层会按可见字符数自动延长，避免长回答来不及阅读。
-    display_seconds: int = 15
+    display_seconds: int = 10
     max_pages: int = 4
     max_file_bytes: int = 2 * 1024 * 1024
 
@@ -314,7 +314,7 @@ class YuiChatEngagementConfig:
     near_distance_m: float = 2.5
     follow_trigger_m: float = 3.0
     approach_distance_m: float = 1.5
-    post_reply_hold_s: float = 15.0
+    post_reply_hold_s: float = 60.0
     no_reply_timeout_s: float = 90.0
     approach_retry_s: float = 10.0
 
@@ -389,6 +389,7 @@ class YuiAutonomyConfig:
     dwell_range_s: tuple[float, float] = (8.0, 20.0)
     explore_range_s: tuple[float, float] = (15.0, 35.0)
     social_cooldown_s: float = 60.0
+    proactive_chat_enabled: bool = True
     llm_inspiration_range_s: tuple[float, float] = (180.0, 360.0)
     chat_engagement: YuiChatEngagementConfig = field(
         default_factory=YuiChatEngagementConfig
@@ -434,6 +435,10 @@ class YuiAutonomyConfig:
                 data.get("social_cooldown_s", defaults.social_cooldown_s),
                 name="autonomy.social_cooldown_s",
                 minimum=0.0,
+            ),
+            proactive_chat_enabled=_boolean(
+                data.get("proactive_chat_enabled", defaults.proactive_chat_enabled),
+                name="autonomy.proactive_chat_enabled",
             ),
             llm_inspiration_range_s=_number_range(
                 data.get(

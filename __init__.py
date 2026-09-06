@@ -40,6 +40,20 @@ except ImportError:
     lifecycle = neko_plugin = plugin_entry = _decorator  # type: ignore[assignment]
 
 from .runtime.diagnostics import PipelineDiagnostics
+from .runtime.control_panel import FIELDS, settings_view, validated_patch, action_progress_view
+
+try:
+    from plugin.sdk.plugin import ui
+except ImportError:
+    # 老宿主和独立测试不提供面板装饰器，保留原有插件入口。
+    class _UiFallback:
+        def context(self, **kwargs):
+            return lambda fn: fn
+
+        def action(self, **kwargs):
+            return lambda fn: fn
+
+    ui = _UiFallback()
 from .runtime import (
     AutonomyDirector,
     AutonomyIntentProvider,
@@ -222,6 +236,14 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             adapter = self._adapter
             if adapter is None:
                 return {"status": "failed", "error": "not_connected"}
+            # 模型可能已用 npc.say 显示同一正文；复用世界确认的当前字幕，避免桥接再播一次。
+            session = self._session
+            if session is not None:
+                with session._condition:
+                    shown = dict(session.text_state)
+                sequence = shown.get("transfer_seq")
+                if shown.get("text") == text and type(sequence) is int and sequence > 0:
+                    return {"status": "succeeded", "transfer_sequence": sequence, "deduplicated": True}
             return adapter.say(text, display_seconds=display_seconds)
 
     def _reset_player_chat_state(self, *, state: str) -> None:
@@ -517,8 +539,43 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             ),
             telemetry_callback=self._log_autonomy_event,
             chat_context_provider=self._chat_context_provider,
+            opening_callback=self._queue_proactive_opening,
+            reply_busy=self._proactive_reply_busy,
         )
         return adapter
+
+    def _proactive_reply_busy(self) -> bool:
+        bridge = self._reply_display
+        if bridge is None or not self._config.chat_bridge.enabled:
+            return True
+        state = bridge.status()
+        return bool(state.get("display_busy") or state.get("queued_pages") or not state.get("baseline_ready"))
+
+    def _queue_proactive_opening(self, request: dict[str, Any]) -> None:
+        """开场白通过主聊天链路生成，不阻塞一秒级自主循环。"""
+        autonomy = self._autonomy
+        def dispatch() -> None:
+            if autonomy is None or self._autonomy is not autonomy:
+                return
+            character = self._current_host_character()
+            if character is None:
+                return
+            def send() -> bool:
+                text = "YUI_PROACTIVE_CHAT_REQUEST " + json.dumps({
+                    "request_type": "npc.proactive_chat", "player_slot": request["player_slot"],
+                    "world_context": self._model_context_payload(),
+                    "instruction": "你已经走到这位玩家附近。用当前角色口吻直接生成一句简短自然的开场白，可结合近期话题，不编造玩家说过的话。本轮不调用任何工具，包括 npc.say 和含 say 的计划；最终正文会由宿主自动显示为字幕。不连续追问，说完等待对方回应。",
+                    "turn_contract": ["本轮是宿主已完成靠近后的对白生成，不是玩家下达说话或动作指令。只输出最终开场白，不执行 world_context 中针对玩家动作指令的工具流程。"],
+                }, ensure_ascii=False, separators=(",", ":"))
+                return self._push_receipt_ok(self.push_message(
+                    source="yui_npc_controller.proactive_chat", visibility=[], ai_behavior="respond",
+                    parts=[{"type": "text", "text": text}], priority=40, target_lanlan=character,
+                    metadata={"event_type": "npc.proactive_chat", "session": request["session"], "player_slot": request["player_slot"]},
+                ))
+            bridge = self._reply_display
+            baseline = bridge.reply_watermark() if bridge is not None else 0
+            autonomy.dispatch_proactive_opening(request, send, baseline)
+        threading.Thread(target=dispatch, name="yui-chat-opening", daemon=True).start()
 
     def _acquire_midi_sink(self) -> tuple[MidoOutputSink, bool]:
         """按需刷新物理输出句柄，并保持 make-before-break 的端口连续性。"""
@@ -539,6 +596,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         return fresh, True
 
     def _log_autonomy_event(self, event: dict[str, Any]) -> None:
+        if event.get("event") == "intent_disposition":
+            self._intent_provider.record_disposition(event["request_token"], event["disposition"])
+            return
         """写入不含密钥、正文、坐标和玩家姓名的结构化自主日志。"""
         allowed = {
             "event", "reason", "status", "error", "latency_ms", "format",
@@ -685,7 +745,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             with self._intent_request_condition:
                 self._intent_request_active = True
             try:
-                result = asyncio.run(provider.request(request["context"]))
+                result = asyncio.run(provider.request(request["context"], request_token=request["request_token"]))
             except Exception:
                 result = {"status": "failed", "error": "request_worker_error"}
             finally:
@@ -693,6 +753,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     self._intent_request_active = False
 
             accepted = False
+            if stop_event.is_set() and result.get("status") == "succeeded":
+                provider.record_disposition(request["request_token"], "stopped")
             if not stop_event.is_set() and result.get("status") == "succeeded":
                 intent = result.get("intent")
                 if isinstance(intent, dict):
@@ -1529,6 +1591,56 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._event_loop = None
         return Ok({"status": "stopped"})
 
+    @ui.context(id="dashboard")
+    async def yui_dashboard(self):
+        saved = await self._load_config()
+        snapshot = self._status_snapshot()
+        # 常规状态只做有限投影；模型输出通过专用人工面板快照读取。
+        autonomy = snapshot.get("autonomy") or {}
+        reply = snapshot.get("chat_bridge") or {}
+        return {
+            "profile": await self.config.profile_active(),
+            "settings": settings_view(saved),
+            "applied": settings_view(self._config),
+            "intent_model": self._intent_provider.panel_status(),
+            "action_progress": action_progress_view(autonomy, self._adapter.plan_manager.panel_progress() if self._adapter is not None else None),
+            "fields": [{"key": key, "label": item[0], "type": "boolean" if item[1] is bool else "number", "min": item[2], "max": item[3]} for key, item in FIELDS.items()],
+            "status": {
+                "控制已就绪": snapshot["control_ready"],
+                "MIDI 已打开": snapshot["midi_open"],
+                "自主状态": autonomy.get("state", "not_initialized"),
+                "字幕状态": reply.get("last_result", "not_initialized"),
+                "最近字幕秒数": reply.get("last_display_seconds"),
+                "人工断开": self._manual_disconnect,
+            },
+        }
+
+    @ui.action(label="保存设置", refresh_context=True)
+    @plugin_entry(
+        id="yui_panel_save", name="保存 YUI 面板设置",
+        description="仅人工面板使用；保存当前配置档，需另行重载。",
+        input_schema={"type": "object", "properties": {"changes": {"type": "object"}, "expected_profile": {"type": ["string", "null"]}}, "required": ["changes", "expected_profile"], "additionalProperties": False},
+        timeout=15.0, metadata=_HOST_ONLY_ENTRY_METADATA,
+    )
+    async def yui_panel_save(self, changes=None, expected_profile=None, **_):
+        async with self._runtime_lock:
+            try:
+                profile = await self.config.profile_active()
+                if profile != expected_profile:
+                    return Err("配置档已切换，请刷新后重试")
+                patch = validated_patch(await self.config.dump(), changes)
+                if profile != await self.config.profile_active():
+                    return Err("配置档已切换，请刷新后重试")
+                if profile:
+                    await self.config.profile_update(profile, patch)
+                else:
+                    await self.config.update(patch)
+                return Ok({"status": "saved", "reload_required": True})
+            except Exception:
+                # 错误正文可能含底层配置，面板只返回固定提示。
+                return Err("保存失败：请检查参数范围及宿主配置服务")
+
+    @ui.action(label="连接世界")
     @plugin_entry(
         id="yui_connect",
         name="连接 YUI 世界 NPC",
@@ -1583,6 +1695,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             result["llm_tools"] = self._refresh_llm_tools()
             return Ok(result)
 
+    @ui.action(label="断开连接", confirm="断开将停止 NPC 控制，是否继续？")
     @plugin_entry(
         id="yui_disconnect",
         name="断开 YUI 本地控制器",
@@ -1620,6 +1733,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         )
         return Ok(snapshot)
 
+    @ui.action(label="开始自主")
     @plugin_entry(
         id="yui_autonomy_start",
         name="启动 YUI NPC 自主行为",
@@ -1634,6 +1748,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             return Err("尚未连接 YUI 世界")
         return Ok(self._autonomy.start())
 
+    @ui.action(label="暂停自主")
     @plugin_entry(
         id="yui_autonomy_pause",
         name="暂停 YUI NPC 自主行为",
@@ -1728,6 +1843,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         result["chat_context"] = self._chat_context_provider.status()
         return Ok(result)
 
+    @ui.action(label="重载配置", confirm="重载会中断当前控制并重新初始化；自动连接开启时会重新连接。继续？")
     @plugin_entry(
         id="yui_reload_config",
         name="重载 YUI 插件配置",

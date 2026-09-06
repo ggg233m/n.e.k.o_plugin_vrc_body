@@ -47,13 +47,31 @@ def _conflicts(manifest: dict) -> set[str]:
 
 
 class YuiPluginConfigTests(unittest.TestCase):
+    def test_reply_bridge_reuses_visible_tool_speech_but_not_cleared_text(self):
+        plugin = _plugin_class()(None)
+        plugin._session = YuiSessionState()
+        sent = []
+        class Adapter:
+            def say(self, text, *, display_seconds):
+                sent.append(text)
+                return {"status": "succeeded", "transfer_sequence": 8}
+        plugin._adapter = Adapter()
+        plugin._session.text_state.update(text="开场白", transfer_seq=7)
+        result = plugin._display_main_reply("开场白", 12)
+        self.assertEqual(result["transfer_sequence"], 7)
+        self.assertTrue(result["deduplicated"])
+        self.assertEqual(sent, [])
+        plugin._session.text_state.update(text=None, transfer_seq=None)
+        self.assertEqual(plugin._display_main_reply("开场白", 12)["transfer_sequence"], 8)
+        self.assertEqual(sent, ["开场白"])
+
     def test_default_configuration_keeps_optional_data_and_tools_closed(self) -> None:
         config = YuiPluginConfig.from_mapping({})
         self.assertFalse(config.free_coordinate_navigation)
         self.assertFalse(config.include_player_names)
         self.assertFalse(config.enable_wander_tool)
         self.assertTrue(config.chat_bridge.enabled)
-        self.assertEqual(config.chat_bridge.display_seconds, 15)
+        self.assertEqual(config.chat_bridge.display_seconds, 10)
         self.assertTrue(config.player_chat.enabled)
         self.assertEqual(config.player_chat.max_chars, 144)
         self.assertEqual(config.player_chat.cooldown_s, 2.0)
@@ -479,7 +497,7 @@ class YuiPluginConfigTests(unittest.TestCase):
 
     def test_autonomy_and_social_events_never_start_host_chat(self) -> None:
         source = (ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count('ai_behavior="respond"'), 1)
+        self.assertEqual(source.count('ai_behavior="respond"'), 2)
 
         plugin = _plugin_class()(None)
         pushed = []
@@ -1125,7 +1143,7 @@ class YuiPluginConfigTests(unittest.TestCase):
             config = type("Config", (), {"enabled": True, "min_interval_s": 0.0})()
 
             @staticmethod
-            async def request(_context):
+            async def request(_context, *, request_token=None):
                 return {
                     "status": "succeeded",
                     "intent": {"motivation": "测试"},

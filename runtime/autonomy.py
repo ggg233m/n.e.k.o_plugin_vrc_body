@@ -88,7 +88,15 @@ class _ChatEngagement:
     retry_at: float = 0.0
     distance_band: str = "unknown"
     look_owned: bool = False
+    look_operation_ids: frozenset[str] = frozenset()
     intent_refresh_needed: bool = True
+    input_until: float = 0.0
+    input_active_at: float = 0.0
+    player_pid: int | None = None
+    proactive: bool = False
+    opening_sent: bool = False
+    opening_queued: bool = False
+    responded: bool = False
 
 
 class AutonomyDirector:
@@ -120,6 +128,8 @@ class AutonomyDirector:
         chat_context_provider: RecentChatContextProvider | None = None,
         inspiration_callback: Callable[[dict[str, Any]], None] | None = None,
         telemetry_callback: Callable[[dict[str, Any]], None] | None = None,
+        opening_callback: Callable[[dict[str, Any]], None] | None = None,
+        reply_busy: Callable[[], bool] | None = None,
         rng: random.Random | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -130,6 +140,8 @@ class AutonomyDirector:
         self.chat_context_provider = chat_context_provider
         self._inspiration_callback = inspiration_callback
         self._telemetry_callback = telemetry_callback
+        self._opening_callback = opening_callback
+        self._reply_busy = reply_busy or (lambda: False)
         self._rng = rng or random.Random()
         self._clock = clock
         self._condition = threading.Condition(threading.RLock())
@@ -158,6 +170,8 @@ class AutonomyDirector:
         self._next_inspiration_at = self._new_inspiration_deadline(self._clock())
         self._intent: _IntentFragment | None = None
         self._pending_intent: _IntentFragment | None = None
+        self._preference: dict[str, Any] | None = None
+        self._preference_last_activity_at = float("-inf")
         self._intent_request_serial = 0
         self._latest_intent_token: str | None = None
         self._startup_intent_needed = True
@@ -171,6 +185,14 @@ class AutonomyDirector:
         self._last_movement_at = self._clock()
         self._chat_engagement: _ChatEngagement | None = None
         self._last_chat_engagement_outcome: str | None = None
+        self._input_sequences: dict[tuple[int, int, int], int] = {}
+        self._input_supported = getattr(session, "chat_input_activity_version", 0) == 1
+        self._social_idle_since = self._clock()
+        self._proactive_next_at = self._clock() + 30.0
+        self._proactive_player_retry_at = 0.0
+        self._player_chat_next: dict[int, float] = {}
+        self._player_interactions: dict[int, float] = {}
+        self._proactive_reason = "idle_wait"
         self.session.add_event_listener(self._on_session_event)
 
     def _emit_telemetry(self, event: str, **fields: Any) -> None:
@@ -182,6 +204,10 @@ class AutonomyDirector:
             callback({"event": event, **fields})
         except Exception:
             pass
+
+    def _intent_disposition(self, token: str, disposition: str) -> None:
+        """在真实状态迁移处报告采纳结果，不把模型建议视为已执行。"""
+        self._emit_telemetry("intent_disposition", request_token=token, disposition=disposition)
 
     def start(self) -> dict[str, Any]:
         """启动或恢复自主；ESTOP 未清除时保持安全暂停。"""
@@ -196,6 +222,7 @@ class AutonomyDirector:
             self._desired_running = True
             self._pause_reason = ""
             self._resume_at = self._clock()
+            self._social_idle_since = self._clock()
             self._startup_intent_needed = True
             # SET_CONTROL_MODE ACK 与 npc.state 投影可能短暂乱序。只在首次启动
             # 给出有界宽限；超过宽限的 safe_idle/watchdog 仍按安全暂停处理。
@@ -275,6 +302,12 @@ class AutonomyDirector:
             if not self._desired_running or player_slot not in self.session.players:
                 return False
             previous = self._chat_engagement
+            player = self.session.players[player_slot]
+            pid = player.get("pid")
+            if isinstance(pid, int):
+                self._player_interactions[pid] = now
+                self._player_chat_next[pid] = now + 300.0
+            self._social_idle_since = now
             clear_look = bool(
                 previous
                 and (
@@ -300,6 +333,8 @@ class AutonomyDirector:
                 started_at=now,
                 deadline_at=now + config.no_reply_timeout_s,
                 retry_at=now,
+                player_pid=pid,
+                responded=True,
             )
             self._pause_reason = "chat_engaged"
             self._last_chat_engagement_outcome = "started"
@@ -313,6 +348,131 @@ class AutonomyDirector:
             reply_baseline_serial=max(0, int(reply_baseline_serial)),
         )
         return True
+
+    def note_chat_input(self, event: Mapping[str, Any]) -> bool:
+        """只接受当前会话的有序输入状态，租约续报不等于发生了新输入。"""
+        slot, pid, sequence = (event.get(key) for key in ("slot", "pid", "input_seq"))
+        if any(type(value) is not int for value in (slot, pid, sequence)):
+            return False
+        if event.get("session") != self.session.session or not 0 <= slot < 64 or pid <= 0 or sequence <= 0:
+            return False
+        player = self.session.players.get(slot)
+        phase = event.get("state")
+        idle_ms = event.get("idle_ms", 0)
+        if not isinstance(player, Mapping) or player.get("pid") != pid or phase not in {"open", "active", "closed", "submitted"}:
+            return False
+        if type(idle_ms) is not int or not 0 <= idle_ms <= 120000:
+            return False
+        now = self._clock()
+        with self._condition:
+            # 世界重连后同一玩家会从 1 重新编号，不能继承旧会话的水位。
+            key = (self.session.session, slot, pid)
+            if sequence <= self._input_sequences.get(key, 0):
+                return False
+            self._input_sequences[key] = sequence
+            self._input_supported = True
+            if not self._desired_running or not self.config.chat_engagement.enabled or now < self._resume_at:
+                return False
+            engagement = self._chat_engagement
+            if phase == "submitted":
+                # 实际正文通过身份和内容校验后才切换到等待回复；不让关框抢先解锁。
+                return True
+            if engagement is not None and engagement.player_slot != slot:
+                return False
+            if phase in {"open", "active"}:
+                if idle_ms >= 120000:
+                    return False
+                if engagement is None or engagement.phase in {"proactive_approach", "preparing_opening"}:
+                    if not self.begin_chat_engagement(slot):
+                        return False
+                    engagement = self._chat_engagement
+                    engagement.phase = "waiting_input"
+                    engagement.responded = False
+                engagement.input_until = now + 15.0
+                engagement.input_active_at = now - idle_ms / 1000.0
+                if engagement.phase == "input_closed":
+                    engagement.phase = "waiting_input"
+                    engagement.release_at = None
+                if engagement.release_at is not None:
+                    engagement.release_at = max(engagement.release_at, now + 60.0)
+                self._social_idle_since = now
+            elif engagement is not None:
+                engagement.input_until = 0.0
+                if engagement.phase == "waiting_input":
+                    engagement.phase = "input_closed"
+                    engagement.release_at = now + 10.0
+            return True
+
+    def _try_proactive_chat(self, now: float) -> bool:
+        """在活动边界选择世界已确认同区可达的玩家，靠近终态之前不发起对白。"""
+        if not self.config.proactive_chat_enabled or not self.config.chat_engagement.enabled or self._opening_callback is None:
+            self._proactive_reason = "disabled"
+            return False
+        if self._chat_engagement is not None or self._reply_busy():
+            self._proactive_reason = "chat_busy"
+            return False
+        if now < self._proactive_next_at or now - self._social_idle_since < 30.0:
+            self._proactive_reason = "cooldown"
+            return False
+        region = (self.session.npc_state.get("location") or {}).get("region_key")
+        candidates = []
+        player_cooldowns = []
+        self._proactive_player_retry_at = 0.0
+        for slot, player in self.session.players.items():
+            pid, distance = player.get("pid"), player.get("d")
+            if (type(pid) is not int or type(distance) not in (float, int) or not 0 <= distance <= 8.0
+                    or not region or player.get("region_key") != region or player.get("reachable") is not True):
+                continue
+            if now < self._player_chat_next.get(pid, 0.0):
+                player_cooldowns.append(self._player_chat_next[pid])
+                continue
+            candidates.append((self._player_interactions.get(pid, float("-inf")), distance, slot, pid))
+        if not candidates:
+            self._proactive_reason = "player_cooldown" if player_cooldowns else "no_eligible_player"
+            self._proactive_player_retry_at = min(player_cooldowns) if player_cooldowns else 0.0
+            return False
+        _last, _distance, slot, pid = min(candidates)
+        if not self.begin_chat_engagement(slot):
+            return False
+        engagement = self._chat_engagement
+        engagement.proactive = True
+        engagement.responded = False
+        engagement.phase = "proactive_approach"
+        self._proactive_next_at = now + 120.0
+        self._proactive_reason = "approaching"
+        submitted = self._submit({"entry": "approach", "nodes": [{"id": "approach", "type": "approach",
+            "player_slot": slot, "distance_m": 1.5, "face_target": True}]},
+            kind="proactive_approach", targets=(f"player_slot:{slot}",), regions=(region,),
+            movement=True, now=now, decision_reason="proactive_chat")
+        if not submitted:
+            self._finish_chat_engagement("approach_failed", request_intent=True)
+        return True
+
+    def dispatch_proactive_opening(self, request: Mapping[str, Any], send: Callable[[], bool], baseline: int) -> bool:
+        """工作线程在发送前原子复核所有权；排队期间的玩家输入可以取消开场。"""
+        with self._condition:
+            engagement = self._chat_engagement
+            player = self.session.players.get(request.get("player_slot"), {})
+            if (not self._desired_running or not self._control_ready() or engagement is None
+                    or engagement.phase != "preparing_opening" or engagement.opening_sent
+                    or engagement.started_at != request.get("started_at")
+                    or self.session.session != request.get("session")
+                    or engagement.player_pid != request.get("player_pid")
+                    or player.get("pid") != engagement.player_pid or self._reply_busy()):
+                return False
+            # push_message 只做宿主投递；持锁保证输入接管和实际投递不会交叉。
+            engagement.opening_sent = True
+            engagement.reply_baseline_serial = baseline
+            engagement.phase = "waiting_reply"
+            engagement.deadline_at = self._clock() + self.config.chat_engagement.no_reply_timeout_s
+            try:
+                accepted = bool(send())
+            except Exception:
+                accepted = False
+            if not accepted:
+                self._finish_chat_engagement("opening_failed", request_intent=True)
+            self._emit_telemetry("proactive_opening", status="accepted" if accepted else "failed")
+            return accepted
 
     def note_reply_page(self, event: Mapping[str, Any]) -> bool:
         """关联提交后真正显示的回复页，不接触或记录回复正文。"""
@@ -334,6 +494,7 @@ class AutonomyDirector:
             engagement = self._chat_engagement
             if (
                 engagement is None
+                or engagement.phase in {"waiting_input", "input_closed", "proactive_approach", "preparing_opening"}
                 or reply_serial <= engagement.reply_baseline_serial
                 or (
                     engagement.reply_serial is not None
@@ -388,7 +549,7 @@ class AutonomyDirector:
                 return False
             cancel_chat_plan = bool(
                 self._active is not None
-                and self._active.kind == "chat_engagement"
+                and self._active.kind in {"chat_engagement", "proactive_approach"}
             )
             clear_look = engagement.look_owned or cancel_chat_plan
             if cancel_chat_plan and self._active is not None:
@@ -399,7 +560,11 @@ class AutonomyDirector:
                 )
                 self._active = None
             self._clear_intent_locked(reason)
+            if engagement.proactive and not engagement.responded and engagement.player_pid is not None:
+                self._player_chat_next[engagement.player_pid] = now + 600.0
+            self._social_idle_since = now
             self._chat_engagement = None
+            self._proactive_reason = "cooldown"
             self._last_chat_engagement_outcome = reason
             if self._pause_reason == "chat_engaged":
                 self._pause_reason = ""
@@ -457,6 +622,7 @@ class AutonomyDirector:
         if tool_name in self._READ_ONLY_TOOLS:
             return
         now = self._clock()
+        self._social_idle_since = now
         clear_look = False
         with self._condition:
             engagement = self._chat_engagement
@@ -529,7 +695,9 @@ class AutonomyDirector:
             chat_remaining = None
             chat_retry_remaining = None
             if chat_engagement is not None:
-                if chat_engagement.release_at is not None:
+                if chat_engagement.input_until > now:
+                    chat_deadline = min(chat_engagement.input_until, chat_engagement.input_active_at + 120.0)
+                elif chat_engagement.release_at is not None:
                     chat_deadline = chat_engagement.release_at
                 elif chat_engagement.fallback_release_at is not None:
                     chat_deadline = chat_engagement.fallback_release_at
@@ -547,6 +715,14 @@ class AutonomyDirector:
                 "pause_reason": self._pause_reason or None,
                 "active_plan_id": None if self._active is None else self._active.plan_id,
                 "active_kind": None if self._active is None else self._active.kind,
+                "panel_activity": None if self._active is None else {
+                    "kind": self._active.kind,
+                    "targets": list(self._active.targets),
+                    "regions": list(self._active.regions),
+                    "elapsed_s": round(max(0.0, now - self._active.started_at), 1),
+                    "index": None if self._active.intent_activity_index is None else self._active.intent_activity_index + 1,
+                    "count": len(intent.activities) if intent is not None and intent.request_token == self._active.intent_token else None,
+                },
                 "movement_ratio": round(ratio, 3),
                 "movement_seconds": round(self._movement_seconds, 1),
                 "dwell_seconds": round(self._dwell_seconds, 1),
@@ -575,7 +751,7 @@ class AutonomyDirector:
                     "player_slot": (
                         None if chat_engagement is None else chat_engagement.player_slot
                     ),
-                    "phase": None if chat_engagement is None else chat_engagement.phase,
+                    "phase": None if chat_engagement is None else "waiting_input" if chat_engagement.input_until > now else chat_engagement.phase,
                     "remaining_s": chat_remaining,
                     "distance_band": (
                         None if chat_engagement is None else chat_engagement.distance_band
@@ -585,6 +761,12 @@ class AutonomyDirector:
                     ),
                     "retry_in_s": chat_retry_remaining,
                     "last_outcome": self._last_chat_engagement_outcome,
+                    "input_supported": self._input_supported,
+                },
+                "proactive_chat": {
+                    "enabled": self.config.proactive_chat_enabled,
+                    "reason": self._proactive_reason,
+                    "retry_in_s": round(max(0.0, self._proactive_next_at - now, self._proactive_player_retry_at - now, 30.0 - (now - self._social_idle_since)), 1),
                 },
                 "current_intent": None if intent is None else {
                     "motivation": intent.motivation,
@@ -600,6 +782,7 @@ class AutonomyDirector:
                     "expires_in_s": round(max(0.0, intent.expires_at - now), 1),
                 },
                 "pending_intent": pending is not None,
+                "current_preference": self._preference_view(now),
                 "last_intent_request_reason": self._last_intent_request_reason,
                 "last_intent_outcome": self._last_intent_outcome,
                 "last_decision_reason": self._last_decision_reason,
@@ -629,6 +812,7 @@ class AutonomyDirector:
                 or not isinstance(value.get("activities"), list)
             ):
                 self._last_intent_outcome = "stale_or_paused"
+                self._intent_disposition(request_token, "paused" if not self._desired_running else "chat_engaged" if self._chat_engagement is not None else "superseded")
                 return False
             ttl_s = value.get("ttl_s", 240)
             if isinstance(ttl_s, bool) or not isinstance(ttl_s, int) or not 60 <= ttl_s <= 600:
@@ -674,6 +858,8 @@ class AutonomyDirector:
                     "strength": float(strength),
                     "expires_at": now + interest_ttl,
                 })
+            if self._pending_intent is not None:
+                self._intent_disposition(self._pending_intent.request_token, "superseded")
             self._pending_intent = _IntentFragment(
                 motivation=str(value["motivation"]),
                 mood=str(value["mood"]),
@@ -685,6 +871,7 @@ class AutonomyDirector:
                 request_token=request_token,
             )
             self._last_intent_outcome = "queued"
+            self._intent_disposition(request_token, "queued")
             self._condition.notify_all()
             self._emit_telemetry(
                 "intent_queued",
@@ -751,9 +938,13 @@ class AutonomyDirector:
             return
         self._last_decision_at = now
         self._activate_pending_intent(now)
+        if self._try_proactive_chat(now):
+            return
         if self._submit_intent_activity(now):
             return
         self._maybe_request_inspiration(now)
+        if self._submit_preference_activity(now):
+            return
         self._submit_routine(now)
 
     def _poll_chat_context(self) -> str | None:
@@ -765,6 +956,7 @@ class AutonomyDirector:
         if not update.changed:
             return None
         if update.character_changed:
+            self._finish_chat_engagement("character_changed", request_intent=False)
             with self._condition:
                 self._clear_intent_locked("character_changed")
             return "character_changed"
@@ -777,7 +969,12 @@ class AutonomyDirector:
             engagement = self._chat_engagement
             if engagement is None:
                 return False
-            if engagement.release_at is not None and now >= engagement.release_at:
+            input_live = engagement.input_until > now and now - engagement.input_active_at < 120.0
+            if engagement.phase == "waiting_input" and not input_live:
+                finish_reason = "input_expired"
+            elif input_live:
+                finish_reason = None
+            elif engagement.release_at is not None and now >= engagement.release_at:
                 finish_reason = "post_reply_hold_complete"
             elif (
                 engagement.release_at is None
@@ -806,10 +1003,16 @@ class AutonomyDirector:
         if player is None:
             self._finish_chat_engagement("player_left", request_intent=True)
             return True
+        if engagement.player_pid is not None and player.get("pid") != engagement.player_pid:
+            self._finish_chat_engagement("player_changed", request_intent=True)
+            return True
 
         if self._active is not None:
             return True
-        if not self._control_ready() or self._has_unowned_active_operation():
+        # 接近成功留下的持续注视属于当前陪伴，不能把它当成外部动作阻塞开场。
+        active_ops = self.session.npc_state.get("active_ops") or []
+        own_look_only = bool(active_ops) and all(op in engagement.look_operation_ids for op in active_ops)
+        if not self._control_ready() or (self._has_unowned_active_operation() and not own_look_only):
             return True
 
         numeric_distance = (
@@ -826,6 +1029,15 @@ class AutonomyDirector:
             distance_band = "hysteresis"
         else:
             distance_band = "far"
+
+        if engagement.phase == "proactive_approach":
+            return True
+        if engagement.phase == "preparing_opening":
+            if not engagement.opening_queued and self._opening_callback is not None:
+                engagement.opening_queued = True
+                self._opening_callback({"player_slot": engagement.player_slot, "player_pid": engagement.player_pid,
+                                        "started_at": engagement.started_at, "session": self.session.session})
+            return True
 
         clear_look = False
         with self._condition:
@@ -912,6 +1124,25 @@ class AutonomyDirector:
         status = result.get("status")
         if status not in TERMINAL_STATUSES:
             return
+        if record.kind == "proactive_approach":
+            self._active = None
+            engagement = self._chat_engagement
+            if engagement is not None and engagement.phase == "proactive_approach":
+                if status == "succeeded":
+                    self._plans_completed += 1
+                    # approach 的 face_target 会替换注视通道；记录终态时已确认的操作，
+                    # 后续出现的新操作仍按外部接管处理，不能只凭 kind=look 放行。
+                    engagement.look_operation_ids = frozenset(
+                        op_id for op_id, op in self.session.operations.items()
+                        if op.get("kind") == "look" and op.get("status") == "running"
+                    )
+                    engagement.look_owned = True
+                    engagement.phase = "preparing_opening"
+                    engagement.deadline_at = now + self.config.chat_engagement.no_reply_timeout_s
+                else:
+                    self._plans_failed += 1
+                    self._finish_chat_engagement("approach_failed", request_intent=True)
+            return
         if record.kind == "chat_engagement":
             self._record_elapsed(record, now, include_planned_dwell=False)
             if status == "succeeded":
@@ -955,6 +1186,11 @@ class AutonomyDirector:
                 self._route_history[record.route_signature] = now + 600.0
             if record.cross_region:
                 self._last_cross_region_at = now
+                with self._condition:
+                    if self._preference is not None and (
+                        record.kind.startswith("preference_") or record.intent_token == self._preference["request_token"]
+                    ):
+                        self._preference["cross_region_count"] += 1
             for target in record.targets:
                 self._recent_targets.append(target)
                 self._failures.pop(target, None)
@@ -974,6 +1210,7 @@ class AutonomyDirector:
                         intent.activity_index += 1
                         self._last_intent_outcome = "activity_succeeded"
                         if intent.activity_index >= len(intent.activities):
+                            self._intent_disposition(intent.request_token, "completed")
                             self._intent = None
                             self._fallback_active = True
                             self._last_intent_outcome = "fragment_completed"
@@ -986,6 +1223,8 @@ class AutonomyDirector:
                 self._failures[target] = (count, now + min(300.0, 15.0 * (2 ** (count - 1))))
             if record.intent_activity_index is not None:
                 with self._condition:
+                    if record.intent_token:
+                        self._intent_disposition(record.intent_token, "execution_failed")
                     self._intent = None
                     self._fallback_active = True
                     self._last_intent_outcome = "activity_failed"
@@ -1030,6 +1269,12 @@ class AutonomyDirector:
         self._request_intent("fallback_timer")
 
     def _clear_intent_locked(self, outcome: str) -> None:
+        # 人工接管、暂停、聊天切换或角色切换后不继续执行旧偏好。
+        self._preference = None
+        self._preference_last_activity_at = float("-inf")
+        for fragment in (self._intent, self._pending_intent):
+            if fragment is not None:
+                self._intent_disposition(fragment.request_token, "superseded" if outcome == "explicit_control" else "paused" if outcome == "paused" else "chat_engaged" if outcome == "chat_engaged" else "stopped")
         self._intent = None
         self._pending_intent = None
         self._intent_request_serial += 1
@@ -1132,6 +1377,7 @@ class AutonomyDirector:
                 ],
                 "movement_ratio": round(ratio, 3),
                 "previous_intent": previous_intent,
+                "current_preference": self._preference_view(self._clock()),
                 "last_outcome": self._last_intent_outcome,
                 "trigger_event": dict(self._last_social_event) if self._last_social_event else None,
                 "instruction": (
@@ -1179,6 +1425,7 @@ class AutonomyDirector:
             pending = self._pending_intent
             if pending is None:
                 if self._intent is not None and self._intent.expires_at <= now:
+                    self._intent_disposition(self._intent.request_token, "expired")
                     self._intent = None
                     self._fallback_active = True
                     self._last_intent_outcome = "expired"
@@ -1186,8 +1433,19 @@ class AutonomyDirector:
             self._pending_intent = None
             if pending.expires_at <= now:
                 self._last_intent_outcome = "expired_before_apply"
+                self._intent_disposition(pending.request_token, "expired")
                 return
+            if self._intent is not None:
+                self._intent_disposition(self._intent.request_token, "superseded")
             self._intent = pending
+            self._preference = {
+                "motivation": pending.motivation, "mood": pending.mood,
+                "interests": tuple(dict(item) for item in pending.interests),
+                "avoid_targets": pending.avoid_targets, "expires_at": pending.expires_at,
+                "request_token": pending.request_token, "cross_region_count": 0,
+            }
+            self._preference_last_activity_at = float("-inf")
+            self._intent_disposition(pending.request_token, "active")
             self._fallback_active = False
             self._last_intent_outcome = "active"
             self._emit_telemetry(
@@ -1202,6 +1460,7 @@ class AutonomyDirector:
             if intent is None:
                 return False
             if intent.expires_at <= now or intent.activity_index >= len(intent.activities):
+                self._intent_disposition(intent.request_token, "expired" if intent.expires_at <= now else "completed")
                 self._intent = None
                 self._fallback_active = True
                 self._last_intent_outcome = "expired" if intent.expires_at <= now else "fragment_completed"
@@ -1219,6 +1478,7 @@ class AutonomyDirector:
         if compiled is None:
             with self._condition:
                 if self._intent is intent:
+                    self._intent_disposition(intent.request_token, "execution_failed")
                     self._intent = None
                     self._fallback_active = True
                     self._last_intent_outcome = "activity_unavailable"
@@ -1259,6 +1519,11 @@ class AutonomyDirector:
 
     def _on_session_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
+        if event_type == "sys.chat_input_ready" and event.get("session") == self.session.session:
+            self._input_supported = event.get("activity_version") == 1
+        if event_type == "player.chat_activity":
+            self.note_chat_input(event)
+            return
         if event_type == "sys.watchdog":
             # 自动连接前日志尾部可能仍在输出旧会话的 watchdog。Director 尚未
             # 启动时忽略它；运行中的 watchdog 仍保持持久安全暂停。
@@ -1840,6 +2105,60 @@ class AutonomyDirector:
             interest_override_target,
         )
 
+    def _preference_view(self, now: float) -> dict[str, Any] | None:
+        """片段结束后仍保留有限期偏好；每个兴趣也受自己的有效期限制。"""
+        with self._condition:
+            preference = self._preference
+            if preference is None or preference["expires_at"] <= now:
+                return None
+            return {
+                "motivation": preference["motivation"], "mood": preference["mood"],
+                "expires_in_s": round(preference["expires_at"] - now, 1),
+                "interests": [
+                    {"target_key": item["target_key"], "strength": item["strength"], "expires_in_s": round(item["expires_at"] - now, 1)}
+                    for item in preference["interests"] if item["expires_at"] > now
+                ],
+                "avoid_targets": sorted(preference["avoid_targets"]),
+            }
+
+    def _submit_preference_activity(self, now: float) -> bool:
+        """等待下一片段时延续已采纳偏好，仍由原有编译器约束路径和动作。"""
+        preference = self._preference_view(now)
+        if preference is None or now - self._preference_last_activity_at < 30.0:
+            return False
+        mood = preference["mood"]
+        duration = {"quiet": 20, "restful": 25, "playful": 8, "curious": 12, "social": 15}.get(mood, 12)
+        avoid = frozenset(preference["avoid_targets"])
+        candidates = []
+        for interest in sorted(preference["interests"], key=lambda item: item["strength"], reverse=True):
+            target = interest["target_key"]
+            if target in avoid or self._blacklisted(target, now) or interest["strength"] <= 0:
+                continue
+            if target not in self._recent_targets:
+                candidates.append({"kind": "visit", "target_key": target, "duration_s": duration})
+            candidates.append({"kind": "observe", "target_key": target, "duration_s": duration})
+        if mood == "social" and self.session.players:
+            candidates.append({"kind": "socialize", "duration_s": duration})
+        style = {"quiet": "stay_and_look", "restful": "stay_and_look", "playful": "small_loop", "curious": "meander", "social": "stay_and_look"}.get(mood, "stay_and_look")
+        candidates.append({"kind": "local_roam", "style": style, "duration_s": duration})
+        for activity in candidates:
+            compiled = self._compile_intent_activity(activity, avoid, now)
+            if compiled is None:
+                continue
+            graph, kind, targets, regions, movement, dwell, _reason, route, cross_region, _override = compiled
+            with self._condition:
+                if cross_region and (self._preference is None or self._preference["cross_region_count"] >= 1):
+                    continue
+            if self._submit(graph, kind=f"preference_{kind}", targets=targets, regions=regions,
+                            movement=movement, now=now, planned_dwell_s=dwell,
+                            decision_reason="llm_persistent_preference", route_signature=route,
+                            cross_region=cross_region):
+                self._preference_last_activity_at = now
+                self._fallback_active = False
+                self._last_decision_reason = "llm_persistent_preference"
+                return True
+        return False
+
     def _submit_routine(self, now: float) -> None:
         self._fallback_active = True
         self._last_decision_reason = "rule_fallback"
@@ -2123,11 +2442,16 @@ class AutonomyDirector:
             # 越近期访问的目标惩罚越大，较早记录会自然衰减。
             penalty = 4.0 / (1.0 + recent[::-1].index(key))
         local_bonus = 1.0 if isinstance(region, str) and region == current_region else 0.0
-        return 5.0 + local_bonus - penalty + self._rng.random()
+        preference = self._preference_view(self._clock())
+        interest_bonus = 0.0 if preference is None else max(
+            (4.0 * item["strength"] for item in preference["interests"] if item["target_key"] == key), default=0.0,
+        )
+        return 5.0 + local_bonus + interest_bonus - penalty + self._rng.random()
 
     def _blacklisted(self, key: str, now: float) -> bool:
         failure = self._failures.get(key)
-        return failure is not None and failure[1] > now
+        preference = self._preference_view(now)
+        return (failure is not None and failure[1] > now) or (preference is not None and key in preference["avoid_targets"])
 
     def _prune_route_history(self, now: float) -> None:
         expired = [key for key, expires_at in self._route_history.items() if expires_at <= now]

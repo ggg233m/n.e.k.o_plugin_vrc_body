@@ -11,6 +11,16 @@ entry = "plugin.plugins.yui_npc_controller:YuiNpcControllerPlugin"
 [plugin.author]
 name = "N.E.K.O Community"
 
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "main"
+title = "YUI 控制面板"
+entry = "ui/panel.tsx"
+context = "dashboard"
+permissions = ["state:read", "action:call"]
+
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"

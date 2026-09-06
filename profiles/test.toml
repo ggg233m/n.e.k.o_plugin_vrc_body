@@ -16,7 +16,7 @@ log_directory = ""
 enabled = true
 source = "recent_file"
 poll_interval_s = 0.5
-display_seconds = 15
+display_seconds = 10
 max_pages = 4
 max_file_bytes = 2097152
 
@@ -26,6 +26,7 @@ max_chars = 144
 cooldown_s = 2.0
 
 [yui.autonomy]
+proactive_chat_enabled = true
 enabled = true
 auto_connect = true
 decision_interval_s = 1
@@ -41,7 +42,7 @@ enabled = true
 near_distance_m = 2.5
 follow_trigger_m = 3.0
 approach_distance_m = 1.5
-post_reply_hold_s = 15
+post_reply_hold_s = 60
 no_reply_timeout_s = 90
 approach_retry_s = 10
 

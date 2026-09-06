@@ -38,9 +38,10 @@ class MainReplyDisplayBridge:
     """
 
     _PAGE_BODY_BYTES = 370
-    _READING_CHARS_PER_SECOND = 6
+    # 阅读与逐字播放同时进行，不再额外叠加一整段慢速阅读时间。
+    _READING_CHARS_PER_SECOND = 8
     _POST_READ_SECONDS = 6
-    _MAX_ADAPTIVE_DISPLAY_SECONDS = 30
+    _MAX_ADAPTIVE_DISPLAY_SECONDS = 25
     _STORAGE_TIMESTAMP = re.compile(
         r"^\[\d{8}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\]\s*",
     )
@@ -493,6 +494,7 @@ class MainReplyDisplayBridge:
                 "worker_running": bool(thread is not None and thread.is_alive()),
                 "baseline_ready": self._baseline_ready,
                 "queued_pages": len(self._pending_pages),
+                "display_busy": bool(self._pending_pages) or self._clock() < self._next_page_at,
                 "displayed_replies": self._displayed_replies,
                 "displayed_pages": self._displayed_pages,
                 "reply_serial": self._reply_serial,
