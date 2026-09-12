@@ -11,7 +11,6 @@ using UnityEngine.AI;
 public static class NekoYuiFullNpcBuilder
 {
     const string RootName = "NekoNpc_YUI";
-    const string ChiffonPackage = "H:/Unity/vrc/ChiffonLite_2026-7-14/ChiffonLite/ChiffonLite_2026-7-14.unitypackage";
 
     static readonly string[] ExtensionKeys = {
         "cat_pose", "happy_one", "happy_two", "stand_clap", "sit_clap", "dance", "naughty", "spin",
@@ -28,7 +27,13 @@ public static class NekoYuiFullNpcBuilder
     static string ResolveChiffonPackage()
     {
         string custom = EditorPrefs.GetString(ChiffonPackagePrefKey, "");
-        return string.IsNullOrEmpty(custom) ? ChiffonPackage : custom;
+        if (System.IO.File.Exists(custom)) return custom;
+        if (Application.isBatchMode)
+            throw new InvalidOperationException("请先导入模型，或通过 EditorPrefs 键 " + ChiffonPackagePrefKey + " 配置本机模型包路径。");
+        // 模型由用户自行提供，选择结果只保存在当前电脑。
+        custom = EditorUtility.OpenFilePanel("选择 ChiffonLite 模型包", "", "unitypackage");
+        if (!string.IsNullOrEmpty(custom)) EditorPrefs.SetString(ChiffonPackagePrefKey, custom);
+        return custom;
     }
     static void GuardNotFormalScene(string menu)
     {
@@ -45,6 +50,7 @@ public static class NekoYuiFullNpcBuilder
         GuardNotFormalScene("NEKO/YUI NPC/1 Import ChiffonLite");
         if (FindChiffonPrefab() != null) { Debug.Log("[NEKO] ChiffonLiteMB_Medium 已导入，跳过 package。 "); return; }
         string chiffon = ResolveChiffonPackage();
+        if (string.IsNullOrEmpty(chiffon)) return;
         if (!System.IO.File.Exists(chiffon)) throw new System.IO.FileNotFoundException("找不到 Chiffon package（可用 EditorPrefs 键 " + ChiffonPackagePrefKey + " 覆盖路径）", chiffon);
         AssetDatabase.ImportPackage(chiffon, false);
         AssetDatabase.Refresh();

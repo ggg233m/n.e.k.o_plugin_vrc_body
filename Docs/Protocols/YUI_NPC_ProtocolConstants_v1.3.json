@@ -39,7 +39,9 @@
   },
   "capabilities_add": {
     "region_localization": 19,
-    "local_navigation": 20
+    "local_navigation": 20,
+    "pose_stream_v1": 21,
+    "pose_operation_v1": 22
   },
   "capability_contracts_add": {
     "region_localization": {

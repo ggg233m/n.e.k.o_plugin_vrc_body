@@ -169,6 +169,37 @@ class BehaviorPlanTests(unittest.TestCase):
             ("clear_look", None),
         ])
 
+    def test_spatial_selector_recovers_only_confirmed_geometry_rejection(self) -> None:
+        for status, error, expected in (
+            ("failed", "target_not_on_navmesh", "succeeded"),
+            ("failed", "timeout", "failed"),
+            ("failed", "estop_latched", "failed"),
+            ("unknown", "target_not_on_navmesh", "unknown"),
+        ):
+            with self.subTest(status=status, error=error):
+                self.adapter.calls.clear()
+                def reject(target_key, **kwargs):
+                    self.adapter.calls.append(("navigate", target_key))
+                    return {"status": status, "error": error, "op_id": None}
+                self.adapter.navigate_wire = reject
+                accepted = self.manager.submit(_graph(
+                    {"id": "root", "type": "selector", "children": ["go", "fallback"],
+                     "recover_errors": ["target_not_on_navmesh"]},
+                    {"id": "go", "type": "navigate", "target_key": "plaza"},
+                    {"id": "fallback", "type": "turn_relative", "delta_deg": 20},
+                ), origin="autonomy")
+                done = self._wait(accepted["plan_id"])
+                self.assertEqual(done["status"], expected)
+                self.assertEqual(len(self.adapter.calls), 2 if expected == "succeeded" else 1)
+
+    def test_spatial_selector_rejects_unsafe_recovery_configuration(self) -> None:
+        for errors in (["timeout"], ["estop_latched"], [], ["no_path", "no_path"], "no_path"):
+            with self.subTest(errors=errors), self.assertRaises(BehaviorGraphError):
+                BehaviorGraphCompiler(self.session).compile(_graph(
+                    {"id": "root", "type": "selector", "children": ["wait"], "recover_errors": errors},
+                    {"id": "wait", "type": "wait", "duration_ms": 1},
+                ))
+
     def test_retry_is_explicit_and_bounded(self) -> None:
         self.adapter.navigate_results = ["failed", "succeeded"]
         result = self.manager.submit(_graph(

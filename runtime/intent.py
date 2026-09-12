@@ -92,6 +92,8 @@ def _response_schema(context: Mapping[str, Any] | None = None) -> dict[str, Any]
             "action_key": {"type": "string", "minLength": 1, "maxLength": 64, "description": "动作名称，从 action_keys 选择；字段名不是 action，也不能放进 target_key。"},
             "style": {"type": "string", "enum": sorted(_LOCAL_ROAM_STYLES)},
             "duration_s": {"type": "integer", "minimum": 5, "maximum": 60},
+            "motion_description": {"type": "string", "minLength": 1, "maxLength": 320},
+            "motion_style": {"type": "string", "enum": ["natural", "relaxed", "gentle", "lively"]},
         },
         "required": ["kind", "duration_s"],
     }
@@ -226,7 +228,7 @@ def validate_intent(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
     constraints = _catalog_constraints(context)
     normalized_activities: list[dict[str, Any]] = []
     activity_fields = {
-        "kind", "target_key", "tags", "player_slot", "action_key", "style", "duration_s",
+        "kind", "target_key", "tags", "player_slot", "action_key", "style", "duration_s", "motion_description", "motion_style",
     }
     for raw in activities:
         if not isinstance(raw, Mapping) or set(raw) - activity_fields:
@@ -295,6 +297,14 @@ def validate_intent(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
             normalized["action_key"] = action_key
         if style is not None:
             normalized["style"] = style
+        for field in ("motion_description", "motion_style"):
+            if field in raw:
+                content = raw[field]
+                if not isinstance(content, str) or not content.strip() or len(content) > 320:
+                    raise IntentModelError("invalid_motion_description")
+                if field == "motion_style" and content not in {"natural", "relaxed", "gentle", "lively"}:
+                    raise IntentModelError("invalid_motion_style")
+                normalized[field] = content.strip()
         normalized_activities.append(normalized)
 
     avoid_targets = value.get("avoid_targets", [])
@@ -506,6 +516,8 @@ class AutonomyIntentProvider:
             "不得增加 reason、tags、description 等字段；没有明确兴趣时返回空数组。"
             "mood 只能是 curious/quiet/social/playful/restful；"
             "kind 只能是 visit/explore/linger/socialize/perform/observe/local_roam；"
+            "可选 motion_description 用简短英文描述身体运动，motion_style 为 natural/relaxed/gentle/lively。"
+            "它们只补充姿态，不替代 target_key、player_slot、action_key，不可写入坐标或绕过活动边界。"
             "local_roam 必须提供 stay_and_look/turn_left/turn_right/meander/small_loop 之一的 style；"
             "observe 必须引用目录 target_key 或当前 player_slot；"
             "\n三类引用不可混用：地点/物体用 target_key 字符串；玩家用 player_slot 整数；动作名用 action_key 字符串。"
@@ -546,7 +558,7 @@ class AutonomyIntentProvider:
                 "repair": {
                     "unknown_target": "target_key/avoid_targets/interests 只能引用 target_keys。若目标是玩家，删除 target_key，改用 player_slot 整数；若想做动作，用 perform 和 action_key。不要把玩家或动作填入兴趣目标。",
                     "unknown_tag": "tags 只能从 reference_options.tags 选择；不需要筛选时直接删除 tags。动作名不是标签。",
-                    "invalid_activity_fields": "活动字段只允许 kind、duration_s、target_key、player_slot、action_key、tags、style；动作字段名必须是 action_key。",
+                    "invalid_activity_fields": "活动字段只允许 kind、duration_s、target_key、player_slot、action_key、tags、style、motion_description、motion_style；动作字段名必须是 action_key。",
                     "unknown_player_slot": "player_slot 必须是 reference_options.player_slots 内的整数，不能是字符串、浮点数或布尔值。",
                 }.get(correction_error, "对照 schema 修正字段、类型与必填项。"),
                 "instruction": "按 activity_examples 的字段用法和 reference_options 重新生成完整 JSON。只使用当前有效引用，不猜测旧引用对应哪个目标，不解释错误。",

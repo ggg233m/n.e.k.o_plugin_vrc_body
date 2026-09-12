@@ -606,7 +606,7 @@ class AutonomyTests(unittest.TestCase):
             director._intent = None
             self.assertTrue(director._submit_preference_activity(self.clock()))
             nodes = self.adapter.plan_manager.submissions[-1]["graph"]["nodes"]
-            durations[mood] = next(node["duration_ms"] for node in nodes if node["type"] == "wait")
+            durations[mood] = next(node["duration_ms"] for node in nodes if node["id"] == "linger")
             self.assertEqual(any(node["type"] == "move_relative" for node in nodes), mood == "playful")
         self.assertEqual(durations, {"quiet": 20000, "playful": 8000})
         self.clock.advance(61)

@@ -20,6 +20,42 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public Transform npcRoot;
     public NavMeshAgent navAgent;
     public Animator animator;
+    [HideInInspector] public bool externalPoseActive;
+    [HideInInspector] public bool poseTransitionActive;
+    private UdonSharpBehaviour _externalPoseOwner;
+    private bool _externalAnimatorEnabled;
+
+    public bool AcquireExternalPose(UdonSharpBehaviour owner)
+    {
+        if (owner == null || externalPoseActive || poseTransitionActive || npcRoot == null || animator == null || router == null
+            || !router.HasLocalDriverAuthority() || router.GetControlState() != NekoMidiRouter.STATE_EXTERNAL) return false;
+        Stop();
+        DisableAgent();
+        _externalAnimatorEnabled = animator.enabled;
+        _externalPoseOwner = owner;
+        externalPoseActive = true;
+        animator.enabled = false;
+        _lastPos = npcRoot.position;
+        return true;
+    }
+
+    public void ReleaseExternalPose()
+    {
+        if (!externalPoseActive) return;
+        // 先撤销所有权再通知执行器，避免恢复回调重新进入释放流程。
+        externalPoseActive = false;
+        UdonSharpBehaviour owner = _externalPoseOwner;
+        _externalPoseOwner = null;
+        DisableAgent();
+        _hasTarget = false;
+        _speed = 0f;
+        _vel = Vector3.zero;
+        if (owner != null) owner.SendCustomEvent("ReleasePose");
+        if (animator != null) animator.enabled = _externalAnimatorEnabled;
+        if (npcRoot != null) _lastPos = npcRoot.position;
+        // 下一条通过验证的导航命令重新启用 NavMeshAgent，不恢复旧路径。
+        ApplyAnimator();
+    }
 
     [Header("NavMeshAgent 固定参数（协议 v1.1 §11.1）")]
     public float maxSpeed = 2.0f;
@@ -28,6 +64,17 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     public float stopDistance = 0.3f;
     public float followDistance = 1.2f;
     public float followRefreshSec = 0.2f;
+    [Tooltip("[NEKO 2026-09-03] 命令未指定速度（speed≤0.01）以及 wander/explore 的默认巡航速度（m/s）。maxSpeed 仍是协议上限，本值只改默认值，不改协议。")]
+    public float defaultCruiseSpeed = 1.1f;
+    [Tooltip("[NEKO 2026-09-03] Animator Speed 参数的阻尼时间（秒），避免起步/到达时走-站混合瞬切。")]
+    public float speedDampTime = 0.12f;
+    [Tooltip("协调注视：头眼先转，身体在超过死区并稳定后补转")]
+    public bool coordinatedTurning;
+    public float bodyAssistStartAngle = 35f;
+    public float bodyAssistStopAngle = 12f;
+    public float bodyAssistDelay = 0.18f;
+    private float _bodyAssistSince = -1f;
+    private bool _bodyAssistTurning;
     [Tooltip("连续巡逻在到达该距离时预切下一航点，必须大于 stoppingDistance 才能避免逐点停车")]
     public float wanderSwitchDistance = 0.9f;
     [Tooltip("v1.2 绕行每圈路点数；冻结验收配置使用 24")]
@@ -148,7 +195,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         turnRateDeg = 180f;
         stopDistance = 0.3f;
         followDistance = 1.2f;
-        _cruise = maxSpeed;
+        _cruise = DefaultCruise();
         _lastPos = npcRoot.position;
         _stuckAnchor = _lastPos;
         ConfigureAgent();
@@ -350,7 +397,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _exploreTargetsVisited = 0;
         _exploreHistoryCount = 0;
         _exploreHistoryCursor = 0;
-        _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
+        _cruise = Mathf.Clamp(speed <= 0.01f ? DefaultCruise() : speed, 0.1f, maxSpeed);
         _arrivalDistance = stopDistance;
         _hasTarget = false;
         _mode = MODE_EXPLORE;
@@ -524,7 +571,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _hasTarget = true;
         _finishingGotoYaw = false;
         _turnYaw = -1f;
-        _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
+        _cruise = Mathf.Clamp(speed <= 0.01f ? DefaultCruise() : speed, 0.1f, maxSpeed);
         _mode = mode;
         if (mode != MODE_GOTO) _arrivalDistance = stopDistance;
         ResetStuck();
@@ -542,7 +589,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         _hasTarget = true;
         _finishingGotoYaw = false;
         _turnYaw = -1f;
-        _cruise = Mathf.Clamp(speed <= 0.01f ? maxSpeed : speed, 0.1f, maxSpeed);
+        _cruise = Mathf.Clamp(speed <= 0.01f ? DefaultCruise() : speed, 0.1f, maxSpeed);
         _mode = mode;
         navAgent.speed = _cruise;
         navAgent.stoppingDistance = MovementStoppingDistance(mode);
@@ -709,6 +756,29 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     }
 
     public void SetStateRate(int level) { stateRateLevel = Mathf.Clamp(level, 0, 3); }
+
+    private float DefaultCruise() { return Mathf.Clamp(defaultCruiseSpeed <= 0.01f ? maxSpeed : defaultCruiseSpeed, 0.1f, maxSpeed); }
+
+    // [NEKO 2026-09-03] 供 NekoNpcLife 读取当前显式注视目标（LOOK_AT 槽位或注视点）；无目标返回 false。
+    public bool HasLookTarget()
+    {
+        if (_lookSlot >= 0 && perception != null)
+        {
+            VRCPlayerApi watched = perception.PlayerOfSlot(_lookSlot);
+            return watched != null && watched.IsValid();
+        }
+        return _hasLookPoint;
+    }
+
+    public Vector3 GetLookTargetPosition()
+    {
+        if (_lookSlot >= 0 && perception != null)
+        {
+            VRCPlayerApi watched = perception.PlayerOfSlot(_lookSlot);
+            if (watched != null && watched.IsValid()) return watched.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).position;
+        }
+        return _lookPoint;
+    }
     public int GetMode() { return _mode; }
     public int GetAnimId() { return _actionId; }
     public int GetActionId() { return _actionId; }
@@ -726,6 +796,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         bool owner = npcRoot != null && Networking.IsOwner(npcRoot.gameObject);
         if (!driver || !sessionReady || !owner)
         {
+            if (externalPoseActive && router != null) router.CancelExternalPose("authority_lost");
             DisableAgent();
             if (driver && sessionReady && !owner)
             {
@@ -744,6 +815,26 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         float dt = Time.deltaTime;
         if (dt <= 0f) return;
         float now = Time.timeSinceLevelLoad;
+
+        // 表情独立计时，身体控制权交给ARDY时也必须正常过期。
+        if (_expressionUntil > 0f && now >= _expressionUntil)
+        {
+            ClearExpression();
+            if (router != null) router.OnExpressionExpired();
+        }
+
+        if (externalPoseActive || poseTransitionActive)
+        {
+            // 外部执行器独占根和骨骼；遥测继续更新，不调用 Step、注视或 Animator。
+            if (navAgent != null && navAgent.enabled) { router.CancelExternalPose("root_writer_conflict"); return; }
+            _vel = (npcRoot.position - _lastPos) / dt;
+            _lastPos = npcRoot.position;
+            _speed = new Vector2(_vel.x, _vel.z).magnitude;
+            float externalHz = stateRateLevel == 1 ? 1f : (stateRateLevel == 2 ? 5f : (stateRateLevel == 3 ? 10f : 0f));
+            _stateTimer += dt;
+            if (externalHz > 0f && _stateTimer >= 1f / externalHz) { _stateTimer = 0f; EmitState(); }
+            return;
+        }
 
         if (_lookPointUntil > 0f && now >= _lookPointUntil)
         {
@@ -765,11 +856,6 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         {
             StopAction();
             if (router != null) router.OnActionFinished();
-        }
-        if (_expressionUntil > 0f && now >= _expressionUntil)
-        {
-            ClearExpression();
-            if (router != null) router.OnExpressionExpired();
         }
 
         if (_mode == MODE_ESTOP)
@@ -974,6 +1060,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     {
         float faceYaw = -1f;
         bool completingTurn = false;
+        bool bodyAssist = false;
         if (_turnYaw >= 0f) { faceYaw = _turnYaw; completingTurn = true; }
         else if (_mode == MODE_ORBIT && _orbitFaceTarget)
         {
@@ -982,6 +1069,7 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         }
         else if (_mode == MODE_IDLE && _lookSlot >= 0 && perception != null)
         {
+            bodyAssist = true;
             VRCPlayerApi player = perception.PlayerOfSlot(_lookSlot);
             if (player != null && player.IsValid())
             {
@@ -991,12 +1079,29 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
         }
         else if (_mode == MODE_IDLE && _hasLookPoint && _lookBodyAssist)
         {
+            bodyAssist = true;
             Vector3 d = _lookPoint - npcRoot.position; d.y = 0f;
             if (d.sqrMagnitude > 0.01f) faceYaw = YawOf(d.normalized);
         }
-        if (faceYaw < 0f) return;
+        if (faceYaw < 0f) { _bodyAssistSince = -1f; _bodyAssistTurning = false; return; }
+        float rotationSpeed = turnRateDeg;
+        if (coordinatedTurning && bodyAssist)
+        {
+            float error = Mathf.Abs(Mathf.DeltaAngle(npcRoot.eulerAngles.y, faceYaw));
+            if ((_actionId >= 0 && _actionLayer == 2) || error < bodyAssistStopAngle)
+            { _bodyAssistSince = -1f; _bodyAssistTurning = false; return; }
+            if (!_bodyAssistTurning)
+            {
+                if (error < bodyAssistStartAngle) { _bodyAssistSince = -1f; return; }
+                if (_bodyAssistSince < 0f) _bodyAssistSince = Time.timeSinceLevelLoad;
+                if (Time.timeSinceLevelLoad - _bodyAssistSince < bodyAssistDelay) return;
+                _bodyAssistTurning = true;
+            }
+            rotationSpeed = Mathf.Min(turnRateDeg, Mathf.Max(20f, error * 3f));
+        }
+        else { _bodyAssistSince = -1f; _bodyAssistTurning = false; }
         Quaternion wanted = Quaternion.Euler(0f, faceYaw, 0f);
-        npcRoot.rotation = Quaternion.RotateTowards(npcRoot.rotation, wanted, turnRateDeg * dt);
+        npcRoot.rotation = Quaternion.RotateTowards(npcRoot.rotation, wanted, rotationSpeed * dt);
         if (completingTurn && Quaternion.Angle(npcRoot.rotation, wanted) <= 2f)
         {
             _turnYaw = -1f;
@@ -1182,12 +1287,16 @@ public class NekoNpcLocomotion : UdonSharpBehaviour
     private void ApplyAnimator()
     {
         if (animator == null) return;
-        animator.SetFloat("Speed", _speed);
+        // 只同步参数；独立面部播放器使用相同语义状态，退出后Animator可直接接续。
+        animator.SetInteger("ExpressionId", _expressionId);
+        animator.SetFloat("ExpressionWeight", _expressionWeight);
+        if (externalPoseActive || poseTransitionActive) return;
+        // [NEKO 2026-09-03] 带阻尼写入，起步/停步时走-站混合平滑过渡（急停时立即归零）。
+        if (_mode == MODE_ESTOP || speedDampTime <= 0f) animator.SetFloat("Speed", _speed);
+        else animator.SetFloat("Speed", _speed, speedDampTime, Time.deltaTime);
         animator.SetInteger("ActionId", _actionId);
         animator.SetInteger("ActionSeq", _actionSeq);
         animator.SetBool("ActionLoop", _actionLoop);
-        animator.SetInteger("ExpressionId", _expressionId);
-        animator.SetFloat("ExpressionWeight", _expressionWeight);
         animator.SetBool("Estop", _mode == MODE_ESTOP);
     }
 

@@ -20,3 +20,32 @@ memory/
 .trae/
 # 同一工作区中的独立 YUI 工作副本，禁止再次提交为自嵌套 gitlink。
 yui_npc_controller/
+
+# 本机凭据与配置；模板仍可提交。
+.secrets/
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.cache/
+.huggingface/
+/ardy.local.json
+.ardy-integration-backups/
+
+# 原始验收数据和逐次结果留在本地，Git仅保留人工整理的验收报告。
+/Docs/ARDY/evidence/**
+!/Docs/ARDY/evidence/**/
+!/Docs/ARDY/evidence/**/REPORT.md
+!/Docs/ARDY/evidence/**/VALIDATION.md
+
+# 本机实测输出，不排除验收脚本和可复现的沙盒素材。
+/integrations/acceptance/*.log
+/integrations/acceptance/*.signal
+/integrations/acceptance/recovery-live-*/
+
+# 本机测试配置保留在磁盘，不提交到仓库。
+/profiles/test.toml
+
+# 本地 UdonSharp 编译生成文件；保留源码，不屏蔽其他 Unity 资产。
+/unity/Assets/SerializedUdonPrograms/*.asset
+/unity/Assets/SerializedUdonPrograms/*.asset.meta

@@ -15,6 +15,106 @@ public class NekoMidiRouter : UdonSharpBehaviour
     public NekoNpcLocomotion locomotion;
     public NekoNpcPerception perception;
     public NekoNpcNameplate nameplate;
+    [Header("可选全身姿态执行，默认关闭")]
+    public bool enablePoseStream;
+    public UdonSharpBehaviour poseExecutor;
+    [HideInInspector] public bool poseCapabilityReady;
+    [HideInInspector] public bool poseContinuousReady;
+    private string _motionStreamId;
+    [HideInInspector] public string poseReleaseReason;
+
+    public bool BeginMotionStream(string streamId,UdonSharpBehaviour executor)
+    {
+        if(!poseContinuousReady || executor!=poseExecutor || _motionStreamId!=null
+            || _state!=STATE_EXTERNAL || ActiveOpsJson()!="[]" || !HasLocalDriverAuthority()) return false;
+        if(!locomotion.AcquireExternalPose(executor)) return false;
+        _motionStreamId=streamId;
+        _poseLeaseUntil=Time.realtimeSinceStartup+.5f;
+        return true;
+    }
+
+    public bool BeginStreamTask(string opId)
+    {
+        if(_motionStreamId==null || !TouchExternalPose(_motionStreamId)) return false;
+        if(_opId[LaneAction]!=null) CancelOperation(LaneAction,"replaced");
+        _opId[LaneAction]=opId; _opKind[LaneAction]="motion";
+        _opSeq[LaneAction]=0; _opHash[LaneAction]=0;
+        _opStartedAt[LaneAction]=Time.timeSinceLevelLoad;
+        SetState(STATE_ACTION);
+        telemetry.EmitForced("npc.operation_started","\"op_id\":"+telemetry.J(opId)+",\"kind\":\"motion\",\"request_seq\":0,\"request_hash\":\"0000\",\"expected_end_ms\":null");
+        return true;
+    }
+
+    public bool CompleteStreamTask(string opId)
+    {
+        if(_motionStreamId==null || _opId[LaneAction]!=opId || !TouchExternalPose(_motionStreamId)) return false;
+        SetState(STATE_EXTERNAL);
+        CompleteOperation(LaneAction,"motion_completed");
+        // 语义任务终态不释放身体所有权。
+        return true;
+    }
+
+    public void EndMotionStream()
+    {
+        if(_motionStreamId==null) return;
+        CancelExternalPose("stream_closed");
+    }
+
+    private float _poseLeaseUntil;
+
+    public string BeginExternalPoseOperation(string opId, UdonSharpBehaviour executor)
+    {
+        if (!enablePoseStream || poseExecutor == null || executor != poseExecutor || !enableOperationLifecycle) return "unsupported_capability";
+        if (_session <= 0 || !HasLocalDriverAuthority()) return "not_driver";
+        if (_state != STATE_EXTERNAL || locomotion == null || locomotion.externalPoseActive) return "invalid_state";
+        if (opId == null || opId.Length != 32) return "invalid_param";
+        for (int i=0; i<32; i++) if ("0123456789abcdef".IndexOf(opId.Substring(i,1)) < 0) return "invalid_param";
+        for (int i=0; i<_opId.Length; i++) if (_opId[i] != null) return "action_busy";
+        if (!locomotion.AcquireExternalPose(executor)) return "invalid_state";
+        _opId[LaneAction] = opId; _opKind[LaneAction] = "motion";
+        _opSeq[LaneAction] = 0; _opHash[LaneAction] = 0;
+        _opStartedAt[LaneAction] = Time.timeSinceLevelLoad;
+        _poseLeaseUntil = Time.realtimeSinceStartup + .5f;
+        SetState(STATE_ACTION);
+        telemetry.Emit("npc.operation_started", "\"op_id\":" + telemetry.J(opId)
+            + ",\"kind\":\"motion\",\"request_seq\":0,\"request_hash\":\"0000\",\"expected_end_ms\":null");
+        return null;
+    }
+
+    public bool TouchExternalPose(string opId)
+    {
+        if(!IsExternalPoseAuthorized(opId))return false;
+        _poseLeaseUntil = Time.realtimeSinceStartup + .5f;
+        return true;
+    }
+
+    // 只读取同一个授权时钟；接收器与骨骼执行器不能各自维持冲突的持续租约。
+    public bool IsExternalPoseAuthorized(string opId)
+    {
+        if(!enablePoseStream || locomotion==null || !locomotion.externalPoseActive
+            || !HasLocalDriverAuthority() || Time.realtimeSinceStartup>=_poseLeaseUntil)return false;
+        return _motionStreamId!=null ? opId==_motionStreamId : _opKind[LaneAction]=="motion" && _opId[LaneAction]==opId;
+    }
+
+    public bool CompleteExternalPose(string opId)
+    {
+        if (!TouchExternalPose(opId)) return false;
+        // 调用者只能在末帧应用、接触和目标验证完成后进入此终态。
+        locomotion.ReleaseExternalPose();
+        CompleteOperation(LaneAction, "motion_completed");
+        SetState(StateAfterAction());
+        return true;
+    }
+
+    public void CancelExternalPose(string reason)
+    {
+        if (locomotion == null || !locomotion.externalPoseActive) return;
+        _motionStreamId=null;
+        poseReleaseReason=reason;
+        locomotion.ReleaseExternalPose();
+        if (_opKind[LaneAction] == "motion") CancelOperation(LaneAction, reason);
+        if (_state == STATE_ACTION) SetState(StateAfterAction());
+    }
 
     [Header("世界与握手")]
     public string worldName = "YUI Matchbox";
@@ -63,6 +163,8 @@ public class NekoMidiRouter : UdonSharpBehaviour
     public string[] actionLayers = new string[] { "upper_body", "upper_body", "upper_body", "upper_body", "full_body", "upper_body", "upper_body", "full_body", "upper_body", "upper_body", "upper_body", "upper_body", "upper_body", "upper_body", "upper_body", "upper_body" };
     public int[] actionDurationMs = new int[] { 1800, 1200, 1400, 1800, 2200, 2400, 2600, 2200, 2000, 1800, 1600, 1600, 1600, 1500, 2000, 2200 };
     public bool[] actionLoopable = new bool[16];
+    [Tooltip("停用动作只从目录移除，保留编号，旧请求返回 action_not_found")]
+    public int[] disabledActionIds = new int[0];
     public string[] actionMovement = new string[] { "allow", "allow", "allow", "allow", "block", "allow", "allow", "block", "allow", "allow", "allow", "allow", "allow", "allow", "allow", "allow" };
     public int[] actionPriority = new int[] { 30, 30, 30, 40, 60, 30, 30, 70, 20, 30, 30, 30, 30, 30, 40, 50 };
     public bool[] actionInterruptible = new bool[] { true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true };
@@ -288,6 +390,11 @@ public class NekoMidiRouter : UdonSharpBehaviour
     {
         if (actionNames == null || actionNames.Length < 16 || actionNames.Length > 127) return "action 目录必须包含核心 0..15";
         int n = actionNames.Length;
+        if(disabledActionIds!=null)for(int i=0;i<disabledActionIds.Length;i++)
+        {
+            if(disabledActionIds[i]<0||disabledActionIds[i]>=n)return "停用 action ID 越界";
+            for(int j=0;j<i;j++)if(disabledActionIds[j]==disabledActionIds[i])return "停用 action ID 重复";
+        }
         if (actionSemanticKeys == null || actionSemanticKeys.Length != n || actionDescriptionsZh == null || actionDescriptionsZh.Length != n
             || actionIntentTagsJson == null || actionIntentTagsJson.Length != n || actionTargetRequired == null || actionTargetRequired.Length != n
             || actionSpeechCompatible == null || actionSpeechCompatible.Length != n || actionLayers == null || actionLayers.Length != n
@@ -684,7 +791,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
     private string PrepareAction(int actionSeq, int actionId, bool loop)
     {
         _preparedPost = 0;
-        if (actionId < 0 || actionNames == null || actionId >= actionNames.Length) return "action_not_found";
+        if (!IsActionAvailable(actionId)) return "action_not_found";
         if (loop && !actionLoopable[actionId]) return "invalid_param";
         if (actionTargetRequired[actionId] == "player" && (_targetSlot < 0 || perception.PlayerOfSlot(_targetSlot) == null)) return "slot_unknown";
         if (actionTargetRequired[actionId] == "point") return "invalid_param";
@@ -832,7 +939,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
 
     private void SendHelloAndCatalog(bool includePlayers)
     {
-        int actionCount = enableActions && actionNames != null ? actionNames.Length : 0;
+        int actionCount = GetAvailableActionCount();
         int expressionCount = enableExpressions && expressionNames != null ? expressionNames.Length : 0;
         int presetCount = enableTextPreset && textPresets != null ? textPresets.Length : 0;
         int anchorCount = enableAnchors && anchorTransforms != null ? anchorTransforms.Length : 0;
@@ -861,18 +968,35 @@ public class NekoMidiRouter : UdonSharpBehaviour
 
     private void SendActionCatalog()
     {
-        int count = enableActions && actionNames != null ? actionNames.Length : 0;
+        int count = GetAvailableActionCount();
         if (count == 0) { SendEmptyCatalog("action"); return; }
-        for (int i = 0; i < count; i++)
+        int page=0;
+        for (int i = 0; i < actionNames.Length; i++)
         {
+            if(!IsActionAvailable(i))continue;
+            page++;
             string item = "{\"id\":" + i + ",\"name\":" + telemetry.J(actionNames[i]) + ",\"semantic_key\":" + telemetry.J(actionSemanticKeys[i])
                 + ",\"description_zh\":" + telemetry.J(actionDescriptionsZh[i]) + ",\"intent_tags\":" + actionIntentTagsJson[i]
                 + ",\"target_required\":" + telemetry.J(actionTargetRequired[i]) + ",\"speech_compatible\":" + telemetry.B(actionSpeechCompatible[i])
                 + ",\"layer\":" + telemetry.J(actionLayers[i]) + ",\"duration_ms\":" + actionDurationMs[i] + ",\"loopable\":" + telemetry.B(actionLoopable[i])
                 + ",\"movement\":" + telemetry.J(actionMovement[i]) + ",\"priority\":" + actionPriority[i] + ",\"interruptible\":" + telemetry.B(actionInterruptible[i])
                 + ",\"fade_in_ms\":" + actionFadeInMs[i] + ",\"fade_out_ms\":" + actionFadeOutMs[i] + "}";
-            telemetry.Emit("sys.catalog", "\"catalog_rev\":" + catalogRevision + ",\"kind\":\"action\",\"page\":" + (i + 1) + ",\"pages\":" + count + ",\"items\":[" + item + "]");
+            telemetry.Emit("sys.catalog", "\"catalog_rev\":" + catalogRevision + ",\"kind\":\"action\",\"page\":" + page + ",\"pages\":" + count + ",\"items\":[" + item + "]");
         }
+    }
+
+    public bool IsActionAvailable(int id)
+    {
+        if(!enableActions||actionNames==null||id<0||id>=actionNames.Length)return false;
+        if(disabledActionIds!=null)for(int i=0;i<disabledActionIds.Length;i++)if(disabledActionIds[i]==id)return false;
+        return true;
+    }
+
+    public int GetAvailableActionCount()
+    {
+        if(!enableActions||actionNames==null)return 0;
+        int count=0;for(int i=0;i<actionNames.Length;i++)if(IsActionAvailable(i))count++;
+        return count;
     }
 
     private void SendExpressionCatalog()
@@ -953,7 +1077,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         int playerPages = perception.SnapshotPageCount();
         int parts = playerPages + 4; int part = 1;
         string watchdogAge = _lastHeartbeat < 0f ? "null" : Mathf.Max(0, Mathf.RoundToInt((Time.timeSinceLevelLoad - _lastHeartbeat) * 1000f)).ToString();
-        int actionCount = enableActions && actionNames != null ? actionNames.Length : 0;
+        int actionCount = GetAvailableActionCount();
         int expressionCount = enableExpressions && expressionNames != null ? expressionNames.Length : 0;
         int presetCount = enableTextPreset && textPresets != null ? textPresets.Length : 0;
         int anchorCount = enableAnchors && anchorTransforms != null ? anchorTransforms.Length : 0;
@@ -1147,6 +1271,10 @@ public class NekoMidiRouter : UdonSharpBehaviour
 
     private string StateError(int cmd)
     {
+        if (locomotion != null && locomotion.externalPoseActive
+            && cmd != CMD_STOP && cmd != CMD_HEARTBEAT && cmd != CMD_SNAPSHOT_REQUEST
+            && cmd != CMD_TEXT_BEGIN && cmd != CMD_TEXT_COMMIT && cmd != CMD_TEXT_PRESET
+            && cmd != CMD_SET_RATE && cmd != CMD_RAY_SCAN && cmd != CMD_SET_CONTROL_MODE) return "action_busy";
         if (_state == STATE_ESTOP) { if (cmd == CMD_HEARTBEAT || cmd == CMD_CLEAR_ESTOP || cmd == CMD_SNAPSHOT_REQUEST) return null; return "estop_latched"; }
         if (_state == STATE_SAFE_IDLE)
         {
@@ -1352,9 +1480,14 @@ public class NekoMidiRouter : UdonSharpBehaviour
         int elapsed = Mathf.Max(0, Mathf.RoundToInt((Time.timeSinceLevelLoad - _opStartedAt[lane]) * 1000f));
         ClearOperation(lane);
         if (enableOperationLifecycle)
-            telemetry.Emit("npc.operation_completed", "\"op_id\":" + telemetry.J(opId) + ",\"kind\":" + telemetry.J(kind)
+        {
+            string body = "\"op_id\":" + telemetry.J(opId) + ",\"kind\":" + telemetry.J(kind)
                 + ",\"request_seq\":" + seq + ",\"request_hash\":" + telemetry.J(Hex4(hash))
-                + ",\"elapsed_ms\":" + elapsed + ",\"result\":" + telemetry.J(result));
+                + ",\"elapsed_ms\":" + elapsed + ",\"result\":" + telemetry.J(result);
+            // 姿态操作的双终态同走强制队列，避免普通状态积压导致已完成动作被误判超时。
+            if (kind == "motion") telemetry.EmitForced("npc.operation_completed", body);
+            else telemetry.Emit("npc.operation_completed", body);
+        }
     }
 
     private void CancelOperation(int lane, string reason)
@@ -1363,10 +1496,13 @@ public class NekoMidiRouter : UdonSharpBehaviour
         string opId = _opId[lane]; string kind = _opKind[lane]; int seq = _opSeq[lane]; int hash = _opHash[lane];
         int elapsed = Mathf.Max(0, Mathf.RoundToInt((Time.timeSinceLevelLoad - _opStartedAt[lane]) * 1000f));
         ClearOperation(lane);
-        if (enableOperationLifecycle)
-            telemetry.Emit("npc.operation_cancelled", "\"op_id\":" + telemetry.J(opId) + ",\"kind\":" + telemetry.J(kind)
+        if (enableOperationLifecycle) {
+            string body="\"op_id\":" + telemetry.J(opId) + ",\"kind\":" + telemetry.J(kind)
                 + ",\"request_seq\":" + seq + ",\"request_hash\":" + telemetry.J(Hex4(hash))
-                + ",\"elapsed_ms\":" + elapsed + ",\"reason\":" + telemetry.J(reason));
+                + ",\"elapsed_ms\":" + elapsed + ",\"reason\":" + telemetry.J(reason);
+            if(kind=="motion")telemetry.EmitForced("npc.operation_cancelled",body);
+            else telemetry.Emit("npc.operation_cancelled",body);
+        }
     }
 
     private void FailOperation(int lane, string error, string detail)
@@ -1408,6 +1544,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
 
     private void CancelAllOperations(string reason)
     {
+        CancelExternalPose(reason);
         CancelOperation(LaneMovement, reason); CancelOperation(LaneLook, reason); CancelAction(reason); CancelOperation(LaneExpression, reason);
         _movementSemanticKey = null;
     }
@@ -1546,6 +1683,9 @@ public class NekoMidiRouter : UdonSharpBehaviour
 
     void Update()
     {
+        if (locomotion != null && locomotion.externalPoseActive
+            && (!enablePoseStream || poseExecutor == null || !HasLocalDriverAuthority() || Time.realtimeSinceStartup >= _poseLeaseUntil))
+            CancelExternalPose("pose_lease_lost");
         float now = Time.timeSinceLevelLoad;
         if (_textTransferSeq != 0 && now >= _textDeadline)
         {
@@ -1638,6 +1778,7 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (HasNavmeshCapability()) bits += 1 << 13; if (enableSocialSignals) bits += 1 << 14; if (enableAnchors) bits += 1 << 15; if (enableOperationLifecycle) bits += 1 << 16;
         if (enableWorldMap) bits += 1 << 17; if (enableSemanticNavigation) bits += 1 << 18;
         if (enableRegionLocalization) bits += 1 << 19; if (enableLocalNavigation) bits += 1 << 20;
+        if (PoseReady()) { bits += 1 << 21; bits += 1 << 22; }
         return bits;
     }
 
@@ -1662,8 +1803,18 @@ public class NekoMidiRouter : UdonSharpBehaviour
         if (enableWorldMap) { if (comma) result += ","; result += "\"world_map\""; comma = true; }
         if (enableSemanticNavigation) { if (comma) result += ","; result += "\"semantic_navigation\""; comma = true; }
         if (enableRegionLocalization) { if (comma) result += ","; result += "\"region_localization\""; comma = true; }
-        if (enableLocalNavigation) { if (comma) result += ","; result += "\"local_navigation\""; }
+        if (enableLocalNavigation) { if (comma) result += ","; result += "\"local_navigation\""; comma = true; }
+        if (PoseReady()) { if (comma) result += ","; result += "\"pose_stream_v1\",\"pose_operation_v1\""; if(poseContinuousReady) result += ",\"pose_stream_v2\",\"pose_link_recovery_v1\",\"pose_wrapped_root_v1\",\"pose_surface_path_v1\",\"pose_curved_path_v1\",\"pose_surface_recovery_v1\",\"pose_navmesh_region_v1\",\"pose_soft_contacts_v1\""; }
         return result + "]";
+    }
+
+    private bool PoseReady()
+    {
+        // 执行桥现场核验引用；未安装或失效的桥不能宣告动作能力。
+        if (!enablePoseStream || !enableOperationLifecycle || poseExecutor == null) return false;
+        poseCapabilityReady = false; poseContinuousReady=false;
+        poseExecutor.SendCustomEvent("RefreshCapability");
+        return poseCapabilityReady;
     }
 
     private bool IsSpecV12Plus() { return telemetry != null && (telemetry.specVersion == "1.2" || telemetry.specVersion == "1.3"); }

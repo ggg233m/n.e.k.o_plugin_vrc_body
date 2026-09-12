@@ -109,6 +109,7 @@ class YuiSessionState:
         self.driver_pid: int | None = None
         self.chat_input_activity_version = 0
         self.control_state = "unhandshaken"
+        self._state_revision = None
         self.estop = False
         self.capabilities: tuple[str, ...] = ()
         self.capability_bits = 0
@@ -204,6 +205,7 @@ class YuiSessionState:
         self.session = session
         self.control_state = "safe_idle"
         self.estop = False
+        self._state_revision = None
         self.capabilities = ()
         self.capability_bits = 0
         self.wire_bounds = None
@@ -314,12 +316,32 @@ class YuiSessionState:
             if isinstance(event_spec, str):
                 self.spec_version = event_spec
 
+            project_state = True
+            if event_type in {"npc.ack", "npc.state", "npc.operation_started", "npc.operation_completed", "npc.operation_cancelled", "npc.operation_failed"}:
+                revision = event_copy.get("state_revision")
+                project_state = (event_session == self.session or (self.session == 0 and revision is None)) and not event_copy.get("replayed", False)
+                if revision is None:
+                    project_state = project_state and self._state_revision is None
+                else:
+                    project_state = (project_state and type(revision) is int and revision > 0
+                                     and (self._state_revision is None or revision > self._state_revision))
+                if project_state and revision is not None:
+                    self._state_revision = revision
+                if not project_state:
+                    event_copy["projection_stale"] = True
+                elif event_type.startswith("npc.operation_") and event_copy.get("control_state") in {
+                    "unhandshaken","safe_idle","external","moving","action","estop"}:
+                    self.control_state=event_copy["control_state"]
+                    self.estop=self.control_state=="estop"
+                    if self.estop:self.host_arm_authorized=False
+
             if event_type == "npc.ack":
                 self._ack_generation += 1
                 ack = replace(YuiAck.from_event(event_copy), arrival_index=self._ack_generation)
                 self._acks.append(ack)
-                self.control_state = ack.state
-                self.estop = ack.state == "estop"
+                if project_state:
+                    self.control_state = ack.state
+                    self.estop = ack.state == "estop"
                 if self.estop or ack.error in {"not_owner", "ownership_failed"}:
                     self.host_arm_authorized = False
                 self._condition.notify_all()
@@ -382,7 +404,7 @@ class YuiSessionState:
                     merged = dict(self.players.get(slot, {"slot": slot}))
                     merged.update(dict(player))
                     self.players[slot] = merged
-            elif event_type == "npc.state":
+            elif event_type == "npc.state" and project_state:
                 self.npc_state = {
                     key: value
                     for key, value in event_copy.items()
@@ -457,6 +479,9 @@ class YuiSessionState:
         if not isinstance(op_id, str):
             return
         record = dict(self.operations.get(op_id, {}))
+        # 迟到的开始/取消快照不能复活或改写已经实际终结的同一操作。
+        if record.get("status") in {"succeeded","cancelled","failed"}:
+            return
         record.update({
             "op_id": op_id,
             "kind": event.get("kind"),
@@ -511,13 +536,22 @@ class YuiSessionState:
             return
         if section == "session":
             self.driver_pid = data.get("driver_pid") if isinstance(data.get("driver_pid"), int) else None
-            self.control_state = str(data.get("control_state", self.control_state))
-            self.estop = bool(data.get("estop", self.estop))
+            # 分片快照可能晚于新的ACK。缺少生成版本时不能覆盖已版本化控制投影。
+            revision = data.get("state_revision")
+            if ((self._state_revision is None and revision is None)
+                or (type(revision) is int and revision>0
+                    and (self._state_revision is None or revision>self._state_revision))):
+                self.control_state = str(data.get("control_state", self.control_state))
+                self.estop = bool(data.get("estop", self.estop))
+                if revision is not None:
+                    self._state_revision = revision
             self.capabilities = tuple(str(item) for item in data.get("caps", self.capabilities))
             if self.estop or self.driver_pid is None:
                 self.host_arm_authorized = False
         elif section == "npc":
-            self.npc_state = dict(data)
+            # 新版世界的完整NPC状态由单调npc.state更新，旧快照不能回灌旧动作。
+            if self._state_revision is None:
+                self.npc_state = dict(data)
         elif section == "players":
             for player in data.get("players", []):
                 if isinstance(player, Mapping) and isinstance(player.get("slot"), int):

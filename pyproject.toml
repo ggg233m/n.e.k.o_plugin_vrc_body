@@ -28,7 +28,16 @@ yui_npc_controller = ["Docs/Protocols/*", "config.example.toml", "ui/*.tsx", "pl
 [tool.neko.build]
 # N.E.K.O 插件包只携带运行时、协议文档、配置与 vendor 依赖。
 # 测试证据、Unity 验收源和旧工作区临时文件由各自仓库维护。
+exclude = ["profiles/test.toml", "Docs/ARDY/**", ".env", ".env.*", "ardy.local.json", "config.local.toml", "*.log", "**/*.log", "**/*.signal"]
 exclude_dirs = [
+  "Docs/ARDY",
+  ".secrets",
+  ".cache",
+  ".huggingface",
+  ".ardy-integration-backups",
+  ".claude",
+  ".trae",
+  "integrations",
   ".ruff_cache",
   ".tmp",
   "backend",

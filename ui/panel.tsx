@@ -36,11 +36,12 @@ type State = {
 const groups = [
   { title: "对白与字幕", description: "设置玩家对话入口和世界中的回复显示。", keys: ["player_chat.enabled", "chat_bridge.enabled", "chat_bridge.display_seconds", "chat_bridge.max_pages"] },
   { title: "自主陪伴", description: "管理自动连接、日常活动和对话陪伴。", keys: ["autonomy.auto_connect", "autonomy.enabled", "autonomy.chat_engagement.enabled", "autonomy.proactive_chat_enabled"] },
-  { title: "动作决策", description: "为自主活动提供独立的意图判断。", keys: ["autonomy.intent_model.enabled", "autonomy.intent_model.chat_context.enabled"] },
+  { title: "动作决策", description: "为自主活动提供独立的意图判断。", keys: ["autonomy.intent_model.enabled", "autonomy.intent_model.chat_context.enabled", "ardy.enabled"] },
 ]
 const hints: Record<string, string> = {
   "autonomy.proactive_chat_enabled": "空闲时靠近附近玩家并说一句开场白；全局至少间隔 2 分钟，同一玩家至少 5 分钟。",
   "player_chat.enabled": "玩家在世界聊天框发言时，请求角色回复。",
+  "ardy.enabled": "启用可选 ARDY 服务；世界动作执行端尚未就绪时继续使用原动作系统。保存后需重载。",
   "chat_bridge.enabled": "将角色回复显示为世界中的 NPC 字幕。",
   "chat_bridge.display_seconds": "每页至少显示 10–25 秒；较长内容会自动延长。",
   "chat_bridge.max_pages": "单次回复最多展示 1–4 页字幕。",

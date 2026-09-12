@@ -17,6 +17,9 @@ class ControlPanelTests(unittest.TestCase):
         instance._status_snapshot = Mock(return_value={"control_ready": False, "midi_open": False, "world": {"private": "world payload"}})
         instance._manual_disconnect = False
         instance._adapter = None
+        instance._session = None
+        instance._motion_backend = Mock()
+        instance._motion_backend.snapshot.return_value = {"ready": False}
         instance.config = Mock()
         instance.config.profile_active = AsyncMock(return_value="test")
         instance._intent_provider = Mock()

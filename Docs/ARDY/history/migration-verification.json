@@ -1,0 +1,11 @@
+{
+  "migrated_files": 70,
+  "hashes_verified": true,
+  "pytest_passed": 367,
+  "pytest_skipped": 1,
+  "subtests_passed": 292,
+  "git_diff_check": "passed",
+  "active_host_deployed": false,
+  "formal_scene_modified": false,
+  "backup_manifest": "H:\\AI\\NVidia\\integrations\\migration-backups\\20260911-224110\\manifest.json"
+}

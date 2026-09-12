@@ -222,7 +222,7 @@ class BehaviorGraphCompiler:
         common = {"id", "type"}
         allowed: dict[str, set[str]] = {
             "sequence": common | {"children"},
-            "selector": common | {"children"},
+            "selector": common | {"children", "recover_errors"},
             "parallel": common | {"children", "join"},
             "repeat": common | {"child", "count"},
             "retry": common | {"child", "max_attempts", "delay_ms"},
@@ -255,6 +255,13 @@ class BehaviorGraphCompiler:
                 raise BehaviorGraphError(f"节点 {node_id}.children 不得重复")
             if node_type == "parallel" and node.get("join", "all") not in {"all", "race"}:
                 raise BehaviorGraphError(f"节点 {node_id}.join 必须是 all|race")
+            if node_type == "selector" and "recover_errors" in node:
+                errors = node["recover_errors"]
+                spatial = {"no_path", "target_not_on_navmesh", "target_out_of_bounds", "local_obstacle", "stuck"}
+                if (not isinstance(errors, list) or not 1 <= len(errors) <= len(spatial)
+                        or not all(isinstance(error, str) and error in spatial for error in errors)
+                        or len(set(errors)) != len(errors)):
+                    raise BehaviorGraphError(f"节点 {node_id}.recover_errors 只能包含不重复的空间拒绝错误")
         elif node_type in {"repeat", "retry", "timeout"}:
             if not isinstance(node.get("child"), str) or not node["child"]:
                 raise BehaviorGraphError(f"节点 {node_id}.child 必须是非空字符串")
@@ -743,6 +750,9 @@ class BehaviorPlanManager:
             if outcome["status"] == "succeeded":
                 return outcome
             if outcome["status"] in {"unknown", "cancelled"}:
+                return outcome
+            # 受限回退只能处理已确认的空间拒绝，不能把失联或执行故障变成成功。
+            if "recover_errors" in node and outcome.get("error") not in node["recover_errors"]:
                 return outcome
             last = outcome
         return last

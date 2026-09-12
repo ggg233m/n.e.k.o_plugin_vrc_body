@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import deque
+from .motion_intent import compile_motion_intent
 from dataclasses import dataclass, field
 import random
 import threading
@@ -768,6 +769,7 @@ class AutonomyDirector:
                     "reason": self._proactive_reason,
                     "retry_in_s": round(max(0.0, self._proactive_next_at - now, self._proactive_player_retry_at - now, 30.0 - (now - self._social_idle_since)), 1),
                 },
+                "motion_intent": self.motion_intent_snapshot(),
                 "current_intent": None if intent is None else {
                     "motivation": intent.motivation,
                     "mood": intent.mood,
@@ -1269,6 +1271,7 @@ class AutonomyDirector:
         self._request_intent("fallback_timer")
 
     def _clear_intent_locked(self, outcome: str) -> None:
+        self._motion_intent = compile_motion_intent({}, explicit_stop=True)
         # 人工接管、暂停、聊天切换或角色切换后不继续执行旧偏好。
         self._preference = None
         self._preference_last_activity_at = float("-inf")
@@ -1391,6 +1394,15 @@ class AutonomyDirector:
                 context["recent_conversation"] = provider.context()
             return context
 
+    def motion_intent_snapshot(self):
+        """聊天和暂停只允许原地姿态，绝不借基础动作恢复导航。"""
+        with self._condition:
+            if not self._desired_running or self._pause_reason:
+                return compile_motion_intent({}, explicit_stop=True)
+            if self._chat_engagement is not None:
+                return compile_motion_intent({}, chat_engaged=True)
+            return dict(getattr(self, "_motion_intent", compile_motion_intent({})))
+
     def _request_intent(self, reason: str) -> None:
         callback = self._inspiration_callback
         if callback is None:
@@ -1474,6 +1486,8 @@ class AutonomyDirector:
             self._request_intent(reason)
             return False
 
+        # 基础动作意图与原活动共用同一次模型结果，不增加模型调用。
+        motion_intent = compile_motion_intent(activity)
         compiled = self._compile_intent_activity(activity, avoid_targets, now)
         if compiled is None:
             with self._condition:
@@ -1513,6 +1527,7 @@ class AutonomyDirector:
         )
         if submitted:
             with self._condition:
+                self._motion_intent = motion_intent
                 self._fallback_active = False
                 self._last_decision_reason = decision_reason
         return submitted
@@ -1851,6 +1866,17 @@ class AutonomyDirector:
                             "face_travel": True,
                             "allow_shorter": True,
                         })
+                    # 边缘连最短步长都容不下时，结束本次绕圈并驻足。
+                    # 保留失败子节点证据；不重新发送被拒绝或结果未知的移动。
+                    step_ids = list(children)
+                    children = ["local_space_choice"]
+                    nodes.extend([
+                        {"id": "local_steps", "type": "sequence", "children": step_ids},
+                        {"id": "local_space_choice", "type": "selector",
+                         "children": ["local_steps", "local_space_rest"],
+                         "recover_errors": ["no_path", "target_not_on_navmesh", "target_out_of_bounds", "local_obstacle", "stuck"]},
+                        {"id": "local_space_rest", "type": "wait", "duration_ms": 250},
+                    ])
                     movement = True
 
             if player_slot is not None:

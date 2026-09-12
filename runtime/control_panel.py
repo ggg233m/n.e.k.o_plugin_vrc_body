@@ -1,9 +1,11 @@
 """人工面板配置白名单；不向浏览器传递密钥或聊天内容。"""
 from copy import deepcopy
+from collections.abc import Mapping
 from .config import YuiPluginConfig
 
 
 FIELDS = {
+    "ardy.enabled": ("ARDY 动作后端（需要世界执行端）", bool, None, None),
     "chat_bridge.enabled": ("角色字幕", bool, None, None),
     "chat_bridge.display_seconds": ("字幕最短秒数", int, 10, 25),
     "chat_bridge.max_pages": ("回复最多页数", int, 1, 4),
@@ -22,7 +24,7 @@ def settings_view(config):
     for path in FIELDS:
         value = config
         for key in path.split("."):
-            value = getattr(value, key)
+            value = value.get(key, False) if isinstance(value, Mapping) else getattr(value, key)
         result[path] = value
     return result
 

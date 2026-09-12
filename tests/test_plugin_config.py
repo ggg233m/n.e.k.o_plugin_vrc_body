@@ -478,7 +478,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         }
         self.assertIn("central_obstacle", nearby_keys)
         instructions = "\n".join(payload["instructions"])
-        self.assertIn("本轮必须先调用 npc.observe", instructions)
+        self.assertIn("环境由插件去重后自动注入", instructions)
         self.assertIn("严禁回复", instructions)
         self.assertIn("accepted 只表示已受理", instructions)
         self.assertIn("只供内部追踪", instructions)
@@ -487,13 +487,15 @@ class YuiPluginConfigTests(unittest.TestCase):
         for private_field in ('"name"', '"pid"', '"pos"', '"center"', '"x"', '"y"', '"z"'):
             self.assertNotIn(private_field, encoded)
 
-        # 玩家距离高频变化不重复注入；楼层/区域变化必须产生新上下文。
-        session.players[0]["d"] = 2.0
+        # 同一区间内距离变化去重；跨区间与楼层变化均产生上下文。
+        session.players[0]["d"] = 3.2
         self.assertFalse(plugin._push_context_snapshot())
+        session.players[0]["d"] = 2.0
+        self.assertTrue(plugin._push_context_snapshot())
         session.npc_state["location"]["region_key"] = "upper_floor"
         session.npc_state["location"]["floor_label"] = "L1"
         self.assertTrue(plugin._push_context_snapshot())
-        self.assertEqual(len(pushed), 2)
+        self.assertEqual(len(pushed), 3)
 
     def test_autonomy_and_social_events_never_start_host_chat(self) -> None:
         source = (ROOT / "__init__.py").read_text(encoding="utf-8")
@@ -635,7 +637,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertFalse(payload["connection"]["connected"])
         self.assertFalse(payload["connection"]["fresh"])
         self.assertFalse(payload["world"]["available"])
-        self.assertEqual(payload["available_tools"], [])
+        self.assertEqual(payload["available_tools"], ["npc.stop"])
         self.assertIsNone(payload["plan"])
         instructions = "\n".join(payload["instructions"])
         self.assertIn("此前注入的全部位置", instructions)
@@ -665,7 +667,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         plugin._transport = Closable()
         plugin._surface = object()
         plugin._driver_lease = Lease()
-        plugin._registered_yui_tools = {"npc.observe", "npc.navigate"}
+        plugin._registered_yui_tools = {"npc.observe", "npc.navigate", "npc.stop"}
         plugin.unregister_llm_tool = lambda name: unregistered.append(name) or True
         plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
 
@@ -678,7 +680,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertIsNone(plugin._transport)
         self.assertIsNone(plugin._surface)
         self.assertIsNone(plugin._driver_lease)
-        self.assertEqual(plugin._registered_yui_tools, set())
+        self.assertEqual(plugin._registered_yui_tools, {"npc.stop"})
         self.assertEqual(plugin._context_push_status["state"], "offline_sent")
         payload = json.loads(
             pushed[-1]["parts"][0]["text"].removeprefix("YUI_WORLD_CONTEXT ")
@@ -783,7 +785,7 @@ class YuiPluginConfigTests(unittest.TestCase):
         self.assertFalse(plugin._midi_refresh_required)
         self.assertEqual(events, ["open:fresh", "close:stale"])
 
-    def test_startup_announces_disconnected_state_without_registering_tools(self) -> None:
+    def test_startup_announces_disconnected_state_with_stop_only(self) -> None:
         plugin = _plugin_class()(None)
         pushed = []
 
@@ -793,13 +795,16 @@ class YuiPluginConfigTests(unittest.TestCase):
         plugin._load_config = load_config
         plugin._configure_reply_display = lambda: None
         plugin._start_log_tailer = lambda: None
+        registered = []
+        plugin.register_llm_tool = lambda **kwargs: registered.append(kwargs["name"])
         plugin.push_message = lambda **kwargs: pushed.append(kwargs) or {"ok": True}
 
         result = asyncio.run(plugin.startup())
 
         self.assertEqual(result.value["status"], "ready")
         self.assertFalse(result.value["result"]["midi_open"])
-        self.assertEqual(result.value["result"]["llm_tools"], [])
+        self.assertEqual(result.value["result"]["llm_tools"], ["npc.stop"])
+        self.assertEqual(registered, ["npc.stop"])
         payload = json.loads(
             pushed[-1]["parts"][0]["text"].removeprefix("YUI_WORLD_CONTEXT ")
         )

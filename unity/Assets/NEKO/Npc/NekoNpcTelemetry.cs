@@ -56,6 +56,11 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
     private string[] _keys = new string[KeySlots];
     private float[] _keyLastTime = new float[KeySlots];
     private int _keyCursor;
+    public bool motionStreamActive;
+    private float[] _normalLineTimes = new float[MaxBudget];
+    private int _normalLineCursor;
+    private float[] _nonReceiptLineTimes = new float[MaxBudget];
+    private int _nonReceiptLineCursor;
     private float[] _lineTimes = new float[MaxBudget];
     private int _lineTimeCursor;
     private int _nextLogSeq = 1;
@@ -85,7 +90,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
             _keys[i] = null;
             _keyLastTime[i] = -999f;
         }
-        for (int i = 0; i < MaxBudget; i++) _lineTimes[i] = -999f;
+        for (int i = 0; i < MaxBudget; i++) { _lineTimes[i] = -999f; _normalLineTimes[i] = -999f; _nonReceiptLineTimes[i] = -999f; }
         _router = GetComponent<NekoMidiRouter>();
         Emit("sys.boot", "\"ready\":true");
     }
@@ -101,7 +106,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
             + ",\"first_dropped_log_seq\":" + _firstDroppedLogSeq
             + ",\"last_dropped_log_seq\":" + _lastDroppedLogSeq
             + ",\"wrap_count\":" + logWrapCount;
-        if (WriteAllocated(seq, "sys.telemetry", body))
+        if (WriteAllocated(seq, "sys.telemetry", body, true))
         {
             _droppedSinceReport = 0;
             _firstDroppedLogSeq = 0;
@@ -109,7 +114,28 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         }
     }
 
-    public void SetSession(int session) { _session = session; }
+    private int _stateRevision;
+    public void SetSession(int session)
+    {
+        if (_session != session) {
+            // 旧会话排队事件不能套上新会话日志头。
+            _normalHead = _normalTail = _normalCount = 0;
+            _forcedHead = _forcedTail = _forcedCount = 0;
+            _stateRevision = 0;
+        }
+        _session = session;
+    }
+    private string CaptureStateRevision(string type, string body)
+    {
+        bool operation=type=="npc.operation_started" || type=="npc.operation_completed"
+            || type=="npc.operation_cancelled" || type=="npc.operation_failed";
+        if (type != "npc.state" && type != "npc.ack" && !operation) return body;
+        // 版本在事件生成时分配，不在出队时重新变新。
+        _stateRevision++;
+        body += ",\"state_revision\":" + _stateRevision;
+        if(operation && _router!=null)body+=",\"control_state\":"+J(_router.StateName(_router.GetControlState()));
+        return body;
+    }
     public int GetSession() { return _session; }
     public bool IsTouchEnabled() { return _router != null && _router.IsTouchEnabled(); }
 
@@ -134,17 +160,19 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
 
     public void Emit(string type, string body)
     {
+        body = CaptureStateRevision(type, body);
         if (!CanLogHere()) return;
         if (!FitsEvent(type, body)) { droppedTooLong++; RecordDrop(AllocateLogSeq(), 2); return; }
-        if (_forcedCount == 0 && _normalCount == 0 && HasNormalBudget()) WriteAllocated(AllocateLogSeq(), type, body);
+        if (_forcedCount == 0 && _normalCount == 0 && HasNormalBudget()) WriteAllocated(AllocateLogSeq(), type, body, true);
         else EnqueueNormal(type, body);
     }
 
     // MIDI ACK/ESTOP 需要在授权失败或 ownership 丢失时仍可回传给本机后端。
     public void EmitForced(string type, string body)
     {
+        body = CaptureStateRevision(type, body);
         if (!FitsEvent(type, body)) { droppedTooLong++; RecordDrop(AllocateLogSeq(), 2); return; }
-        if (_forcedCount == 0 && HasBudget()) WriteAllocated(AllocateLogSeq(), type, body);
+        if (HasBudget() && (motionStreamActive && IsReceipt(type) || _forcedCount == 0 && HasNonReceiptBudget())) WriteAllocated(AllocateLogSeq(), type, body, false);
         else EnqueueForced(type, body);
     }
 
@@ -194,6 +222,13 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
 
     private bool HasNormalBudget()
     {
+        if(motionStreamActive) {
+            if(!HasBudget() || !HasNonReceiptBudget()) return false;
+            int count=0;
+            for(int i=0;i<MaxBudget;i++) if(Time.timeSinceLevelLoad-_normalLineTimes[i]<BudgetWindowSeconds)count++;
+            // 仍保持20行总预算；持续动作时普通快照最多占两行，其余留给真实回执。
+            return count<2;
+        }
         int limit = Mathf.Clamp(logBudgetPerSec, 1, MaxBudget);
         int reserve = Mathf.Min(ForcedBudgetReserve, Mathf.Max(0, limit - 1));
         int normalLimit = limit - reserve;
@@ -212,6 +247,22 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         _lineTimeCursor = (_lineTimeCursor + 1) % MaxBudget;
     }
 
+    private bool IsReceipt(string type)
+    {
+        return type=="npc.pose_ack" || type=="npc.ack" || type=="npc.stream_control" || type=="npc.stream_progress"
+            || type=="npc.stream_prepared" || type=="npc.stream_armed" || type=="npc.stream_path"
+            || type=="npc.stream_released";
+    }
+
+    private bool HasNonReceiptBudget()
+    {
+        if(!motionStreamActive)return true;
+        int count=0;
+        for(int i=0;i<MaxBudget;i++)if(Time.timeSinceLevelLoad-_nonReceiptLineTimes[i]<BudgetWindowSeconds)count++;
+        // 回执决定端口信用，其他遥测最多占六行；20行总预算保持不变。
+        return count<6;
+    }
+
     private void FlushQueues()
     {
         if (!CanLogHere()) return;
@@ -219,12 +270,24 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         {
             string type;
             string body;
+            bool normal=_forcedCount==0;
             if (_forcedCount > 0)
             {
                 if (!HasBudget()) return;
-                type = _forcedTypes[_forcedHead]; body = _forcedBodies[_forcedHead];
-                _forcedTypes[_forcedHead] = null; _forcedBodies[_forcedHead] = null;
-                _forcedHead = (_forcedHead + 1) % ForcedQueueSize; _forcedCount--;
+                int chosen=0;
+                if(motionStreamActive)for(int i=0;i<_forcedCount;i++) {
+                    if(IsReceipt(_forcedTypes[(_forcedHead+i)%ForcedQueueSize])) {chosen=i;break;}
+                }
+                int slot=(_forcedHead+chosen)%ForcedQueueSize;
+                type = _forcedTypes[slot]; body = _forcedBodies[slot];
+                if(motionStreamActive && !IsReceipt(type) && !HasNonReceiptBudget())return;
+                // 在分配日志序号前优先取回执，其余事件保持原有相对顺序。
+                for(int i=chosen;i<_forcedCount-1;i++) {
+                    int a=(_forcedHead+i)%ForcedQueueSize,b=(_forcedHead+i+1)%ForcedQueueSize;
+                    _forcedTypes[a]=_forcedTypes[b];_forcedBodies[a]=_forcedBodies[b];
+                }
+                _forcedTail=(_forcedTail+ForcedQueueSize-1)%ForcedQueueSize;
+                _forcedTypes[_forcedTail]=null;_forcedBodies[_forcedTail]=null;_forcedCount--;
             }
             else
             {
@@ -233,15 +296,33 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
                 _normalTypes[_normalHead] = null; _normalBodies[_normalHead] = null;
                 _normalHead = (_normalHead + 1) % NormalQueueSize; _normalCount--;
             }
-            WriteAllocated(AllocateLogSeq(), type, body);
+            WriteAllocated(AllocateLogSeq(), type, body, normal);
         }
     }
 
     private void EnqueueNormal(string type, string body)
     {
+        // 合并积压状态快照，操作生命周期不合并。
+        if (type == "npc.state" || type == "player.pose") {
+            for (int i=0; i<_normalCount; i++) {
+                int slot=(_normalHead+i)%NormalQueueSize;
+                if (_normalTypes[slot] == type && (type=="npc.state" || PosePage(_normalBodies[slot])==PosePage(body))) {
+                    _normalBodies[slot]=body; return;
+                }
+            }
+        }
         if (_normalCount >= NormalQueueSize) { droppedBudget++; RecordDrop(AllocateLogSeq(), 0); return; }
         _normalTypes[_normalTail] = type; _normalBodies[_normalTail] = body;
         _normalTail = (_normalTail + 1) % NormalQueueSize; _normalCount++;
+    }
+
+    private string PosePage(string body)
+    {
+        // 玩家姿态按分页合并，保留同页最新批次；目录与生命周期不合并。
+        int start=body.IndexOf("\"page\":");
+        if(start<0)return body;
+        int end=body.IndexOf(",",start);
+        return end<0?body.Substring(start):body.Substring(start,end-start);
     }
 
     private void EnqueueForced(string type, string body)
@@ -273,7 +354,7 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
         return value;
     }
 
-    private bool WriteAllocated(int seq, string type, string body)
+    private bool WriteAllocated(int seq, string type, string body, bool normal)
     {
         string json = Header(seq, type);
         if (body != null && body.Length > 0) json = json + "," + body;
@@ -285,6 +366,14 @@ public class NekoNpcTelemetry : UdonSharpBehaviour
             return false;
         }
         ConsumeBudget();
+        if(!IsReceipt(type)) {
+            _nonReceiptLineTimes[_nonReceiptLineCursor]=Time.timeSinceLevelLoad;
+            _nonReceiptLineCursor=(_nonReceiptLineCursor+1)%MaxBudget;
+        }
+        if(normal) {
+            _normalLineTimes[_normalLineCursor]=Time.timeSinceLevelLoad;
+            _normalLineCursor=(_normalLineCursor+1)%MaxBudget;
+        }
         Debug.Log("[NEKO]" + json);
         emittedLines++;
         return true;

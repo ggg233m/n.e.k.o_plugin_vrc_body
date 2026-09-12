@@ -74,6 +74,7 @@ class YuiProtocolTests(unittest.TestCase):
             "yui_protocol",
             "yui_session",
             "yui_transport",
+            "pose_sender",
         }
         for path in sorted((ROOT / "runtime").glob("yui_*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
+def _validated_ardy(value):
+    from dataclasses import asdict
+    from .motion_backend import MotionBackendConfig
+    if not isinstance(value, Mapping):
+        raise ValueError("ardy 必须为配置表")
+    return asdict(MotionBackendConfig.from_mapping(value))
+
+
 def _finite_number(value: Any, *, name: str, minimum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} 必须是数值")
@@ -477,6 +485,7 @@ class YuiPluginConfig:
     free_coordinate_navigation: bool = False
     include_player_names: bool = False
     enable_wander_tool: bool = False
+    ardy: dict[str, Any] = field(default_factory=dict)
     chat_bridge: YuiChatBridgeConfig = field(default_factory=YuiChatBridgeConfig)
     player_chat: YuiPlayerChatConfig = field(default_factory=YuiPlayerChatConfig)
     autonomy: YuiAutonomyConfig = field(default_factory=YuiAutonomyConfig)
@@ -514,6 +523,7 @@ class YuiPluginConfig:
 
         return cls(
             midi_port=midi_port.strip(),
+            ardy=_validated_ardy(data.get("ardy", {})),
             claim_code=claim_code,
             log_path=log_path.strip() if isinstance(log_path, str) and log_path.strip() else None,
             log_directory=(

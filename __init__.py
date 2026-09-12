@@ -39,6 +39,9 @@ except ImportError:
 
     lifecycle = neko_plugin = plugin_entry = _decorator  # type: ignore[assignment]
 
+from .runtime.motion_backend import MotionBackend, MotionBackendConfig
+from .runtime.session_pose_factory import SessionPoseFactory
+from .runtime.refresh_worker import RefreshWorker
 from .runtime.diagnostics import PipelineDiagnostics
 from .runtime.control_panel import FIELDS, settings_view, validated_patch, action_progress_view
 
@@ -97,6 +100,9 @@ _HOST_ONLY_ENTRY_METADATA: dict[str, object] = {
 }
 
 
+from .runtime.context_semantics import semantic_projection as _semantic_projection
+
+
 @neko_plugin
 class YuiNpcControllerPlugin(NekoPluginBase):
     """只负责 N.E.K.O 集成；协议事实和工具 schema 全部留在 runtime。"""
@@ -152,6 +158,12 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._connect_rebuilds = 0
         self._last_connect_error: str | None = None
         self._registered_yui_tools: set[str] = set()
+        self._registered_tool_specs = {}
+        self._tool_registry_lock = threading.RLock()
+        self._last_world_event_at = None
+        self._host_refresh = RefreshWorker(self._refresh_motion_context)
+        self._motion_backend = MotionBackend(MotionBackendConfig())
+        self._pose_lifecycle = None
         self._tool_signature = ""
         self._tool_state_key: tuple[Any, ...] | None = None
         self._last_context_signature = ""
@@ -162,6 +174,35 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         }
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._runtime_lock = asyncio.Lock()
+
+    def _configure_motion_backend(self):
+        self._motion_backend.close()
+        self._motion_backend = MotionBackend(MotionBackendConfig.from_mapping(self._config.ardy), changed=self._motion_changed)
+        if self._surface is not None:
+            self._surface.motion_backend = self._motion_backend
+        self._bind_motion_execution()
+        self._motion_backend.start()
+
+    def _bind_motion_execution(self):
+        if self._transport is not None and self._session is not None and self._motion_backend.config.enabled:
+            self._motion_backend.bind_execution(SessionPoseFactory(
+                self._motion_backend, self._transport, self._session, expired=self._world_snapshot_expired))
+            self._motion_backend.configure_continuous(self._transport,self._session,expired=self._world_snapshot_expired)
+
+    def _motion_changed(self):
+        self._host_refresh.wake.set()
+
+    def _refresh_motion_context(self):
+        self._motion_backend.refresh_continuous()
+        if self._pose_lifecycle is not None and self._session is not None:
+            binding=self._motion_backend.execution_binding(self._session)
+            if self._world_snapshot_expired():
+                binding["ready"]=False
+            self._pose_lifecycle.update(binding)
+        self._refresh_llm_tools()
+        self._push_context_snapshot()
+        if self._autonomy is not None and self._session is not None and not self._world_snapshot_expired():
+            self._motion_backend.update_base_intent(self._session, self._autonomy.motion_intent_snapshot())
 
     async def _load_config(self) -> YuiPluginConfig:
         raw = await self.config.dump(timeout=5.0)
@@ -519,6 +560,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._driver_lease = lease
         self._midi_sink = sink
         self._transport = transport
+        self._pose_lifecycle = None
+        self._bind_motion_execution()
         self._adapter = adapter
         self._surface = YuiToolSurface(
             adapter,
@@ -528,6 +571,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             enable_wander_tool=self._config.enable_wander_tool,
             command_deadline_s=self._config.command_deadline_s,
         )
+        self._surface.motion_backend = self._motion_backend
         self._autonomy = AutonomyDirector(
             adapter,
             self._session,
@@ -618,13 +662,20 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         except Exception:
             pass
 
-    def _unregister_yui_tools(self) -> None:
-        for name in sorted(self._registered_yui_tools):
+    def _unregister_yui_tools(self, *, keep_stop: bool = False) -> None:
+        with self._tool_registry_lock:
+            self._unregister_yui_tools_locked(keep_stop=keep_stop)
+
+    def _unregister_yui_tools_locked(self, *, keep_stop: bool = False) -> None:
+        removed = self._registered_yui_tools - ({"npc.stop"} if keep_stop else set())
+        for name in sorted(removed):
             try:
                 self.unregister_llm_tool(name)
             except Exception:
                 pass
-        self._registered_yui_tools.clear()
+        self._registered_yui_tools.difference_update(removed)
+        for name in removed:
+            self._registered_tool_specs.pop(name, None)
         self._tool_signature = ""
         self._tool_state_key = None
 
@@ -638,11 +689,14 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                     "detail": "尚未由宿主连接 YUI 世界",
                     "midi_sent": False,
                 }
+            if tool_name != "npc.stop" and self._world_snapshot_expired():
+                return {"status": "failed", "error": "world_snapshot_expired", "midi_sent": False}
             autonomy = self._autonomy
             if autonomy is not None:
                 autonomy.before_explicit_tool(tool_name, arguments)
             try:
-                result = await asyncio.to_thread(surface.call, tool_name, arguments)
+                call = getattr(surface, "call_host", surface.call)
+                result = await asyncio.to_thread(call, tool_name, arguments)
             except Exception:
                 if autonomy is not None:
                     autonomy.after_explicit_tool(
@@ -998,6 +1052,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         surface = self._surface
         if session is None or surface is None:
             return (0,)
+        if self._world_snapshot_expired():
+            return ("expired", session.session)
         control_group = (
             "armed"
             if session.control_state in {"external", "moving", "action"}
@@ -1026,13 +1082,20 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             surface.free_coordinate_navigation,
             surface.include_player_names,
             surface.enable_wander_tool,
+            self._motion_backend.world_ready(session),
         )
 
     def _refresh_llm_tools(self) -> list[str]:
+        with self._tool_registry_lock:
+            return self._refresh_llm_tools_locked()
+
+    def _refresh_llm_tools_locked(self) -> list[str]:
         state_key = self._current_tool_state_key()
         if state_key == self._tool_state_key:
             return sorted(self._registered_yui_tools)
-        definitions = self._surface.definitions() if self._surface is not None else []
+        definitions = (getattr(self._surface, "host_definitions", self._surface.definitions)()
+                       if self._surface is not None and not self._world_snapshot_expired()
+                       else [YuiToolSurface.stop_definition()])
         signature = json.dumps(
             [
                 {
@@ -1050,16 +1113,30 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         if signature == self._tool_signature:
             self._tool_state_key = state_key
             return sorted(self._registered_yui_tools)
-        self._unregister_yui_tools()
+        # 只变更差异项；停止入口在后端切换期间保持注册。
+        wanted = {item.name: item for item in definitions}
+        specs = getattr(self, "_registered_tool_specs", {})
+        for name in sorted(self._registered_yui_tools - wanted.keys()):
+            self.unregister_llm_tool(name)
+            self._registered_yui_tools.discard(name)
+            specs.pop(name, None)
         for definition in definitions:
-            self.register_llm_tool(
-                name=definition.name,
-                description=definition.description,
+            spec = (definition.description, definition.input_schema, definition.timeout_s)
+            if definition.name in self._registered_yui_tools and specs.get(definition.name) == spec:
+                continue
+            if definition.name in self._registered_yui_tools:
+                self.unregister_llm_tool(definition.name)
+                self._registered_yui_tools.discard(definition.name)
+            receipt = self.register_llm_tool(
+                name=definition.name, description=definition.description,
                 parameters=definition.input_schema,
-                handler=self._make_tool_handler(definition.name),
-                timeout=definition.timeout_s,
+                handler=self._make_tool_handler(definition.name), timeout=definition.timeout_s,
             )
+            if receipt is False:
+                raise RuntimeError("宿主拒绝注册动作工具")
             self._registered_yui_tools.add(definition.name)
+            specs[definition.name] = spec
+        self._registered_tool_specs = specs
         self._tool_signature = signature
         self._tool_state_key = state_key
         return sorted(self._registered_yui_tools)
@@ -1076,11 +1153,16 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             return [YuiNpcControllerPlugin._privacy_safe(item) for item in value]
         return value
 
+    def _world_snapshot_expired(self):
+        return self._last_world_event_at is not None and time.monotonic() - self._last_world_event_at > 10
+
     def _model_context_payload(self) -> dict[str, Any] | None:
         """构建只含世界确认事实的 fast 模型上下文，不携带绝对坐标。"""
         session = self._session
         if session is None or session.session <= 0:
             return None
+        if self._world_snapshot_expired():
+            return self._offline_context_payload("world_snapshot_expired")
         if self._adapter is not None:
             observation = self._adapter.observe(
                 include_player_names=self._config.include_player_names
@@ -1108,8 +1190,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             },
             "instructions": [
                 "这些是 Unity 和冻结目录确认的事实，不是视觉推断。",
-                "用户询问当前位置、附近对象、玩家或当前状态时，本轮必须先调用 npc.observe；需要更大范围地图或路线时调用 npc.world_query。注入快照只能用于选择工具参数，不能冒充本轮实时观察。",
-                "用户要求移动、导航、跟随、探索、注视、动作、表情、说话、停止或急停时，本轮必须在回复前调用匹配的 npc.* 工具；没有工具返回时，严禁回复‘开始’、‘马上’、‘正在执行’或‘已经完成’。",
+                "环境由插件去重后自动注入；只使用当前会话的最新有效快照，失效时不得猜测环境。未提供的信息明确说明未知。",
+                "距离仅在小于 1 米、1 到 3 米、3 米以上分区改变时刷新；区间内数值只是最近快照，不能当作持续实时测量。",
+                "用户要求移动、导航、跟随、探索、注视、动作、表情、停止或急停时，本轮必须在回复前调用匹配的 npc.* 工具；没有工具返回时，严禁回复‘开始’、‘马上’、‘正在执行’或‘已经完成’。普通对话由宿主回复桥接，无需额外动作工具。",
                 "只能选择当前 available_tools 和目录已发布的 semantic_key 或 player_slot；不可用时明确说明当前无法执行。",
                 "工具返回 accepted 只表示已受理；plan_id 与 op_id 只供内部追踪及后续状态查询使用。除非用户明确询问编号，否则禁止在面向用户的可朗读回复中输出这些编号或 UUID。只有 operation/plan 的 succeeded 才能报告完成，failed、cancelled、unknown 都不得当作成功。",
             ],
@@ -1124,6 +1207,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "available_tools": sorted(self._registered_yui_tools),
             "plan": plan,
         }
+        payload["motion_backend"] = self._motion_backend.snapshot()
+        payload["motion_execution"] = self._motion_backend.execution_status()
         payload = self._privacy_safe(payload)
         if session.spec_version in {"1.2", "1.3"}:
             payload = session._without_absolute_coordinates(payload)
@@ -1147,7 +1232,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 "不得承诺移动、导航、跟随、探索、注视、动作、表情、说话、停止或急停将会执行。",
                 "不得承诺连接后自动执行、稍后补执行或记住当前动作请求；连接成功后必须由用户重新发起。",
                 "用户询问世界或要求控制 NPC 时，应明确回复：YUI 未连接，请先由宿主连接 YUI 世界 NPC。",
-                "只有收到新的 connection.connected=true 上下文，并在本轮取得对应 npc.* 工具返回后，才能陈述实时事实或执行状态。",
+                "新的 connection.connected=true 上下文可提供已确认事实；执行请求仍须取得对应 npc.* 工具返回。离线时 npc.stop 可调用，但不得声称世界已经停止。",
             ],
             "world": {
                 "available": False,
@@ -1157,7 +1242,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 "revision": None,
                 "counts": {},
             },
-            "available_tools": [],
+            "available_tools": ["npc.stop"],
             "plan": None,
         }
 
@@ -1180,6 +1265,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
         stable = {
             "context_revision": payload.get("context_revision"),
+            "motion_backend": payload.get("motion_backend"),
+            "world_semantics": _semantic_projection(world),
             "connection": payload.get("connection"),
             "session": world.get("session"),
             "spec": world.get("spec"),
@@ -1302,6 +1389,10 @@ class YuiNpcControllerPlugin(NekoPluginBase):
     def _on_session_event(self, event: dict[str, Any]) -> None:
         event_copy = dict(event)
         event_type = str(event_copy.get("type") or "")
+        if (event_type == "npc.state" and self._session is not None
+                and event_copy.get("session") == getattr(self._session, "session", -1)):
+            self._last_world_event_at = time.monotonic()
+            self._host_refresh.wake.set()
         if event_type == "npc.ack" and event_copy.get("ok") is False:
             self._diagnostics.emit(
                 "connection.ack_failed", deduplicate=True,
@@ -1523,10 +1614,14 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             preserve_midi=preserve_midi,
         )
         self._cancel_intent_requests()
-        self._unregister_yui_tools()
+        self._unregister_yui_tools(keep_stop=True)
         if self._autonomy is not None:
             self._autonomy.close()
         with self._reply_display_send_lock:
+            self._motion_backend.unbind_execution()
+            if self._pose_lifecycle is not None:
+                self._pose_lifecycle.close()
+                self._pose_lifecycle=None
             if self._adapter is not None:
                 self._adapter.close()
             if self._transport is not None:
@@ -1551,6 +1646,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         self._push_context_unavailable(reason, force=True)
 
     def _close_runtime(self, *, reason: str = "plugin_stopped") -> None:
+        self._host_refresh.close()
+        self._motion_backend.close()
         self._reset_player_chat_state(state=reason)
         self._cancel_auto_connect_task()
         if self._reply_display is not None:
@@ -1559,6 +1656,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         # 热重载时新插件通常会在数秒内重新打开同一端口；旧端口只保持空闲，
         # 不再发送心跳或命令，并在交接窗口结束后关闭。
         self._close_control(reason=reason, midi_handoff_s=30.0)
+        self._unregister_yui_tools()
         self._stop_intent_worker()
         if self._tailer is not None:
             self._tailer.close()
@@ -1572,12 +1670,15 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         try:
             self._event_loop = asyncio.get_running_loop()
             self._config = await self._load_config()
+            self._configure_motion_backend()
             self._configure_intent_provider()
             self._configure_reply_display()
             self._manual_disconnect = False
             # 通用配置仍只跟随日志；仅显式 autonomy.auto_connect 才打开 MIDI。
             self._start_log_tailer()
+            self._refresh_llm_tools()
             self._push_context_unavailable("plugin_started_disconnected", force=True)
+            self._host_refresh.start()
             self._schedule_auto_connect()
             return Ok({"status": "ready", "result": self._status_snapshot()})
         except Exception as exc:
@@ -1608,6 +1709,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "status": {
                 "控制已就绪": snapshot["control_ready"],
                 "MIDI 已打开": snapshot["midi_open"],
+                "ARDY 服务在线": self._motion_backend.snapshot()["ready"],
+                "ARDY 世界执行就绪": bool(self._session and self._motion_backend.world_ready(self._session)),
                 "自主状态": autonomy.get("state", "not_initialized"),
                 "字幕状态": reply.get("last_result", "not_initialized"),
                 "最近字幕秒数": reply.get("last_display_seconds"),
@@ -1858,6 +1961,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             try:
                 self._close_runtime(reason="config_reload")
                 self._config = await self._load_config()
+                self._configure_motion_backend()
+                self._host_refresh.start()
                 self._configure_intent_provider()
                 self._configure_reply_display()
                 self._manual_disconnect = False

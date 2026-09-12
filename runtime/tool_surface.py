@@ -462,6 +462,66 @@ class YuiToolSurface:
         self.include_player_names = bool(include_player_names)
         self.enable_wander_tool = bool(enable_wander_tool)
         self.command_deadline_s = max(0.1, float(command_deadline_s))
+        self.motion_backend = None
+
+    @staticmethod
+    def stop_definition() -> YuiToolDefinition:
+        return YuiToolDefinition(
+            "npc.stop", "停止当前任务并暂停自主活动；immediate=true 为锁存急停，不会自动解除。",
+            _object_schema({"immediate": {"type": "boolean", "default": False}}), 7.0,
+        )
+
+    def host_definitions(self) -> list[YuiToolDefinition]:
+        """主对话只暴露动作和停止；完整工具面仍用于内部与调试。"""
+        stop = self.stop_definition()
+        backend = self.motion_backend
+        if backend is not None and backend.world_ready(self.session):
+            perform = YuiToolDefinition(
+                "npc.perform", "按动作描述执行连续身体动作；只选择环境上下文中已发布的目标。受理不等于完成。",
+                _object_schema({"prompt": {"type": "string", "minLength": 1, "maxLength": 320},
+                                "target_key": {"type": "string", "minLength": 1, "maxLength": 64},
+                                "player_slot": {"type": "integer", "minimum": 0, "maximum": 63},
+                                "replace_active": {"type": "boolean", "default": False}}, required=["prompt"]), 3.0,
+            )
+            if getattr(backend,"_continuous",None) is not None:
+                # 持续模式始终优先替换未来意图，不向主模型暴露骨骼或控制坐标。
+                properties=perform.input_schema["properties"]
+                properties.pop("replace_active",None)
+                properties.pop("player_slot",None)
+                properties.update({
+                    "mode":{"type":"string","enum":["idle","free_action","path"]},
+                    "end_condition":{"type":"string","enum":["duration","arrived","until_replaced"]},
+                    "duration_s":{"type":"number","minimum":.2,"maximum":300},
+                })
+            return [stop, perform]
+        plans = [item for item in self.definitions() if item.name == "npc.execute_plan"]
+        return [stop, *plans]
+
+    def call_host(self, name: str, arguments=None):
+        definitions = {item.name: item for item in self.host_definitions()}
+        if name not in definitions:
+            return {"status": "failed", "error": "tool_unavailable", "midi_sent": False}
+        if arguments is not None and not isinstance(arguments, Mapping):
+            return {"status": "failed", "error": "invalid_arguments", "midi_sent": False}
+        values = dict(arguments or {})
+        error = _schema_error(values, definitions[name].input_schema)
+        if error:
+            return {"status": "failed", "error": "invalid_arguments", "detail": error, "midi_sent": False}
+        if name == "npc.stop":
+            result = self.adapter.estop("explicit_stop") if values.get("immediate", False) else self.adapter.stop("all")
+            if self.motion_backend is not None:
+                self.motion_backend.cancel(self.session)
+            return result
+        if name == "npc.perform":
+            target = values.get("target_key")
+            keys = {item.get("semantic_key") for kind, catalog in self.session.catalogs.items()
+                    if kind in {"anchor", "region", "entity"} for item in catalog.values()}
+            if target is not None and target not in keys:
+                return {"status": "failed", "error": "unknown_target", "midi_sent": False}
+            if "player_slot" in values and values["player_slot"] not in self.session.players:
+                return {"status": "failed", "error": "slot_unknown", "midi_sent": False}
+            return self.motion_backend.perform(self.session, **values)
+        return self.call(name, values)
 
     def definitions(self) -> list[YuiToolDefinition]:
         if self.session.session <= 0:

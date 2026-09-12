@@ -116,7 +116,7 @@ class MidoOutputSink:
             )
         else:
             message = self._mido.Message(
-                "note_on",
+                event.type,
                 channel=event.channel,
                 note=event.number,
                 velocity=event.value,
@@ -138,10 +138,14 @@ class YuiReliableTransport:
         ack_timeout_s: float = 2.0,
         command_deadline_s: float = 5.0,
         heartbeat_interval_s: float = 1.0,
+        shared_sender: Any = None,
     ) -> None:
         # 构造期加载冻结常量；缺文件时提前失败，不等到第一条命令。
         preload_command_constraints()
         self._sink = sink
+        if shared_sender is not None and shared_sender.sink is not sink:
+            raise ValueError("共享发送器必须拥有同一个 sink")
+        self._shared_sender = shared_sender
         self.session = session
         self.ack_timeout_s = max(0.01, float(ack_timeout_s))
         self.command_deadline_s = max(self.ack_timeout_s, float(command_deadline_s))
@@ -160,6 +164,7 @@ class YuiReliableTransport:
         self._heartbeat_thread: threading.Thread | None = None
         self._heartbeat_enabled = False
         self._upper_body_active = False
+        self.motion_recovery_blocked = False
         self._text_transfer_active = False
 
     def _allocate_sequence(self) -> int:
@@ -167,6 +172,32 @@ class YuiReliableTransport:
             value = self._next_sequence
             self._next_sequence = 1 if value >= 127 else value + 1
             return value
+
+    def attach_pose_sender(self, epoch: int, *, pose_pipeline=False):
+        """只在已完成姿态能力握手后调用；等待旧命令退出，再转移 sink 所有权。"""
+        from .pose_sender import PoseSender
+        self.stop_heartbeat()
+        try:
+            with self._normal_lock, self._send_lock:
+                if self._shared_sender is not None:
+                    raise RuntimeError("共享发送器已经安装")
+                self._shared_sender = PoseSender(self._sink,self.session.session,epoch,pose_pipeline=pose_pipeline,
+                    fault_recovery=pose_pipeline and 'pose_link_recovery_v1' in getattr(self.session,'capabilities',[]))
+                self._upper_body_active=False
+                return self._shared_sender
+        finally:
+            self.start_heartbeat()
+
+    def detach_pose_sender(self, *, graceful=False):
+        self.stop_heartbeat()
+        with self._normal_lock, self._send_lock:
+            sender=self._shared_sender
+            if sender is not None:
+                sender.close(close_sink=False, graceful=graceful)
+                self._shared_sender=None
+        if graceful and sender is not None and sender.gracefully_closed:
+            self.start_heartbeat()
+        # 急停后不在这里恢复心跳或解除世界停止，交给明确的新握手。
 
     def _allocate_upper_body_sequence(self) -> int:
         with self._sequence_lock:
@@ -200,6 +231,8 @@ class YuiReliableTransport:
             self._rate_lock.notify_all()
 
     def _send_events(self, events: Sequence[MidiEvent]) -> None:
+        if self._shared_sender is not None:
+            return self._shared_sender.send(events)
         with self._send_lock:
             for event in events:
                 self._sink(event)
@@ -258,7 +291,7 @@ class YuiReliableTransport:
             expected_session = self._expected_session(frame, self.session.session)
             after_ack = self.session.ack_generation
             started = time.monotonic()
-            self._send_events(frame.events)
+            receipt_ticket = self._send_events(frame.events)
             ack = self.session.wait_for_ack(
                 frame.sequence,
                 frame.command_id,
@@ -268,6 +301,9 @@ class YuiReliableTransport:
                 after_arrival_index=after_ack,
             )
             if ack is None:
+                if self._shared_sender is not None:
+                    self._shared_sender.fault_stop()
+                    raise TimeoutError("共享端口未取得命令 ACK，停止且不重发")
                 # 只原样重发一次；旧 seq/hash/寄存器不得重建。
                 self._wait_normal_rate_slot()
                 self._send_events(frame.events)
@@ -298,6 +334,8 @@ class YuiReliableTransport:
                     session_rebuild_required=True,
                     snapshot_requested=snapshot_requested,
                 )
+            if self._shared_sender is not None:
+                self._shared_sender.ack(receipt_ticket, ack.session)
             return self._outcome_from_ack(frame, ack)
 
     def _request_snapshot_evidence(self, failed_frame: CommandFrame) -> bool:
@@ -357,21 +395,56 @@ class YuiReliableTransport:
             )
         with self._normal_lock:
             frame = encode_command(command, self._allocate_sequence(), parameters)
-            return self._send_prebuilt_normal(frame)
+            outcome=self._send_prebuilt_normal(frame)
+            if command_id==COMMAND_IDS['CLEAR_ESTOP'] and outcome.status=='succeeded':
+                self.motion_recovery_blocked=False
+            return outcome
 
     def send_heartbeat(self) -> CommandFrame:
         frame = encode_command("HEARTBEAT", self._allocate_sequence())
         self._record_priority_reliable()
-        self._send_events(frame.events)
+        sender = self._shared_sender
+        if sender is None:
+            self._send_events(frame.events)
+        else:
+            # 共享端口的心跳也占信用；验证真实 ACK 后归还，不重发。
+            after_ack = self.session.ack_generation
+            expected_session = self.session.session
+            ticket = sender.send(frame.events, lane="heartbeat")
+            ack = self.session.wait_for_ack(frame.sequence, frame.command_id, frame.request_hash, .4,
+                session=expected_session, after_arrival_index=after_ack)
+            if ack is None or not ack.ok:
+                sender.fault_stop()
+                raise TimeoutError("共享端口心跳未确认")
+            sender.ack(ticket, ack.session)
         return frame
 
     def send_estop(self, *, channel: int = 0, acknowledge: bool = True) -> CommandFrame:
+        self.motion_recovery_blocked=True
         sequence = self._allocate_sequence() if acknowledge else 0
         frame = encode_command("ESTOP", sequence, estop_channel=channel)
         # ESTOP 不等待预算、不等待普通命令锁，也不依赖队列腾位。
-        self._send_events(frame.events)
+        if self._shared_sender is not None:
+            self._shared_sender.stop()
+        else:
+            self._send_events(frame.events)
         self.session.set_host_arm_authorized(False)
         return frame
+
+    def recover_motion_link(self):
+        """只探测并重新授权通信故障会话；从不发送CLEAR_ESTOP。"""
+        if self._shared_sender is not None or self.session.estop or self.motion_recovery_blocked:return False
+        identity=(self.session.world_id,self.session.session)
+        # 新序号的真实ACK确认客户端已恢复；缓存回放不算恢复证据。
+        probe=self.send_command('SNAPSHOT_REQUEST')
+        if probe.status!='succeeded' or probe.ack_replayed:return False
+        if self.session.estop or self.motion_recovery_blocked or identity!=(self.session.world_id,self.session.session):return False
+        stopped=self.send_command('STOP')
+        if stopped.status!='succeeded' or self.session.estop or self.motion_recovery_blocked:return False
+        mode=self.send_command('SET_CONTROL_MODE',(0,0,0,1,0,0))
+        if mode.status!='succeeded' or self.session.estop or self.motion_recovery_blocked or identity!=(self.session.world_id,self.session.session):return False
+        self.start_heartbeat()
+        return self.session.control_state=='external'
 
     def set_heartbeat_enabled(self, enabled: bool) -> None:
         self._heartbeat_enabled = bool(enabled)
@@ -406,6 +479,8 @@ class YuiReliableTransport:
 
     def send_upper_body(self, values: Mapping[str, Any]) -> tuple[MidiEvent, ...] | None:
         """发送一帧名义 20Hz 上身流；文本事务和非执行态直接暂停。"""
+        if self._shared_sender is not None:
+            return None
         if self._text_transfer_active:
             return None
         if self.session.control_state not in {"external", "moving", "action"}:
@@ -430,6 +505,7 @@ class YuiReliableTransport:
         self._upper_body_active = False
 
     def _send_text_payload(self, payload: Sequence[MidiEvent]) -> None:
+        unfenced=0
         for event in payload:
             with self._rate_lock:
                 while True:
@@ -438,8 +514,19 @@ class YuiReliableTransport:
                     if len(self._text_payload_times) < 159:
                         self._text_payload_times.append(now)
                         break
+                    if self._shared_sender is not None and unfenced:
+                        # 限速等待可能长于接收租约；先用真实心跳 ACK 确认已读进度。
+                        self.send_heartbeat()
+                        unfenced=0
                     self._rate_lock.wait(max(0.001, 1.0 - (now - self._text_payload_times[0])))
             self._send_events((event,))
+            unfenced+=1
+            if self._shared_sender is not None and unfenced>=32:
+                # 文字本身没有逐字 ACK，分段归还信用，避免长字幕耗尽共享端口。
+                self.send_heartbeat()
+                unfenced=0
+        if self._shared_sender is not None and unfenced:
+            self.send_heartbeat()
 
     def send_text(
         self,
@@ -472,6 +559,9 @@ class YuiReliableTransport:
 
     def close(self) -> None:
         self.stop_heartbeat()
+        if self._shared_sender is not None:
+            self._shared_sender.close()
+            return
         close = getattr(self._sink, "close", None)
         if callable(close):
             close()

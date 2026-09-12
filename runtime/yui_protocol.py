@@ -93,6 +93,8 @@ CAPABILITY_BITS: dict[str, int] = {
     "semantic_navigation": 18,
     "region_localization": 19,
     "local_navigation": 20,
+    "pose_stream_v1": 21,
+    "pose_operation_v1": 22,
 }
 
 ERROR_CODES: dict[str, int] = {
@@ -160,7 +162,7 @@ class YuiLogDecodeError(YuiProtocolError):
 class MidiEvent:
     """与测试向量字段一一对应的单条 MIDI 事件。"""
 
-    type: Literal["cc", "note_on"]
+    type: Literal["cc", "note_on", "note_off"]
     channel: int
     number: int
     value: int
