@@ -324,7 +324,7 @@ ClientSim 和真实双客户端验收。
 
 普通YUI插件无需ARDY模型；按上方宿主CLI流程重新sync依赖、build与install，配置新机器的NEKO_MIDI端口、世界及日志位置。不要复制旧虚拟环境或个人令牌。profiles.toml不再启用test配置；使用通用默认配置，默认日志路径留空并自动跟随VRChat日志。profiles/test.toml仅留在本机，不参与Git提交或安装包。
 
-可选ARDY后台需要单独准备轻量接入包，并由使用者下载官方ARDY源码及模型，详见[轻量接入说明](Docs/ARDY/PORTABLE.md)。这份插件仓库本身不包含portable安装工具、ARDY补丁和图重放模块；不要把仅克隆本仓库当成完整后台安装。
+可选ARDY后台需要单独准备轻量接入包，并由使用者下载官方ARDY源码及模型，详见[轻量接入说明](Docs/ARDY/PORTABLE.md)。ARDY补丁和应用工具已纳入 [integrations/ardy-patches](integrations/ardy-patches/README.md)。完整portable安装工具和图重放运行工具仍由接入包提供，仅克隆仓库不等于安装完整后端。
 
 本仓库 integrations/start-motion-service.ps1 已转发至接入包启动器；源码仓库开发调试用 -KitRoot 指定接入包目录。日常使用直接双击接入包的 启动NPC动作.cmd。验收脚本使用指定接入包的环境和当前验收Python，模型导入工具通过Unity文件选择器获取本机模型包。XPU在本机换目录、新环境生成验证通过，CUDA与第二台电脑尚未实测。Unity集成文件也不等于完整家园工程，需原工程及对应SDK。
 

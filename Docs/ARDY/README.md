@@ -1,5 +1,6 @@
 # ARDY 文档索引
 
+- [仓库补丁安装](../../integrations/ardy-patches/README.md)：补丁维护位置、独立应用、升级与回退。
 - [安装与启动](PORTABLE.md)：接入包、用户自行下载的源码和模型，以及无令牌启动步骤。
 - [持续动作计划](CONTINUOUS_PLAN.md)与[原始集成计划](PLAN.md)：包含分阶段进度，阅读时保留各记录的时间和验收边界。
 - [持续运动协议 v2](CONTINUOUS_PROTOCOL_V2.md)与[早期姿态协议](PROTOCOL.md)：设计和候选说明；实际能力以代码和世界握手为准。

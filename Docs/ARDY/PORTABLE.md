@@ -1,6 +1,8 @@
 # ARDY / NEKO 轻量接入包
 
-ARDY源码和模型由使用者自行下载。本包只提供接入代码、49个必要补丁文件、CUDA/XPU配置、安装/检查工具、已构建的viser可视化依赖、NEKO插件与Unity集成；不包含ARDY完整工程、ARDY wheel或模型权重。
+ARDY源码和模型由使用者自行下载。本包只提供接入代码、49个补丁覆盖文件、CUDA/XPU配置、安装/检查工具、已构建的viser可视化依赖、NEKO插件与Unity集成；不包含ARDY完整工程、ARDY wheel或模型权重。
+
+补丁源文件由插件仓库的 `integrations/ardy-patches/` 维护，打包时导出到本包 `ardy-patches/`；应用工具、清单和许可证一起发布。
 
 ## 准备官方ARDY
 
