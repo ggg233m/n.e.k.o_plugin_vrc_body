@@ -1,8 +1,8 @@
-import { Page, Card, Stack, Text, ActionButton, RefreshButton, StatusBadge, useEffect } from "@neko/plugin-ui"
+import { Page, Card, Stack, Text, ActionButton, RefreshButton, StatusBadge, useEffect, useState } from "@neko/plugin-ui"
 import type { PluginSurfaceProps } from "@neko/plugin-ui"
 import { ErrorDiagnosis } from "./diagnostics"
 
-type Value = boolean | number
+type Value = boolean | number | string
 type TokenUsage = { input_tokens: number | null; output_tokens: number | null; total_tokens: number | null }
 type ModelCall = { number: number; started_at: string; status: string; output: string | null; truncated: boolean; error: string | null; latency_ms: number | null; format: string | null; source: string; disposition?: string; usage?: TokenUsage; usage_reported_requests?: number }
 type IntentModelState = {
@@ -24,21 +24,46 @@ type ActionProgress = {
   plan?: { status: string; origin: string; elapsed_s: number; completed_nodes: number; total_nodes: number; error?: string | null; active_nodes: { id: string; kind: string; target: string | null; player_slot: number | null; remaining_s: number | null }[] } | null
 }
 type State = {
+  key_configured?: boolean
+  key_reload_required?: boolean
   profile?: string
   settings?: Record<string, Value>
   applied?: Record<string, Value>
   status?: Record<string, unknown>
   intent_model?: IntentModelState
   action_progress?: ActionProgress
-  fields?: { key: string; label: string; type: string; min?: number; max?: number }[]
+  fields?: { key: string; label: string; type: string; min?: number; max?: number; step?: number }[]
+}
+
+function visibleSaveError(error: unknown) {
+  const detail = error instanceof Error ? error.message : String(error ?? "")
+  for (const marker of ["设置校验失败：", "宿主配置服务读取失败", "宿主配置服务写入失败", "配置档已切换"]) {
+    const start = detail.indexOf(marker)
+    if (start >= 0) return detail.slice(start).split("\n", 1)[0].slice(0, 240)
+  }
+  return "保存失败，修改已保留。请刷新配置档后重试。"
 }
 
 const groups = [
+  { title: "世界连接", description: "日志文件与日志目录二选一；均留空时自动寻找VRChat日志。", keys: ["midi_port", "claim_code", "log_path", "log_directory", "ardy.endpoint"] },
+  { title: "模型连接", description: "配置独立意图模型；密钥写入宿主本机配置，不回显，也不保存在面板草稿缓存中。", keys: ["autonomy.intent_model.endpoint", "autonomy.intent_model.model", "autonomy.intent_model.api_key", "autonomy.intent_model.clear_api_key", "autonomy.intent_model.api_key_env", "autonomy.intent_model.persona_prompt", "autonomy.intent_model.timeout_s", "autonomy.intent_model.min_interval_s", "autonomy.intent_model.max_output_tokens"] },
   { title: "对白与字幕", description: "设置玩家对话入口和世界中的回复显示。", keys: ["player_chat.enabled", "chat_bridge.enabled", "chat_bridge.display_seconds", "chat_bridge.max_pages"] },
   { title: "自主陪伴", description: "管理自动连接、日常活动和对话陪伴。", keys: ["autonomy.auto_connect", "autonomy.enabled", "autonomy.chat_engagement.enabled", "autonomy.proactive_chat_enabled"] },
   { title: "动作决策", description: "为自主活动提供独立的意图判断。", keys: ["autonomy.intent_model.enabled", "autonomy.intent_model.chat_context.enabled", "ardy.enabled"] },
 ]
 const hints: Record<string, string> = {
+  "midi_port": "填写已创建的虚拟MIDI输出端口，例如NEKO_MIDI。",
+  "claim_code": "与Unity世界中的控制码一致，范围0–16383。",
+  "log_path": "填写完整日志文件路径。Unity测试使用当前用户 AppData/Local/Unity/Editor/Editor.log；留空可自动查找VRChat日志。",
+  "log_directory": "只填写目录时自动选择其中最新VRChat日志；配置日志文件时请清空此项。",
+  "ardy.endpoint": "默认 http://127.0.0.1:2346；只支持本机HTTP服务，无需令牌。",
+  "autonomy.intent_model.endpoint": "完整的HTTPS Chat Completions地址，例如 https://example.com/v1/chat/completions。",
+  "autonomy.intent_model.model": "填写API服务支持的模型标识。",
+  "autonomy.intent_model.api_key": "留空保留原密钥，填写新值则替换；直接配置的密钥优先于环境变量。",
+  "autonomy.intent_model.clear_api_key": "勾选并保存后清除直接配置的密钥；如需同时禁用备用密钥，请清空环境变量名称。",
+  "autonomy.intent_model.api_key_env": "可选兼容旧配置；直接填写API Key后无需设置环境变量。",
+  "autonomy.intent_model.persona_prompt": "描述角色性格与动作表达偏好，不需要编写骨骼或坐标。",
+  "autonomy.intent_model.min_interval_s": "控制日常活动请求频率；聊天动作最短间隔仍为2秒。",
   "autonomy.proactive_chat_enabled": "空闲时靠近附近玩家并说一句开场白；全局至少间隔 2 分钟，同一玩家至少 5 分钟。",
   "player_chat.enabled": "玩家在世界聊天框发言时，请求角色回复。",
   "ardy.enabled": "启用可选 ARDY 服务；世界动作执行端尚未就绪时继续使用原动作系统。保存后需重载。",
@@ -48,7 +73,7 @@ const hints: Record<string, string> = {
   "autonomy.auto_connect": "插件启动或重载后，自动尝试连接世界。",
   "autonomy.enabled": "允许 NPC 自主安排活动；即时控制请使用上方按钮。",
   "autonomy.chat_engagement.enabled": "玩家发言后暂缓日常活动，优先留在发言者附近。",
-  "autonomy.intent_model.enabled": "使用单独配置的模型选择动作，需要配置服务地址和环境变量密钥。",
+  "autonomy.intent_model.enabled": "使用单独配置的模型选择动作，需要配置模型连接信息。",
   "autonomy.intent_model.chat_context.enabled": "读取近期聊天上下文，辅助独立模型选择动作。",
 }
 const labels: Record<string, string> = {
@@ -152,7 +177,9 @@ function ModelActivity({ model }: { model?: IntentModelState }) {
 export default function Panel(props: PluginSurfaceProps<State>) {
   const { state, actions } = props
   const profileKey = JSON.stringify(state.profile ?? null)
-  const [draft, setDraft] = props.useLocalState<Record<string, Value | string>>("settings-draft:" + profileKey, {})
+  // 密钥只存在当前组件内存；切换配置档或关闭面板即清除。
+  const [draft, setDraft] = useState<Record<string, Value>>({})
+  useEffect(() => { setDraft({}) }, [profileKey])
   const [busy, setBusy] = props.useLocalState("saving", false)
   const [message, setMessage] = props.useLocalState("message:" + profileKey, "")
   const [autoRefresh, setAutoRefresh] = props.useLocalState("auto-refresh", true)
@@ -180,8 +207,8 @@ export default function Panel(props: PluginSurfaceProps<State>) {
   const fields = state.fields || []
   // 比较实际值，改回原值不计为修改；只提交后端提供的字段。
   const changed = fields.filter(field => draft[field.key] !== undefined && draft[field.key] !== state.settings?.[field.key])
-  const pending = fields.filter(field => state.settings?.[field.key] !== state.applied?.[field.key])
-  const invalid = changed.some(field => field.type !== "boolean" && (typeof draft[field.key] !== "number" || !Number.isInteger(draft[field.key]) || Number(draft[field.key]) < (field.min ?? -Infinity) || Number(draft[field.key]) > (field.max ?? Infinity)))
+  const pending = fields.filter(field => field.type === "password" ? state.key_reload_required : state.settings?.[field.key] !== state.applied?.[field.key])
+  const invalid = changed.some(field => field.type === "number" && (typeof draft[field.key] !== "number" || !Number.isFinite(draft[field.key]) || ((field.step ?? 1) === 1 && !Number.isInteger(draft[field.key])) || Number(draft[field.key]) < (field.min ?? -Infinity) || Number(draft[field.key]) > (field.max ?? Infinity)))
   const status = state.status || {}
   const ready = status["控制已就绪"] === true
   const midi = status["MIDI 已打开"] === true
@@ -201,8 +228,8 @@ export default function Panel(props: PluginSurfaceProps<State>) {
       setDraft({})
       setMessage("已保存。重载配置后生效。")
       try { await props.api.refresh() } catch (_) { setMessage("已保存，但状态刷新失败。请刷新状态确认，再重载配置。") }
-    } catch (_) {
-      setMessage("保存失败，修改已保留。请刷新状态，检查配置档与参数后重试。")
+    } catch (error) {
+      setMessage(visibleSaveError(error))
     } finally { setBusy(false) }
   }
   // 后端缺失时不能把空数据当作正常配置展示。
@@ -227,6 +254,8 @@ export default function Panel(props: PluginSurfaceProps<State>) {
       .yui-field:last-child { border-bottom:0; }
       .yui-field label { font-weight:600; cursor:pointer; }
       .yui-field input[type=checkbox] { width:20px; height:20px; accent-color:var(--primary); cursor:pointer; flex-shrink:0; }
+      .yui-text { flex:1; min-width:180px; max-width:440px; }
+      .yui-text input { box-sizing:border-box; width:100%; padding:9px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); }
       .yui-number { display:flex; align-items:center; gap:8px; flex-shrink:0; }
       .yui-number input { width:76px; min-height:38px; padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); }
       .yui-field input:focus-visible, .yui-help summary:focus-visible { outline:2px solid var(--primary); outline-offset:4px; }
@@ -256,7 +285,8 @@ export default function Panel(props: PluginSurfaceProps<State>) {
       <Card title="陪伴设置">
         <div className="yui-row"><Text>当前配置档：{state.profile || "基础配置"}</Text><StatusBadge tone={pending.length ? "warning" : "success"}>{pending.length ? pending.length + " 项等待重载" : "已保存配置与运行一致"}</StatusBadge></div>
         {pending.length ? <div className="yui-notice" role="status">已保存但尚未应用：{pending.map(field => field.label).join("、")}。</div> : null}
-        <form onSubmit={event => { event.preventDefault(); void save() }}>
+        {/* 宿主沙盒禁止原生表单提交，保存按钮直接调用接口。 */}
+        <div role="group" aria-label="陪伴设置编辑">
           {groups.map(group => <section key={group.title} aria-label={group.title} style={{ marginTop: 24 }}>
             <h3 style={{ margin: 0, fontSize: 16 }}>{group.title}</h3>
             <p className="yui-muted">{group.description}</p>
@@ -269,21 +299,22 @@ export default function Panel(props: PluginSurfaceProps<State>) {
               return <div className="yui-field" key={key}>
                 <div><label for={inputId}>{field.label}</label>{modified ? <span className="yui-muted"> · 未保存</span> : null}<p id={inputId + "-hint"} className="yui-muted">{hints[key]}</p></div>
                 {field.type === "boolean" ? <input id={inputId} aria-describedby={inputId + "-hint"} type="checkbox" disabled={busy} checked={Boolean(value)} onChange={event => setDraft({ ...draft, [key]: event.target.checked })} />
-                  : <div className="yui-number"><input id={inputId} aria-describedby={inputId + "-hint"} type="number" required disabled={busy} min={field.min} max={field.max} step={1} value={value === undefined ? "" : String(value)} onInput={event => setDraft({ ...draft, [key]: event.target.value === "" ? "" : Number(event.target.value) })} /><span className="yui-muted">{key === "chat_bridge.max_pages" ? "页" : "秒"}</span></div>}
+                  : field.type === "text" || field.type === "password" ? <div className="yui-text"><input id={inputId} aria-describedby={inputId + "-hint"} type={field.type} autoComplete={field.type === "password" ? "new-password" : "off"} disabled={busy} value={String(value ?? "")} placeholder={field.type === "password" ? state.key_configured ? "已配置，留空保留" : "尚未直接配置" : ""} onInput={event => setDraft({ ...draft, [key]: event.target.value })} /></div>
+                  : <div className="yui-number"><input id={inputId} aria-describedby={inputId + "-hint"} type="number" required disabled={busy} min={field.min} max={field.max} step={field.step ?? 1} value={value === undefined ? "" : String(value)} onInput={event => setDraft({ ...draft, [key]: event.target.value === "" ? "" : Number(event.target.value) })} /><span className="yui-muted">{key === "chat_bridge.max_pages" ? "页" : key.endsWith("_s") || key.endsWith("seconds") ? "秒" : ""}</span></div>}
               </div>
             })}
           </section>)}
           <div className="yui-save">
             <p className="yui-muted" aria-live="polite">{invalid ? "请输入范围内的整数后再保存。" : changed.length ? changed.length + " 项未保存。保存后需重载配置。" : "没有未保存的修改。"}</p>
-            <div className="yui-actions"><button className="neko-button" data-tone="primary" type="submit" disabled={busy || invalid || !changed.length}>{busy ? "保存中…" : "保存设置"}</button><button className="neko-button" data-tone="default" type="button" disabled={busy || !changed.length} onClick={() => { setDraft({}); setMessage("") }}>撤销修改</button></div>
+            <div className="yui-actions"><button className="neko-button" data-tone="primary" type="button" onClick={() => { void save() }} disabled={busy || invalid || !changed.length}>{busy ? "保存中…" : "保存设置"}</button><button className="neko-button" data-tone="default" type="button" disabled={busy || !changed.length} onClick={() => { setDraft({}); setMessage("") }}>撤销修改</button></div>
             {message ? <p role="status" aria-live="polite">{message}</p> : null}
           </div>
-        </form>
+        </div>
         <div className="yui-notice"><div className="yui-row"><div><strong>应用已保存的配置</strong><p className="yui-muted">重载会中断当前控制并重新初始化；启用自动连接后会尝试重连。未保存的修改不会应用。</p></div>{busy ? <Text>请等待保存完成</Text> : action("yui_reload_config")}</div></div>
       </Card>
       <Card title="使用提示">
         <details className="yui-help"><summary>世界聊天与字幕显示</summary><p className="yui-muted">在支持聊天输入的世界中，按 T 打开输入框，Enter 发送，Esc 关闭。字幕逐字效果和全文至少留存 6 秒由世界端实现，需要上传包含该功能的世界版本。</p></details>
-        <details className="yui-help"><summary>模型配置与控制说明</summary><p className="yui-muted">独立意图模型用于动作决策。密钥从配置指定的宿主环境变量读取，本面板不读取或保存密钥。自主暂停和断开连接不会自动解除紧急停止（ESTOP）。</p></details>
+        <details className="yui-help"><summary>模型配置与控制说明</summary><p className="yui-muted">独立意图模型用于动作决策。可在模型连接中输入密钥并保存；直接配置优先，环境变量作为备用。密钥保存在宿主本机配置，面板不回显。自主暂停和断开连接不会自动解除紧急停止（ESTOP）。</p></details>
       </Card>
     </Stack>
   </Page>

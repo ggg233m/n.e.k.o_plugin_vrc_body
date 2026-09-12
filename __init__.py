@@ -19,7 +19,7 @@ if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
 try:
-    from plugin.sdk.plugin import Err, NekoPluginBase, Ok, lifecycle, neko_plugin, plugin_entry
+    from plugin.sdk.plugin import Err, NekoPluginBase, Ok, TransportError, lifecycle, neko_plugin, plugin_entry
 except ImportError:
     # 单元测试环境没有 N.E.K.O SDK，使用最小桩保持核心可导入。
     class NekoPluginBase:  # type: ignore[no-redef]
@@ -34,6 +34,9 @@ except ImportError:
         def __init__(self, message: str = "") -> None:
             self.message = message
 
+    class TransportError(RuntimeError):  # type: ignore[no-redef]
+        pass
+
     def _decorator(*args: Any, **kwargs: Any) -> Any:
         return args[0] if len(args) == 1 and callable(args[0]) and not kwargs else (lambda func: func)
 
@@ -43,7 +46,14 @@ from .runtime.motion_backend import MotionBackend, MotionBackendConfig
 from .runtime.session_pose_factory import SessionPoseFactory
 from .runtime.refresh_worker import RefreshWorker
 from .runtime.diagnostics import PipelineDiagnostics
-from .runtime.control_panel import FIELDS, settings_view, validated_patch, action_progress_view
+from .runtime.control_panel import (
+    FIELDS,
+    action_progress_view,
+    merge_profile_patch,
+    persist_profile_compat,
+    settings_view,
+    validated_patch,
+)
 
 try:
     from plugin.sdk.plugin import ui
@@ -774,7 +784,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             while not stop_event.is_set():
                 wait_s = max(
                     0.0,
-                    self._intent_provider.config.min_interval_s
+                    (min(2.0, self._intent_provider.config.min_interval_s)
+                     if request["context"].get("mode") == "chat_motion"
+                     else self._intent_provider.config.min_interval_s)
                     - (time.monotonic() - self._intent_last_started_at),
                 )
                 if wait_s <= 0.0:
@@ -1701,11 +1713,13 @@ class YuiNpcControllerPlugin(NekoPluginBase):
         reply = snapshot.get("chat_bridge") or {}
         return {
             "profile": await self.config.profile_active(),
+            "key_configured": bool(saved.autonomy.intent_model.api_key),
+            "key_reload_required": saved.autonomy.intent_model.api_key != self._config.autonomy.intent_model.api_key,
             "settings": settings_view(saved),
             "applied": settings_view(self._config),
             "intent_model": self._intent_provider.panel_status(),
             "action_progress": action_progress_view(autonomy, self._adapter.plan_manager.panel_progress() if self._adapter is not None else None),
-            "fields": [{"key": key, "label": item[0], "type": "boolean" if item[1] is bool else "number", "min": item[2], "max": item[3]} for key, item in FIELDS.items()],
+            "fields": [{"key": key, "label": item[0], "type": "password" if key == "autonomy.intent_model.api_key" else "boolean" if item[1] is bool else "text" if item[1] is str else "number", "step": 0.1 if item[1] is float else 1, "min": item[2], "max": item[3]} for key, item in FIELDS.items()],
             "status": {
                 "控制已就绪": snapshot["control_ready"],
                 "MIDI 已打开": snapshot["midi_open"],
@@ -1732,16 +1746,58 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 if profile != expected_profile:
                     return Err("配置档已切换，请刷新后重试")
                 patch = validated_patch(await self.config.dump(), changes)
+            except ValueError as exc:
+                return Err(f"设置校验失败：{exc}")
+            except Exception as exc:
+                self.logger.warning(
+                    "YUI panel config read failed: err_type=%s",
+                    type(exc).__name__,
+                )
+                return Err("宿主配置服务读取失败，请刷新配置档后重试")
+            try:
                 if profile != await self.config.profile_active():
                     return Err("配置档已切换，请刷新后重试")
                 if profile:
-                    await self.config.profile_update(profile, patch)
+                    try:
+                        await self.config.profile_update(profile, patch)
+                    except TransportError as exc:
+                        detail = str(exc)
+                        missing_write_channel = (
+                            "PLUGIN_CONFIG_PROFILE_UPSERT" in detail
+                            or "upsert_own_profile_config is not available" in detail
+                        )
+                        if not missing_write_channel:
+                            raise
+                        current = await self.config.profile_get(profile)
+                        if profile != await self.config.profile_active():
+                            return Err("配置档已切换，请刷新后重试")
+                        roots = []
+                        for attr in ("runtime_config_path", "config_dir"):
+                            try:
+                                value = getattr(self, attr)
+                            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                                continue
+                            roots.append(value.parent if attr == "runtime_config_path" else value)
+                        await asyncio.to_thread(
+                            persist_profile_compat,
+                            profile,
+                            merge_profile_patch(current, patch),
+                            roots,
+                        )
+                        self.logger.info(
+                            "YUI panel profile saved through plugin compatibility path: profile=%s",
+                            profile,
+                        )
                 else:
                     await self.config.update(patch)
                 return Ok({"status": "saved", "reload_required": True})
-            except Exception:
-                # 错误正文可能含底层配置，面板只返回固定提示。
-                return Err("保存失败：请检查参数范围及宿主配置服务")
+            except Exception as exc:
+                # 宿主异常正文可能包含本机路径或配置内容，只记录异常类型。
+                self.logger.warning(
+                    "YUI panel config write failed: err_type=%s",
+                    type(exc).__name__,
+                )
+                return Err("宿主配置服务写入失败，请刷新配置档后重试")
 
     @ui.action(label="连接世界")
     @plugin_entry(

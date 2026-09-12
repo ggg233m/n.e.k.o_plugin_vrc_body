@@ -6,7 +6,7 @@ startup_failure = "fail"
 [yui]
 # 与世界端约定的 MIDI 输出端口。
 midi_port = "NEKO_MIDI"
-claim_code = 0
+claim_code = 4321
 
 # 留空时自动跟随当前用户最新的 VRChat output_log。
 log_path = ""
@@ -70,8 +70,8 @@ post_reply_hold_s = 60
 no_reply_timeout_s = 90
 approach_retry_s = 10
 
-# 独立意图模型不使用宿主回复/TTS 通道。通用配置默认关闭；密钥只从指定环境变量
-# 读取，绝不能写入本文件。可选聊天上下文仅从落盘 recent.json 只读取得。
+# 独立意图模型不使用宿主回复/TTS通道。通过面板输入密钥写入本机配置；
+# 不把真实密钥提交到仓库。环境变量作为备用。聊天上下文只读取得。
 [yui.autonomy.intent_model]
 enabled = true
 # 留空表示不配置中转站，意图模型不会启用。要接入 OpenAI 兼容中转站，
@@ -80,6 +80,7 @@ enabled = true
 endpoint = ""
 model = "gemini-3.7-flash"
 api_key_env = "TEST_API"
+api_key = ""
 persona_prompt = "你是友好、好奇且会自然安排生活片段的世界 NPC。"
 timeout_s = 20
 min_interval_s = 30

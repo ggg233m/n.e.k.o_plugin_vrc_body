@@ -348,6 +348,7 @@ class AutonomyDirector:
             player_slot=player_slot,
             reply_baseline_serial=max(0, int(reply_baseline_serial)),
         )
+        self._request_intent("chat_started")
         return True
 
     def note_chat_input(self, event: Mapping[str, Any]) -> bool:
@@ -807,7 +808,6 @@ class AutonomyDirector:
         with self._condition:
             if (
                 not self._desired_running
-                or self._chat_engagement is not None
                 or request_token != self._latest_intent_token
                 or not isinstance(value.get("motivation"), str)
                 or not isinstance(value.get("mood"), str)
@@ -860,6 +860,29 @@ class AutonomyDirector:
                     "strength": float(strength),
                     "expires_at": now + interest_ttl,
                 })
+            if self._chat_engagement is not None:
+                # 聊天结果立即更新姿态意图，不提交旧生活片段或导航任务。
+                activity = activities[0]
+                if activity.get("kind") != "linger" or not activity.get("motion_description"):
+                    self._last_intent_outcome = "invalid_chat_motion"
+                    self._intent_disposition(request_token, "invalid")
+                    return False
+                try:
+                    motion = compile_motion_intent({key: activity[key] for key in
+                        ("kind", "motion_description", "motion_style", "duration_s") if key in activity})
+                except ValueError:
+                    self._last_intent_outcome = "invalid_chat_motion"
+                    return False
+                previous = getattr(self, "_chat_motion_token", None)
+                if previous:
+                    self._intent_disposition(previous, "superseded")
+                self._chat_motion = motion
+                self._chat_motion_until = now + 30.0
+                self._chat_motion_token = request_token
+                self._last_intent_outcome = "chat_motion_active"
+                self._intent_disposition(request_token, "active")
+                self._condition.notify_all()
+                return True
             if self._pending_intent is not None:
                 self._intent_disposition(self._pending_intent.request_token, "superseded")
             self._pending_intent = _IntentFragment(
@@ -922,6 +945,9 @@ class AutonomyDirector:
         if self._active is not None:
             self._update_active(now)
         if self._service_chat_engagement(now):
+            refresh_after = 10.0 if self._latest_intent_token == getattr(self, "_chat_motion_token", None) else 30.0
+            if self._chat_engagement is not None and now - getattr(self, "_chat_motion_requested_at", float("-inf")) >= refresh_after:
+                self._request_intent("chat_motion_refresh")
             return
         social = self._pop_social()
         if social is not None:
@@ -1271,6 +1297,13 @@ class AutonomyDirector:
         self._request_intent("fallback_timer")
 
     def _clear_intent_locked(self, outcome: str) -> None:
+        previous = getattr(self, "_chat_motion_token", None)
+        if previous:
+            self._intent_disposition(previous, "stopped")
+        self._chat_motion = None
+        self._chat_motion_token = None
+        self._chat_motion_until = float("-inf")
+        self._chat_motion_requested_at = float("-inf")
         self._motion_intent = compile_motion_intent({}, explicit_stop=True)
         # 人工接管、暂停、聊天切换或角色切换后不继续执行旧偏好。
         self._preference = None
@@ -1389,6 +1422,14 @@ class AutonomyDirector:
                     "只有真的对远处目标感兴趣时才跨区域。"
                 ),
             }
+            if self._chat_engagement is not None:
+                context["mode"] = "chat_motion"
+                context["instruction"] = (
+                    "当前正在与玩家聊天，根据最新对话情绪生成原地身体表达。"
+                    "activities均使用linger并提供英文motion_description；第一项是现在要做的动作。"
+                    "只允许原地手势、头部和躯干表达，不离开玩家，不输出导航或旧动作键。"
+                    "不按字幕页、文字长度或音频时长安排动作。"
+                )
             provider = self.chat_context_provider
             if provider is not None and provider.config.enabled:
                 context["recent_conversation"] = provider.context()
@@ -1397,9 +1438,12 @@ class AutonomyDirector:
     def motion_intent_snapshot(self):
         """聊天和暂停只允许原地姿态，绝不借基础动作恢复导航。"""
         with self._condition:
-            if not self._desired_running or self._pause_reason:
+            if not self._desired_running or (self._pause_reason and self._pause_reason != "chat_engaged"):
                 return compile_motion_intent({}, explicit_stop=True)
             if self._chat_engagement is not None:
+                motion = getattr(self, "_chat_motion", None)
+                if motion and self._clock() < self._chat_motion_until:
+                    return dict(motion)
                 return compile_motion_intent({}, chat_engaged=True)
             return dict(getattr(self, "_motion_intent", compile_motion_intent({})))
 
@@ -1410,11 +1454,11 @@ class AutonomyDirector:
         with self._condition:
             if not self._desired_running:
                 return
+            if self._explicit_plan_id or self._explicit_operation_id or self._clock() < self._resume_at:
+                return
             if self._chat_engagement is not None:
                 self._chat_engagement.intent_refresh_needed = True
-                self._last_intent_request_reason = reason
-                self._last_intent_outcome = "deferred_for_chat"
-                return
+                self._chat_motion_requested_at = self._clock()
             self._intent_request_serial += 1
             token = f"{self.session.session}:{self._intent_request_serial}"
             self._latest_intent_token = token

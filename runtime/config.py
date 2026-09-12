@@ -238,6 +238,7 @@ class YuiIntentModelConfig:
     endpoint: str = ""
     model: str = "gemini-3.7-flash"
     api_key_env: str = "TEST_API"
+    api_key: str = field(default="", repr=False)
     persona_prompt: str = "你是友好、好奇且会自然安排生活片段的世界 NPC。"
     timeout_s: float = 20.0
     min_interval_s: float = 30.0
@@ -265,7 +266,11 @@ class YuiIntentModelConfig:
         )
         if api_key_env and not api_key_env.replace("_", "").isalnum():
             raise ValueError("autonomy.intent_model.api_key_env 只能包含字母、数字和下划线")
+        api_key = _string(data.get("api_key", ""), name="autonomy.intent_model.api_key", allow_empty=True, maximum_length=4096)
+        if any(ch in api_key for ch in ("\r", "\n", "\0")):
+            raise ValueError("模型密钥不能包含换行或空字符")
         return cls(
+            api_key=api_key,
             enabled=_boolean(
                 data.get("enabled", defaults.enabled),
                 name="autonomy.intent_model.enabled",

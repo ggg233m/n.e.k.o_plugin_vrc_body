@@ -86,5 +86,5 @@ def enable_core8_runtime(model, *, encode=False, decode=False, schedule=True):
     model._core8_runtime_enabled=True
     model._core8_runtime_calls=0
     model._core8_schedule_builds=0
-    print(f'[Core8] 编码编译={encode}，解码编译={decode}，采样计划缓存={schedule}',flush=True)
+    print(f'[Core{model.gen_horizon_len}] 编码编译={encode}，解码编译={decode}，采样计划缓存={schedule}',flush=True)
     return True

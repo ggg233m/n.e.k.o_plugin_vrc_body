@@ -305,6 +305,11 @@ def validate_intent(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
                 if field == "motion_style" and content not in {"natural", "relaxed", "gentle", "lively"}:
                     raise IntentModelError("invalid_motion_style")
                 normalized[field] = content.strip()
+        if context.get("mode") == "chat_motion" and (
+            kind != "linger" or not normalized.get("motion_description")
+            or target_key is not None or player_slot is not None or action_key is not None
+        ):
+            raise IntentModelError("invalid_chat_motion")
         normalized_activities.append(normalized)
 
     avoid_targets = value.get("avoid_targets", [])
@@ -402,6 +407,8 @@ class AutonomyIntentProvider:
         self._key_state = "present" if (not config.api_key_env or self._api_key()) else "missing"
 
     def _api_key(self) -> str:
+        if self.config.api_key:
+            return self.config.api_key
         if not self.config.api_key_env:
             return ""
         return os.environ.get(self.config.api_key_env, "").strip()
@@ -534,6 +541,13 @@ class AutonomyIntentProvider:
             "已完成的活动不要机械重复，有新聊天或目标不可用时可改变方向。"
         )
         constraints = _catalog_constraints(context)
+        if context.get("mode") == "chat_motion":
+            system += (
+                "\n当前任务为聊天身体表达：保持原地，根据最新聊天的情绪和意图更新动作。"
+                "activities仍为2到4项，但必须全部使用linger，并填写英文motion_description。"
+                "第一项会立即作为当前动作意图；其余仅为备选，不按字幕排队。"
+                "不提供target_key、player_slot或action_key，不生成走远计划；interests和avoid_targets为空。"
+            )
         request_context = dict(context)
         request_context["reference_options"] = {key: sorted(value) for key, value in constraints.items()}
         # 示例只引用本次快照中的真实值，避免模型照抄虚构槽位或占位目标。

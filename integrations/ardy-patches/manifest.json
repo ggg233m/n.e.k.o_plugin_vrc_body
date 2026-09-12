@@ -91,8 +91,8 @@
     {
       "path": "ardy/model/xpu_core8_runtime.py",
       "base_sha256": null,
-      "patched_sha256": "889c82ce839a5894baa02d4c4ef75f989f5f942d79861611f8f2ac727ba9a47b",
-      "patched_content_sha256": "889c82ce839a5894baa02d4c4ef75f989f5f942d79861611f8f2ac727ba9a47b"
+      "patched_sha256": "905d5771b71ee76417c66c9336c5e6d8a17127a7993f9f633592d3a551a613af",
+      "patched_content_sha256": "905d5771b71ee76417c66c9336c5e6d8a17127a7993f9f633592d3a551a613af"
     },
     {
       "path": "ardy/model/xpu_core8_warmup.py",
