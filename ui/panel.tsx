@@ -213,8 +213,9 @@ export default function Panel(props: PluginSurfaceProps<State>) {
   const ready = status["控制已就绪"] === true
   const midi = status["MIDI 已打开"] === true
   const manual = status["人工断开"] === true
-  const connection = ready ? "世界控制已就绪" : manual ? "已手动断开" : midi ? "等待世界握手" : "尚未连接世界"
-  const connectionHint = ready ? "可以发送控制指令，并查看自主陪伴状态。" : manual ? "点击连接世界，即可重新建立控制连接。" : midi ? "MIDI 通道已打开，世界控制尚未就绪。请确认已进入支持 YUI 的世界。" : "进入支持 YUI 的世界后，点击连接世界。"
+  const estop = status["急停已锁存"] === true
+  const connection = estop ? "已紧急停止" : ready ? "世界控制已就绪" : manual ? "已手动断开" : midi ? "等待世界握手" : "尚未连接世界"
+  const connectionHint = estop ? "确认可以继续后，点击解除急停恢复控制；需要自主陪伴时再点击启动自主。" : ready ? "可以发送控制指令，并查看自主陪伴状态。" : manual ? "点击连接世界，即可重新建立控制连接。" : midi ? "MIDI 通道已打开，世界控制尚未就绪。请确认已进入支持 YUI 的世界。" : "进入支持 YUI 的世界后，点击连接世界。"
   function action(id: string) {
     const item = actions.find(a => a.id === id)
     return item ? <ActionButton key={id} action={item} refresh={true} /> : null
@@ -277,7 +278,7 @@ export default function Panel(props: PluginSurfaceProps<State>) {
           <div className="yui-metric"><span className="yui-muted">自主陪伴</span><strong>{statusLabel(status["自主状态"])}</strong></div>
           <div className="yui-metric"><span className="yui-muted">字幕发送</span><strong>{statusLabel(status["字幕状态"])}</strong><p className="yui-muted">{typeof status["最近字幕秒数"] === "number" && Number(status["最近字幕秒数"]) > 0 ? "最近一页 · " + status["最近字幕秒数"] + " 秒" : "暂无发送时长"}</p></div>
         </div>
-        <div className="yui-actions">{action("yui_connect")}{action("yui_disconnect")}{action("yui_autonomy_start")}{action("yui_autonomy_pause")}</div>
+        <div className="yui-actions">{estop && action("yui_clear_estop")}{action("yui_connect")}{action("yui_disconnect")}{action("yui_autonomy_start")}{action("yui_autonomy_pause")}</div>
         <p className="yui-muted">状态以最近一次刷新为准。暂停自主只停止自主活动；断开连接会停止 NPC 控制。</p>
       </Card>
       <ActionProgressCard progress={state.action_progress} />

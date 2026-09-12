@@ -435,6 +435,9 @@ class MotionBackend:
                     "request_id": uuid.uuid4().hex, "intent": intent, "instance": self._health.get("instance")})
                 result = self._dispatch_task(session,result)
             self._base_task = result.get("op_id") if result.get("status")=="accepted" else None
+            if result.get('error') == 'world_busy':
+                # 未发送的忙碌请求可在旧操作结束后重新尝试。
+                self._base_signature = None
         except Exception:
             # 不确定请求仅等待下次语义变化；避免后台循环重复启动动作。
             self._base_task = None

@@ -472,11 +472,12 @@ class ContinuousExecution:
                 return dict(op_id=self.path_goal['op_id'],arguments=dict(self.path_goal['arguments']))
             return None
 
-    def stop(self):
+    def stop(self, *, fault=False):
         self.discard_path_goal()
         self.halt.set()
         if self.sender:
-            self.sender.stop()
+            if fault:self.sender.fault_stop()
+            else:self.sender.stop()
         with self.condition:
             self.condition.notify_all()
 
@@ -485,5 +486,5 @@ class ContinuousExecution:
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(3)
             if self.thread.is_alive():
-                self.stop()
+                self.stop(fault=True)
         self.session.remove_event_listener(self.ingest)

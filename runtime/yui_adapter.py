@@ -229,6 +229,11 @@ class YuiSemanticAdapter:
                         "当前会话的 sys.hello 或声明目录未在期限内完整到达",
                         requested_session=session_value,
                     )
+                if self.session.control_state == 'estop':
+                    # 握手已经成功，只是控制被人工锁存；复用会话供恢复入口使用。
+                    self._connected_session = session_value
+                    return _local_result('estop_latched', '连接已建立，请通过面板解除急停',
+                                         requested_session=session_value, already_connected=True)
                 # 地图 NPC 的活动范围和可用目标已由世界 capability、目录、NavMesh
                 # 与 ownership 共同约束，不再把 ARM 作为 LLM 权限门。SET_CONTROL_MODE
                 # 是宿主连接流程的内部可靠步骤，模型工具面从不暴露 npc.arm。
@@ -1198,9 +1203,12 @@ class YuiSemanticAdapter:
             )
         if isinstance(control_outcome, dict):
             return control_outcome
+        if control_outcome.status == 'succeeded':
+            self.transport.set_heartbeat_enabled(True)
+            self.transport.start_heartbeat()
         return self._outcome(
             control_outcome,
-            control_state="external",
+            control_state="external" if control_outcome.status == 'succeeded' else self.session.control_state,
             estop_cleared=True,
             clear_wire_seq=clear_outcome.wire_sequence,
             clear_request_hash=clear_outcome.request_hash,

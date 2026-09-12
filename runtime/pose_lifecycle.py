@@ -41,7 +41,7 @@ class PoseLifecycle:
         receipts=self.receipts
         if receipts is not None:
             if event.get("type")=="sys.boot" or self.session.session!=receipts.session or self.session.world_id!=receipts.world_id:
-                receipts.stop()
+                receipts.stop(fault=True)
             else:
                 receipts.ingest(event)
 
@@ -50,6 +50,6 @@ class PoseLifecycle:
             self.closed=True
             self.session.remove_event_listener(self.ingest)
             if self.receipts is not None:
-                self.receipts.stop()
+                self.receipts.stop(fault=True)
                 self.transport.detach_pose_sender()
                 self.receipts=None

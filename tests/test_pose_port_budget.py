@@ -47,9 +47,9 @@ def test_full_throttle_overload_keeps_998_normal_events_and_reserved_stop():
         port.step(now)
         if port.stopped:break
         for lane,seq in list(port.pending):assert port.ack(lane,7,1,seq,now)
-    # 不受控生产者耗尽滚动预算时不能继续普通发送，事务失效后只补两个急停。
+    # 耗尽滚动预算后停止姿态流，额外保留人工急停的一个事件。
     assert port.stopped and port.reason=='receipt_timeout'
-    assert len(sent)==1000 and port.outstanding<=112
+    assert len(sent)==999 and port.outstanding<=112
 
 
 def test_missing_ack_still_stops_without_sending_another_pose():
@@ -63,7 +63,7 @@ def test_missing_ack_still_stops_without_sending_another_pose():
     assert not port.submit('pose',2,[event]*78,.07)
     port.step(.51)
     assert port.stopped and port.reason=='receipt_timeout'
-    assert len(sent)==80
+    assert len(sent)==79
 
 
 def test_pipeline_stops_at_112_until_verified_receipt_then_continues_same_packet():
@@ -93,7 +93,9 @@ def test_pipeline_missing_ack_keeps_reserved_stop_within_114_events():
     port.submit('pose',2,[event]*78,.06)
     for tick in range(100,200):port.step(tick*.0006)
     port.step(.51)
-    assert len(sent)==114 and port.stopped and port.reason=='receipt_timeout'
+    assert len(sent)==113 and port.stopped and port.reason=='receipt_timeout'
+    port.stop('explicit_stop')
+    assert len(sent)==114
 
 
 def test_expired_unsent_transactions_do_not_accumulate_audit_entries():

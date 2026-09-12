@@ -1,6 +1,9 @@
 """同一 MIDI 所有者完成路径准备、服务租约和动作武装。"""
 import threading
 import uuid
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .motion_space import MotionSpace
 from .pose_codec import encode_motion_control, midi_events
@@ -77,6 +80,9 @@ class SessionPoseFactory:
                 self.condition.wait_for(lambda: session.control_state == "external" or not self.ready(session), .5)
             if not self.ready(session) or session.control_state != "external":
                 raise RuntimeError("world_prepare_unavailable")
+            # 旧世界要求所有操作结束；注视也占操作槽，忙碌时不取得端口。
+            if getattr(session, 'npc_state', {}).get('active_ops'):
+                raise RuntimeError("world_busy")
             if arguments.get("player_slot") is not None:
                 raise ValueError("interaction_bridge_not_implemented")
             target = arguments.get("target_key")
@@ -118,7 +124,10 @@ class SessionPoseFactory:
                     raise RuntimeError("service_binding_unconfirmed")
                 self.binding = binding
                 return health
-            except Exception:
+            except Exception as exc:
+                logger.warning('YUI_PREPARE_FAILED session=%s request_seq=%s error=%s active_ops=%s',
+                               session.session, self.request_seq, type(exc).__name__,
+                               len(getattr(session, 'npc_state', {}).get('active_ops', [])))
                 self.stop()
                 raise
 
@@ -152,7 +161,7 @@ class SessionPoseFactory:
         # 不等待路径准备锁或 HTTP；在途准备也不能逃过停止。
         self.stopped.set()
         if self.sender:
-            self.sender.stop()
+            self.sender.fault_stop()
 
     def close(self):
         self.stop()

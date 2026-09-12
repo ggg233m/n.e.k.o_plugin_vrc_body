@@ -1,6 +1,9 @@
 """姿态实验的单端口调度核心；只允许一个调度线程调用，尚未接管正式发送器。"""
 from collections import deque
 from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,7 +66,7 @@ class SharedPort:
         return True
 
     def _expired(self, now):
-        if self.unconfirmed and now-self.unconfirmed[0][1] >= self.timeout:
+        if any(now >= item[2] for item in self.unconfirmed):
             self.stop("receipt_timeout")
         return self.stopped
 
@@ -94,7 +97,9 @@ class SharedPort:
         if entry is not None and tx.offset==0:entry["first_sent"]=now
         # 先占用信用；底层报错也按可能已经发出处理，不重试。
         self.serial += 1
-        self.unconfirmed.append((self.serial,now))
+        # 控制回执容忍日志回传抖动；姿态仍保留原来的短租约。
+        receipt_timeout = max(self.timeout, 1.5) if tx.lane in ('heartbeat', 'control') else self.timeout
+        self.unconfirmed.append((self.serial,now,now+receipt_timeout))
         self.window.append(now)
         # 单帧允许较短发送突发；998条/滚动秒与112条未确认上限保持不变。
         self.next_send = now+(1/4000 if self.pose_pipeline else 1/2000)
@@ -139,15 +144,20 @@ class SharedPort:
                 except Exception as exc:self.stop_errors.append(type(exc).__name__)
             return
         self.stopped, self.reason = True, reason
+        logger.warning('YUI_PORT_STOP reason=%s session=%s epoch=%s outstanding=%s active_lane=%s',
+                       reason, self.session, self.epoch, self.outstanding,
+                       self.active.lane if self.active else None)
         self.active = None
         for queue in self.queues.values():
             queue.clear()
         self.pending.clear()
         self.audit_pending.clear()
         # 最多 112 条普通未确认事件，再加两个停止，仍为有界发送。
-        explicit=reason=='explicit_stop' or self.fault_events is None
+        explicit=reason=='explicit_stop'
         self.estop_sent=explicit
-        for event in (self.stop_events if explicit else self.fault_events):
+        # 旧世界只停止姿态桥，不把普通故障升级成全局急停。
+        fault_events = self.fault_events if self.fault_events is not None else self.stop_events[1:]
+        for event in (self.stop_events if explicit else fault_events):
             try:
                 self.sink(event)
             except Exception as exc:

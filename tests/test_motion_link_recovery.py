@@ -9,14 +9,14 @@ from yui_npc_controller.runtime.motion_backend import MotionBackend,MotionBacken
 from yui_npc_controller.runtime.yui_transport import YuiReliableTransport
 
 
-def test_timeout_keeps_legacy_estop_but_new_capability_only_pauses():
+def test_timeout_only_pauses_on_both_legacy_and_new_worlds():
     for recovery in (False,True):
         sent=[]
         port=SharedPort(sent.append,7,1,('estop','pose_stop'),fault_events=('fault',) if recovery else None)
         port.submit('pose',1,['data'],0);port.step(0);port.step(.51)
-        assert sent==(['data','fault'] if recovery else ['data','estop','pose_stop'])
+        assert sent==(['data','fault'] if recovery else ['data','pose_stop'])
         port.stop('explicit_stop');port.stop('explicit_stop')
-        assert sent==(['data','fault','estop'] if recovery else ['data','estop','pose_stop'])
+        assert sent==(['data','fault','estop'] if recovery else ['data','pose_stop','estop'])
 
 
 def test_sender_manual_stop_after_fault_always_escalates_once():

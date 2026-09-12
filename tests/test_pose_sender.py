@@ -115,7 +115,8 @@ def test_unconfirmed_graceful_close_still_stops():
     actor.send([MidiEvent("note_off",15,1,1)],lane="pose")
     actor.close(graceful=True)
     assert not actor.gracefully_closed
-    assert [event.number for event in calls[-2:]]==[127,112]
+    assert calls[-1] == MidiEvent('cc',15,112,1)
+    assert not any(event.type == 'note_on' and event.number == 127 for event in calls)
 
 def test_world_release_can_settle_unconfirmed_pose_without_estop():
     from yui_npc_controller.runtime.pose_receipts import PoseReceipts

@@ -1729,6 +1729,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 "字幕状态": reply.get("last_result", "not_initialized"),
                 "最近字幕秒数": reply.get("last_display_seconds"),
                 "人工断开": self._manual_disconnect,
+                "急停已锁存": bool(self._session and self._session.estop),
             },
         }
 
@@ -1837,6 +1838,7 @@ class YuiNpcControllerPlugin(NekoPluginBase):
                 self._ensure_auto_connect_worker()
                 return Err(f"{type(exc).__name__}: {exc}")
 
+    @ui.action(label="解除急停", refresh_context=True)
     @plugin_entry(
         id="yui_clear_estop",
         name="人工清除 YUI ESTOP",

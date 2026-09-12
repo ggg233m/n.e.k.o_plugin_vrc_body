@@ -49,7 +49,7 @@ class SessionPoseWorld:
         with self.condition:
             if event.get("type")=="sys.boot" or not self.is_current():
                 self.failure="world_binding_lost"
-                self.receipts.stop()
+                self.receipts.stop(fault=True)
                 self.condition.notify_all()
                 return
             if (event.get("world_id"),event.get("session"),event.get("npc_id"))!=(self.world_id,self.session_id,"yui"):
@@ -85,7 +85,7 @@ class SessionPoseWorld:
                         self.operation_completed=dict(event)
                 elif kind in {"npc.operation_cancelled","npc.operation_failed"}:
                     self.failure=event.get("reason") or event.get("err") or "world_operation_failed"
-                    self.receipts.stop()
+                    self.receipts.stop(fault=True)
             self.condition.notify_all()
 
     def begin(self,task):
@@ -96,7 +96,7 @@ class SessionPoseWorld:
         with self.condition:
             self.condition.wait_for(lambda:self.armed or not self.is_current(),.5)
             if not self.is_current() or not self.armed:
-                self.receipts.stop()
+                self.receipts.stop(fault=True)
                 raise RuntimeError("world_arm_unconfirmed")
             self.sender.ack(ticket,self.session_id)
             return self.wire_epoch
@@ -127,7 +127,7 @@ class SessionPoseWorld:
 
     def stop(self):
         self.stopped=True
-        self.receipts.stop()
+        self.receipts.stop(fault=True)
         with self.condition:
             self.condition.notify_all()
 

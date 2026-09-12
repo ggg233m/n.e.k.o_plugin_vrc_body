@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -26,6 +27,7 @@ from .yui_session import YuiAck, YuiSessionState
 
 
 MidiSink = Callable[[MidiEvent], None]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -231,11 +233,28 @@ class YuiReliableTransport:
             self._rate_lock.notify_all()
 
     def _send_events(self, events: Sequence[MidiEvent]) -> None:
-        if self._shared_sender is not None:
-            return self._shared_sender.send(events)
         with self._send_lock:
+            self._release_faulted_sender()
+            if self._shared_sender is not None:
+                return self._shared_sender.send(events)
             for event in events:
                 self._sink(event)
+
+    def _release_faulted_sender(self, *, manual_clear=False):
+        """只在写线程确实退出后收回端口；不重放姿态、不自动清除人工急停。"""
+        with self._send_lock:
+            sender = self._shared_sender
+            if sender is None:
+                return
+            if manual_clear:
+                sender.closed.wait(1)
+            if not sender.closed.is_set():
+                return
+            if sender.core.estop_sent and not manual_clear:
+                return
+            logger.warning('YUI_PORT_RELEASE reason=%s session=%s manual_clear=%s',
+                           sender.core.reason, self.session.session, manual_clear)
+            self._shared_sender = None
 
     @staticmethod
     def _expected_session(frame: CommandFrame, current_session: int) -> int:
@@ -291,7 +310,9 @@ class YuiReliableTransport:
             expected_session = self._expected_session(frame, self.session.session)
             after_ack = self.session.ack_generation
             started = time.monotonic()
-            receipt_ticket = self._send_events(frame.events)
+            with self._send_lock:
+                receipt_ticket = self._send_events(frame.events)
+                sender = self._shared_sender
             ack = self.session.wait_for_ack(
                 frame.sequence,
                 frame.command_id,
@@ -301,8 +322,8 @@ class YuiReliableTransport:
                 after_arrival_index=after_ack,
             )
             if ack is None:
-                if self._shared_sender is not None:
-                    self._shared_sender.fault_stop()
+                if receipt_ticket is not None:
+                    sender.fault_stop()
                     raise TimeoutError("共享端口未取得命令 ACK，停止且不重发")
                 # 只原样重发一次；旧 seq/hash/寄存器不得重建。
                 self._wait_normal_rate_slot()
@@ -334,8 +355,8 @@ class YuiReliableTransport:
                     session_rebuild_required=True,
                     snapshot_requested=snapshot_requested,
                 )
-            if self._shared_sender is not None:
-                self._shared_sender.ack(receipt_ticket, ack.session)
+            if receipt_ticket is not None:
+                sender.ack(receipt_ticket, ack.session)
             return self._outcome_from_ack(frame, ack)
 
     def _request_snapshot_evidence(self, failed_frame: CommandFrame) -> bool:
@@ -369,6 +390,8 @@ class YuiReliableTransport:
         parameters: Sequence[Any] = (0, 0, 0, 0, 0, 0),
     ) -> YuiCommandOutcome:
         command_id = COMMAND_IDS.get(command.strip().upper()) if isinstance(command, str) else int(command)
+        if command_id == COMMAND_IDS['CLEAR_ESTOP']:
+            self._release_faulted_sender(manual_clear=True)
         if command_id == COMMAND_IDS["HEARTBEAT"]:
             frame = self.send_heartbeat()
             return YuiCommandOutcome(
@@ -401,6 +424,7 @@ class YuiReliableTransport:
             return outcome
 
     def send_heartbeat(self) -> CommandFrame:
+        self._release_faulted_sender()
         frame = encode_command("HEARTBEAT", self._allocate_sequence())
         self._record_priority_reliable()
         sender = self._shared_sender
@@ -411,9 +435,11 @@ class YuiReliableTransport:
             after_ack = self.session.ack_generation
             expected_session = self.session.session
             ticket = sender.send(frame.events, lane="heartbeat")
-            ack = self.session.wait_for_ack(frame.sequence, frame.command_id, frame.request_hash, .4,
+            ack = self.session.wait_for_ack(frame.sequence, frame.command_id, frame.request_hash, 1.0,
                 session=expected_session, after_arrival_index=after_ack)
             if ack is None or not ack.ok:
+                logger.warning('YUI_HEARTBEAT_UNCONFIRMED session=%s seq=%s error=%s',
+                               expected_session, frame.sequence, None if ack is None else ack.error)
                 sender.fault_stop()
                 raise TimeoutError("共享端口心跳未确认")
             sender.ack(ticket, ack.session)

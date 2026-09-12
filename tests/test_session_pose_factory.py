@@ -13,7 +13,7 @@ def setup(modify=lambda event: event):
         capabilities={"pose_stream_v1", "pose_operation_v1"}, last_log_sequence=10,
         add_event_listener=listeners.append, remove_event_listener=listeners.remove,
         _target_anchor_id=lambda key: 3 if key == "desk" else None)
-    sender = SimpleNamespace(closed=threading.Event(), ack=Mock(), stop=Mock())
+    sender = SimpleNamespace(closed=threading.Event(), ack=Mock(), stop=Mock(), fault_stop=Mock())
     transport = SimpleNamespace(attach_pose_sender=Mock(return_value=sender), detach_pose_sender=Mock())
     backend = SimpleNamespace(_request=Mock(return_value=dict(instance="service", world_session=7, execution_ready=True, epoch=51)))
     factory = SessionPoseFactory(backend, transport, session)
@@ -70,7 +70,8 @@ def test_invalid_height_stops_without_service_submission():
         with pytest.raises(ValueError, match="unsupported_path_height"):
             factory.prepare(session, {"target_key":"desk"}, "service")
         backend._request.assert_not_called()
-        sender.stop.assert_called()
+        sender.fault_stop.assert_called()
+        sender.stop.assert_not_called()
     finally:
         factory.close()
 
