@@ -185,6 +185,7 @@ class AutonomyDirector:
         self._last_cross_region_at = float("-inf")
         self._last_movement_at = self._clock()
         self._chat_engagement: _ChatEngagement | None = None
+        self._owned_look_ids: frozenset[str] = frozenset()
         self._last_chat_engagement_outcome: str | None = None
         self._input_sequences: dict[tuple[int, int, int], int] = {}
         self._input_supported = getattr(session, "chat_input_activity_version", 0) == 1
@@ -277,6 +278,13 @@ class AutonomyDirector:
         """只清理 Director 自己建立的对话注视；失败不影响状态机。"""
 
         try:
+            # 陪伴结束后可能已经有工具或新计划接管；不得清掉它的注视。
+            running = frozenset(op_id for op_id, op in self.session.operations.items()
+                                if op.get("kind") == "look" and op.get("status") == "running")
+            owned = self._owned_look_ids
+            self._owned_look_ids = frozenset()
+            if running - owned:
+                return
             self.adapter.clear_look_wire()
         except Exception:
             pass
@@ -1121,6 +1129,9 @@ class AutonomyDirector:
                 with self._condition:
                     if self._chat_engagement is engagement:
                         engagement.look_owned = True
+                        op_id = result.get("op_id")
+                        engagement.look_operation_ids = frozenset({op_id}) if isinstance(op_id, str) else frozenset()
+                        self._owned_look_ids = engagement.look_operation_ids
         return True
 
     def _update_explicit_wait(self, now: float) -> None:
@@ -1165,6 +1176,7 @@ class AutonomyDirector:
                         if op.get("kind") == "look" and op.get("status") == "running"
                     )
                     engagement.look_owned = True
+                    self._owned_look_ids = engagement.look_operation_ids
                     engagement.phase = "preparing_opening"
                     engagement.deadline_at = now + self.config.chat_engagement.no_reply_timeout_s
                 else:
@@ -1183,6 +1195,11 @@ class AutonomyDirector:
                 if engagement is not None:
                     if status == "succeeded":
                         engagement.look_owned = True
+                        engagement.look_operation_ids = frozenset(
+                            op_id for op_id, op in self.session.operations.items()
+                            if op.get("kind") == "look" and op.get("status") == "running"
+                        )
+                        self._owned_look_ids = engagement.look_operation_ids
                         engagement.distance_band = "near"
                         engagement.retry_at = now
                     elif status != "cancelled":
@@ -1683,7 +1700,8 @@ class AutonomyDirector:
                 "type": "approach",
                 "player_slot": stimulus.player_slot,
                 "distance_m": 1.5,
-                "face_target": True,
+                # 后续 look 节点负责有限注视，接近阶段不另建永久注视。
+                "face_target": False,
             },
             {
                 "id": "look",
@@ -2009,7 +2027,8 @@ class AutonomyDirector:
                     "type": "approach",
                     "player_slot": slot,
                     "distance_m": 1.5,
-                    "face_target": True,
+                    # 后续 look 节点统一取得并释放注视通道。
+                    "face_target": False,
                 },
                 {
                     "id": "look",

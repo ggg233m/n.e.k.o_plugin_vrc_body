@@ -50,6 +50,30 @@ def test_preparation_uses_world_epoch_and_converted_path():
     assert not listeners
 
 
+def test_slow_lease_http_does_not_block_world_log_delivery():
+    factory, session, _, backend, _, _ = setup()
+    entered, release, delivered = threading.Event(), threading.Event(), threading.Event()
+    try:
+        factory.prepare(session, {}, "service")
+        def slow(*args):
+            entered.set()
+            release.wait(2)
+            return dict(instance="service", execution_ready=True)
+        backend._request.side_effect = slow
+        assert entered.wait(1)
+        def deliver():
+            factory.ingest(dict(type="npc.pose_ack"))
+            delivered.set()
+        thread = threading.Thread(target=deliver)
+        thread.start()
+        # 同步屏障保证续租已进入 HTTP；日志必须在 HTTP 释放前到达后续监听器。
+        assert delivered.wait(.2)
+        thread.join(1)
+    finally:
+        release.set()
+        factory.close()
+
+
 @pytest.mark.parametrize("field,value", [("world_id","old"),("request_seq",99),("pose_epoch",0),("session",8)])
 def test_old_or_invalid_preparation_never_binds_service(field,value):
     factory, session, _, backend, sender, _ = setup(lambda event: dict(event, **{field:value}))

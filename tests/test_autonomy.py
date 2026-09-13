@@ -199,6 +199,19 @@ class AutonomyTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.session.remove_event_listener(self.director._on_session_event)
 
+    def test_look_cleanup_preserves_new_owner(self) -> None:
+        self.director._owned_look_ids = frozenset({"old"})
+        self.session.operations["old"] = {"kind": "look", "status": "cancelled"}
+        self.session.operations["new"] = {"kind": "look", "status": "running"}
+        self.director._clear_owned_look()
+        self.assertEqual(self.adapter.clear_look_calls, 0)
+
+    def test_look_cleanup_releases_own_operation(self) -> None:
+        self.director._owned_look_ids = frozenset({"own"})
+        self.session.operations["own"] = {"kind": "look", "status": "running"}
+        self.director._clear_owned_look()
+        self.assertEqual(self.adapter.clear_look_calls, 1)
+
     def test_autonomy_movement_defaults_to_walk_speed(self) -> None:
         graph = {
             "entry": "root",

@@ -146,16 +146,23 @@ class SessionPoseFactory:
     def _lease(self):
         while not self.stopped.wait(.4):
             with self.lock:
-                if not self.binding:
-                    continue
-                try:
-                    if not self.ready(self.session):
-                        raise RuntimeError("world_binding_lost")
-                    health = self.backend._request("/world", self.binding)
-                    if health.get("instance") != self.binding["instance"] or health.get("execution_ready") is not True:
+                binding = self.binding
+            if not binding:
+                continue
+            try:
+                if not self.ready(self.session):
+                    raise RuntimeError("world_binding_lost")
+                # HTTP 等待不能占用日志接收锁，否则姿态 ACK 和 finish 回执都会排队。
+                health = self.backend._request("/world", binding)
+                with self.lock:
+                    if self.binding is not binding or self.stopped.is_set():
+                        continue
+                    if health.get("instance") != binding["instance"] or health.get("execution_ready") is not True:
                         raise RuntimeError("service_binding_lost")
-                except Exception:
-                    self.stop()
+            except Exception:
+                with self.lock:
+                    if self.binding is binding:
+                        self.stop()
 
     def stop(self):
         # 不等待路径准备锁或 HTTP；在途准备也不能逃过停止。

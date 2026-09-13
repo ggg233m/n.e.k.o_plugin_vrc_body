@@ -1,8 +1,11 @@
 """有界分段执行桥；世界适配器必须提供帧应用和动作终态，接收 ACK 不代表成功。"""
 import threading
 import time
+import logging
 
 from .pose_frames import compile_chunk
+
+logger = logging.getLogger(__name__)
 
 
 class MotionExecution:
@@ -106,6 +109,7 @@ class MotionExecution:
                 terminal=reply.get("status")=="awaiting_world" and bool(chunk.get("final"))
                 completion=None
                 if terminal:
+                    logger.info("YUI_POSE_FINISH session=%s op_id=%s sequence=%s", task["session"], task["op_id"], frame_sequence)
                     completion=self.world.finish(task,frame_sequence-1,.5)
                     if (not isinstance(completion,dict) or completion.get("state")!="succeeded" or completion.get("op_id")!=task["op_id"]
                         or (completion.get("pose_session"),completion.get("pose_epoch"),completion.get("pose_sequence"))!=(task["session"],wire_epoch,frame_sequence)):
@@ -124,6 +128,7 @@ class MotionExecution:
                     return
                 chunk_sequence+=1
         except Exception as exc:
+            logger.warning("YUI_POSE_FAILED session=%s op_id=%s error=%s", task["session"], task["op_id"], str(exc) if isinstance(exc,(RuntimeError,ValueError)) else type(exc).__name__)
             was_cancelled=self.cancelled.is_set()
             self.stop()
             try:
