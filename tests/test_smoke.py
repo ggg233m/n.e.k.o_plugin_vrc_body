@@ -21,8 +21,9 @@ class PluginSmokeTests(unittest.TestCase):
             manifest = tomllib.load(handle)
         plugin = manifest["plugin"]
         self.assertEqual(plugin["id"], "neko_anyadance_body")
-        self.assertEqual(plugin["entry"], "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin")
+        self.assertEqual(plugin["entry"], "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin")
         self.assertFalse(manifest["plugin_runtime"]["auto_start"])
+        self.assertEqual(manifest["plugin_runtime"]["timeout"], 60.0)
         self.assertEqual(manifest["vmc_idle"]["listen_port"], 39539)
         self.assertTrue(manifest["vmc_idle"]["manage_host_output"])
 
