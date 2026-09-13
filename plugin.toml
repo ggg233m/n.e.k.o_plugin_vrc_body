@@ -6,7 +6,7 @@ short_description = "VRChat 视觉感知、本地导航与 AnyaDance 身体控�
 keywords = ["anyadance", "steamvr", "vrchat", "vision", "navigation", "npc", "follow", "osc", "body", "视觉", "感知", "导航", "移动", "跟随"]
 version = "0.13.22"
 type = "plugin"
-entry = "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
+entry = "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 
 [plugin.author]
 name = "N.E.K.O Community"
@@ -36,6 +36,7 @@ permissions = ["state:read", "action:call"]
 [plugin_runtime]
 enabled = true
 auto_start = false
+timeout = 60.0
 
 [anyadance]
 host = "127.0.0.1"

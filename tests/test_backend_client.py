@@ -23,6 +23,7 @@ from neko_anyadance_body.backend.client import (
     RemoteScheduler,
     RemoteVision,
 )
+from neko_anyadance_body.backend.process import resolve_plugin_package_name
 from neko_anyadance_body.backend.direction_memory import SegmentOutcome
 from neko_anyadance_body.backend.service import BackendService, _effective_detector_interval_ms
 from neko_anyadance_body.backend.vision import VisionObservation
@@ -1836,6 +1837,27 @@ class BackendClientTests(unittest.TestCase):
                     process.wait(timeout=1.0)
                 if process.stderr is not None:
                     process.stderr.close()
+
+
+class PluginPackageNameTests(unittest.TestCase):
+    def test_script_launch_ignores_dotted_git_directory_name(self) -> None:
+        dotted = Path("n.e.k.o_plugin_vrc_body")
+        self.assertEqual(
+            resolve_plugin_package_name(package=None, project_dir=dotted),
+            "neko_anyadance_body",
+        )
+        self.assertTrue(
+            resolve_plugin_package_name(package=None, project_dir=dotted).isidentifier()
+        )
+
+    def test_imported_backend_keeps_host_package_prefix(self) -> None:
+        self.assertEqual(
+            resolve_plugin_package_name(
+                package="plugin.plugins.neko_anyadance_body.backend",
+                project_dir=Path("neko_anyadance_body"),
+            ),
+            "plugin.plugins.neko_anyadance_body",
+        )
 
 
 if __name__ == "__main__":

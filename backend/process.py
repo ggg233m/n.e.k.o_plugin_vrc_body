@@ -28,7 +28,39 @@ from urllib.parse import urlsplit
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BACKEND_DIR.parent
-PACKAGE_NAME = __package__.rsplit(".", 1)[0] if __package__ else PROJECT_DIR.name
+_FALLBACK_PACKAGE_NAME = "neko_anyadance_body"
+
+
+def _toml_string(path: Path, *keys: str) -> str:
+    try:
+        current: Any = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    for key in keys:
+        if not isinstance(current, dict):
+            return ""
+        current = current.get(key)
+    return current.strip() if isinstance(current, str) else ""
+
+
+def resolve_plugin_package_name(*, package: str | None, project_dir: Path) -> str:
+    """独立 ``python process.py`` 必须用合法包名，不能用带点的 git 目录名。"""
+    if package not in {None, ""}:
+        parent = package.rsplit(".", 1)[0]
+        if parent:
+            return parent
+    for candidate in (
+        _toml_string(project_dir / "pyproject.toml", "project", "name"),
+        _toml_string(project_dir / "plugin.toml", "plugin", "id"),
+        project_dir.name,
+        _FALLBACK_PACKAGE_NAME,
+    ):
+        if candidate.isidentifier():
+            return candidate
+    return _FALLBACK_PACKAGE_NAME
+
+
+PACKAGE_NAME = resolve_plugin_package_name(package=__package__, project_dir=PROJECT_DIR)
 # 后端是独立子进程，不继承宿主为插件添加的 sys.path。
 # 保留宿主已有依赖的优先级，仅把安装包内的依赖作为补充。
 VENDOR_DIR = PROJECT_DIR / "vendor"
