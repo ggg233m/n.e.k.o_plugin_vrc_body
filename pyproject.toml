@@ -4,5 +4,10 @@ version = "0.13.21"
 requires-python = ">=3.11"
 dependencies = []
 
+[tool.neko.build]
+# 安装包保留运行源码、界面和模型，排除开发及本机运行数据。
+exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory"]
+exclude_files = [".git", "test_*.py", "backend.settings.json", "world_memory.json", "store.db"]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
