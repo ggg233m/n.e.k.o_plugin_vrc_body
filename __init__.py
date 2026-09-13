@@ -1583,7 +1583,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "semantic_push_last_reason": self._semantic_push_last_reason,
         }
         return {
-            "version": "0.13.21",
+            "version": "0.13.22",
             "updated_at_unix": time.time(),
             "body": body,
             "awareness": awareness,

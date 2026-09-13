@@ -6,8 +6,8 @@
   },
   {
     "file": "person_detect_v1.3_s_labels.json",
-    "bytes": 16,
-    "sha256": "A1C27F859FE559A27EE00C8BCBF1188E0FDFF92DC248FE6BEF35EAA9AE1F19CC"
+    "bytes": 18,
+    "sha256": "6126F3C1F095907157B0717F1BF4A0249A705C3CCEF95F2CFD5737BD82568044"
   },
   {
     "file": "person_detect_v1.3_s_model_artifacts.json",
@@ -16,7 +16,7 @@
   },
   {
     "file": "person_detect_v1.3_s_threshold.json",
-    "bytes": 48,
-    "sha256": "35159EDE3869468033F977DC0CC1F6763C7ACE047D904C524D76BD3D939B05D6"
+    "bytes": 51,
+    "sha256": "729B1C7CB0E0AD234FBD10AD31DA009357730D865371C593F321D9B893C1BCA4"
   }
 ]

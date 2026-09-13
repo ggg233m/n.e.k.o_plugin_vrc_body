@@ -1,0 +1,26 @@
+{
+  "platform": "Windows x64",
+  "python": "CPython 3.11",
+  "packages": {
+    "comtypes": "1.4.16",
+    "dxcam": "0.3.0",
+    "flatbuffers": "25.12.19",
+    "numpy": "2.4.6",
+    "onnxruntime": "1.30.0",
+    "opencv-python-headless": "4.14.0.94",
+    "packaging": "26.3",
+    "pillow": "12.3.0",
+    "protobuf": "7.36.1",
+    "typing_extensions": "4.16.0",
+    "websocket-client": "1.9.2",
+    "winrt-Windows.Foundation": "3.2.1",
+    "winrt-Windows.Foundation.Collections": "3.2.1",
+    "winrt-Windows.Graphics": "3.2.1",
+    "winrt-Windows.Graphics.Capture": "3.2.1",
+    "winrt-Windows.Graphics.Capture.Interop": "3.2.1",
+    "winrt-Windows.Graphics.DirectX": "3.2.1",
+    "winrt-Windows.Graphics.DirectX.Direct3D11": "3.2.1",
+    "winrt-Windows.Graphics.DirectX.Direct3D11.Interop": "3.2.1",
+    "winrt-runtime": "3.2.1"
+  }
+}

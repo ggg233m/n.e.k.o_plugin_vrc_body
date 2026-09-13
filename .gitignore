@@ -15,3 +15,4 @@ tmp/
 world_memory.json
 backend.settings.json
 memory/
+vendor/

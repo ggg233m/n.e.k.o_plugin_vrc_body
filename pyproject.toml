@@ -1,12 +1,19 @@
 [project]
 name = "neko_anyadance_body"
-version = "0.13.21"
+version = "0.13.22"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy>=1.26,<3",
+    "Pillow>=10,<13",
+    "onnxruntime>=1.20,<2",
+    "opencv-python-headless>=4.10,<5",
+    "dxcam[winrt]>=0.0.5,<1; sys_platform == 'win32'",
+    "websocket-client>=1.8,<2",
+]
 
 [tool.neko.build]
 # 安装包保留运行源码、界面和模型，排除开发及本机运行数据。
-exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory"]
+exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory", "packaging"]
 exclude_files = [".git", "test_*.py", "backend.settings.json", "world_memory.json", "store.db"]
 
 [tool.pytest.ini_options]

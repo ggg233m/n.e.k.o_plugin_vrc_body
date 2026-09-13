@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import site
 import sys
 import threading
 import time
@@ -27,7 +28,12 @@ from urllib.parse import urlsplit
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BACKEND_DIR.parent
-PACKAGE_NAME = PROJECT_DIR.name
+PACKAGE_NAME = __package__.rsplit(".", 1)[0] if __package__ else PROJECT_DIR.name
+# 后端是独立子进程，不继承宿主为插件添加的 sys.path。
+# 保留宿主已有依赖的优先级，仅把安装包内的依赖作为补充。
+VENDOR_DIR = PROJECT_DIR / "vendor"
+if VENDOR_DIR.is_dir():
+    site.addsitedir(str(VENDOR_DIR))
 if __package__ in {None, ""}:
     parent = str(PROJECT_DIR.parent)
     if parent not in sys.path:
