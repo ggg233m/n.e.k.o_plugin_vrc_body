@@ -198,7 +198,7 @@ class AutonomyRuntime:
         # 不做成通用事件总线：只有这一个事件需要跨出授权层。
         self._on_world_changed = on_world_changed
         self._clock = clock
-        self._session_ttl_s = min(3600.0, max(60.0, float(session_ttl_s)))
+        self._session_ttl_s = float('inf') if session_ttl_s <= 0 else min(3600.0, max(60.0, float(session_ttl_s)))
         self._lock = threading.RLock()
         self._state = "disarmed"
         self._reason = "manual_arm_required"
@@ -215,10 +215,15 @@ class AutonomyRuntime:
     def arm(self, *, ttl_s: float | None = None) -> dict[str, Any]:
         with self._lock:
             now = self._clock()
-            ttl = self._session_ttl_s if ttl_s is None else min(self._session_ttl_s, max(60.0, float(ttl_s)))
+            if ttl_s is None:
+                ttl = self._session_ttl_s
+            elif ttl_s <= 0:
+                ttl = float('inf')
+            else:
+                ttl = min(self._session_ttl_s, max(60.0, float(ttl_s)))
             self._state = "armed"
             self._reason = "manual_session_arm"
-            self._armed_until = now + ttl
+            self._armed_until = None if ttl == float('inf') else now + ttl
             self._goal = None
             return self.snapshot()
 

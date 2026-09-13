@@ -106,7 +106,7 @@ emergency_release_ms = 50
 
 [autonomy]
 manual_arm = true
-session_ttl_minutes = 30
+session_ttl_minutes = 0
 
 [world_memory]
 # 只保存可复用的 world:* 等世界事实。检测轨迹、avatar:session:*、synthetic

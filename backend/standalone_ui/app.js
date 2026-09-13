@@ -199,7 +199,7 @@ function populateConfig() {
   byId("cfgOscEnabled").checked = Boolean(osc.enabled);
   byId("cfgOscSendPort").value = osc.send_port ?? 9000;
   byId("cfgOscListenPort").value = osc.listen_port ?? 9001;
-  byId("cfgAutonomyTtl").value = autonomy.session_ttl_minutes ?? 30;
+  byId("cfgAutonomyTtl").value = autonomy.session_ttl_minutes ?? 0;
   byId("cfgPersistWorld").checked = Boolean(memory.persist_world);
   byId("cfgPersistPlayers").checked = Boolean(memory.persist_players);
   text("settingsPath", state.config.settings_path || "配置由宿主管理");

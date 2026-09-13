@@ -407,9 +407,9 @@ class PluginConfig:
             manual_arm=_boolean(autonomy.get("manual_arm"), True, name="autonomy.manual_arm"),
             session_ttl_minutes=_bounded_int(
                 autonomy.get("session_ttl_minutes"),
-                30,
-                minimum=1,
-                maximum=240,
+                0,
+                minimum=0,
+                maximum=0,
                 name="autonomy.session_ttl_minutes",
             ),
         )
