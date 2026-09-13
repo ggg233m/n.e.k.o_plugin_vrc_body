@@ -1558,6 +1558,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         with self._ui_event_lock:
             events = list(self._ui_events)
+        # 面板直接读取带框缓存，不经过 LLM 发图入口，也不触发新的推理。
+        vision_frame = {"available": False, "reason": "backend_unavailable"}
+        if self._vision:
+            try:
+                vision_frame = await asyncio.to_thread(
+                    self._vision.frame, max_age_ms=3000, overlay=True
+                )
+            except Exception:
+                # 预览失败不能阻断急停等控制按钮的状态刷新。
+                vision_frame = {"available": False, "reason": "preview_failed"}
         bridge_thread = self._world_bridge_thread
         bridge = {
             "running": bool(bridge_thread is not None and bridge_thread.is_alive()),
@@ -1589,6 +1599,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "uncertainties": ["backend_unavailable"],
             },
             "world_bridge": bridge,
+            "vision_frame": vision_frame,
             "autonomy": await asyncio.to_thread(self._backend_client.autonomy.snapshot) if self._backend_client else {
                 "state": "disarmed",
                 "armed": False,

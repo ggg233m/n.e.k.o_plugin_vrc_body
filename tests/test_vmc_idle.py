@@ -54,6 +54,34 @@ def _complete_frame_messages():
 
 
 class VmcIdleRelayTests(unittest.TestCase):
+    def test_missing_upper_chest_calibrates_and_tracks_chest_rotation(self) -> None:
+        # 复现真实 53 骨骼流：上胸骨缺省，但胸部旋转仍须传到头和双手。
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile(), clock=lambda: 10.0)
+        messages = [item for item in _complete_frame_messages()
+                    if not (item[0] == "/VMC/Ext/Bone/Pos" and item[1][0] == "UpperChest")]
+        relay.reset_calibration(reason="host_t_pose")
+        relay.ingest_messages(messages, now=10.0)
+        frame = relay.latest_frame()
+        self.assertIsNotNone(frame)
+        self.assertTrue(relay.snapshot()["calibration"]["calibrated"])
+        self.assertEqual(relay.snapshot()["incomplete_frames"], 0)
+        assert frame is not None
+        rotation = (0.0, math.sin(math.pi / 8), 0.0, math.cos(math.pi / 8))
+        rotated = [(address, (*args[:4], *rotation))
+                   if address == "/VMC/Ext/Bone/Pos" and args[0] == "Chest"
+                   else (address, args) for address, args in messages]
+        relay.ingest_messages(rotated, now=10.0)
+        moved = relay.latest_frame()
+        self.assertIsNotNone(moved)
+        assert moved is not None
+        # VMC 左手坐标输入在接收端转换为 AnyaDance 的右手坐标。
+        output_rotation = (0.0, -rotation[1], 0.0, rotation[3])
+        for device in ("hmd", "left_controller", "right_controller"):
+            expected = _quat_multiply(output_rotation, frame.devices[device].rotation)
+            for actual, value in zip(moved.devices[device].rotation, expected):
+                self.assertAlmostEqual(actual, value, places=6)
+        self.assertEqual(relay.snapshot()["accepted_frames"], 2)
+
     def test_listening_receiver_is_not_reported_as_unknown(self) -> None:
         relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile())
         with relay._lock:

@@ -112,7 +112,7 @@ API key 只从环境变量读取。完整说明见 [独立后端](backend/README
 
 插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable；启用采集但没有模型时只运行 capture-only 诊断，不发布猜测实体。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
 
-当前版本默认不加载第三方模型，但已经提供 DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 的可选适配器；未配置依赖时 `world_observe` 会明确返回 `available=false`，不会伪造世界状态。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
+当前发布配置启用桌面采集，并从插件内的 `models/person_detect_v1.3_s/` 加载人物检测 ONNX 和标签文件。目录包含原始模型说明、参考阈值和 SHA-256 清单，详见 [模型说明](models/person_detect_v1.3_s/README.md)。模型路径相对于插件配置目录解析；复制插件时应保留整个 `models/` 目录。DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 仍使用可选适配器；缺少依赖时明确报告不可用。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
 桌面镜像采集会自动探测 DXGI 的 GPU/显示输出，并在失败时逐个尝试 MSS 物理显示器；
 `/perception` 会保留每个候选输出的错误，便于区分权限、显卡和 BitBlt 问题。可在

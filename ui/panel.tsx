@@ -7,6 +7,7 @@ import {
   Field,
   Grid,
   Input,
+  ImagePreview,
   JsonView,
   KeyValue,
   LogViewer,
@@ -53,6 +54,7 @@ type DebugState = {
   driver_log?: Record<string, any>
   host_vmc?: Record<string, any>
   world?: Record<string, any>
+  vision_frame?: Record<string, any>
   autonomy?: Record<string, any>
   clips?: {
     clips?: ClipSummary[]
@@ -145,6 +147,18 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const idleRelay = body.idle_relay || awareness.idle_relay || {}
   const hostVmc = state.host_vmc || {}
   const autonomy = state.autonomy || {}
+  const [refreshFailed, setRefreshFailed] = props.useLocalState("refreshFailed", false)
+  const visionFrame = state.vision_frame || {}
+  const overlay = visionFrame.overlay || {}
+  const previewSrc = !refreshFailed && visionFrame.available && visionFrame.mime === "image/jpeg" && visionFrame.data_base64
+    ? `data:image/jpeg;base64,${visionFrame.data_base64}` : ""
+  const previewReasons: Record<string, string> = {
+    backend_unavailable: "视觉后端尚未连接",
+    capture_stopped: "画面采集已停止",
+    no_frame_cached: "等待第一帧画面",
+    frame_stale: "画面已过期，等待新画面",
+    preview_failed: "画面读取失败，请刷新重试",
+  }
   const navigation = autonomy.navigation || {}
   // 卡墙判据的两个数据源：OSC 快照里的实时读数，以及导航器 tick 里的最后一次
   // 采样。后者在解除授权后就冻住了，所以优先用前者。
@@ -205,10 +219,22 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
 
   useEffect(() => {
     if (!autoRefresh) return
-    const timer = window.setInterval(() => {
-      props.api.refresh().catch(() => undefined)
-    }, 1000)
-    return () => window.clearInterval(timer)
+    // 上次刷新完成后再排下一次，避免带图上下文在慢连接上积压。
+    let disposed = false
+    let timer: number
+    const refresh = async () => {
+      try {
+        await props.api.refresh()
+        if (!disposed) setRefreshFailed(false)
+      } catch {
+        // 连接中断时隐藏旧图，防止将历史画面误认为当前识别结果。
+        if (!disposed) setRefreshFailed(true)
+      } finally {
+        if (!disposed) timer = window.setTimeout(refresh, 1000)
+      }
+    }
+    timer = window.setTimeout(refresh, 1000)
+    return () => { disposed = true; window.clearTimeout(timer) }
   }, [autoRefresh])
 
   const appendLog = (line: string) => {
@@ -295,6 +321,20 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
       {idleRelay.frame_error ? <Alert tone="warning">VMC 待机帧：{String(idleRelay.frame_error)}</Alert> : null}
       {hostVmc.last_error ? <Alert tone="warning">宿主 VMC 控制：{String(hostVmc.last_error)}</Alert> : null}
       {body.last_error ? <Alert tone="danger">身体调度器：{String(body.last_error)}</Alert> : null}
+
+      <Card title="YOLO 识别画面">
+        <Stack>
+          <Text>{autoRefresh ? "随面板自动刷新（约每秒一次）" : "自动刷新已暂停，当前为历史快照"}</Text>
+          {previewSrc ? (
+            <ImagePreview src={previewSrc} alt="VRChat 画面与 YOLO 检测框" />
+          ) : (
+            <Alert tone="warning">{refreshFailed ? "面板刷新失败，等待连接恢复" : previewReasons[visionFrame.reason] || "暂无可用识别画面，请确认视觉采集已启动"}</Alert>
+          )}
+          {previewSrc ? <Text>画面尺寸 {visionFrame.width} × {visionFrame.height} · 获取时帧龄 {fixed(visionFrame.age_ms, 0)} ms · 检测框 {overlay.drawn ? overlay.boxes_drawn ?? 0 : "未就绪"}</Text> : null}
+          {previewSrc && !overlay.drawn ? <Alert tone="warning">检测框尚未就绪，当前仅显示原始画面。</Alert> : null}
+          {previewSrc && overlay.skew_warning ? <Alert tone="warning">检测结果与画面时间差较大，请等待下一帧。</Alert> : null}
+        </Stack>
+      </Card>
 
       <Grid cols={4}>
         <StatCard label="状态" value={body.state || "shutdown"} />

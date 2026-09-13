@@ -1,0 +1,22 @@
+[
+  {
+    "file": "person_detect_v1.3_s_model.onnx",
+    "bytes": 44583231,
+    "sha256": "6DA88929438CD442E31E45FF4F934DD2D7EB9CF7A423C22885D650EE52550F90"
+  },
+  {
+    "file": "person_detect_v1.3_s_labels.json",
+    "bytes": 16,
+    "sha256": "A1C27F859FE559A27EE00C8BCBF1188E0FDFF92DC248FE6BEF35EAA9AE1F19CC"
+  },
+  {
+    "file": "person_detect_v1.3_s_model_artifacts.json",
+    "bytes": 946,
+    "sha256": "1B31D530D0CBCCFF02A420DDAD19D678E40857B0EBB8E94C544DB85637E810F2"
+  },
+  {
+    "file": "person_detect_v1.3_s_threshold.json",
+    "bytes": 48,
+    "sha256": "35159EDE3869468033F977DC0CC1F6763C7ACE047D904C524D76BD3D939B05D6"
+  }
+]

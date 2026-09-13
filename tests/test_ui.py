@@ -10,6 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HostedUiTests(unittest.TestCase):
+    def test_manifest_keeps_debug_entry_discoverable_without_import(self) -> None:
+        # 安装信息刷新不执行装饰器，清单必须独立提供同一份有界入口参数。
+        with (ROOT / "plugin.toml").open("rb") as handle:
+            manifest = tomllib.load(handle)
+        entry = next(item for item in manifest["plugin"]["entries"] if item["id"] == "debug_command")
+        tree = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
+        commands = next(ast.literal_eval(node.value) for node in tree.body
+                        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id == "_DEBUG_COMMAND_NAMES")
+        schema = entry["input_schema"]
+        self.assertEqual(schema["required"], ["command"])
+        self.assertEqual(schema["properties"]["command"]["enum"], list(commands))
+        self.assertEqual(schema["properties"]["arguments"], {"type": "object", "default": {}})
+
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         with (ROOT / "plugin.toml").open("rb") as handle:
             manifest = tomllib.load(handle)

@@ -33,7 +33,8 @@ class Transform:
 _ROOT = Transform((0.0, 0.0, 0.0), IDENTITY_QUAT)
 _REQUIRED_BONES = frozenset({
     "Hips",
-    "Spine", "Chest", "UpperChest", "Neck",
+    # 部分宿主模型没有上胸骨；颈部和肩部沿现有父级候选回退到 Chest。
+    "Spine", "Chest", "Neck",
     "Head",
     "LeftShoulder", "RightShoulder",
     "LeftUpperArm", "LeftLowerArm", "LeftHand",

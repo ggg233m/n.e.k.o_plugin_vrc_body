@@ -11,6 +11,14 @@ entry = "plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 [plugin.author]
 name = "N.E.K.O Community"
 
+# 宿主刷新安装信息时不导入 Python。显式保留面板入口，避免清空入口预览后
+# 将已注册的控制按钮误判为非插件入口；参数范围须与 Python 装饰器一致。
+[[plugin.entries]]
+id = "debug_command"
+name = "执行 VRChat 身体、观察与导航命令"
+description = "面板共用的有界调试入口；自主移动仍要求手动授权。"
+input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_stop", "body_reset", "body_status", "body_cancel", "body_arm_pose", "body_move_hand", "body_hand", "body_reach_and_grab", "body_gesture", "body_express", "body_play_clip", "body_avatar_parameter", "body_vrchat_input", "body_locomotion", "body_turn", "body_stop_movement", "body_chatbox", "vrc_controller_input", "vrc_menu_navigate", "vrc_jump", "vrc_autonomy_status", "vrc_autonomy_goal", "vrc_wander_step", "vrc_wander_route", "vrc_autonomy_stop", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_status", "vrc_vision_start", "vrc_vision_stop", "vrc_vision_frame", "vrc_semantic_commit", "vrc_scan_surroundings", "observe_vrchat_world", "navigate_vrchat_world"] }, arguments = { type = "object", default = {} } } }
+
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"
@@ -118,7 +126,7 @@ stale_after_ms = 3000
 history_size = 64
 
 # 模型无关的视觉 worker；具体 FrameSource/FrameDetector 由独立后端注入。
-# 默认关闭，未接入外部 detector 时不会抓屏或加载模型。
+# 发布配置启用桌面采集和随插件携带的人物检测模型。
 [vision]
 enabled = true
 # 直接从桌面镜像采集 VRChat；window_title 会在多屏环境中跟踪窗口区域。
@@ -127,8 +135,8 @@ capture = "desktop_mirror"
 local_backend = "openvino"
 # OpenVINO IR XML/ONNX 模型和可选标签文件。留空表示未部署本地模型；此时感知
 # 会报告 unavailable，而不是进行猜测。
-model_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_model.onnx"
-labels_path = "H:/AI/neko-music/vrc/anime_models/person_detect_v1.3_s_labels.json"
+model_path = "models/person_detect_v1.3_s/person_detect_v1.3_s_model.onnx"
+labels_path = "models/person_detect_v1.3_s/person_detect_v1.3_s_labels.json"
 # AUTO 表示按 NPU -> GPU -> CPU 挨个试，取第一个能编译的；实际落在哪个设备
 # 由 /perception 的 resolved_device 报出，失败原因在 device_fallbacks 里。
 #
