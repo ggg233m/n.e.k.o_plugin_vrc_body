@@ -204,10 +204,10 @@ class YuiPluginConfigTests(unittest.TestCase):
                 {"ack_timeout_s": 2.0, "command_deadline_s": 1.0}
             )
 
-    def test_yui_manifest_declares_anydance_conflict(self) -> None:
+    def test_yui_manifest_allows_installed_anyadance(self) -> None:
         with (ROOT / "plugin.toml").open("rb") as handle:
             yui_manifest = tomllib.load(handle)
-        self.assertIn("neko_anyadance_body", _conflicts(yui_manifest))
+        self.assertNotIn("neko_anyadance_body", _conflicts(yui_manifest))
 
     def test_host_diagnostic_entries_are_hidden_from_automatic_agent(self) -> None:
         module = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))

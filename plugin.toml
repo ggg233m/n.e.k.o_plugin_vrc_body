@@ -25,7 +25,4 @@ permissions = ["state:read", "action:call"]
 recommended = ">=0.1.0,<0.2.0"
 supported = ">=0.1.0,<0.3.0"
 
-# YUI 直接驱动世界原生 NPC，与 AnyaDance/YOLO 身体方案互斥。
-[[plugin.dependency]]
-id = "neko_anyadance_body"
-conflicts = true
+# 允许与已安装的 AnyaDance 插件共存；YUI 内部的 VMC/ARDY 互斥由配置校验负责。

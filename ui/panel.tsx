@@ -29,6 +29,8 @@ type State = {
   profile?: string
   settings?: Record<string, Value>
   applied?: Record<string, Value>
+  motion_source?: { backend?: string; state?: string; ready?: boolean; frames?: number; restore_error?: string | null }
+  motion_execution?: { status?: string }
   status?: Record<string, unknown>
   intent_model?: IntentModelState
   action_progress?: ActionProgress
@@ -45,11 +47,12 @@ function visibleSaveError(error: unknown) {
 }
 
 const groups = [
-  { title: "世界连接", description: "日志文件与日志目录二选一；均留空时自动寻找VRChat日志。", keys: ["midi_port", "claim_code", "log_path", "log_directory", "ardy.endpoint"] },
+  { title: "世界连接", description: "日志文件与日志目录二选一；均留空时自动寻找VRChat日志。", keys: ["midi_port", "claim_code", "log_path", "log_directory"] },
   { title: "模型连接", description: "配置独立意图模型；密钥写入宿主本机配置，不回显，也不保存在面板草稿缓存中。", keys: ["autonomy.intent_model.endpoint", "autonomy.intent_model.model", "autonomy.intent_model.api_key", "autonomy.intent_model.clear_api_key", "autonomy.intent_model.api_key_env", "autonomy.intent_model.persona_prompt", "autonomy.intent_model.timeout_s", "autonomy.intent_model.min_interval_s", "autonomy.intent_model.max_output_tokens"] },
   { title: "对白与字幕", description: "设置玩家对话入口和世界中的回复显示。", keys: ["player_chat.enabled", "chat_bridge.enabled", "chat_bridge.display_seconds", "chat_bridge.max_pages"] },
   { title: "自主陪伴", description: "管理自动连接、日常活动和对话陪伴。", keys: ["autonomy.auto_connect", "autonomy.enabled", "autonomy.chat_engagement.enabled", "autonomy.proactive_chat_enabled"] },
-  { title: "动作决策", description: "为自主活动提供独立的意图判断。", keys: ["autonomy.intent_model.enabled", "autonomy.intent_model.chat_context.enabled", "ardy.enabled"] },
+  { title: "动作来源", description: "VMC 与 ARDY 互斥；勾选一个会关闭另一个。保存后重载插件生效。", keys: ["vmc.enabled", "ardy.enabled", "ardy.endpoint"] },
+  { title: "动作决策", description: "为自主活动提供独立的意图判断。", keys: ["autonomy.intent_model.enabled", "autonomy.intent_model.chat_context.enabled"] },
 ]
 const hints: Record<string, string> = {
   "midi_port": "填写已创建的虚拟MIDI输出端口，例如NEKO_MIDI。",
@@ -66,7 +69,8 @@ const hints: Record<string, string> = {
   "autonomy.intent_model.min_interval_s": "控制日常活动请求频率；聊天动作最短间隔仍为2秒。",
   "autonomy.proactive_chat_enabled": "空闲时靠近附近玩家并说一句开场白；全局至少间隔 2 分钟，同一玩家至少 5 分钟。",
   "player_chat.enabled": "玩家在世界聊天框发言时，请求角色回复。",
-  "ardy.enabled": "启用可选 ARDY 服务；世界动作执行端尚未就绪时继续使用原动作系统。保存后需重载。",
+  "ardy.enabled": "使用 ARDY 生成动作；开启时关闭 VMC。保存后重载。",
+  "vmc.enabled": "共享 N.E.K.O 的身体动作，无需 ARDY 服务。请保持宿主 3D 模型页面打开；重载后自动校准，断流会交回原动作系统。",
   "chat_bridge.enabled": "将角色回复显示为世界中的 NPC 字幕。",
   "chat_bridge.display_seconds": "每页至少显示 10–25 秒；较长内容会自动延长。",
   "chat_bridge.max_pages": "单次回复最多展示 1–4 页字幕。",
@@ -266,6 +270,13 @@ export default function Panel(props: PluginSurfaceProps<State>) {
       @media(max-width:420px) { .yui-field { gap:12px; } .yui-metrics { grid-template-columns:1fr; } }
     `}</style>
     <Stack>
+      {state.motion_source?.backend === "vmc" ? <Card title="VMC 动作共享">
+        <Text>{({ starting: "正在连接宿主", calibrating: "正在校准 T-pose", receiving: "正在接收宿主动作",
+          source_stale: "宿主动作已断流，正在交回原动作系统", waiting_model: "未收到 T-pose，请打开宿主 3D 页面后重载",
+          calibration_failed: "校准失败或模型已切换，请重载重新校准", failed: "接收启动失败，请检查宿主和 UDP 端口", stopped: "共享已停止", disabled: "未启用" } as Record<string, string>)[state.motion_source.state || "disabled"] || "等待宿主动作"}</Text>
+        <p className="yui-muted">已接收 {state.motion_source.frames ?? 0} 帧 · 世界播放：{state.motion_execution?.status === "running" ? "播放中" : "尚未就绪"}</p>
+        {state.motion_source.restore_error ? <Text>宿主 VMC 原设置恢复失败，请检查宿主连接。</Text> : null}
+      </Card> : null}
       <div className="yui-row"><label><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)} /> 每 5 秒自动刷新</label><span className="yui-muted">{autoRefresh ? "面板隐藏或保存设置时暂停刷新" : "自动刷新已关闭"}</span></div>
       {refreshError ? <p role="status">{refreshError}</p> : null}
       <Card title="连接与运行">
@@ -299,7 +310,12 @@ export default function Panel(props: PluginSurfaceProps<State>) {
               const inputId = "yui-" + key
               return <div className="yui-field" key={key}>
                 <div><label for={inputId}>{field.label}</label>{modified ? <span className="yui-muted"> · 未保存</span> : null}<p id={inputId + "-hint"} className="yui-muted">{hints[key]}</p></div>
-                {field.type === "boolean" ? <input id={inputId} aria-describedby={inputId + "-hint"} type="checkbox" disabled={busy} checked={Boolean(value)} onChange={event => setDraft({ ...draft, [key]: event.target.checked })} />
+                {field.type === "boolean" ? <input id={inputId} aria-describedby={inputId + "-hint"} type="checkbox" disabled={busy} checked={Boolean(value)} onChange={event => {
+                    const enabled = event.target.checked
+                    setDraft(previous => ({ ...previous, [key]: enabled,
+                      ...(enabled && key === "vmc.enabled" ? { "ardy.enabled": false } : {}),
+                      ...(enabled && key === "ardy.enabled" ? { "vmc.enabled": false } : {}) }))
+                  }} />
                   : field.type === "text" || field.type === "password" ? <div className="yui-text"><input id={inputId} aria-describedby={inputId + "-hint"} type={field.type} autoComplete={field.type === "password" ? "new-password" : "off"} disabled={busy} value={String(value ?? "")} placeholder={field.type === "password" ? state.key_configured ? "已配置，留空保留" : "尚未直接配置" : ""} onInput={event => setDraft({ ...draft, [key]: event.target.value })} /></div>
                   : <div className="yui-number"><input id={inputId} aria-describedby={inputId + "-hint"} type="number" required disabled={busy} min={field.min} max={field.max} step={field.step ?? 1} value={value === undefined ? "" : String(value)} onInput={event => setDraft({ ...draft, [key]: event.target.value === "" ? "" : Number(event.target.value) })} /><span className="yui-muted">{key === "chat_bridge.max_pages" ? "页" : key.endsWith("_s") || key.endsWith("seconds") ? "秒" : ""}</span></div>}
               </div>

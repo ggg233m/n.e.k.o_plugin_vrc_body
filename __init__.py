@@ -187,7 +187,12 @@ class YuiNpcControllerPlugin(NekoPluginBase):
 
     def _configure_motion_backend(self):
         self._motion_backend.close()
-        self._motion_backend = MotionBackend(MotionBackendConfig.from_mapping(self._config.ardy), changed=self._motion_changed)
+        if self._config.vmc.get("enabled", False):
+            from .runtime.vmc_backend import VmcBackend
+            from .runtime.vmc_receiver import VmcConfig
+            self._motion_backend = VmcBackend(VmcConfig.from_mapping(self._config.vmc), changed=self._motion_changed)
+        else:
+            self._motion_backend = MotionBackend(MotionBackendConfig.from_mapping(self._config.ardy), changed=self._motion_changed)
         if self._surface is not None:
             self._surface.motion_backend = self._motion_backend
         self._bind_motion_execution()
@@ -1715,6 +1720,8 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "profile": await self.config.profile_active(),
             "key_configured": bool(saved.autonomy.intent_model.api_key),
             "key_reload_required": saved.autonomy.intent_model.api_key != self._config.autonomy.intent_model.api_key,
+            "motion_source": self._motion_backend.snapshot(),
+            "motion_execution": self._motion_backend.execution_status(),
             "settings": settings_view(saved),
             "applied": settings_view(self._config),
             "intent_model": self._intent_provider.panel_status(),
@@ -1723,7 +1730,9 @@ class YuiNpcControllerPlugin(NekoPluginBase):
             "status": {
                 "控制已就绪": snapshot["control_ready"],
                 "MIDI 已打开": snapshot["midi_open"],
-                "ARDY 服务在线": self._motion_backend.snapshot()["ready"],
+                "ARDY 服务在线": bool(self._config.ardy.get("enabled") and self._motion_backend.snapshot()["ready"]),
+                "VMC 共享已启用": bool(self._config.vmc.get("enabled")),
+                "VMC 数据就绪": bool(self._config.vmc.get("enabled") and self._motion_backend.snapshot()["ready"]),
                 "ARDY 世界执行就绪": bool(self._session and self._motion_backend.world_ready(self._session)),
                 "自主状态": autonomy.get("state", "not_initialized"),
                 "字幕状态": reply.get("last_result", "not_initialized"),

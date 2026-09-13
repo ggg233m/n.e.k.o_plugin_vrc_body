@@ -18,7 +18,7 @@ class Transaction:
 class SharedPort:
     PRIORITY = ("control", "heartbeat", "pose", "text")
 
-    def __init__(self, sink, session, epoch, stop_events, *, timeout=.5, pose_pipeline=False, fault_events=None):
+    def __init__(self, sink, session, epoch, stop_events, *, timeout=2.0, pose_pipeline=False, fault_events=None):
         if len(stop_events) != 2:
             raise ValueError("必须提供原控制与姿态的两个停止事件")
         self.sink, self.session, self.epoch = sink, session, epoch
@@ -66,7 +66,10 @@ class SharedPort:
         return True
 
     def _expired(self, now):
-        if any(now >= item[2] for item in self.unconfirmed):
+        expired_items = [(serial, lane, deadline) for serial, lane, deadline in self.unconfirmed if now >= deadline]
+        if expired_items:
+            logger.error('YUI_PORT_EXPIRED unconfirmed=%d expired=%d items=%s',
+                         len(self.unconfirmed), len(expired_items), expired_items[:5])
             self.stop("receipt_timeout")
         return self.stopped
 
@@ -97,10 +100,12 @@ class SharedPort:
         if entry is not None and tx.offset==0:entry["first_sent"]=now
         # 先占用信用；底层报错也按可能已经发出处理，不重试。
         self.serial += 1
-        # 控制回执容忍日志回传抖动；姿态仍保留原来的短租约。
+        # 控制/心跳放宽到 1.5s 容忍日志抖动；姿态保持 timeout（默认 2.0s）
         receipt_timeout = max(self.timeout, 1.5) if tx.lane in ('heartbeat', 'control') else self.timeout
         self.unconfirmed.append((self.serial,now,now+receipt_timeout))
         self.window.append(now)
+        logger.debug('YUI_PORT_SEND lane=%s seq=%d serial=%d deadline=+%.3f outstanding=%d',
+                     tx.lane, tx.sequence, self.serial, receipt_timeout, self.outstanding)
         # 单帧允许较短发送突发；998条/滚动秒与112条未确认上限保持不变。
         self.next_send = now+(1/4000 if self.pose_pipeline else 1/2000)
         try:
@@ -120,19 +125,32 @@ class SharedPort:
         return True
 
     def ack(self, lane, session, epoch, sequence, now):
-        if self._expired(now) or (session,epoch) != (self.session,self.epoch):
+        if self._expired(now):
+            logger.warning('YUI_PORT_ACK_EXPIRED lane=%s seq=%d', lane, sequence)
             return False
-        watermark = self.pending.get((lane,sequence))
+        if (session, epoch) != (self.session, self.epoch):
+            logger.warning('YUI_PORT_ACK_MISMATCH lane=%s seq=%d session=%s/%s epoch=%s/%s',
+                           lane, sequence, session, self.session, epoch, self.epoch)
+            return False
+        watermark = self.pending.get((lane, sequence))
         if watermark is None:
+            logger.warning('YUI_PORT_ACK_UNKNOWN lane=%s seq=%d pending=%s',
+                           lane, sequence, list(self.pending.keys())[:10])
             return False
-        self.retired = max(self.retired,watermark)
-        for key,end in self.pending.items():
-            if end<=self.retired:
-                entry=self.audit_pending.pop(key,None)
-                if entry is not None:entry["acked"]=now
+        old_retired = self.retired
+        self.retired = max(self.retired, watermark)
+        cleared = 0
+        for key, end in self.pending.items():
+            if end <= self.retired:
+                cleared += 1
+                entry = self.audit_pending.pop(key, None)
+                if entry is not None:
+                    entry["acked"] = now
+        logger.debug('YUI_PORT_ACK lane=%s seq=%d watermark=%d retired=%d→%d cleared=%d',
+                     lane, sequence, watermark, old_retired, self.retired, cleared)
         while self.unconfirmed and self.unconfirmed[0][0] <= self.retired:
             self.unconfirmed.popleft()
-        self.pending = {key:end for key,end in self.pending.items() if end > self.retired}
+        self.pending = {key: end for key, end in self.pending.items() if end > self.retired}
         return True
 
     def stop(self, reason="explicit_stop"):

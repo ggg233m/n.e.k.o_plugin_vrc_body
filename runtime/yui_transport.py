@@ -197,9 +197,8 @@ class YuiReliableTransport:
             if sender is not None:
                 sender.close(close_sink=False, graceful=graceful)
                 self._shared_sender=None
-        if graceful and sender is not None and sender.gracefully_closed:
-            self.start_heartbeat()
-        # 急停后不在这里恢复心跳或解除世界停止，交给明确的新握手。
+        # detach 后立即重启心跳，避免旧 pose 事件在空窗期超时
+        self.start_heartbeat()
 
     def _allocate_upper_body_sequence(self) -> int:
         with self._sequence_lock:

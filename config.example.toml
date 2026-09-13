@@ -94,3 +94,9 @@ max_turns = 6
 max_chars = 6000
 poll_interval_s = 1
 max_file_bytes = 2097152
+
+# 与 yui.ardy.enabled 互斥；不需要启动 ARDY 服务。
+[yui.vmc]
+enabled = false
+host_api_url = "http://127.0.0.1:48911"
+listen_port = 39540

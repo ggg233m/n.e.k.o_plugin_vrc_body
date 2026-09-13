@@ -491,6 +491,7 @@ class YuiPluginConfig:
     include_player_names: bool = False
     enable_wander_tool: bool = False
     ardy: dict[str, Any] = field(default_factory=dict)
+    vmc: dict[str, Any] = field(default_factory=dict)
     chat_bridge: YuiChatBridgeConfig = field(default_factory=YuiChatBridgeConfig)
     player_chat: YuiPlayerChatConfig = field(default_factory=YuiPlayerChatConfig)
     autonomy: YuiAutonomyConfig = field(default_factory=YuiAutonomyConfig)
@@ -526,9 +527,17 @@ class YuiPluginConfig:
             minimum=ack_timeout_s,
         )
 
+        from dataclasses import asdict
+        from .vmc_receiver import VmcConfig
+        ardy = _validated_ardy(data.get("ardy", {}))
+        vmc = asdict(VmcConfig.from_mapping(data.get("vmc", {})))
+        if ardy["enabled"] and vmc["enabled"]:
+            raise ValueError("VMC 动作共享与 ARDY 不能同时启用")
+
         return cls(
             midi_port=midi_port.strip(),
-            ardy=_validated_ardy(data.get("ardy", {})),
+            ardy=ardy,
+            vmc=vmc,
             claim_code=claim_code,
             log_path=log_path.strip() if isinstance(log_path, str) and log_path.strip() else None,
             log_directory=(

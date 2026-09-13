@@ -30,6 +30,7 @@ FIELDS = {
     "autonomy.intent_model.timeout_s": ("模型超时（秒）", float, 1, 120),
     "autonomy.intent_model.min_interval_s": ("自主意图最短间隔（秒）", float, 1, 3600),
     "autonomy.intent_model.max_output_tokens": ("模型输出 Token 上限", int, 128, 4096),
+    "vmc.enabled": ("VMC 动作共享（N.E.K.O → YUI）", bool, None, None),
     "ardy.enabled": ("ARDY 动作后端（需要世界执行端）", bool, None, None),
     "chat_bridge.enabled": ("角色字幕", bool, None, None),
     "chat_bridge.display_seconds": ("字幕最短秒数", int, 10, 25),
@@ -149,6 +150,13 @@ def validated_patch(raw, changes):
         raise ValueError("没有可保存的修改")
     if set(changes) - FIELDS.keys():
         raise ValueError("提交中包含面板不支持的设置")
+    changes = dict(changes)
+    if changes.get("vmc.enabled") is True and changes.get("ardy.enabled") is True:
+        raise ValueError("VMC 动作共享与 ARDY 不能同时启用")
+    if changes.get("vmc.enabled") is True:
+        changes["ardy.enabled"] = False
+    elif changes.get("ardy.enabled") is True:
+        changes["vmc.enabled"] = False
     candidate = deepcopy(raw.get("yui", {}))
     patch = {}
     if changes.get(CLEAR_SECRET) is True and changes.get(SECRET):

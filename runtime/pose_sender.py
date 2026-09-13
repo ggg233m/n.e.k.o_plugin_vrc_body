@@ -1,10 +1,13 @@
 """候选全身流的单线程端口所有者；仅显式注入时接管旧传输。"""
 from concurrent.futures import Future
 from queue import Queue, Empty, Full
+import logging
 import threading
 import time
 from .pose_shared_port import SharedPort
 from .yui_protocol import MidiEvent, encode_command
+
+logger = logging.getLogger(__name__)
 
 
 class PoseSender:
@@ -70,6 +73,7 @@ class PoseSender:
     def _run(self):
         waiting={}
         sequence=0
+        last_exception_log = 0
         try:
             while not self.stop_requested.is_set() and not self.core.stopped:
                 now=time.perf_counter()
@@ -79,7 +83,9 @@ class PoseSender:
                     pass
                 else:
                     if kind=="ack":
-                        self.core.ack(a[0],b,self.core.epoch,a[1],now)
+                        success = self.core.ack(a[0],b,self.core.epoch,a[1],now)
+                        logger.debug('YUI_SENDER_ACK lane=%s seq=%d session=%s epoch=%s success=%s',
+                                     a[0], a[1], b, self.core.epoch, success)
                     else:
                         sequence+=1
                         if self.core.submit(a,sequence,b,now):
@@ -109,13 +115,19 @@ class PoseSender:
                 else:
                     time.sleep(0)
         except Exception as exc:
+            if time.perf_counter() - last_exception_log > 1:
+                logger.exception('YUI_SENDER_EXCEPTION waiting=%d stopped=%s', len(waiting), self.core.stopped)
+                last_exception_log = time.perf_counter()
             for future in waiting.values():
                 if not future.done():
                     future.set_exception(exc)
         finally:
             with self._exit_lock:
                 if not self.gracefully_closed:
-                    self.core.stop('explicit_stop' if self._manual_stop else 'sender_stopped')
+                    reason = 'explicit_stop' if self._manual_stop else 'sender_stopped'
+                    logger.warning('YUI_SENDER_STOP reason=%s waiting=%d outstanding=%d stopped=%s',
+                                   reason, len(waiting), self.core.outstanding, self.core.stopped)
+                    self.core.stop(reason)
                 self.closed.set()
             for future in waiting.values():
                 if not future.done():
