@@ -219,6 +219,7 @@ class BackendService:
         config_data: Mapping[str, Any],
         config_dir: str | Path,
         *,
+        state_dir: str | Path | None = None,
         logger: Any = None,
         dry_run: bool = False,
         vision_source: FrameSource | None = None,
@@ -227,6 +228,21 @@ class BackendService:
     ) -> None:
         self.config = PluginConfig.from_mapping(config_data)
         self.config_dir = Path(config_dir)
+        # 运行时写盘一律走 state_dir，绝不落回 config_dir。宿主把安装目录当成包
+        # 内容的指纹：start_plugin 先比对 plugin.meta.json 里的 source_files，一
+        # 致就直接用打包期算好的元数据，不一致就回落到起一个 worker 子进程去真
+        # import 一遍插件。我们往安装目录写下一个 world_memory.json，文件集就对
+        # 不上了——于是装完的第一次启动走快路径正常，插件自己跑一轮把目录写脏之
+        # 后，后续每次启动都改走 worker，而那条路在本机必崩（见下）。
+        #
+        # worker 崩的是宿主的锅，但我们躲得开：父进程按 UTF-8 写请求，子进程的
+        # sys.stdin 在 cp936 机器上是 gbk/surrogateescape，于是 plugin.toml 里
+        # [plugin.entries] 的中文被解成孤立代理对；worker 回写结果时那句
+        # .encode("utf-8") 正好落在它 except BaseException 的外面，UnicodeEncodeError
+        # 直接掀掉进程，stderr 又已重定向到 devnull——宿主只看到 "worker exited
+        # with code 1"，一路压扁成 "start_plugin failed"。不写脏目录，就永远走
+        # 不到那条路径。
+        self.state_dir = Path(state_dir) if state_dir is not None else self.config_dir
         self.logger = logger
         self.dry_run = bool(dry_run)
         # 必须在这里，而且必须在建采集源／检测器之前：OpenMP 只在初始化时读一次
@@ -316,7 +332,7 @@ class BackendService:
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
         self.world_state = WorldStateStore(
             lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
-            persistence_path=self.config_dir / "world_memory.json",
+            persistence_path=self.state_dir / "world_memory.json",
             # 除非调用方明确提供该配置段，否则隔离库/测试调用方；随插件发布的
             # plugin.toml 会启用持久化配置段。
             persist_world=self.config.world_memory.persist_world and "world_memory" in config_data,

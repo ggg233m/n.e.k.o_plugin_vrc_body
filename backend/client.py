@@ -49,9 +49,19 @@ class RemoteOscConfig:
 class BackendClient:
     """启动一个后端子进程并与其通信。"""
 
-    def __init__(self, config_data: Mapping[str, Any], config_dir: str | Path, *, logger: Any = None) -> None:
+    def __init__(
+        self,
+        config_data: Mapping[str, Any],
+        config_dir: str | Path,
+        *,
+        state_dir: str | Path | None = None,
+        logger: Any = None,
+    ) -> None:
         self.config_data = dict(config_data)
         self.config_dir = str(config_dir)
+        # 安装目录只读：往里写运行时文件会让宿主的打包元数据校验失配，重启时
+        # 被迫改走隔离扫描 worker。详见 BackendService.__init__ 的注释。
+        self.state_dir = str(state_dir) if state_dir is not None else str(config_dir)
         self.logger = logger
         self.port = 0
         self.token = ""
@@ -107,6 +117,7 @@ class BackendClient:
             # 误当成另一个选项。
             f"--token={self.token}",
             f"--config-dir={self.config_dir}",
+            f"--state-dir={self.state_dir}",
             f"--config-json={encoded_config}",
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

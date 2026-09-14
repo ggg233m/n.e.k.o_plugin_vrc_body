@@ -412,6 +412,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=48912)
     parser.add_argument("--token", default=None)
     parser.add_argument("--config-dir", default=str(PROJECT_DIR))
+    # 只读的包内容（模型、片段）来自 --config-dir；一切运行时写盘走这里。缺省
+    # 回落到 --config-dir 是为了独立运行/测试，插件路径下宿主会显式给出数据目录。
+    parser.add_argument("--state-dir", default=None)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--config-json", default=None)
     source.add_argument("--config-file", type=Path, default=None, help="JSON or TOML config file")
@@ -436,6 +439,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config_dir = Path(args.config_dir).resolve()
+        state_dir = Path(args.state_dir).resolve() if args.state_dir else config_dir
         settings_path: Path | None = None
         config_source = "defaults"
         if args.config_json:
@@ -453,9 +457,9 @@ def main() -> int:
         if not isinstance(config_data, dict):
             raise ValueError("config must be a JSON object")
         if args.standalone:
-            settings_path = args.settings_file or (config_dir / "backend.settings.json")
+            settings_path = args.settings_file or (state_dir / "backend.settings.json")
             if not settings_path.is_absolute():
-                settings_path = config_dir / settings_path
+                settings_path = state_dir / settings_path
             settings_path = settings_path.resolve()
             if settings_path.suffix.lower() != ".json":
                 raise ValueError("standalone settings file must use the .json suffix")
@@ -484,7 +488,7 @@ def main() -> int:
             source=config_source,
             offline=offline,
         )
-        service = BackendService(config_data, config_dir, dry_run=offline)
+        service = BackendService(config_data, config_dir, state_dir=state_dir, dry_run=offline)
         server: BackendHttpServer | None = None
         try:
             # 先完成端口绑定再启动 VMC/OSC 资源，并把两者放在同一个 finally 块中；

@@ -224,6 +224,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._backend_client = BackendClient(
             self._raw_config,
             self.config_dir,
+            # config_dir 是只读的安装载荷（模型、片段都在里面）；运行时状态必须
+            # 落到 SDK 给的数据目录，否则安装目录的文件集会和 plugin.meta.json
+            # 对不上，插件跑过一轮之后就再也起不来了。
+            state_dir=self.data_path(),
             logger=self.logger,
         )
         try:
