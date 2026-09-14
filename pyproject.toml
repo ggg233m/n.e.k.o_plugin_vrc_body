@@ -5,7 +5,10 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26,<3",
     "Pillow>=10,<13",
-    "onnxruntime>=1.20,<2",
+    # onnxruntime 刻意不声明、也不进 vendor：宿主 pyproject 已声明并钉在
+    # 1.25.0。打包器的 host-provided 允许清单只认 n-e-k-o，声明了就会强制
+    # vendor 一份副本，于是同一进程里出现两个版本的 onnxruntime.dll，后加载
+    # 的那份 DllMain 返回 1114，检测器整条降级到 OpenCV DNN。
     "opencv-python-headless>=4.10,<5",
     "dxcam[winrt]>=0.0.5,<1; sys_platform == 'win32'",
     "websocket-client>=1.8,<2",

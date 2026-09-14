@@ -55,6 +55,7 @@ type DebugState = {
   host_vmc?: Record<string, any>
   world?: Record<string, any>
   vision_frame?: Record<string, any>
+  vision_worker?: Record<string, any>
   autonomy?: Record<string, any>
   clips?: {
     clips?: ClipSummary[]
@@ -150,6 +151,22 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const [refreshFailed, setRefreshFailed] = props.useLocalState("refreshFailed", false)
   const visionFrame = state.vision_frame || {}
   const overlay = visionFrame.overlay || {}
+  // 检测器/采集的真实状态在这两处，面板此前一处都没读：没有它们，「检测框尚未
+  // 就绪」就只是一句无法排查的症状描述。
+  const visionRuntime = state.world?.vision || state.world?.backends?.vision_runtime || {}
+  const detector = visionRuntime.detector || {}
+  const visionWorker = state.vision_worker || {}
+  const captureSource = visionWorker.source || {}
+  // dxcam 先试 DXGI 再退 WinRT。退到 WinRT 就是屏幕外沿那圈黄色捕获指示框的
+  // 来源，也比 DXGI 重得多，所以「现在用的是哪条」必须能直接读到。
+  const captureBackend = captureSource.backend || null
+  const captureCandidateErrors = Object.entries(captureSource.candidate_errors || {})
+  // 降级链：每一步失败各记一条。只报 last_error 会把整条链压成最后一个运行时的
+  // 错误——OpenVINO 缺 wheel、ORT 为什么没接住，全被 OpenCV 的报错盖掉。
+  const detectorFallbacks: string[] = Array.isArray(detector.device_fallbacks) ? detector.device_fallbacks : []
+  const overlayReasons: Record<string, string> = {
+    frame_detection_pair_unavailable: "这一帧没有配对的检测结果（检测器未就绪或该帧被限流跳过）",
+  }
   const previewSrc = !refreshFailed && visionFrame.available && visionFrame.mime === "image/jpeg" && visionFrame.data_base64
     ? `data:image/jpeg;base64,${visionFrame.data_base64}` : ""
   const previewReasons: Record<string, string> = {
@@ -331,7 +348,43 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             <Alert tone="warning">{refreshFailed ? "面板刷新失败，等待连接恢复" : previewReasons[visionFrame.reason] || "暂无可用识别画面，请确认视觉采集已启动"}</Alert>
           )}
           {previewSrc ? <Text>画面尺寸 {visionFrame.width} × {visionFrame.height} · 获取时帧龄 {fixed(visionFrame.age_ms, 0)} ms · 检测框 {overlay.drawn ? overlay.boxes_drawn ?? 0 : "未就绪"}</Text> : null}
-          {previewSrc && !overlay.drawn ? <Alert tone="warning">检测框尚未就绪，当前仅显示原始画面。</Alert> : null}
+          {previewSrc && !overlay.drawn ? (
+            <Alert tone="warning">
+              检测框尚未就绪，当前仅显示原始画面。原因：{overlayReasons[overlay.reason] || overlay.reason || "未知"}
+            </Alert>
+          ) : null}
+          {!detector.available ? (
+            <Alert tone="danger">
+              本地检测器不可用，不会有任何检测框。原因：{detector.reason || detector.last_error || detector.openvino_error || "未报告"}
+            </Alert>
+          ) : null}
+          {!visionRuntime.capture_active ? (
+            <Alert tone="warning">画面采集未在运行（{visionRuntime.capture_reason || "未报告"}），请点击「启动采集」。</Alert>
+          ) : null}
+          <KeyValue items={[
+            { key: "detector", label: "检测器", value: detector.available ? `可用${detector.degraded ? "（降级）" : ""}` : `不可用（${detector.reason || detector.last_error || "未报告"}）` },
+            // 配的设备和跑起来的设备经常不是一回事，AUTO 掉到 CPU 是 22 倍延迟差。
+            { key: "runtime", label: "推理运行时", value: `${detector.runtime || "—"} · ${detector.resolved_device || detector.device || "—"}` },
+            { key: "model", label: "模型路径", value: detector.model_path || (detector.model_path_configured ? "已配置" : "未配置") },
+            { key: "detectAge", label: "最近一次检测", value: visionRuntime.detect_throttle?.age_ms == null ? "从未" : `${fixed(visionRuntime.detect_throttle.age_ms, 0)} ms 前` },
+            { key: "pair", label: "帧/检测配对", value: visionRuntime.frame_cache?.paired ? "已配对" : "未配对" },
+            // WinRT/WGC 就是屏幕外沿那圈黄色捕获指示框的来源，也比 DXGI 重。
+            { key: "captureBackend", label: "采集后端", value: captureBackend ? (captureBackend === "winrt" ? "winrt（WGC，会显示黄色捕获边框）" : String(captureBackend)) : `${captureSource.name || "—"}` },
+            { key: "captureFrames", label: "采集帧数", value: `${captureSource.frames ?? 0}（空帧 ${captureSource.empty_grabs ?? 0}）` },
+          ]} />
+          {captureCandidateErrors.length ? (
+            <Alert tone="info">
+              采集候选回退：{captureCandidateErrors.map(([spec, err]) => `${spec} → ${String(err)}`).join("；")}
+            </Alert>
+          ) : null}
+          {detectorFallbacks.length ? (
+            <Alert tone="info">
+              检测器降级链：{detectorFallbacks.map((entry, idx) => `${idx + 1}. ${entry}`).join("；")}
+            </Alert>
+          ) : null}
+          {visionRuntime.last_error ? <Alert tone="danger">视觉运行时：{String(visionRuntime.last_error)}</Alert> : null}
+          {visionWorker.last_error ? <Alert tone="danger">采集 worker：{String(visionWorker.last_error)}</Alert> : null}
+          {captureSource.last_error ? <Alert tone="danger">采集来源：{String(captureSource.last_error)}</Alert> : null}
           {previewSrc && overlay.skew_warning ? <Alert tone="warning">检测结果与画面时间差较大，请等待下一帧。</Alert> : null}
         </Stack>
       </Card>
@@ -392,7 +445,10 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             <Text>{autonomy.reason || "必须手动授权；世界观测失败会自动降级。"}</Text>
             <KeyValue items={[
               { key: "state", label: "状态", value: autonomy.state || "disarmed" },
-              { key: "ttl", label: "剩余授权", value: autonomy.remaining_seconds == null ? "—" : `${fixed(autonomy.remaining_seconds, 0)} 秒` },
+              // session_ttl_minutes 被加载器钳在 0，arm() 因此拿到 inf、不写
+              // armed_until，remaining_seconds 恒为 null。显示「—」会让永久授权
+              // 看起来像读不到剩余时间，所以这里按授权与否分开写。
+              { key: "ttl", label: "剩余授权", value: !autonomy.armed ? "—" : autonomy.remaining_seconds == null ? "永久（无到期时间）" : `${fixed(autonomy.remaining_seconds, 0)} 秒` },
               { key: "revision", label: "世界 revision", value: autonomy.world_revision ?? 0 },
               { key: "goal", label: "当前目标", value: autonomy.goal?.text || "无" },
               { key: "navReason", label: "导航决策", value: navigation.last_decision?.reason || "—" },
@@ -421,7 +477,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               },
             ]} />
             <ButtonGroup>
-              <Button tone="success" disabled={busy || autonomy.armed} onClick={() => run("vrc_autonomy_arm")}>手动授权 30 分钟</Button>
+              <Button tone="success" disabled={busy || autonomy.armed} onClick={() => run("vrc_autonomy_arm")}>手动授权（永久有效）</Button>
               <Button tone="danger" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_disarm")}>解除授权并释放</Button>
               <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_stop")}>停止自主目标</Button>
             </ButtonGroup>

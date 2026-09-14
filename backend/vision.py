@@ -3845,10 +3845,12 @@ class VisionRuntime:
 # 已经完成初始化。
 from .local_perception import OpenVinoLocalDetector as OpenVinoLocalDetector  # noqa: E402,F401
 from .local_perception import cap_openmp_threads as cap_openmp_threads  # noqa: E402,F401
+from .local_perception import preload_inference_runtime as preload_inference_runtime  # noqa: E402,F401
 
 
 __all__ = [
     "cap_openmp_threads",
+    "preload_inference_runtime",
     "CapturedFrame",
     "draw_detection_overlay",
     "encode_frame_jpeg",

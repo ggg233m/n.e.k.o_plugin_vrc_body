@@ -166,7 +166,10 @@ class AutonomyConfig:
     """会话授权默认值；绝不隐式启用。"""
 
     manual_arm: bool = True
-    session_ttl_minutes: int = 30
+    # 0 = 永久授权（无到期时间），解除只能靠显式 disarm。加载器把该键钳到
+    # [0, 0]，所以 plugin.toml 写什么都只会是 0；默认值必须跟着写 0，否则
+    # 读代码的人会以为还存在一个 30 分钟的会话上限。
+    session_ttl_minutes: int = 0
 
 
 @dataclass(frozen=True)

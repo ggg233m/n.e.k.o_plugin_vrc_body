@@ -63,6 +63,10 @@ def resolve_plugin_package_name(*, package: str | None, project_dir: Path) -> st
 PACKAGE_NAME = resolve_plugin_package_name(package=__package__, project_dir=PROJECT_DIR)
 # 后端是独立子进程，不继承宿主为插件添加的 sys.path。
 # 保留宿主已有依赖的优先级，仅把安装包内的依赖作为补充。
+#
+# onnxruntime 刻意不进 vendor：宿主自带一份，两份不同版本的 onnxruntime.dll
+# 落进同一进程时，后加载的那份 DllMain 会返回 1114（"动态链接库初始化例程失
+# 败"），检测器整条降级到 OpenCV DNN。统一用宿主那份，唯一一份 DLL。
 VENDOR_DIR = PROJECT_DIR / "vendor"
 if VENDOR_DIR.is_dir():
     site.addsitedir(str(VENDOR_DIR))

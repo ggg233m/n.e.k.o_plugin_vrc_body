@@ -26,6 +26,7 @@ from .autonomy import AutonomyRuntime
 from .navigator import LocalNavigator
 from .vision import (
     cap_openmp_threads,
+    preload_inference_runtime,
     DesktopMirrorFrameSource,
     DxcamFrameSource,
     find_window_region,
@@ -234,6 +235,23 @@ class BackendService:
         # numpy 拉进来，环境变量随之失效，只剩 ctypes 那条降级路。
         # 收的是 numpy/BLAS 的池，不是 YOLO 的：实测采集路径空转自旋就吃 7.23 核。
         self._openmp = cap_openmp_threads(self.config.vision.detector_threads)
+        # 同样必须早于建采集源：WinRT/WGC 会话的 is_border_required 只在
+        # duplicator 的 __post_init__ 里读一次环境变量，相机建完再设就没用了。
+        # 不设时 WGC 会沿屏幕外沿画一圈黄色捕获指示框（Windows 的采集提示），
+        # 而且这条路径本身就比 DXGI 重。dxcam 仅在环境变量显式给值时才去设这个
+        # 属性，所以默认值得由我们补上；用户已显式设置时不覆盖，Windows 拒绝
+        # 该请求时 dxcam 只记一条警告，不影响采集。
+        os.environ.setdefault("DXCAM_WINRT_BORDER_REQUIRED", "0")
+        # 也必须早于建采集源，而且理由更硬：dxcam[winrt] 会把
+        # winrt.windows.graphics.* 的 C++/WinRT 扩展拉进进程，之后
+        # ``import onnxruntime`` 就会卡 4.3 秒再报 DLL 初始化失败(1114)。
+        # 顺序是单向的——ORT 先进来则两者共存无碍。详见
+        # ``preload_inference_runtime``。
+        self._ort_preload = preload_inference_runtime()
+        if not self._ort_preload["ok"] and self.logger is not None:
+            self.logger.warning(
+                "ONNX Runtime 预热失败，检测器将不可用：%s", self._ort_preload["error"]
+            )
         # FrameSource 持有操作系统句柄，调用 ``close()`` 后刻意不再复用。
         # 为已配置的来源保留工厂，使视觉停止/启动接口可以销毁并重新创建句柄。
         # 注入的来源只保证一个生命周期；测试或旁路进程可显式提供工厂来重复创建。

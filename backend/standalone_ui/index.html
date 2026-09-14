@@ -190,7 +190,7 @@
               <label class="switch-field"><input id="cfgOscEnabled" type="checkbox"><span>启用 VRChat OSC</span></label>
               <label class="field"><span>OSC 发送端口</span><input id="cfgOscSendPort" type="number" min="1" max="65535"></label>
               <label class="field"><span>OSC 监听端口</span><input id="cfgOscListenPort" type="number" min="1" max="65535"></label>
-              <label class="field"><span>授权时长（分钟，0=永久）</span><input id="cfgAutonomyTtl" type="number" min="0" max="240"></label>
+              <label class="field"><span>授权时长（分钟，固定 0=永久）</span><input id="cfgAutonomyTtl" type="number" min="0" max="0" readonly></label>
               <label class="switch-field"><input id="cfgPersistWorld" type="checkbox"><span>持久化世界事实</span></label>
               <label class="switch-field"><input id="cfgPersistPlayers" type="checkbox"><span>持久化玩家信息</span></label>
             </div>

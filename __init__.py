@@ -1568,6 +1568,24 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             except Exception:
                 # 预览失败不能阻断急停等控制按钮的状态刷新。
                 vision_frame = {"available": False, "reason": "preview_failed"}
+        # 面板要同时读世界快照和采集 worker 状态：只有 worker 里带 FrameSource 的
+        # 后端选择与候选错误（dxgi/winrt），那是「为什么没有检测框」和「为什么屏幕
+        # 上有黄框」在插件外唯一能看到的证据。/perception 一次返回两者，不多加一轮
+        # 请求；后端不可用时 RemoteVision 自己会降级成带 reason 的对象。
+        perception = (
+            await asyncio.to_thread(self._vision.perception)
+            if self._vision
+            else {}
+        )
+        world = perception.get("world") or {
+            "available": False,
+            "uncertainties": ["backend_unavailable"],
+        }
+        vision_worker = perception.get("worker") or {
+            "enabled": False,
+            "running": False,
+            "reason": "backend_unavailable",
+        }
         bridge_thread = self._world_bridge_thread
         bridge = {
             "running": bool(bridge_thread is not None and bridge_thread.is_alive()),
@@ -1594,12 +1612,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "active": False,
                 "last_error": "host VMC controller is not initialized",
             },
-            "world": await asyncio.to_thread(self._vision.snapshot) if self._vision else {
-                "available": False,
-                "uncertainties": ["backend_unavailable"],
-            },
+            "world": world,
             "world_bridge": bridge,
             "vision_frame": vision_frame,
+            "vision_worker": vision_worker,
             "autonomy": await asyncio.to_thread(self._backend_client.autonomy.snapshot) if self._backend_client else {
                 "state": "disarmed",
                 "armed": False,

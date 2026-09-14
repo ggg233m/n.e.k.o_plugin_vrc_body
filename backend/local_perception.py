@@ -40,6 +40,68 @@ _OPENMP_RUNTIME_DLLS: tuple[str, ...] = ("vcomp140", "libiomp5md", "libomp", "vc
 _OPENMP_STATE: dict[str, Any] = {}
 
 
+# ONNX Runtime 的进程级导入结果。``module`` 与 ``error`` 至多有一个存在。
+_ORT_IMPORT: dict[str, Any] = {}
+
+
+def import_onnxruntime() -> Any:
+    """导入 ONNX Runtime，成功和失败都在进程内缓存。
+
+    缓存失败不是为了省那点导入时间，是因为**失败本身很贵**：ORT 的
+    ``onnxruntime_pybind11_state`` 在被污染的进程里要耗 4.8 秒才走完 DllMain
+    并返回 1114，而 ``_initialize_model`` 会为 CUDA 和 CPU 各试一次——9.7 秒，
+    刚好顶穿 ``client.py`` 里 10 秒的就绪预算，于是宿主只看到
+    ``<urlopen error timed out>`` 且子进程 stderr 是空的。
+
+    而且重试没有意义：DLL 初始化失败是进程级的终态，不会自愈。
+    """
+    module = _ORT_IMPORT.get("module")
+    if module is not None:
+        return module
+    cached_error = _ORT_IMPORT.get("error")
+    if cached_error is not None:
+        raise ImportError(cached_error)
+    try:
+        import onnxruntime as ort  # type: ignore[import-not-found]
+    except BaseException as exc:
+        # 原样保留消息文本，status() 里的降级链读起来和直接导入时一致。
+        _ORT_IMPORT["error"] = f"{exc}"
+        raise
+    _ORT_IMPORT["module"] = ort
+    return ort
+
+
+def preload_inference_runtime() -> dict[str, Any]:
+    """在采集栈之前把 ONNX Runtime 拉进进程。这是顺序问题，不是性能优化。
+
+    ``winrt.windows.graphics.*``（``dxcam[winrt]`` 带进来的 C++/WinRT 扩展）
+    一旦先加载，之后 ``import onnxruntime`` 必然失败：
+
+        ImportError: DLL load failed while importing
+        onnxruntime_pybind11_state: 动态链接库(DLL)初始化例程失败。  (1114)
+
+    实测是单向的——ORT 先导入则两者共存，WinRT 采集和 640x640 推理都正常；
+    反过来必挂，且要先卡 4.3 秒。触发单元是 ``winrt.windows.graphics`` 下的
+    编译扩展，命名空间包 ``winrt`` 本身无害。
+
+    所以调用点必须早于任何采集源构造。曾经这条链表现为「检测器整条降级到
+    OpenCV DNN」，而 OpenCV 又读不了本模型的 ``/model.11/Concat``，最终面板
+    显示「检测框尚未就绪」——真正的原因在这里，不在模型上。
+    """
+    started = time.perf_counter()
+    result: dict[str, Any] = {"ok": False, "error": None, "version": None}
+    try:
+        ort = import_onnxruntime()
+    except BaseException as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    else:
+        result["ok"] = True
+        result["version"] = getattr(ort, "__version__", None)
+    result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return result
+
+
+
 def cap_openmp_threads(threads: int) -> dict[str, Any]:
     """收住**进程级** OpenMP 线程池，返回实际做到了什么。
 
@@ -724,8 +786,7 @@ class OpenVinoLocalDetector:
         label = "ONNX Runtime CUDA" if use_cuda else "ONNX Runtime"
         try:
             self._cap_openmp_before_import()
-            import onnxruntime as ort  # type: ignore[import-not-found]
-
+            ort = import_onnxruntime()
             getter = getattr(ort, "get_available_providers", None)
             if callable(getter):
                 self._onnx_available_providers = tuple(str(item) for item in getter())
@@ -801,6 +862,9 @@ class OpenVinoLocalDetector:
             if use_cuda:
                 self._record_cuda_failure(message)
             else:
+                entry = f"ONNX Runtime CPU: {message}"[:360]
+                if entry not in self._device_fallbacks:
+                    self._device_fallbacks = (*self._device_fallbacks, entry)
                 self._last_error = f"{label} unavailable: {message}"[:500]
 
     def _run_onnxruntime(self, frame: Any) -> Any:
@@ -833,7 +897,11 @@ class OpenVinoLocalDetector:
             self._source_name = "opencv_dnn"
             self._last_error = None
         except Exception as exc:
-            self._last_error = f"OpenCV ONNX loader unavailable: {type(exc).__name__}: {exc}"[:500]
+            message = f"{type(exc).__name__}: {exc}"
+            entry = f"OpenCV DNN: {message}"[:360]
+            if entry not in self._device_fallbacks:
+                self._device_fallbacks = (*self._device_fallbacks, entry)
+            self._last_error = f"OpenCV ONNX loader unavailable: {message}"[:500]
 
     def _run_opencv_dnn(self, frame: Any) -> Any:
         network = self._opencv_net
