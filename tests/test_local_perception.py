@@ -1017,6 +1017,8 @@ class LocalPerceptionTests(unittest.TestCase):
                 "identity_reid_margin": 0.06,
                 "identity_reid_retention_s": 900,
                 "identity_reid_max_identities": 48,
+                "identity_reid_model_path": "models/osnet.onnx",
+                "identity_reid_model_similarity": 0.78,
             },
         })
         self.assertEqual(config.vision.model_path, "models/yolox.xml")
@@ -1028,6 +1030,13 @@ class LocalPerceptionTests(unittest.TestCase):
         self.assertEqual(config.vision.identity_reid_margin, 0.06)
         self.assertEqual(config.vision.identity_reid_retention_s, 900)
         self.assertEqual(config.vision.identity_reid_max_identities, 48)
+        self.assertEqual(config.vision.identity_reid_model_path, "models/osnet.onnx")
+        self.assertEqual(config.vision.identity_reid_model_similarity, 0.78)
+
+    def test_config_reid_model_defaults(self) -> None:
+        config = PluginConfig.from_mapping({"vision": {"enabled": True}})
+        self.assertIsNone(config.vision.identity_reid_model_path)
+        self.assertEqual(config.vision.identity_reid_model_similarity, 0.75)
 
 
 class OpenMpCapTests(unittest.TestCase):

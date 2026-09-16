@@ -58,6 +58,11 @@ def main() -> None:
             data = archive.read(model_dir + record["file"])
             assert len(data) == record["bytes"]
             assert hashlib.sha256(data).hexdigest().lower() == record["sha256"].lower()
+        reid_dir = prefix + "models/osnet_x0_25_msmt17/"
+        for record in json.loads(archive.read(reid_dir + "checksums.json")):
+            data = archive.read(reid_dir + record["file"])
+            assert len(data) == record["bytes"]
+            assert hashlib.sha256(data).hexdigest().lower() == record["sha256"].lower()
     # 仅安装到工作区新建的测试目录，不接触当前宿主插件和配置。
     install_root = Path(tempfile.mkdtemp(prefix="安装验证 空格-", dir=root / "build"))
     installed = install_package(out, plugins_root=install_root / "plugins", profiles_root=install_root / "profiles")

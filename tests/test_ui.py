@@ -107,7 +107,7 @@ class HostedUiTests(unittest.TestCase):
 
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         manifest = self._manifest()
-        self.assertEqual(manifest["plugin"]["version"], "0.13.29")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.30")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")

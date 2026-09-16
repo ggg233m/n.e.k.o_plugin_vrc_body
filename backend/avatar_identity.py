@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import secrets
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 _DEFAULT_LABELS = frozenset({"person", "player", "avatar", "人物", "玩家"})
@@ -287,6 +287,8 @@ class AvatarIdentityRegistry:
         max_identities: int = 128,
         session_token: str | None = None,
         eligible_labels: Iterable[str] = _DEFAULT_LABELS,
+        descriptor_fn: Callable[[Any, Sequence[float]], tuple[float, ...] | None] | None = None,
+        descriptor_name: str = "color_histogram",
     ) -> None:
         self.enabled = bool(enabled)
         self.similarity_threshold = min(0.999, max(0.5, float(similarity_threshold)))
@@ -296,6 +298,11 @@ class AvatarIdentityRegistry:
         raw_token = str(session_token or secrets.token_hex(4)).strip().replace(":", "_")
         self.session_token = raw_token[:24] or secrets.token_hex(4)
         self._eligible_labels = frozenset(str(item).strip().lower() for item in eligible_labels)
+        # 描述子可替换（OSNet 嵌入等），但整个会话必须只用一种：不同描述子的
+        # 向量长度不同，_similarity 对长度不匹配返回 0，混库会让所有历史身份
+        # 永远匹配不上、被静默视为陌生人。因此这里固定在构造期，不做运行时切换。
+        self._descriptor_fn = descriptor_fn or appearance_descriptor
+        self._descriptor_name = str(descriptor_name or "color_histogram")[:48]
         self._identities: dict[str, _Identity] = {}
         self._track_bindings: dict[int, str] = {}
         self._next_identity = 1
@@ -559,7 +566,7 @@ class AvatarIdentityRegistry:
                     bound.observations + track_id
                 ) % _DESCRIPTOR_REFRESH_OBSERVATIONS == 0
                 descriptor = (
-                    appearance_descriptor(frame, getattr(detection, "bbox", ()))
+                    self._descriptor_fn(frame, getattr(detection, "bbox", ()))
                     if should_refresh
                     else None
                 )
@@ -584,7 +591,7 @@ class AvatarIdentityRegistry:
                 )
                 continue
 
-            descriptor = appearance_descriptor(frame, getattr(detection, "bbox", ()))
+            descriptor = self._descriptor_fn(frame, getattr(detection, "bbox", ()))
             if descriptor is None:
                 continue
 
@@ -658,6 +665,7 @@ class AvatarIdentityRegistry:
         return {
             "enabled": self.enabled,
             "session_token": self.session_token,
+            "descriptor": self._descriptor_name,
             "identity_count": len(self._identities),
             "track_binding_count": len(self._track_bindings),
             "new_count": self._new_count,

@@ -234,6 +234,11 @@ class VisionConfig:
     identity_reid_margin: float = 0.04
     identity_reid_retention_s: float = 1800.0
     identity_reid_max_identities: int = 128
+    # 可选的 OSNet 外观嵌入模型（ONNX）。配置后替换颜色直方图描述子；模型
+    # 缺失或 onnxruntime 不可用时回落直方图并沿用 identity_reid_similarity。
+    # 嵌入向量的工作点与直方图完全不同，所以阈值分开配。
+    identity_reid_model_path: str | None = None
+    identity_reid_model_similarity: float = 0.75
     # main_llm 不另起独立模型请求：它把一次有界语义任务作为被动上下文并入
     # 当前/下一次宿主多模态对话，分类结果再通过工具回填到本地稳定 ID 缓存。
     semantic_backend: str = "main_llm"
@@ -631,6 +636,14 @@ class PluginConfig:
                 minimum=1,
                 maximum=1024,
                 name="vision.identity_reid_max_identities",
+            ),
+            identity_reid_model_path=optional_path("identity_reid_model_path"),
+            identity_reid_model_similarity=_finite_float(
+                vision.get("identity_reid_model_similarity"),
+                0.75,
+                minimum=0.5,
+                maximum=0.999,
+                name="vision.identity_reid_model_similarity",
             ),
             semantic_backend=semantic_backend,
             semantic_endpoint=semantic_endpoint,

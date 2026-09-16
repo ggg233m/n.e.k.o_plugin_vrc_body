@@ -35,7 +35,7 @@ keywords = [
   "anyadance|steamvr|vrchat|osc|npc|avatar",
   "视觉|感知|导航|移动|跟随|身体|姿势|手势|表情",
 ]
-version = "0.13.29"
+version = "0.13.30"
 type = "plugin"
 entry = "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 
@@ -238,10 +238,20 @@ max_detections = 64
 min_box_ratio = 0.02
 min_box_width_ratio = 0.008
 min_box_height_ratio = 0.02
-# 会话级 Avatar 外观重识别。YOLO 的 track_id 变化后，用最多 6 个多视角颜色/布局
-# 原型恢复稳定 ID；相似旧模板按背景指纹、15 秒内几何、长期稳定度依次消歧。特征只
-# 保留在当前后端内存中；两个相同 Avatar 或镜像仍可能歧义。
+# 会话级 Avatar 外观重识别。YOLO 的 track_id 变化后恢复稳定 ID；特征只保留在
+# 当前后端内存中。配置了 identity_reid_model_path 时用 OSNet 外观嵌入（行人
+# 重识别网络，907KB ONNX，CPU 单人约 7ms）：实测 17 张真实截图上颜色直方图
+# 没有可用阈值（亮场景不同 Avatar 互相 0.89~0.99、同一 Avatar 换彩色灯光掉到
+# 0.2），OSNet 不同人 ≤0.72、同人同视角 ≥0.83；在 192 个同画风角色的极端拼图
+# （18336 对负样本）上 0.75 阈值误并率 0.80%、扰动召回 96.7%。模型文件缺失或
+# onnxruntime 不可用时自动回落直方图，此时生效的阈值是 identity_reid_similarity。
+# 两个相同 Avatar 或镜像仍可能歧义，仍由背景指纹、15 秒内几何、长期稳定度依次消歧。
 identity_reid_enabled = true
+identity_reid_model_path = "models/osnet_x0_25_msmt17/osnet_x0_25_msmt17_dynamic.onnx"
+# OSNet 嵌入的匹配阈值。这不是和直方图同一把尺子：嵌入向量的同人/不同人分离带
+# 整体更低，0.90 会把大部分真实重现拒掉，0.75 是拼图阈值扫描的最优工作点。
+identity_reid_model_similarity = 0.75
+# 直方图回落路径的阈值（模型加载失败时用）。
 identity_reid_similarity = 0.90
 identity_reid_margin = 0.04
 identity_reid_retention_s = 1800.0

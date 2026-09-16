@@ -409,6 +409,8 @@ class OpenVinoLocalDetector:
         identity_reid_margin: float = 0.04,
         identity_reid_retention_s: float = 1800.0,
         identity_reid_max_identities: int = 128,
+        identity_reid_model_path: str | None = None,
+        identity_reid_model_similarity: float = 0.75,
         intra_op_threads: int = 2,
         fallback_backend: str = "none",
         infer: Callable[[Any], Mapping[str, Any] | Any] | None = None,
@@ -465,12 +467,34 @@ class OpenVinoLocalDetector:
         self._min_box_width_ratio = width_ratio
         self._min_box_height_ratio = height_ratio
         self._tracker = _IoUTracker(iou_threshold=track_iou_threshold, ttl_s=track_ttl_s)
+        # OSNet 嵌入优先于颜色直方图：真实截图上直方图没有可用阈值（亮场景不同
+        # Avatar 打 0.89~0.99，同一 Avatar 换彩色灯光掉到 0.2），OSNet 有干净的
+        # 分离带但工作点完全不同（同人≥0.83 / 不同人≤0.72），所以两种描述子各配
+        # 各的阈值，绝不共用。模型缺失或 ORT 不可用时安全回落直方图。
+        self._reid_embedder = None
+        reid_descriptor_fn = None
+        reid_descriptor_name = "color_histogram"
+        reid_similarity = identity_reid_similarity
+        if identity_reid_enabled and identity_reid_model_path:
+            from .reid_embedder import OsnetReidEmbedder
+
+            embedder = OsnetReidEmbedder(
+                model_path=identity_reid_model_path,
+                intra_op_threads=intra_op_threads,
+            )
+            self._reid_embedder = embedder
+            if embedder.available:
+                reid_descriptor_fn = embedder.embed
+                reid_descriptor_name = embedder.name
+                reid_similarity = identity_reid_model_similarity
         self._identity_registry = AvatarIdentityRegistry(
             enabled=identity_reid_enabled,
-            similarity_threshold=identity_reid_similarity,
+            similarity_threshold=reid_similarity,
             similarity_margin=identity_reid_margin,
             retention_s=identity_reid_retention_s,
             max_identities=identity_reid_max_identities,
+            descriptor_fn=reid_descriptor_fn,
+            descriptor_name=reid_descriptor_name,
         )
         # 推理线程上限。0 表示不设置，沿用运行时自己的默认（CPU EP 会开到物理
         # 核数）——留这个出口给需要裸速度的基准测量，部署配置不该用它。
@@ -1150,7 +1174,17 @@ class OpenVinoLocalDetector:
                 "min_box_width_ratio": self._min_box_width_ratio,
                 "min_box_height_ratio": self._min_box_height_ratio,
                 # 身份只在当前后端进程内稳定，不落盘，也不冒充 VRChat usr_/avtr_。
-                "identity_reid": dict(self._identity_registry.status()),
+                "identity_reid": {
+                    **dict(self._identity_registry.status()),
+                    # 嵌入器为 None 表示未配置模型（直方图路径）；available=False
+                    # 表示配置了但加载失败并已回落——两种情况必须可区分，否则
+                    # 「以为在用 OSNet 其实在用直方图」只能靠误并率异常去猜。
+                    "embedder": (
+                        None
+                        if self._reid_embedder is None
+                        else dict(self._reid_embedder.status())
+                    ),
+                },
                 # 0 表示没设上限。上限必须能从 /perception 直接读到，否则「配了
                 # 但没生效」和「配对了」在外面看起来完全一样。
                 "intra_op_threads": self._intra_op_threads,

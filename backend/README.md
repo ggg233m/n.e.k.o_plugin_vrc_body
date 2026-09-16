@@ -333,7 +333,13 @@ worker 直接写入 `WorldStateStore`，不经过 HTTP。
 
 内置 OpenVINO detector 会进一步把 Avatar 类轨迹交给 `AvatarIdentityRegistry`：同一
 track 直接延续身份，并为每个身份有界保留最多 6 个正面/侧面/背面外观原型；新 track
-优先按最接近的历史视角匹配。多个旧模板同样相似时，优先比较剔除全部人物框后的
+优先按最接近的历史视角匹配。外观描述子有两档：配置了
+`vision.identity_reid_model_path` 时用 OSNet 外观嵌入（`backend/reid_embedder.py`，
+512 维，阈值 `identity_reid_model_similarity`，默认 0.75）；模型缺失或
+onnxruntime 不可用时回落颜色/布局直方图（阈值 `identity_reid_similarity`，默认
+0.90）。两种向量维度不同、绝不混库，`identity_reid.descriptor` 报出实际生效的
+一档，`identity_reid.embedder` 区分「未配置」与「配置了但加载失败」。多个旧模板
+同样相似时，优先比较剔除全部人物框后的
 4x8 低分辨率背景指纹；背景仍不明确时，仅在 15 秒内检测框几何明显连续，或某个模板的
 稳定观测数至少达到其他候选 3 倍时复用。其余歧义仍分配新 ID，同一帧不允许两个轨迹
 占用同一身份。外观不可提取、功能关闭或类别不是 Avatar 时，会安全降级为上述

@@ -293,6 +293,9 @@ class BackendService:
                 configured_model = str(self.config_dir / configured_model)
             if configured_labels and not Path(configured_labels).is_absolute() and self.config.vision.labels_path:
                 configured_labels = str(self.config_dir / configured_labels)
+            configured_reid_model = self.config.vision.identity_reid_model_path
+            if configured_reid_model and not Path(configured_reid_model).is_absolute():
+                configured_reid_model = str(self.config_dir / configured_reid_model)
             vision_detector = OpenVinoLocalDetector(
                 model_path=configured_model,
                 labels_path=configured_labels,
@@ -312,6 +315,8 @@ class BackendService:
                 identity_reid_margin=self.config.vision.identity_reid_margin,
                 identity_reid_retention_s=self.config.vision.identity_reid_retention_s,
                 identity_reid_max_identities=self.config.vision.identity_reid_max_identities,
+                identity_reid_model_path=configured_reid_model,
+                identity_reid_model_similarity=self.config.vision.identity_reid_model_similarity,
                 fallback_backend=self.config.vision.fallback_backend,
                 intra_op_threads=self.config.vision.detector_threads,
             )
