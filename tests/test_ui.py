@@ -49,10 +49,16 @@ class HostedUiTests(unittest.TestCase):
                 "body_enable",
                 "body_disable",
                 "body_reset",
+                "body_freeze",
+                "llm_freeze_allow",
+                "llm_freeze_deny",
                 "vrc_autonomy_arm",
                 "vrc_autonomy_disarm",
                 "vrc_vision_start",
                 "vrc_vision_stop",
+                "body_chatbox_relay_enable",
+                "body_chatbox_relay_disable",
+                "vmc_recalibrate",
             },
         )
         self.assertEqual(set(switches) & set(debug_commands), set())
@@ -78,6 +84,21 @@ class HostedUiTests(unittest.TestCase):
         # body_stop(scope="unfreeze") 自己松开，面板急停与故障闩锁仍只认 body_reset。
         self.assertIn("body_stop", debug_commands)
         self.assertIn("body_reset", switches)
+        # 但「用户下的急停」必须有一条模型走不到的入口。共用入口拿不到调用方身份，
+        # 参数里的 source 是模型也能填的字符串；panel_command 的 agent_auto=False
+        # 才是宿主真会执行的拦截，所以面板急停走 body_freeze 而不是 body_stop。
+        self.assertIn("body_freeze", switches)
+        self.assertNotIn("body_freeze", debug_commands)
+        # 「是否允许模型急停」同理：这条权限本身要是模型改得动，开关就白设了。
+        self.assertIn("llm_freeze_allow", switches)
+        self.assertIn("llm_freeze_deny", switches)
+        self.assertNotIn("llm_freeze_allow", debug_commands)
+        self.assertNotIn("llm_freeze_deny", debug_commands)
+        # 重新校准要救的故障（零点锁错，动作一直是歪的）只有人眼看得出来：中转不
+        # 报错、帧也在正常收，模型手里没有任何能判断「歪没歪」的信号。给它这个入口
+        # 只会让它在看不见的状态上乱按，而每按一次角色都可能停在最后一帧。
+        self.assertIn("vmc_recalibrate", switches)
+        self.assertNotIn("vmc_recalibrate", debug_commands)
         # 读取刻意留给 Agent，否则它无从知道能力关着，也就没法提示用户去面板打开。
         # 三份状态已经并进 body_status(include=…)，共用表里只剩这一个入口。
         self.assertIn("body_status", debug_commands)
@@ -86,7 +107,7 @@ class HostedUiTests(unittest.TestCase):
 
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         manifest = self._manifest()
-        self.assertEqual(manifest["plugin"]["version"], "0.13.26")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.29")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -161,9 +182,11 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("_vision.perception", status_source)
         self.assertIn("_body_snapshot", status_source)
         # 合并后的停止入口同理：撤目标和清轴都要在，且撤目标必须排在清轴之前。
-        self.assertIn("autonomy.stop", stop_source)
+        goal_cleanup_source = ast.unparse(methods["_stop_autonomy_goal"])
+        self.assertIn("autonomy.stop", goal_cleanup_source)
+        self.assertIn("_stop_autonomy_goal", stop_source)
         self.assertIn("stop_movement", stop_source)
-        self.assertLess(stop_source.index("autonomy.stop"), stop_source.index("stop_movement"))
+        self.assertLess(stop_source.index("_stop_autonomy_goal"), stop_source.index("stop_movement"))
         # 急停必须能被下急停的人自己解除：模型有权进入 freeze，就得有权离开，
         # 否则它踩一脚刹车就把自己锁死，只能干等用户去点面板。
         unfreeze_source = ast.unparse(methods["_unfreeze"])
@@ -175,6 +198,35 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("_freeze_owner != 'llm'", unfreeze_source)
         self.assertIn("stopped_latched", unfreeze_source)
         self.assertIn("'reset'", unfreeze_source)
+        # 急停要停「所有动作」，所以 freeze 这一支也得撤掉自主目标：闩锁只让导航器的
+        # 指令发不出去，不会让它收手，否则它一路重试到自己超时、目标还挂在 body_status。
+        self.assertIn("goal_cleanup", stop_source)
+        # 但撤目标是尽力而为的副作用，不能参与成败判定——后端连不上时身体其实已经停住
+        # 了，算进去会把一次成功的急停报成失败，调用方于是重发一次急停。
+        self.assertIn("{'scope', 'goal_cleanup'}", stop_source)
+        # 「允许模型急停」是面板开关，所以 freeze 这一支必须真的读那个标志，而且只
+        # 拦模型这一侧——面板自己那颗按钮不受开关影响，否则关掉之后用户也停不下来。
+        self.assertIn("_llm_freeze_allowed", stop_source)
+        self.assertIn("normalized_source != 'panel'", stop_source)
+        # 来源参数必须带下划线前缀，并由共用派发体剥掉：那里把 arguments 原样展开成
+        # 关键字参数且拿不到调用方身份，留一个可填的 source 等于让模型冒充用户急停，
+        # 既绕过开关，又把自己锁进只有面板能解的那把锁里。
+        self.assertIn("str(_source or '')", stop_source)
+        self.assertIn("startswith('_')", dispatch_source)
+        freeze_source = ast.unparse(methods["body_freeze"])
+        self.assertIn("_source='panel'", freeze_source)
+        # 开关只管「能不能进 freeze」。顺手封掉 unfreeze 会把模型困在自己下的那次
+        # 急停里，反而要用户多点一次面板才能救——那比放它自己解开更糟。
+        deny_source = ast.unparse(methods["llm_freeze_deny"])
+        self.assertIn("_llm_freeze_allowed = False", deny_source)
+        self.assertNotIn("_freeze_owner", deny_source)
+        self.assertIn("'llm_freeze'", context_source)
+        # 重新校准默认走宿主 T Pose；退路必须是显式布尔参数，不能靠字符串真值。
+        # 它决定的是「等一次权威静止姿势」还是「拿下一个动画帧当零点」，用
+        # "false" 这种非空字符串误判成 True，救援就变成了第二次锁错。
+        recalibrate_source = ast.unparse(methods["vmc_recalibrate"])
+        self.assertIn("_boolean('accept_current_pose'", recalibrate_source)
+        self.assertIn("recalibrate", recalibrate_source)
 
         world_observe_source = ast.unparse(methods["world_observe"])
         navigate_source = ast.unparse(methods["navigate_vrchat_world"])
@@ -237,11 +289,11 @@ class HostedUiTests(unittest.TestCase):
             "body_vrchat_input",
         ):
             self.assertIn(f'run("{command}"', source)
-        # 面板的「停止自主目标」和「立即急停」都改走合并后的 body_stop，
-        # 两个按钮的差别只剩 scope——写错 scope 会让急停退化成普通停车。
-        # 急停还必须带 source: "panel"：漏了它，用户按下的急停会被记成模型自己
-        # 下的，模型随后一句 unfreeze 就能把用户的刹车松开。
-        self.assertIn('run("body_stop", { scope: "freeze", source: "panel" })', source)
+        # 面板的「停止自主目标」走合并后的 body_stop；「立即急停」则必须离开这条
+        # 共用路——参数里的 source 是模型也能填的字符串，靠它区分来源等于没区分。
+        # 面板急停改走只有面板能分派的 body_freeze（panel_command，agent_auto=false）。
+        self.assertIn('runSwitch("body_freeze")', source)
+        self.assertNotIn('source: "panel"', source)
         self.assertIn('run("body_stop", { scope: "navigation" })', source)
         self.assertNotIn('run("vrc_autonomy_stop"', source)
         # 开关类必须走 panel_command，且渲染成滑块而不是按钮——按钮看不出当前
@@ -250,7 +302,21 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn('toggle("body_enable", "body_disable")', source)
         self.assertIn('toggle("vrc_autonomy_arm", "vrc_autonomy_disarm")', source)
         self.assertIn('toggle("vrc_vision_start", "vrc_vision_stop")', source)
+        self.assertIn('toggle("llm_freeze_allow", "llm_freeze_deny")', source)
+        # 聊天框转发是隐私开关：关掉它等于停止把她说的话广播给周围玩家，
+        # 所以必须走 panel_command，Agent 不能自行开关。
+        self.assertIn('toggle("body_chatbox_relay_enable", "body_chatbox_relay_disable")', source)
+        # 默认允许，所以只有显式 false 才算关闭：写成 Boolean(...) 会让旧版本
+        # 后端（没有 permissions 段）把「默认允许」显示成「已禁止」。
+        self.assertIn("permissions.llm_freeze !== false", source)
         self.assertIn('runSwitch("body_reset"', source)
+        # 重新校准要救的是「动作一直是歪的」，而那个故障不产生任何错误状态——
+        # 帧照收、last_error 是空的。所以按钮必须常驻，不能藏在某个条件后面。
+        self.assertIn('runSwitch("vmc_recalibrate")', source)
+        # 严格路径失败时必须有出口：否则用户被留在「角色停在最后一帧」里，
+        # 只能重启后端。
+        self.assertIn("accept_current_pose: true", source)
+        self.assertIn("calibrationNeedsFallback", source)
         for switch in (
             "body_enable",
             "body_disable",
@@ -259,6 +325,12 @@ class HostedUiTests(unittest.TestCase):
             "vrc_vision_start",
             "vrc_vision_stop",
             "body_reset",
+            "body_freeze",
+            "llm_freeze_allow",
+            "llm_freeze_deny",
+            "body_chatbox_relay_enable",
+            "body_chatbox_relay_disable",
+            "vmc_recalibrate",
         ):
             self.assertNotIn(f'run("{switch}"', source)
         self.assertIn("wrist_pitch_deg: wristPitch", source)

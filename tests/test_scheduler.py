@@ -442,6 +442,11 @@ class SchedulerTests(unittest.TestCase):
 
         blocked = self.scheduler.submit("gesture", {"name": "wave", "side": "right", "intensity": 0.8})
         self.assertFalse(blocked["accepted"])
+        # 急停要停「所有动作」，转向也算。turn 不在 NORMAL/INPUT 两组里，而 play space
+        # 的 yaw 每帧无条件推进（_advance_yaw 不看 state），漏掉它急停后角色还能原地
+        # 转——导航器的朝向修正走的正是这条路。
+        blocked_turn = self.scheduler.submit("turn", {"delta_deg": 45.0})
+        self.assertFalse(blocked_turn["accepted"], blocked_turn.get("reason"))
         reset = self.scheduler.submit("reset", {"duration_ms": 100})
         self.assertTrue(reset["accepted"])
         wait_until(lambda: self.scheduler.snapshot()["state"] == "idle")

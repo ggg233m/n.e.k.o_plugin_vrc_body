@@ -136,6 +136,15 @@ class BodyScheduler:
         "express", "semantic_clip",
     }
     INPUT_COMMANDS = {"input_axes", "input_button", "input_release"}
+    # 闩锁期间必须连 turn 一起挡住。它不属于上面两组，但 play space 的 yaw 每帧无条件
+    # 推进（见 _advance_yaw），出队处也不看 state，所以急停之后只要再来一条 turn，角色
+    # 就会继续原地转——那样 body_stop(scope="freeze") 只做到了「不走」，没做到「不动」。
+    # 导航器的朝向修正走的正是这条路（backend/service.py::_navigator_send_turn）。
+    #
+    # 但 disabled 不在 LATCHED_STATES 里：宿主不在线时开 body 输出会把角色拽成 T Pose，
+    # 所以导航必须能在输出关闭的状态下转向，见 test_turn_works_while_body_output_is_disabled。
+    LATCHED_STATES = {"stopped_latched", "fault_latched", "shutdown"}
+    BLOCKED_STATES = {"disabled"} | LATCHED_STATES
 
     def __init__(
         self,
@@ -320,7 +329,9 @@ class BodyScheduler:
             return self._rejection(action_id, state, f"invalid command parameters: {exc}")
         if not self.thread_alive:
             return self._rejection(action_id, state, "scheduler is not running")
-        if (kind in self.NORMAL_COMMANDS or kind in self.INPUT_COMMANDS) and state in {"disabled", "stopped_latched", "fault_latched", "shutdown"}:
+        if (
+            (kind in self.NORMAL_COMMANDS or kind in self.INPUT_COMMANDS) and state in self.BLOCKED_STATES
+        ) or (kind == "turn" and state in self.LATCHED_STATES):
             return self._rejection(action_id, state, f"body output cannot accept motions while state is {state}")
         if kind == "reset" and state == "disabled":
             return self._rejection(action_id, state, "body output is disabled; call body_enable first")

@@ -757,6 +757,31 @@ class RemoteVmcIdle:
         except BackendUnavailable as exc:
             return {"enabled": False, "connection": "unknown", "last_error": str(exc)}
 
+    def recalibrate(
+        self,
+        reason: str = "panel_recalibrate",
+        *,
+        accept_current_pose: bool = False,
+    ) -> dict[str, Any]:
+        """重新锁定静止基准；默认等宿主的权威 T Pose。"""
+        try:
+            return _control_request(
+                self.client,
+                "POST",
+                "/vmc/recalibrate",
+                {
+                    "reason": str(reason or "panel_recalibrate"),
+                    "accept_current_pose": bool(accept_current_pose),
+                },
+            )
+        except BackendUnavailable as exc:
+            return {
+                "accepted": False,
+                "mode": "none",
+                "reason": str(exc),
+                "calibration": {},
+            }
+
 
 class RemoteHostVmc:
     def __init__(self, client: BackendClient) -> None:

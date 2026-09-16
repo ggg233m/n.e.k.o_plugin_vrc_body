@@ -35,7 +35,7 @@ keywords = [
   "anyadance|steamvr|vrchat|osc|npc|avatar",
   "视觉|感知|导航|移动|跟随|身体|姿势|手势|表情",
 ]
-version = "0.13.26"
+version = "0.13.29"
 type = "plugin"
 entry = "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 
@@ -52,9 +52,9 @@ name = "N.E.K.O Community"
 [[plugin.entries]]
 id = "panel_command"
 name = "AnyaDance 能力开关（仅调试台）"
-description = "只有用户能操作的能力开关：身体输出、自主授权、视觉采集。Agent 不可分派。"
+description = "只有用户能操作的能力开关：身体输出、急停与急停授权、自主授权、视觉采集、聊天框转发、VMC 重新校准。Agent 不可分派。"
 metadata = { agent_auto = false }
-input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_reset", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_start", "vrc_vision_stop"] }, arguments = { type = "object", default = {} } } }
+input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_reset", "body_freeze", "llm_freeze_allow", "llm_freeze_deny", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_start", "vrc_vision_stop", "body_chatbox_relay_enable", "body_chatbox_relay_disable", "vmc_recalibrate"] }, arguments = { type = "object", default = {} } } }
 
 [[plugin.entries]]
 id = "debug_command"
@@ -135,6 +135,26 @@ awareness_parameters = [
   "NEKO_Action", "NEKO_ActionActive", "NEKO_ActionPhase", "NEKO_Holding",
   "VelocityX", "VelocityY", "VelocityZ", "AngularY", "Upright", "Grounded",
 ]
+
+# 把宿主对话轮里「她说出口的那句」转发到 VRChat 聊天框。只转
+# turn_type = "proactive_reply"（宿主确认提交过的回复），不转
+# "proactive_instruction"——后者是用户的原话，属于输入而不是发言，转发它等于
+# 把私聊内容广播给周围所有玩家。
+#
+# 这里是启动默认值；运行期由面板的「聊天框转发」开关控制（panel_command，
+# Agent 不可自动路由），关掉之后不再向 VRChat 发送任何对话文本。
+[chatbox_relay]
+enabled = true
+poll_interval_s = 1.0
+# 每次轮询拉回的历史条数。游标只前进不回补，取小了会在慢轮询期间漏句，
+# 取大了只是多几次本地判重。
+max_count = 20
+# 上限必须跟着 VRChat /chatbox/input 的 144 字符硬限制，放宽只会让超长的那句
+# 被 OSC 层直接拒掉。超长时截断而不是丢弃。
+max_chars = 144
+# 是否在正文前加「角色名: 」。聊天框额度只有 144 字符，前缀每多一个字符就少
+# 一个字符的正文，所以默认关闭。
+include_speaker = false
 
 [input]
 primary = "anyadance"

@@ -17,6 +17,7 @@ from plugin.sdk.plugin import Err, NekoPluginBase, Ok, lifecycle, llm_tool, neko
 
 from .backend.client import BackendClient, BackendUnavailable
 from .behavior import EXPRESSION_INTENTS
+from .chatbox_relay import ChatboxRelay
 from .config import PluginConfig
 from .frame_budget import FrameBudget
 from .instructions import BODY_AI_INSTRUCTIONS
@@ -89,7 +90,16 @@ def _boolean(name: str, value: Any) -> bool:
 # 留在共用表里，等于 Agent 可以自己给自己授权自主移动，plugin.toml 的
 # manual_arm = true 和「请用户去调试台启用」那条规则就都被绕过了。
 #
-# body_stop 故意留在 debug_command：急停是降权，Agent 能踩刹车是好事。
+# body_stop 默认留在 debug_command：急停是降权，Agent 能踩刹车通常是好事。
+# 但「通常」不等于「总是」——闩锁期间连导航器的朝向修正都进不来，模型误判一次
+# 就要用户去点面板才能走。所以这条权限做成面板开关（llm_freeze_allow /
+# llm_freeze_deny），默认开启，关掉之后模型只剩 scope="all" 这类普通停车。
+#
+# body_freeze 是面板自己那颗急停按钮的入口，不是给模型的第二条路：来源必须不可
+# 伪造，而共用入口 _run_bounded_command 把 arguments 原样展开成关键字参数、拿不
+# 到调用方身份，模型填一个 source="panel" 就能冒充用户。改成走这张表之后，
+# metadata.agent_auto=False 由宿主拦截，「这次急停是用户下的」才是真的。
+#
 # 解除急停按「谁锁的谁能解」分流，不是按入口分流：模型自己下的那次急停由
 # body_stop(scope="unfreeze") 自己解开——否则它有权进入一个自己无权离开的状态，
 # 踩一脚刹车就把自己锁死了。面板按钮下的急停和故障闩锁仍然只认这里的 body_reset。
@@ -97,10 +107,22 @@ _PANEL_SWITCH_NAMES = (
     "body_enable",
     "body_disable",
     "body_reset",
+    "body_freeze",
+    "llm_freeze_allow",
+    "llm_freeze_deny",
     "vrc_autonomy_arm",
     "vrc_autonomy_disarm",
     "vrc_vision_start",
     "vrc_vision_stop",
+    # 聊天框转发开关。放在这一侧而不是 debug_command，因为关掉它等于停止把
+    # 她说的话广播给 VRChat 里的其他玩家——这是一项隐私决定，只能由用户做。
+    "body_chatbox_relay_enable",
+    "body_chatbox_relay_disable",
+    # 重新锁定 VMC 静止基准。放在面板侧有两个理由：一是它会让宿主播一次 T Pose、
+    # 期间角色停在最后一帧，属于用户该知情的可见状态变化；二是它要救的那种故障
+    # （零点锁错，动作一直是歪的）只有人眼看得出来——中转不报错、帧也在正常收，
+    # 模型手里没有任何能判断「歪没歪」的信号，给它这个开关只会让它乱按。
+    "vmc_recalibrate",
 )
 
 # 动作与读取：Agent 和面板共用。能力状态的读取刻意留在这里——摘掉它，
@@ -165,8 +187,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         # 谁下的急停：模型自己下的("llm")能自己解除，面板按钮下的("panel")和故障
         # 闩锁(None)只认面板复位。见 body_stop 的 freeze/unfreeze 两段。
         self._freeze_owner: str | None = None
+        # 模型是否有权急停。默认允许——急停是降权，多数时候让它能踩刹车更安全；
+        # 但闩锁期间连导航器的朝向修正都被挡在 submit() 外，误判一次就得用户去点
+        # 面板，所以把这条权限交给面板开关（llm_freeze_allow / llm_freeze_deny）。
+        # 进程内状态，不落盘：重启回到「允许」这个更安全的默认值。
+        self._llm_freeze_allowed = True
         self._vmc_idle: Any | None = None
         self._host_vmc: Any | None = None
+        # 把宿主对话轮里「她说出口的那句」转成 VRChat 聊天框。它跨会话存活，
+        # 且不随身体调度器重启而重建；开关由面板的 panel_command 控制。
+        self._chatbox_relay: ChatboxRelay | None = None
         # 视觉状态独立于 60 Hz 身体调度器；后端可以发布观测而不改变 VMC 待机路径。
         self._vision: Any | None = None
         # 宿主以 asyncio.run() 执行每个生命周期/入口，那个事件循环会在入口返回
@@ -201,6 +231,58 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         # 它比 startup 那次 asyncio.run 活得久，必须有自己的线程。
         self._llm_tool_watch_thread: threading.Thread | None = None
         self._llm_tool_watch_stop = threading.Event()
+
+    def _start_chatbox_relay(self) -> None:
+        """建立（或重建）对话轮 → VRChat 聊天框的转发器。
+
+        宿主以 asyncio.run() 执行每个入口，那个事件循环在入口返回后就关了；
+        转发器是长驻轮询，必须拥有独立线程，不能挂在 startup 的临时 loop 上。
+        """
+        if not self._body_config.chatbox_relay.enabled:
+            return
+        if self._chatbox_relay is not None:
+            return
+        self._chatbox_relay = ChatboxRelay(
+            self._body_config.chatbox_relay,
+            source=self._fetch_conversation_turns,
+            send=self._send_chatbox_line,
+            logger=self.logger,
+        )
+        self._chatbox_relay.start()
+
+    def _stop_chatbox_relay(self) -> None:
+        relay = self._chatbox_relay
+        self._chatbox_relay = None
+        if relay is not None:
+            relay.stop()
+
+    def _fetch_conversation_turns(self, max_count: int, since_ts: float | None) -> Any:
+        """从宿主的对话总线拉取最近的对话轮。
+
+        ``since_ts`` 为空时走 ``bus.get_recent``，否则走带时间过滤的
+        ``bus.query``；两种都由宿主的 ConversationClient 分派。这里只负责把
+        SDK 返回的 BusList 摊成普通列表，真正的过滤在 ChatboxRelay 里做。
+        """
+        client = getattr(self.bus, "conversations", None)
+        if client is None:
+            return []
+        records = client.get(max_count=int(max_count), since_ts=since_ts)
+        # Hosted 侧可能返回 BusList（可迭代），也可能是协程（在事件循环里调用）。
+        # 轮询线程里拿到协程没有意义，只能如实报错而不是静默丢弃整轮记录。
+        if asyncio.iscoroutine(records):
+            raise RuntimeError("conversation bus returned a coroutine from a worker thread")
+        return list(records)
+
+    def _send_chatbox_line(self, text: str) -> tuple[bool, str | None]:
+        """把一行文本发进 VRChat 聊天框。"""
+        osc = self._osc
+        if osc is None:
+            return False, "VRChat OSC bridge is not initialized"
+        try:
+            return osc.send_chatbox(text, True)
+        except TypeError:
+            # 部分代理只接受位置参数；退一步再试一次，避免版本差异让整条链路失效。
+            return osc.send_chatbox(text)
 
     async def _load_config(self) -> PluginConfig:
         self._raw_config = {}
@@ -307,11 +389,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         # main_server 可能在插件之前启动、之后重启，重启后宿主内存里的注册表就
         # 空了。startup 时重发一次，覆盖"插件比 main_server 长寿"这条常见路径。
         self._start_llm_tool_reassert_loop()
+        # 转发器依赖 self._osc，必须放在后端连接建立之后。
+        self._start_chatbox_relay()
         return Ok({"status": "ready", "output_enabled": False})
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_: Any):
         await self._stop_llm_tool_reassert_loop()
+        # 先停转发器再断后端：反过来的话，最后几轮轮询会拿到一个已经关掉的
+        # OSC 代理，白白记一串发送失败。
+        await asyncio.to_thread(self._stop_chatbox_relay)
         await self._stop_world_context_bridge()
         self._unregister_agent_entries()
         if self._backend_client:
@@ -1742,6 +1829,21 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             },
             "world": world,
             "world_bridge": bridge,
+            # 转发器真值。开关滑块不保留本地乐观态，checked 直接绑这份快照；
+            # 转发器未创建时给一个「关闭且未初始化」的诚实默认值。
+            "chatbox_relay": self._chatbox_relay.snapshot() if self._chatbox_relay else {
+                "enabled": False,
+                "thread_alive": False,
+                "forwarded_count": 0,
+                "last_error": None,
+                "last_source_error": None,
+            },
+            # 开关滑块不保留本地乐观态，checked 直接绑这份后端真值；漏掉它，
+            # 面板上的「允许模型急停」每次刷新都会弹回默认值。
+            "permissions": {
+                "llm_freeze": self._llm_freeze_allowed,
+                "freeze_owner": self._freeze_owner,
+            },
             "vision_frame": vision_frame,
             "vision_worker": vision_worker,
             "autonomy": await asyncio.to_thread(self._backend_client.autonomy.snapshot) if self._backend_client else {
@@ -1775,7 +1877,17 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         退回去查全集。
         """
         normalized = str(command or "").strip()
-        params = dict(arguments) if isinstance(arguments, Mapping) else {}
+        # 下划线开头的参数一律剥掉：这里把 arguments 原样展开成关键字参数，而两个
+        # 入口都拿不到调用方身份，于是任何「只有内部调用方能填」的参数在模型眼里
+        # 都是可伪造的。body_stop 的 _source 就是这样一条——不剥掉它，模型填一个
+        # _source="panel" 就能冒充用户下急停，既绕过 llm_freeze_deny，又让自己再
+        # 也解不开（panel 那把锁只认面板复位）。面板需要的那条路另走 body_freeze，
+        # 由 metadata.agent_auto=False 在宿主侧保证来源。
+        params = {
+            key: value
+            for key, value in (arguments.items() if isinstance(arguments, Mapping) else ())
+            if not str(key).startswith("_")
+        }
         if normalized not in allowed:
             state = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
                 "state": "shutdown",
@@ -1835,9 +1947,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         id="panel_command",
         name="AnyaDance 能力开关（仅调试台）",
         description=(
-            "只有用户能操作的能力开关：身体输出启停与复位、自主移动授权、视觉采集启停。"
+            "只有用户能操作的能力开关：身体输出启停与复位、立即急停与「是否允许模型急停」、"
+            "自主移动授权、视觉采集启停、聊天框转发、重新校准 VMC 静止基准。"
             "metadata.agent_auto=False 使本入口对 Agent 自动路由不可见且不可分派——"
-            "这是 plugin.toml 的 manual_arm=true 在插件侧的落点，不要绕开它。"
+            "这是 plugin.toml 的 manual_arm=true 在插件侧的落点，也是「这次急停是用户"
+            "下的」唯一不可伪造的来源，不要绕开它。"
         ),
         metadata={"agent_auto": False},
         input_schema={
@@ -2257,28 +2371,25 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         *,
         scope: Any = "all",
         reason: Any = "autonomy_stop",
-        source: Any = None,
+        _source: Any = None,
         **_: Any,
     ):
-        # source 故意不进 BODY_STOP 的 JSON Schema：模型下的急停永远是它自己的，
+        # _source 故意不进 BODY_STOP 的 JSON Schema：模型下的急停永远是它自己的，
         # 声明出来只会多占上下文，还给它一个把自己锁死的按钮（填 "panel" 就解不开了）。
-        # 面板那颗急停按钮显式带上它，走的是同一个 debug_command 入口。
+        # 下划线前缀不是风格，是与 _run_bounded_command 的约定：那里会把下划线开头
+        # 的 arguments 全部剥掉，所以这个参数只有插件内部调用得到——面板急停走的是
+        # body_freeze，不再是模型也能拿到的 debug_command。
         normalized_scope = _enum(
             "scope", scope, ("all", "navigation", "axes", "action", "freeze", "unfreeze")
         )
         normalized_reason = str(reason or "autonomy_stop").replace("\x00", "").strip()[:160]
-        normalized_source = "panel" if str(source or "").strip().lower() == "panel" else "llm"
+        normalized_source = "panel" if str(_source or "").strip().lower() == "panel" else "llm"
         result: dict[str, Any] = {"accepted": False, "scope": normalized_scope}
 
         # 顺序是有意的：先撤目标再清轴。反过来的话导航器会在下一帧把清掉的轴
         # 重新推回去，于是「停了一下又自己走了」。
         if normalized_scope in ("all", "navigation"):
-            if self._backend_client:
-                result["navigation"] = await asyncio.to_thread(
-                    self._backend_client.autonomy.stop, normalized_reason
-                )
-            else:
-                result["navigation"] = {"accepted": False, "reason": "backend is not initialized"}
+            result["navigation"] = await self._stop_autonomy_goal(normalized_reason)
 
         if normalized_scope in ("all", "axes"):
             if self._osc:
@@ -2300,24 +2411,75 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             result["action"] = cancelled
 
         if normalized_scope == "freeze":
-            # 急停是降权，所以它留在共用表里：Agent 能踩刹车是好事。这里记下是谁
-            # 踩的，因为解除是提权，按「谁锁的谁能解」分流——模型自己锁的那次它能
-            # 用 scope="unfreeze" 解开，否则它有权进入一个自己无权离开的状态。
-            result["freeze"] = await self._submit_async("stop")
-            if result["freeze"].get("accepted"):
-                self._freeze_owner = normalized_source
-            await self._release_osc_inputs()
+            # 急停默认对模型开放：它是降权，Agent 能踩刹车通常更安全。但闩锁会把
+            # NORMAL/INPUT 和 turn 一起挡在 submit() 外，连导航器的朝向修正都进不
+            # 来，所以用户可以在面板上关掉这条权限（llm_freeze_deny）。
+            #
+            # 拒绝时不偷偷降级成 scope="all"：模型会把返回值当成「已经急停」，而
+            # 实际只是停了一下——那正是本仓库反复避免的「它说停了，人没停」。宁可
+            # 明确拒绝，并在 reason 里指出还能用哪一个 scope。
+            if normalized_source != "panel" and not self._llm_freeze_allowed:
+                result["freeze"] = await self._invalid(
+                    "emergency freeze is disabled for the model in the AnyaDance debug "
+                    'panel; use body_stop(scope="all") to stop movement, or tell the '
+                    "user to re-enable 「允许模型急停」 if a hard freeze is really needed"
+                )
+            else:
+                # 这里记下是谁踩的，因为解除是提权，按「谁锁的谁能解」分流——模型
+                # 自己锁的那次它能用 scope="unfreeze" 解开，否则它有权进入一个自己
+                # 无权离开的状态。
+                result["freeze"] = await self._submit_async("stop")
+                if result["freeze"].get("accepted"):
+                    self._freeze_owner = normalized_source
+                await self._release_osc_inputs()
+                # 顺序和上面 scope="all" 那支刻意相反。那边必须先撤目标，否则导航器下一帧
+                # 就把清掉的轴推回去；这边闩锁已经把 input_axes/turn 一起挡在 submit() 外
+                # 面，没有被推回去的风险，所以先落本地即时的物理急停，再做这次可能要走网
+                # 络的目标清理——反过来就是让一次 HTTP 往返卡在急停前面。
+                #
+                # 但目标还是得撤：闩锁只让导航器的指令发不出去，不会让它知道该收手，
+                # 于是它会一路重试到自己超时，body_status 里目标也还挂着。
+                result["goal_cleanup"] = await self._stop_autonomy_goal(normalized_reason)
 
         if normalized_scope == "unfreeze":
             result["unfreeze"] = await self._unfreeze()
 
+        # goal_cleanup 不参与成败判定：它是 freeze 的尽力而为副作用，后端连不上时
+        # 身体其实已经停住了，把它算进去会把一次成功的急停报成失败，调用方于是重发。
         accepted_parts = [
             bool(part.get("accepted"))
             for key, part in result.items()
-            if key != "scope" and isinstance(part, Mapping)
+            if key not in {"scope", "goal_cleanup"} and isinstance(part, Mapping)
         ]
         result["accepted"] = bool(accepted_parts) and all(accepted_parts)
         return Ok(result)
+
+    async def _stop_autonomy_goal(self, reason: str) -> dict[str, Any]:
+        """撤掉后端导航器当前的自主目标。"""
+        if not self._backend_client:
+            return {"accepted": False, "reason": "backend is not initialized"}
+        return await asyncio.to_thread(self._backend_client.autonomy.stop, reason)
+
+    # 面板那颗「立即急停」的入口。它只在 _PANEL_SWITCH_NAMES 里，宿主按
+    # metadata.agent_auto=False 把整个 panel_command 从 Agent 路由里摘掉，所以
+    # _source="panel" 是真的来自用户，而不是模型自称。走 debug_command 的旧写法
+    # （run("body_stop", {scope: "freeze", source: "panel"})）做不到这一点：那条
+    # 路模型也能走，填什么 source 都行。
+    async def body_freeze(self, *, reason: Any = "panel_emergency_stop", **_: Any):
+        return await self.body_stop(scope="freeze", reason=reason, _source="panel")
+
+    # 允许/禁止模型自己急停。只改进程内标志，不动调度器——已经闩上的锁不受影响：
+    # 关掉权限不该顺手把当前急停解开，打开权限也不该凭空急停一次。
+    async def llm_freeze_allow(self, **_: Any):
+        self._llm_freeze_allowed = True
+        return Ok({"accepted": True, "llm_freeze_allowed": True})
+
+    async def llm_freeze_deny(self, **_: Any):
+        self._llm_freeze_allowed = False
+        # 故意不连带封掉 unfreeze：模型此刻可能正锁在自己下的那次急停里，
+        # 撤掉出口只会把它困在一个连用户都要多点一次面板才能救的状态。
+        # 这个开关管的是「能不能进 freeze」，不是「能不能出来」。
+        return Ok({"accepted": True, "llm_freeze_allowed": False})
 
     async def _unfreeze(self) -> dict[str, Any]:
         """解除本模型自己下的那次急停。
@@ -2357,6 +2519,38 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._freeze_owner = None
             await self._release_osc_inputs()
         return Ok(result)
+
+    async def vmc_recalibrate(self, *, accept_current_pose: Any = False, **_: Any):
+        """重新锁定 VMC 静止基准——动作一直是歪的时候用这个救。
+
+        待机中转把宿主的 VMC 骨骼流换算成六点姿态时，手腕朝向和手指弯曲的零点
+        取自一次权威静止姿势。零点要是锁在了某个动画帧上，之后每一帧都带着同样
+        的偏移：动作看起来永远别扭，但中转不报错、帧也在正常接收，`last_error`
+        是空的——除了人眼看着不对，没有任何信号。
+
+        默认走宿主 T Pose 握手（``accept_current_pose=False``）。它更准，但要求
+        托管宿主输出且校准线程在跑；条件不满足时后端会**原样拒绝而不是先清掉基
+        准**——清了没人重建的话，角色会从「歪着能动」变成「正着不动」，比按之前
+        更糟。``accept_current_pose=True`` 是那种情况下的退路：拿下一个完整帧当
+        基准，质量取决于按下那一刻的姿势，但至少中转能重新动起来。
+        """
+        if self._vmc_idle is None:
+            return Ok({
+                "accepted": False,
+                "mode": "none",
+                "reason": "backend_unavailable",
+                "calibration": {},
+            })
+        try:
+            accept = _boolean("accept_current_pose", accept_current_pose)
+        except ValueError as exc:
+            return Ok(await self._invalid(str(exc)))
+        reason = "panel_accept_current_pose" if accept else "panel_recalibrate"
+        return Ok(await asyncio.to_thread(
+            self._vmc_idle.recalibrate,
+            reason,
+            accept_current_pose=accept,
+        ))
 
     # 身体、自主移动和视觉三份状态合成一个入口。分开时模型要先猜「这个问题属于
     # 哪个子系统」才能选对工具，而它恰恰在不知道状态时才需要读状态。
@@ -2514,6 +2708,32 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         result = await asyncio.to_thread(self._vision.stop, normalized_reason)
         await self._stop_world_context_bridge()
         return Ok(result)
+
+    async def body_chatbox_relay_enable(self, **_: Any):
+        """开启「角色发言 → VRChat 聊天框」转发。"""
+        relay = self._chatbox_relay
+        if relay is None:
+            # 配置里关掉了整条链路时不会创建转发器。这里按用户意图现场补建，
+            # 让面板开关始终能生效，而不是报一个用户无法自行解决的
+            # 「未初始化」。
+            self._start_chatbox_relay()
+            relay = self._chatbox_relay
+        if relay is None:
+            return Ok({
+                "accepted": False,
+                "enabled": False,
+                "reason": "chatbox_relay.disabled_in_config",
+            })
+        relay.set_enabled(True)
+        return Ok({"accepted": True, "enabled": True, "reason": None})
+
+    async def body_chatbox_relay_disable(self, **_: Any):
+        """停止把角色发言转发到 VRChat 聊天框。"""
+        relay = self._chatbox_relay
+        if relay is None:
+            return Ok({"accepted": True, "enabled": False, "reason": None})
+        relay.set_enabled(False)
+        return Ok({"accepted": True, "enabled": False, "reason": None})
 
     @llm_tool(**VRC_VISION_FRAME)
     async def vrc_vision_frame(self, *, max_age_ms: Any = 3000, overlay: Any = False, **_: Any):

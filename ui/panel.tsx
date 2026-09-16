@@ -50,6 +50,7 @@ type DebugState = {
   body?: Record<string, any>
   awareness?: Record<string, any>
   vrchat_osc?: Record<string, any>
+  chatbox_relay?: Record<string, any>
   driver_log?: Record<string, any>
   host_vmc?: Record<string, any>
   world?: Record<string, any>
@@ -143,10 +144,23 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const body = state.body || {}
   const awareness = state.awareness || {}
   const osc = state.vrchat_osc || {}
+  const chatboxRelay = state.chatbox_relay || {}
   const driverLog = state.driver_log || {}
   const idleRelay = body.idle_relay || awareness.idle_relay || {}
   const hostVmc = state.host_vmc || {}
+  // 手腕朝向和手指弯曲的零点。锁错之后每一帧都带着同样的偏移，而中转一个错误
+  // 都不报——所以这段状态必须显式渲染出来，否则用户只能看着动作歪着干瞪眼。
+  const calibration = idleRelay.calibration || {}
+  // 等 T Pose 期间普通帧全被拒，角色停在最后一帧。这既是校准正在进行的信号，
+  // 也是「宿主根本给不出 T Pose」时唯一会亮起来的灯，所以退路按钮绑在它上面。
+  const calibrationWaiting = Boolean(calibration.waiting_for_t_pose_frame || calibration.held)
+  // 托管宿主输出关掉时没有校准线程，严格路径会被后端直接拒绝——退路按钮得提前
+  // 出现，否则用户会对着一颗永远失败的按钮反复点。
+  const calibrationNeedsFallback = calibrationWaiting || hostVmc.managed === false
   const autonomy = state.autonomy || {}
+  // 旧插件版本没有这段，llm_freeze 会是 undefined；下面一律按 !== false 判定，
+  // 免得升级前的面板把「默认允许」显示成「已禁止」。
+  const permissions = state.permissions || {}
   const [refreshFailed, setRefreshFailed] = props.useLocalState("refreshFailed", false)
   const visionFrame = state.vision_frame || {}
   const overlay = visionFrame.overlay || {}
@@ -413,10 +427,42 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               label={body.output_enabled ? "身体输出：已启用" : "身体输出：已关闭"}
               onChange={toggle("body_enable", "body_disable")}
             />
+            {/* 急停会把动作、输入和转向一起闩住，连导航器的朝向修正都进不来，
+                所以「模型能不能自己踩这脚刹车」交给用户决定。默认允许：急停是
+                降权，多数时候让它能停下更安全。关掉后模型只剩普通停车。 */}
+            <Switch
+              checked={permissions.llm_freeze !== false}
+              disabled={busy || !panelAction}
+              label={permissions.llm_freeze !== false ? "允许模型急停：已允许" : "允许模型急停：已禁止"}
+              onChange={toggle("llm_freeze_allow", "llm_freeze_deny")}
+            />
             <ButtonGroup>
               <Button tone="info" disabled={busy || !panelAction} onClick={() => runSwitch("body_reset", { duration_ms: 600 })}>复位 T Pose</Button>
-              <Button tone="danger" disabled={busy} onClick={() => run("body_stop", { scope: "freeze", source: "panel" })}>立即急停</Button>
+              <Button tone="danger" disabled={busy || !panelAction} onClick={() => runSwitch("body_freeze")}>立即急停</Button>
             </ButtonGroup>
+            {permissions.freeze_owner === "llm" ? (
+              <Alert tone="warning">当前急停由模型自己下达，它可以自行解除；要改由用户掌控，请点击「复位 T Pose」。</Alert>
+            ) : null}
+            {/* 动作一直是歪的时候用这个救。零点锁错不会产生任何错误——帧照收、
+                last_error 是空的，只有人眼看得出来，所以按钮必须常驻，不能等
+                某个状态亮了才出现。 */}
+            <ButtonGroup>
+              <Button tone="info" disabled={busy || !panelAction} onClick={() => runSwitch("vmc_recalibrate")}>重新校准 VMC</Button>
+              {calibrationNeedsFallback ? (
+                <Button tone="warning" disabled={busy || !panelAction} onClick={() => runSwitch("vmc_recalibrate", { accept_current_pose: true })}>用当前姿势作基准</Button>
+              ) : null}
+            </ButtonGroup>
+            <Text>
+              VMC 基准：{calibration.calibrated ? "已锁定" : (calibration.baseline_established ? "已失效，等待重建" : "尚未锁定")}
+              {" · "}来源 {calibration.reason || "unknown"}
+              {" · "}第 {calibration.generation ?? 0} 代
+            </Text>
+            {calibrationWaiting ? (
+              <Alert tone="warning">
+                正在等宿主播一次 T Pose，期间普通帧全被拒、角色停在最后一帧（已拒绝 {calibration.rejected_frames || 0} 帧）。
+                宿主给不出 T Pose 时点「用当前姿势作基准」：拿下一个完整帧顶上，基准准不准取决于此刻的姿势，但至少能重新动起来。
+              </Alert>
+            ) : null}
             <KeyValue
               items={[
                 { key: "action", label: "当前动作", value: currentAction?.motion_label || currentAction?.clip_name || currentAction?.name || "无" },
@@ -692,6 +738,42 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             hold_ms: inputHold,
           })}>发送并自动释放</Button>
           <Text>VRChat 必须启用 OSC；Grab、Use、Drop 的部分行为只在 VR 模式有效。</Text>
+        </Stack>
+      </Card>
+
+      <Card title="聊天框转发">
+        <Stack>
+          {/* 只转角色说出口的那句。宿主同时抄了「她收到的指令」和「她说出的回复」，
+              指令承载的是用户原话，转发它等于把私聊广播给周围所有玩家。 */}
+          <Switch
+            checked={Boolean(chatboxRelay.enabled)}
+            disabled={busy || !panelAction}
+            label={chatboxRelay.enabled ? "聊天框转发：已开启" : "聊天框转发：已关闭"}
+            onChange={toggle("body_chatbox_relay_enable", "body_chatbox_relay_disable")}
+          />
+          <Text>
+            把她真正说出口的话发送到 VRChat 聊天框（/chatbox/input），周围玩家可见。
+            只转发角色发言，不转发用户的原话；超出 144 字符的部分会被截断。
+          </Text>
+          <KeyValue
+            items={[
+              { key: "forwarded", label: "已转发", value: `${chatboxRelay.forwarded_count ?? 0} 句` },
+              { key: "skipped", label: "已跳过", value: `${chatboxRelay.skipped_count ?? 0} 条（非角色发言或无正文）` },
+              { key: "truncated", label: "已截断", value: `${chatboxRelay.truncated_count ?? 0} 句` },
+              { key: "failures", label: "发送失败", value: chatboxRelay.send_failure_count ?? 0 },
+              { key: "poll", label: "轮询次数", value: `${chatboxRelay.poll_count ?? 0}（间隔 ${fixed(chatboxRelay.poll_interval_s, 1)} s）` },
+              { key: "last", label: "最近转发", value: timestamp(chatboxRelay.last_forwarded_at_unix) },
+              { key: "thread", label: "轮询线程", value: chatboxRelay.thread_alive ? "运行中" : "未运行" },
+            ]}
+          />
+          {chatboxRelay.last_text ? <Text>最近一句：{String(chatboxRelay.last_text)}</Text> : null}
+          {/* 宿主不可用与 OSC 发送失败是两件事：前者说明对话总线没连上，后者说明
+              文本没发进 VRChat。合成一条会让排查时选错方向。 */}
+          {chatboxRelay.last_source_error ? (
+            <Alert tone="warning">对话总线读取失败：{String(chatboxRelay.last_source_error)}</Alert>
+          ) : null}
+          {chatboxRelay.last_error ? <Alert tone="danger">聊天框发送失败：{String(chatboxRelay.last_error)}</Alert> : null}
+          {!osc.enabled ? <Alert tone="info">VRChat OSC 已禁用，转发不会生效。请在插件配置中启用 vrchat_osc。</Alert> : null}
         </Stack>
       </Card>
 

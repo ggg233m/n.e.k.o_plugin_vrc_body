@@ -56,8 +56,9 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
         stop_properties = tool_defs.BODY_STOP["parameters"]["properties"]
         self.assertIn("unfreeze", stop_properties["scope"]["enum"])
-        # source 只给面板用，故意不进 Schema：声明出来等于给模型一个把自己锁死的
-        # 按钮（填 "panel" 就再也解不开），还白占一份上下文。
+        # 来源只给插件内部用，故意不进 Schema：声明出来等于给模型一个把自己锁死的
+        # 按钮（填 "panel" 就再也解不开），还白占一份上下文。实现里它叫 _source，
+        # 共用派发体会把下划线开头的 arguments 剥掉，所以两条路都填不进来。
         self.assertNotIn("source", stop_properties)
         self.assertIn("body_status", BODY_AI_INSTRUCTIONS)
         self.assertIn("accepted=true", BODY_AI_INSTRUCTIONS)

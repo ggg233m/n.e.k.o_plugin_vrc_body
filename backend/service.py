@@ -705,6 +705,69 @@ class BackendService:
         )
         self._vmc_calibration_thread.start()
 
+    def vmc_recalibrate(
+        self,
+        reason: Any = "panel_recalibrate",
+        accept_current_pose: Any = False,
+    ) -> dict[str, Any]:
+        """重新锁定 VMC 静止基准，用来救「动作一直是歪的」。
+
+        手腕朝向和手指弯曲的零点一旦锁在错误的姿势上，之后每一帧都带着同样的
+        偏移，而中转本身一个错误都不报——`last_error` 是空的、帧也在正常接收，
+        所以除了「看起来不对」以外没有任何信号。这条入口就是给那一刻用的。
+
+        最关键的约束是**按了不能比不按更糟**：清掉基准之后如果没有人去重建，
+        中转会一直拒绝普通帧、角色停在最后一帧，从「歪着能动」变成「正着不
+        动」。所以先确认真的有校准线程会跑这次握手，再动状态；确认不了就原样
+        拒绝，并在 reason 里给出退路。
+        """
+        normalized_reason = (
+            str(reason or "panel_recalibrate").replace("\x00", "").strip()[:64]
+            or "panel_recalibrate"
+        )
+        with self._lock:
+            relay = self.vmc_idle
+            thread = self._vmc_calibration_thread
+        if relay is None or not self.config.vmc_idle.enabled:
+            return {
+                "accepted": False,
+                "mode": "none",
+                "reason": "VMC idle relay is disabled or not initialized",
+                "calibration": {},
+            }
+        if accept_current_pose is True:
+            # 退路：不等宿主 T Pose，下一个完整帧直接成为新基准。宿主给不出
+            # T Pose 时（没有托管输出、REST 接口不通、握手反复超时）这是唯一能
+            # 让中转重新动起来的办法。代价是基准质量取决于按下那一刻的姿势，
+            # 所以不做默认——但它必须存在，否则严格路径失败就没有出口了。
+            relay.reset_calibration(reason=normalized_reason)
+            return {
+                "accepted": True,
+                "mode": "accept_current_pose",
+                "reason": normalized_reason,
+                "calibration": relay.snapshot().get("calibration", {}),
+            }
+        if not self.config.vmc_idle.manage_host_output or thread is None or not thread.is_alive():
+            # 没有校准线程就没有人去请求 T Pose。此时清掉基准等于把角色永久冻在
+            # 最后一帧，比错位更糟，所以一个字段都不改。
+            return {
+                "accepted": False,
+                "mode": "none",
+                "reason": (
+                    "no host T-pose handshake is available (vmc_idle.manage_host_output "
+                    "is off or the calibration worker is not running); retry with "
+                    "accept_current_pose=true to lock the next ordinary frame instead"
+                ),
+                "calibration": relay.snapshot().get("calibration", {}),
+            }
+        relay.require_rest_baseline(reason=normalized_reason)
+        return {
+            "accepted": True,
+            "mode": "host_t_pose",
+            "reason": normalized_reason,
+            "calibration": relay.snapshot().get("calibration", {}),
+        }
+
     def _stop_vmc_calibration(self) -> None:
         self._vmc_calibration_stop.set()
         thread = self._vmc_calibration_thread

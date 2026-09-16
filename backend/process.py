@@ -334,6 +334,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.vision_start()
             elif self.path == "/vision/stop":
                 result = self.server.service.vision_stop(value.get("reason"))
+            elif self.path == "/vmc/recalibrate":
+                result = self.server.service.vmc_recalibrate(
+                    value.get("reason"),
+                    value.get("accept_current_pose") is True,
+                )
             elif self.path == "/clips/list":
                 result = self.server.service.list_clips()
             elif self.path == "/semantic_express":

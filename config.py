@@ -141,6 +141,24 @@ class VrchatOscConfig:
 
 
 @dataclass(frozen=True)
+class ChatboxRelayConfig:
+    """把宿主对话轮转发到 VRChat 聊天框。
+
+    只转发角色真正说出口的那句（``turn_type == "proactive_reply"``）。宿主往
+    conversations store 里同时抄了「她收到的指令」和「她说出的回复」两类记录，
+    指令是输入而不是发言——转发它等于把用户私聊内容广播给周围所有玩家。
+    """
+
+    enabled: bool = True
+    poll_interval_s: float = 1.0
+    max_count: int = 20
+    max_chars: int = 144
+    # 只显示「谁在说话」这一个前缀。VRChat 聊天框上限 144 字符，前缀每多一个
+    # 字符就少一个字符的正文；默认关掉，让正文自己占满额度。
+    include_speaker: bool = False
+
+
+@dataclass(frozen=True)
 class DriverLogConfig:
     enabled: bool = True
     multicast_group: str = "239.255.39.71"
@@ -280,6 +298,7 @@ class PluginConfig:
     behavior: BehaviorConfig = BehaviorConfig()
     vmc_idle: VmcIdleConfig = VmcIdleConfig()
     vrchat_osc: VrchatOscConfig = VrchatOscConfig()
+    chatbox_relay: ChatboxRelayConfig = ChatboxRelayConfig()
     driver_log: DriverLogConfig = DriverLogConfig()
     input: ControllerInputConfig = ControllerInputConfig()
     autonomy: AutonomyConfig = AutonomyConfig()
@@ -298,6 +317,7 @@ class PluginConfig:
         behavior = _section(root, "behavior")
         vmc_idle = _section(root, "vmc_idle")
         vrchat_osc = _section(root, "vrchat_osc")
+        chatbox_relay = _section(root, "chatbox_relay")
         driver_log = _section(root, "driver_log")
         input_config = _section(root, "input")
         autonomy = _section(root, "autonomy")
@@ -358,6 +378,40 @@ class PluginConfig:
             input_pulse_ms=_bounded_int(vrchat_osc.get("input_pulse_ms"), 100, minimum=20, maximum=1000, name="vrchat_osc.input_pulse_ms"),
             parameter_cache_size=_bounded_int(vrchat_osc.get("parameter_cache_size"), 256, minimum=16, maximum=2048, name="vrchat_osc.parameter_cache_size"),
             awareness_parameters=tuple(awareness_parameters),
+        )
+
+        chatbox_relay_config = ChatboxRelayConfig(
+            enabled=_boolean(chatbox_relay.get("enabled"), True, name="chatbox_relay.enabled"),
+            poll_interval_s=_finite_float(
+                chatbox_relay.get("poll_interval_s"),
+                1.0,
+                minimum=0.2,
+                maximum=30.0,
+                name="chatbox_relay.poll_interval_s",
+            ),
+            # 轮询拉回的历史条数。取值要盖得住一次慢轮询期间积累的记录，否则
+            # 中间那句会被永久跳过——游标只会前进，不会回补。
+            max_count=_bounded_int(
+                chatbox_relay.get("max_count"),
+                20,
+                minimum=1,
+                maximum=200,
+                name="chatbox_relay.max_count",
+            ),
+            # 上限跟着 VRChat /chatbox/input 的硬限制走，不能放宽：超过 144 字符
+            # 的那句会被 send_chatbox 直接拒掉，转发器只能截断或丢弃。
+            max_chars=_bounded_int(
+                chatbox_relay.get("max_chars"),
+                144,
+                minimum=1,
+                maximum=144,
+                name="chatbox_relay.max_chars",
+            ),
+            include_speaker=_boolean(
+                chatbox_relay.get("include_speaker"),
+                False,
+                name="chatbox_relay.include_speaker",
+            ),
         )
 
         multicast_group = str(driver_log.get("multicast_group", "239.255.39.71")).strip()
@@ -782,6 +836,7 @@ class PluginConfig:
             behavior=behavior_config,
             vmc_idle=vmc_idle_config,
             vrchat_osc=osc_config,
+            chatbox_relay=chatbox_relay_config,
             driver_log=driver_log_config,
             input=controller_input_config,
             autonomy=autonomy_config,

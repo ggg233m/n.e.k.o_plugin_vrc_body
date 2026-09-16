@@ -27,6 +27,7 @@
 - 用 `body_vrchat_input` 安全脉冲 Grab、Use 或 Drop，并自动发送释放值。
 - 用 `body_turn` 发送有时限的 VRChat 转身轴值，或用 `body_stop` 分层停下（`scope=all/navigation/axes/action/freeze/unfreeze`）。
 - 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
+- 把 N.E.K.O 对话里**角色说出口的那句**自动转发到 VRChat 聊天框（`[chatbox_relay]`，默认开启）。只转 `proactive_reply`，不转承载用户原话的 `proactive_instruction`。
 - 用 `body_status(include=["autonomy"])`、`vrc_autonomy_goal`、`body_stop(scope="navigation")` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
 - 向 N.E.K.O 后台 Agent 暴露正式的“观察当前 VRChat 世界”和“寻找或走向 VRChat 目标”入口；自然语言里的“找 NPC / 走过去 / 跟着它”会进入同一个安全导航接口，而不是被误判成仅有身体姿态能力。唯一语义目标可自动绑定稳定 ID，多个候选仍必须交回主 LLM 选择。
 - 用 `body_turn(degrees=360, wait_complete=true)` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。当前没有深度、碰撞地图或 SLAM，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
@@ -39,13 +40,15 @@
 ## 安全与运行约束
 
 1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
-2. `body_stop(scope="freeze")` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作。解除按「谁锁的谁能解」分流：LLM 自己下的急停可以由它自己调用 `body_stop(scope="unfreeze")` 恢复 T Pose（否则它有权进入一个自己无权离开的状态）；面板「立即急停」按钮下的急停和故障闩锁只能由用户点击面板的「复位 T Pose」解除。
-3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_status` 的 `body.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
-4. 插件假设接管期间 AnyaDance UI 不再向 39570 发送。驱动遥测发现其他活跃来源时会报告冲突、解除自主授权并释放输入；否则为 `unsupported` 或 `detected_unattributed`。
-5. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
-6. OSC 同样使用 UDP。`delivery_confirmed=false` 只表示本机完成发送；只有收到 9001 回传时 `connection` 才显示 `detected`，没有回传时为 `unknown`，不能据此断言 VRChat 离线。
-7. 默认只有一个程序能独占监听 `127.0.0.1:9001`。若已有 OSC 路由器占用该端口，应修改 `listen_port`，并让路由器或 VRChat 向新端口转发。
-8. VMC 待机中转默认独占监听 `127.0.0.1:39539`。N.E.K.O 的 VMC 输出必须启用并指向该端口；若端口已被其他 VMC 接收器占用，应修改双方端口或使用 OSC 路由器分流。
+2. `body_stop(scope="freeze")` 会撤掉当前自主目标、冻结当前合法姿态、释放所有控制器输入，并锁定后续动作与转向（`turn` 与 `NORMAL`/`INPUT` 两组命令一起被闩锁挡在 `submit()` 外，因此导航器的朝向修正也进不来）。撤目标是尽力而为的副作用，后端不可用时不影响急停本身报成功。解除按「谁锁的谁能解」分流：LLM 自己下的急停可以由它自己调用 `body_stop(scope="unfreeze")` 恢复 T Pose（否则它有权进入一个自己无权离开的状态）；面板「立即急停」按钮下的急停和故障闩锁只能由用户点击面板的「复位 T Pose」解除。
+3. 调试面板的「允许模型急停」开关决定 LLM 能不能自己下 `scope="freeze"`，默认允许（急停是降权，多数时候让它能停下更安全）。关闭后模型只剩 `scope="all"` 这类普通停车，freeze 会被明确拒绝而不是悄悄降级——降级会让它把返回值当成「已经急停」。开关只管进入 freeze，不影响它解除自己已经下过的那次急停，也不影响面板自己的急停按钮。面板急停走的是只有面板能分派的 `body_freeze`（`panel_command`，`metadata.agent_auto=false`），不是带来源参数的共用入口：共用入口拿不到调用方身份，参数里的来源字符串模型自己也能填。
+4. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_status` 的 `body.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
+5. 插件假设接管期间 AnyaDance UI 不再向 39570 发送。驱动遥测发现其他活跃来源时会报告冲突、解除自主授权并释放输入；否则为 `unsupported` 或 `detected_unattributed`。
+6. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
+7. OSC 同样使用 UDP。`delivery_confirmed=false` 只表示本机完成发送；只有收到 9001 回传时 `connection` 才显示 `detected`，没有回传时为 `unknown`，不能据此断言 VRChat 离线。
+8. 默认只有一个程序能独占监听 `127.0.0.1:9001`。若已有 OSC 路由器占用该端口，应修改 `listen_port`，并让路由器或 VRChat 向新端口转发。
+9. VMC 待机中转默认独占监听 `127.0.0.1:39539`。N.E.K.O 的 VMC 输出必须启用并指向该端口；若端口已被其他 VMC 接收器占用，应修改双方端口或使用 OSC 路由器分流。
+10. 聊天框转发默认开启，会把角色说出口的话广播给 VRChat 里周围所有玩家。它只转发 `proactive_reply`（宿主确认提交过的回复），绝不转发 `proactive_instruction`——后者承载用户的原话，属于输入而不是发言。关闭面板的「聊天框转发」开关（`panel_command`，Agent 不可自动分派）后不再发送任何对话文本；重新开启不会补发关闭期间的历史。`delivery_confirmed=false` 同样适用于这条链路：`accepted=true` 只表示本机 OSC 发送成功，不代表 VRChat 已显示。
 
 ## 身体自知
 
@@ -241,7 +244,15 @@ host_output_host = "127.0.0.1"
 host_send_rate_hz = 60
 ```
 
-只有调度器处于 `idle` 且 VMC 帧未过期时才应用中转。精确动作、VMD、序列、保持姿态和急停不会被 VMC 覆盖；动作结束回到 `idle` 后自动恢复最新宿主姿态。`body_status` 的 `body.idle_relay` 会报告监听状态、帧龄和当前是否正在应用。
+只有调度器处于 `idle` 且 VMC 帧未过期时才应用中转。精确动作、VMD、序列、保持姿态和急停不会被 VMC 覆盖；动作结束回到 `idle` 后自动恢复最新宿主姿态。急停解除也走这条路：`body_reset` 与 `body_stop(scope="unfreeze")` 提交的 `reset` 以 `completion="idle"` 收尾，滑回 T Pose 后状态变回 `idle`，VMC 待机中继随即自动接管，无需另外恢复。`body_status` 的 `body.idle_relay` 会报告监听状态、帧龄和当前是否正在应用。
+
+### 重新校准（动作一直是歪的时候）
+
+零点一旦锁在错误的姿势上，之后每一帧都带着同样的偏移：动作看起来永远别扭，但中转不报任何错误——帧照常接收、`last_error` 是空的，除了人眼看着不对没有别的信号。调试面板的「重新校准 VMC」按钮就是给这一刻用的，它走 `panel_command`（`metadata.agent_auto=false`），模型看不到也分派不了：这个故障它没有任何办法判断，给它入口只会让它在看不见的状态上乱按。
+
+默认走宿主 T Pose 握手，等一次权威静止姿势再重建基准。这条路要求 `vmc_idle.manage_host_output = true` 且校准线程在跑；条件不满足时后端**原样拒绝而不是先清掉基准**——清了没人重建的话，角色会从「歪着能动」变成「正着不动」，比按之前更糟。
+
+宿主给不出 T Pose（没有托管输出、REST 接口不通、握手反复超时）时，面板会亮出「用当前姿势作基准」：不等 T Pose，拿下一个完整帧直接当零点。基准准不准取决于按下那一刻的姿势，所以不做默认，但它必须存在——否则严格路径失败就没有出口，只能重启后端。校准进行中面板会显示已拒绝的帧数，因为那段时间普通帧全被拒、角色停在最后一帧。
 
 宿主暂停、页面冻结或 VMC 输出重新握手时会发 `/VMC/Ext/OK = 0`，插件随即作废六点基准并停止应用中转（VRChat 角色停在最后一帧）。恢复后**不会**用彼时的动画姿势重新自锁手腕朝向与手指弯曲零点——那会让整套骨骼永久错位；插件改为自动重新请求一次 T Pose，拿到权威静止姿势后才重建基准。帧间隔超过 `stale_after_ms` 时丢弃卡顿前残留的半帧，避免与恢复后的新帧拼成跨卡顿的混合帧。校准状态见 `body_status.idle_relay.calibration` 的 `needs_recalibration`、`baseline_established` 与 `rejected_frames`。
 
@@ -286,14 +297,15 @@ body_chatbox(text="你好", immediate=true)
 
 - AnyaDance 120 Hz 发送频率、丢帧、控制器释放延迟、数据包和当前动作进度。
 - VRChat OSC 9000/9001 状态、Avatar ID、收发计数、错误和参数回传。
-- 启用、平滑禁用、复位与急停。
+- 启用、平滑禁用、复位与急停，以及「允许模型急停」权限开关。
+- 「重新校准 VMC」与失败时的「用当前姿势作基准」退路，附当前基准代际与已拒绝帧数。
 - 手臂角度/方位/伸展/掌心调节，手型、程序化手势和伸手抓取测试。
 - 语义表达意图、状态机模式、活动层和优先级保护调试。
 - `.nya` 动作目录诊断（可用/已索引/待解析/缓存/元数据错误）；选片交给 `body_express` 的状态机，面板不再手点片段。
 - Grab/Use/Drop 输入脉冲测试。
 - 每秒自动刷新、身体状态/OSC JSON 快照和最近调试命令日志。
 
-调试面板调用的是与 LLM 工具相同的校验和调度实现，因此仍受启用状态、范围、安全锁定和动作时长限制。面板按下的急停必须点击“复位 T Pose”解除锁定；LLM 自己下的急停由它自己 `body_stop(scope="unfreeze")` 解除。
+调试面板调用的是与 LLM 工具相同的校验和调度实现，因此仍受启用状态、范围、安全锁定和动作时长限制。面板按下的急停必须点击“复位 T Pose”解除锁定；LLM 自己下的急停由它自己 `body_stop(scope="unfreeze")` 解除。能力开关（身体输出、复位、立即急停、允许模型急停、自主授权、视觉采集、重新校准 VMC）走独立的 `panel_command` 入口，`metadata.agent_auto=false` 由宿主保证 Agent 既看不到也分派不了。
 
 面板每秒刷新时只扫描动作文件名、大小和修改时间，不读取或解析 `.nya` 正文。新动作在首次播放时由后台线程完成完整校验；首次解析期间命令按钮会显示执行中，但状态刷新和其他插件事件不会被同步文件读取占住。解析结果按文件签名缓存，文件内容变更后会自动失效。当前最多保留两个已解析动作，便于重复播放和动作切换。
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import threading
+from types import SimpleNamespace
 import unittest
 
 from tests import _bootstrap  # noqa: F401
@@ -416,6 +418,121 @@ class VmcIdleRelayTests(unittest.TestCase):
         relay.ingest_messages(resumed, now=current[0])
         self.assertIsNone(relay.latest_frame())
         self.assertEqual(relay.snapshot()["incomplete_frames"], 1)
+
+
+class ManualRecalibrationTests(unittest.TestCase):
+    """面板「重新校准 VMC」按钮的后端语义。
+
+    这颗按钮要救的是「零点锁错、动作一直是歪的」。它的核心约束不是成功路径，
+    而是**按了不能比不按更糟**：清掉基准之后若没有人去重建，中转会一直拒绝普通
+    帧、角色停在最后一帧，从「歪着能动」变成「正着不动」。
+    """
+
+    class _StubService:
+        """只借 ``BackendService.vmc_recalibrate`` 一个方法，不启动真后端。"""
+
+        def __init__(self, relay, *, manage_host_output: bool, worker_alive: bool) -> None:
+            self.vmc_idle = relay
+            self._lock = threading.RLock()
+            self.config = SimpleNamespace(
+                vmc_idle=VmcIdleConfig(manage_host_output=manage_host_output)
+            )
+            self._vmc_calibration_thread = (
+                SimpleNamespace(is_alive=lambda: True) if worker_alive else None
+            )
+
+    def _service(self, relay, *, manage_host_output: bool = True, worker_alive: bool = True):
+        from neko_anyadance_body.backend.service import BackendService
+
+        stub = self._StubService(
+            relay, manage_host_output=manage_host_output, worker_alive=worker_alive
+        )
+        stub.vmc_recalibrate = BackendService.vmc_recalibrate.__get__(stub, type(stub))
+        return stub
+
+    def _calibrated_relay(self, current: list[float]) -> VmcIdleRelay:
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile(), clock=lambda: current[0])
+        relay.reset_calibration(reason="host_t_pose")
+        relay.ingest_messages(_complete_frame_messages(), now=current[0])
+        assert relay.latest_frame() is not None
+        return relay
+
+    def test_default_path_hands_the_baseline_back_to_the_t_pose_worker(self) -> None:
+        current = [10.0]
+        relay = self._calibrated_relay(current)
+        result = self._service(relay).vmc_recalibrate()
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["mode"], "host_t_pose")
+        # 旧基准作废，并且明确要求一次权威静止姿势——校准线程下一轮就会去请求。
+        self.assertTrue(relay.needs_recalibration())
+        self.assertTrue(relay.snapshot()["calibration"]["waiting_for_t_pose_frame"])
+        self.assertFalse(relay.snapshot()["calibration"]["calibrated"])
+
+        # 期间的普通动画帧仍然不能顶替静止姿势，否则等于没校准。
+        current[0] += 1.0
+        half_sqrt = 2.0 ** -0.5
+        animated = [
+            (address, (*arguments[:4], 0.0, 0.0, half_sqrt, half_sqrt))
+            if address == "/VMC/Ext/Bone/Pos" and arguments[0] == "LeftUpperArm"
+            else (address, arguments)
+            for address, arguments in _complete_frame_messages()
+        ]
+        relay.ingest_messages(animated, now=current[0])
+        self.assertIsNone(relay.latest_frame())
+
+    def test_request_is_refused_outright_when_nobody_can_rebuild_the_baseline(self) -> None:
+        """没有校准线程时必须原样拒绝：清了基准没人重建，角色会永久停在最后一帧。"""
+        for label, kwargs in (
+            ("托管宿主输出已关闭", {"manage_host_output": False}),
+            ("校准线程没在跑", {"worker_alive": False}),
+        ):
+            with self.subTest(label):
+                current = [10.0]
+                relay = self._calibrated_relay(current)
+                before = relay.snapshot()["calibration"]
+                result = self._service(relay, **kwargs).vmc_recalibrate()
+                self.assertFalse(result["accepted"])
+                # 拒绝要指出退路，否则用户只会对着一颗永远失败的按钮反复点。
+                self.assertIn("accept_current_pose=true", result["reason"])
+                # 关键：状态一个字段都没动，中转照常工作。
+                self.assertEqual(relay.snapshot()["calibration"], before)
+                self.assertIsNotNone(relay.latest_frame())
+                self.assertFalse(relay.needs_recalibration())
+
+    def test_fallback_locks_the_next_ordinary_frame_without_waiting_for_a_t_pose(self) -> None:
+        """宿主给不出 T Pose 时的唯一出口：下一个完整帧直接成为新基准。"""
+        current = [10.0]
+        relay = self._calibrated_relay(current)
+        result = self._service(
+            relay, manage_host_output=False, worker_alive=False
+        ).vmc_recalibrate(accept_current_pose=True)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["mode"], "accept_current_pose")
+        self.assertFalse(relay.snapshot()["calibration"]["calibrated"])
+        # 不等 T Pose，所以也不该把活儿丢给一个并不存在的校准线程。
+        self.assertFalse(relay.snapshot()["calibration"]["waiting_for_t_pose_frame"])
+        self.assertFalse(relay.needs_recalibration())
+
+        current[0] += 1.0
+        half_sqrt = 2.0 ** -0.5
+        animated = [
+            (address, (*arguments[:4], 0.0, 0.0, half_sqrt, half_sqrt))
+            if address == "/VMC/Ext/Bone/Pos" and arguments[0] == "LeftUpperArm"
+            else (address, arguments)
+            for address, arguments in _complete_frame_messages()
+        ]
+        relay.ingest_messages(animated, now=current[0])
+        self.assertIsNotNone(relay.latest_frame())
+        self.assertTrue(relay.snapshot()["calibration"]["calibrated"])
+
+    def test_disabled_relay_reports_instead_of_pretending_to_recalibrate(self) -> None:
+        current = [10.0]
+        relay = self._calibrated_relay(current)
+        stub = self._service(relay)
+        stub.config = SimpleNamespace(vmc_idle=VmcIdleConfig(enabled=False))
+        result = stub.vmc_recalibrate()
+        self.assertFalse(result["accepted"])
+        self.assertIsNotNone(relay.latest_frame())
 
 
 if __name__ == "__main__":
