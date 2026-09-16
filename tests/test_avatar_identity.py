@@ -161,6 +161,95 @@ class AvatarIdentityRegistryTests(unittest.TestCase):
         self.assertEqual(ambiguous.method, "new_identity")
         self.assertEqual(registry.status()["identity_count"], 3)
 
+    def test_coexisting_twins_get_one_stable_bucket_instead_of_unbounded_ids(self) -> None:
+        # 死锁回归场景：两个同款 Avatar 同帧出现过，之后单个目标反复以全新
+        # track 重现。修复前 margin 判定永远失败，每次重现都新建身份（实测
+        # 12 次转回增殖出 12 个新 ID）；修复后第一次重现建立"未知是哪一个"
+        # 桶，后续重现全部落进同一个桶，身份总数封顶在 3。
+        registry = AvatarIdentityRegistry(session_token="test")
+        left_box = (0.05, 0.20, 0.30, 0.80)
+        right_box = (0.65, 0.20, 0.90, 0.80)
+        frame = np.maximum(_avatar_frame(left_box), _avatar_frame(right_box))
+        registry.assign(
+            [_detection(1, left_box), _detection(2, right_box)],
+            frame,
+            now=1.0,
+            source_name="openvino",
+        )
+
+        boxes = [
+            (0.375, 0.20, 0.625, 0.80),
+            (0.15, 0.20, 0.40, 0.80),
+            (0.55, 0.20, 0.80, 0.80),
+            (0.30, 0.20, 0.55, 0.80),
+        ]
+        bucket_ids = []
+        for index, box in enumerate(boxes):
+            assignment = registry.assign(
+                [_detection(10 + index, box)],
+                _avatar_frame(box),
+                # 超过 15 秒几何窗口，逼所有启发式失败、走重复兜底。
+                now=20.0 * (index + 1),
+                source_name="openvino",
+            )[10 + index]
+            bucket_ids.append(assignment.identity_id)
+
+        # 首次重现建桶，其余全部复用同一个桶。
+        self.assertEqual(len(set(bucket_ids)), 1)
+        status = registry.status()
+        self.assertEqual(status["identity_count"], 3)
+        self.assertGreaterEqual(status["duplicate_reidentified_count"], len(boxes) - 1)
+        # 两个真实身份的同帧共存对被记录，且从未被兜底互相顶替。
+        self.assertGreaterEqual(status["distinct_pair_count"], 1)
+
+    def test_serial_duplicates_are_absorbed_back_into_one_identity(self) -> None:
+        # 单人场景：库里出现两个都认得同一外观的串行重复后，重复兜底应把
+        # 它们吸并回一个身份，而不是留着第三个候选继续加深歧义。
+        registry = AvatarIdentityRegistry(session_token="test")
+        box_a = (0.10, 0.20, 0.35, 0.80)
+        box_b = (0.60, 0.20, 0.85, 0.80)
+        first = registry.assign(
+            [_detection(1, box_a)],
+            _avatar_frame(box_a),
+            now=1.0,
+            source_name="openvino",
+        )[1]
+        # 第二个身份以完全不同的外观建立（从未与 first 同帧共存）……
+        different = _avatar_frame(
+            box_b,
+            top_color=(25, 210, 75),
+            bottom_color=(230, 225, 225),
+            band_side="right",
+        )
+        duplicate = registry.assign(
+            [_detection(2, box_b)],
+            different,
+            now=20.0,
+            source_name="openvino",
+        )[2]
+        self.assertEqual(duplicate.method, "new_identity")
+        # ……随后在轨迹连续期间学到了与 first 相同的视角（换装/失配的典型
+        # 后果），画廊从此互认，构成打平的串行重复。观测数压在 established
+        # 启发式（>=8）之下，逼真地落进重复兜底。
+        for index in range(6):
+            registry.assign(
+                [_detection(2, box_b)],
+                _avatar_frame(box_b),
+                now=20.1 + index * 0.1,
+                source_name="openvino",
+            )
+        merged = registry.assign(
+            [_detection(3, box_a)],
+            _avatar_frame(box_a),
+            now=60.0,
+            source_name="openvino",
+        )[3]
+        status = registry.status()
+        self.assertEqual(merged.method, "appearance_duplicate_reid")
+        self.assertEqual(status["identity_count"], 1)
+        self.assertGreaterEqual(status["merged_identity_count"], 1)
+        self.assertIn(merged.identity_id, {first.identity_id, duplicate.identity_id})
+
     def test_scene_context_beats_misleading_screen_geometry(self) -> None:
         registry = AvatarIdentityRegistry(session_token="test")
         left_box = (0.05, 0.20, 0.30, 0.80)

@@ -305,6 +305,10 @@ class AvatarIdentityRegistry:
         self._descriptor_name = str(descriptor_name or "color_histogram")[:48]
         self._identities: dict[str, _Identity] = {}
         self._track_bindings: dict[int, str] = {}
+        # 曾在同一帧被同时分配过的身份对。同帧共存是"这是两个真实个体"的
+        # 决定性证据，重复兜底永远不让它们互相顶替或被吸并；对随成员过期而
+        # 清理，容量因此被活跃身份数的组合数约束。
+        self._distinct_pairs: set[frozenset[str]] = set()
         self._next_identity = 1
         self._new_count = 0
         self._reidentified_count = 0
@@ -313,6 +317,8 @@ class AvatarIdentityRegistry:
         self._geometry_reidentified_count = 0
         self._established_reidentified_count = 0
         self._context_reidentified_count = 0
+        self._duplicate_reidentified_count = 0
+        self._merged_identity_count = 0
 
     def _new_identity_id(self) -> str:
         identity_id = f"avatar:session:{self.session_token}:{self._next_identity}"
@@ -344,6 +350,10 @@ class AvatarIdentityRegistry:
             track_id: identity_id
             for track_id, identity_id in self._track_bindings.items()
             if identity_id not in expired
+        }
+        self._distinct_pairs = {
+            pair for pair in self._distinct_pairs
+            if all(identity_id in self._identities for identity_id in pair)
         }
 
     def _bind(self, track_id: int, identity_id: str) -> None:
@@ -390,6 +400,19 @@ class AvatarIdentityRegistry:
             + [_similarity(prototype, descriptor) for prototype in identity.prototypes]
         )
 
+    @classmethod
+    def _cross_gallery_similarity(cls, first: _Identity, second: _Identity) -> float:
+        """两个身份的多视角画廊间的最大相似度。
+
+        串行重复的典型形态是"各自记住了同一 Avatar 的不同时刻"：EMA 主模板
+        可能已漂移到互不相认，但只要画廊里存在一对共同视角，它们就是同一
+        外观。因此这里取跨画廊最大值而不是主模板点积。
+        """
+        return max(
+            cls._identity_similarity(first, vector)
+            for vector in (second.descriptor, *second.prototypes)
+        )
+
     @staticmethod
     def _update_context(
         identity: _Identity,
@@ -416,6 +439,46 @@ class AvatarIdentityRegistry:
             return None
         return max(_similarity(item, descriptor) for item in identity.context_prototypes)
 
+    def _absorb(self, winner: _Identity, loser: _Identity) -> None:
+        """把确认为串行重复的身份并进保留者，重复消失而不是继续攒着。
+
+        只由 duplicate 兜底调用：调用前已确认两者从未同帧共存且模板互认。
+        观测数合并（都是同一 Avatar 的真实观测），原型与背景指纹并入并保持
+        原有容量上限。被吸并 ID 已发布的实体 TTL 只有秒级，过期即消失。
+        """
+        winner.observations += loser.observations
+        winner.last_seen = max(winner.last_seen, loser.last_seen)
+        for prototype in loser.prototypes:
+            best = max(
+                (_similarity(item, prototype) for item in winner.prototypes),
+                default=-1.0,
+            )
+            if best < _PROTOTYPE_NOVELTY_THRESHOLD:
+                winner.prototypes.append(prototype)
+                if len(winner.prototypes) > _MAX_APPEARANCE_PROTOTYPES:
+                    winner.prototypes.pop(1)
+        for context in loser.context_prototypes:
+            self._update_context(winner, context)
+        self._identities.pop(loser.identity_id, None)
+        self._track_bindings = {
+            track_id: (
+                winner.identity_id if identity_id == loser.identity_id else identity_id
+            )
+            for track_id, identity_id in self._track_bindings.items()
+        }
+        # 与第三方的"确证不同"关系随身份合并转移：loser 和 C 是两个人，
+        # 那么 winner（同一 Avatar）和 C 也是。
+        transferred = set()
+        for pair in self._distinct_pairs:
+            if loser.identity_id in pair:
+                other = next(iter(pair - {loser.identity_id}), None)
+                if other is not None and other != winner.identity_id:
+                    transferred.add(frozenset((winner.identity_id, other)))
+            else:
+                transferred.add(pair)
+        self._distinct_pairs = transferred
+        self._merged_identity_count += 1
+
     def _resolve_ambiguous_candidate(
         self,
         candidates: Sequence[tuple[float, _Identity]],
@@ -426,7 +489,9 @@ class AvatarIdentityRegistry:
         """在外观近似的旧模板间，用短时几何或显著稳定度消解冲突。
 
         同帧仍可见的身份在调用前已经排除，因此这里不会把两个同时出现的相同
-        Avatar 合并。几何不明确且没有一个长期稳定模板时继续分配新 ID。
+        Avatar 合并。启发式全部失败时，末尾的重复兜底还会检查打平候选是否为
+        库内串行重复（从未同帧共存且模板互认），是则复用最稳身份并吸并其余；
+        只有确证不同或证据不足时才继续分配新 ID。
         """
 
         if not candidates:
@@ -509,7 +574,47 @@ class AvatarIdentityRegistry:
             ):
                 self._established_reidentified_count += 1
                 return identity, score, "appearance_established_reid"
-        return None
+
+        # 最后的重复兜底。三条启发式全部失败时，margin 判定在库内出现重复
+        # 身份后会永远失败——每次重现都新建身份、重复越多越失败（实测 2 人
+        # 12 次转回增殖到 14 个身份、0 次救回）。这里把打平候选分成两类：
+        # 参与过同帧共存对的成员是确证的真实个体，在它们之间选择等于猜测
+        # 具体某个人，全部剔除；其余成员若彼此模板互认（双向都过正常匹配
+        # 阈值），就是同一 Avatar 的串行重复，复用最稳的并把其余吸并进去。
+        # 干净子集为空（例如仅剩确证不同的双胞胎）则维持原语义分配新 ID，
+        # 该新 ID 会成为后续重现的"未知是哪一个"稳定桶。双胞胎在长间隔后
+        # 同时重现仍可能各造一个桶，这是留给几何/背景启发式的残余场景。
+        blocked = {
+            identity.identity_id
+            for _score, identity in near
+            for _other_score, other in near
+            if identity.identity_id != other.identity_id
+            and frozenset((identity.identity_id, other.identity_id)) in self._distinct_pairs
+        }
+        clean = [
+            (score, identity)
+            for score, identity in near
+            if identity.identity_id not in blocked
+        ]
+        if not clean:
+            return None
+        if len(clean) == 1 and len(near) == 1:
+            # 唯一过阈值的候选没有真正的竞争者（margin 只是被一个低于阈值的
+            # 次名挤掉），交给上面的启发式已足够；这里不重复放行，避免把
+            # 次阈值歧义也当成库内重复。
+            return None
+        for index, (_score, identity) in enumerate(clean):
+            for _other_score, other in clean[index + 1:]:
+                if self._cross_gallery_similarity(identity, other) < self.similarity_threshold:
+                    return None
+        score, winner = max(
+            clean, key=lambda item: (item[1].observations, item[1].last_seen)
+        )
+        for _score, identity in clean:
+            if identity.identity_id != winner.identity_id:
+                self._absorb(winner, identity)
+        self._duplicate_reidentified_count += 1
+        return winner, score, "appearance_duplicate_reid"
 
     def assign(
         self,
@@ -656,6 +761,12 @@ class AvatarIdentityRegistry:
                 method,
                 similarity,
             )
+        # 同帧拿到不同身份的目标是"确证不同"的证据对，重复兜底永远不合并
+        # 它们。放在批次末尾统一记录，同帧任意两两组合都成立。
+        assigned_ids = sorted(assigned_this_frame)
+        for index, first_id in enumerate(assigned_ids):
+            for second_id in assigned_ids[index + 1:]:
+                self._distinct_pairs.add(frozenset((first_id, second_id)))
         # 通常单帧目标数远小于容量；仍在批次末尾再收口一次，保证极端输入也
         # 不会让会话身份表持续超过配置上限。
         self._prune(now)
@@ -675,6 +786,9 @@ class AvatarIdentityRegistry:
             "geometry_reidentified_count": self._geometry_reidentified_count,
             "established_reidentified_count": self._established_reidentified_count,
             "context_reidentified_count": self._context_reidentified_count,
+            "duplicate_reidentified_count": self._duplicate_reidentified_count,
+            "merged_identity_count": self._merged_identity_count,
+            "distinct_pair_count": len(self._distinct_pairs),
             "similarity_threshold": self.similarity_threshold,
             "similarity_margin": self.similarity_margin,
             "retention_s": self.retention_s,

@@ -341,8 +341,14 @@ onnxruntime 不可用时回落颜色/布局直方图（阈值 `identity_reid_sim
 一档，`identity_reid.embedder` 区分「未配置」与「配置了但加载失败」。多个旧模板
 同样相似时，优先比较剔除全部人物框后的
 4x8 低分辨率背景指纹；背景仍不明确时，仅在 15 秒内检测框几何明显连续，或某个模板的
-稳定观测数至少达到其他候选 3 倍时复用。其余歧义仍分配新 ID，同一帧不允许两个轨迹
-占用同一身份。外观不可提取、功能关闭或类别不是 Avatar 时，会安全降级为上述
+稳定观测数至少达到其他候选 3 倍时复用。启发式全部失败时还有重复兜底：同帧拿到
+不同身份的组合会被记为"确证不同"对（`distinct_pair_count`），打平候选剔除确证对
+成员后，若剩余成员的画廊互认（跨画廊相似度过匹配阈值），判定为库内串行重复——
+复用最稳身份并把其余吸并进去（`appearance_duplicate_reid`/`merged_identity_count`），
+打断"失配→重复→更失配"的增殖循环；确证对成员之间绝不互相顶替，双胞胎场景会
+得到一个稳定的"未知是哪一个"桶而不是无限新 ID。其余歧义仍分配新 ID，同一帧
+不允许两个轨迹占用同一身份。外观不可提取、功能关闭或类别不是 Avatar 时，会安全
+降级为上述
 `{source}:track:{track_id}`。`identity_reid` 状态中的 `ambiguous_reused_count`、
 `context_reidentified_count`、`geometry_reidentified_count`、
 `established_reidentified_count`、`appearance_prototype_count` 和
