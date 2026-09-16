@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import threading
-import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -100,25 +99,22 @@ class HostVmcController:
         on_t_pose_started: Callable[[], None],
         *,
         duration_sec: float = 2.0,
-        timeout_seconds: float | None = 8.0,
-        poll_interval_seconds: float = 0.1,
         stop_event: threading.Event | None = None,
     ) -> bool:
-        """Request the documented host T-pose and reset the relay once it starts."""
+        """请求宿主播一次权威静止姿势，受理后立刻让中转交出基准。
+
+        受理凭据就是 ``POST /api/vmc/t_pose`` 的成功返回，它与本次调用一一对应。
+        旧实现绕道轮询 ``t_pose_requested`` 复位才动手，方向是反的：复位代表 T Pose
+        已经播完，那时流里只剩普通动画帧，过不了解剖校验，角色会被永久冻在最后一帧。
+        """
         if not self.config.enabled or not self.config.manage_host_output:
             return False
-        if timeout_seconds is None:
-            timeout_seconds = 8.0
-        if (
-            not math.isfinite(duration_sec)
-            or not 0.1 <= duration_sec <= 10.0
-            or (
-                not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0
-            )
-            or not math.isfinite(poll_interval_seconds)
-            or poll_interval_seconds < 0.0
-        ):
+        if not math.isfinite(duration_sec) or not 0.1 <= duration_sec <= 10.0:
             raise ValueError("invalid VMC T-pose calibration timing")
+        if stop_event is not None and stop_event.is_set():
+            with self._lock:
+                self._calibration_state = "cancelled"
+            return False
         try:
             with self._lock:
                 if not self._active:
@@ -129,43 +125,20 @@ class HostVmcController:
                 self._calibration_error = None
 
             token = self._csrf_token()
-            requested = self._request_t_pose(duration_sec=duration_sec, token=token)
+            status = self._request_t_pose(duration_sec=duration_sec, token=token)
             with self._lock:
-                self._status = dict(requested)
-                self._calibration_state = "waiting_for_t_pose"
+                self._status = dict(status)
 
-            # A freshly restarted N.E.K.O page may need one 5-second status
-            # poll plus WebSocket reconnect/backoff before it can publish the
-            # requested rest pose.  This wait runs on a daemon worker and does
-            # not block plugin startup.
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                if stop_event is not None and stop_event.is_set():
-                    with self._lock:
-                        self._calibration_state = "cancelled"
-                    return False
-                status = self._requester("GET", "/api/vmc/status", None, None)
-                with self._lock:
-                    self._status = dict(status)
-                # The browser clears t_pose_requested immediately before it
-                # emits the first raw-rest frame.  The requested duration then
-                # leaves ample time for the relay's next complete frame to be
-                # captured as its calibration basis.
-                if not bool(status.get("t_pose_requested")):
-                    on_t_pose_started()
-                    with self._lock:
-                        self._calibration_state = "calibrated"
-                        self._calibration_error = None
-                    return True
-                if stop_event is not None:
-                    stop_event.wait(poll_interval_seconds)
-                elif poll_interval_seconds > 0.0:
-                    time.sleep(poll_interval_seconds)
-
+            # POST 返回即受理，这就是与本次调用一一对应的凭据。不能改用
+            # t_pose_requested 复位当起点：那个 false 说明静止姿势已经播完，此时流里
+            # 只剩普通动画帧，永远过不了解剖校验，角色会被永久冻在最后一帧。
+            # 也不能拿 t_pose_generation 当受理信号——它是全宿主共享的计数器，别的
+            # 页面或残留重试都能让它自增，会把无关请求认成自己的。
+            on_t_pose_started()
             with self._lock:
-                self._calibration_state = "timeout"
-                self._calibration_error = "N.E.K.O did not start the requested T-pose before timeout"
-            return False
+                self._calibration_state = "calibrated"
+                self._calibration_error = None
+            return True
         except Exception as exc:
             with self._lock:
                 self._calibration_state = "failed"

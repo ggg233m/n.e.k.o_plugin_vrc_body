@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -10,6 +11,7 @@ from neko_anyadance_body.config import BodyProfile, VmcIdleConfig
 from neko_anyadance_body.model import LEFT_CANONICAL_QUAT, RIGHT_CANONICAL_QUAT
 from neko_anyadance_body.osc import encode_osc_message
 from neko_anyadance_body.vmc_idle import VmcIdleRelay, _quat_multiply
+from neko_anyadance_body.backend import service as service_module
 
 
 def _bone(name: str, x: float, y: float, z: float = 0.0):
@@ -533,6 +535,66 @@ class ManualRecalibrationTests(unittest.TestCase):
         result = stub.vmc_recalibrate()
         self.assertFalse(result["accepted"])
         self.assertIsNotNone(relay.latest_frame())
+
+
+class CalibrationWorkerThrottleTests(unittest.TestCase):
+    """握手变成「一次 POST 即受理」之后，校准线程必须自己节流。
+
+    基准要等真实的 T Pose 帧到达才算建立，而在此之前 needs_recalibration() 恒为
+    真。旧握手自带 8 秒轮询，把循环拖慢了；握手一快，紧接着的 continue 就再也
+    不经过等待，整条线程会退化成打满宿主 API 的紧循环。
+    """
+
+    class _Harness:
+        """只借 ``_start_vmc_calibration``，不启动真后端。"""
+
+        def __init__(self, host_vmc, relay, window_seconds: float) -> None:
+            self.host_vmc = host_vmc
+            self.vmc_idle = relay
+            self._lock = threading.RLock()
+            self._vmc_calibration_thread = None
+            self._vmc_calibration_stop = None
+            self.config = SimpleNamespace(
+                vmc_idle=VmcIdleConfig(),
+                host_api_timeout_seconds=0.1,
+            )
+            self.window_seconds = window_seconds
+
+    class _RecordingHostVmc:
+        def __init__(self) -> None:
+            self.handshakes = 0
+
+        def snapshot(self):
+            return {"active": True}
+
+        def start(self):
+            return True
+
+        def calibrate_rest_pose(self, on_started, *, stop_event=None):
+            self.handshakes += 1
+            on_started()
+            # 模拟「请求已受理，但基准帧还没到」：置真后 needs_recalibration 仍为真。
+            return True
+
+    def test_successful_handshakes_are_throttled_instead_of_spinning(self) -> None:
+        from neko_anyadance_body.backend.service import BackendService
+
+        host_vmc = self._RecordingHostVmc()
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile())
+        # 窗口缩到 20ms，避免测试真的等满 2 秒。
+        harness = self._Harness(host_vmc, relay, window_seconds=0.02)
+        original = service_module._VMC_T_POSE_WINDOW_SECONDS
+        service_module._VMC_T_POSE_WINDOW_SECONDS = harness.window_seconds
+        try:
+            BackendService._start_vmc_calibration(harness)
+            time.sleep(0.5)
+            harness._vmc_calibration_stop.set()
+            harness._vmc_calibration_thread.join(timeout=2.0)
+        finally:
+            service_module._VMC_T_POSE_WINDOW_SECONDS = original
+        # 0.5 秒最多只应发生 window 次握手；无节流时会多出几个数量级。
+        self.assertLessEqual(host_vmc.handshakes, int(0.5 / 0.02) + 2)
+        self.assertGreater(host_vmc.handshakes, 0)
 
 
 if __name__ == "__main__":
