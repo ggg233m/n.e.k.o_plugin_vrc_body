@@ -27,12 +27,15 @@ keywords = [
   # 身体与姿态
   "转(身|过来|过去|向)|面(向|对)",
   "停(下|住|一下)|别动|站住|不要动",
+  # 急停之后的出口。漏写这一行，用户喊「解除急停」会被预门刹在插件之外，
+  # 而此时身体正闩锁着——最需要放行的时刻反而进不来。
+  "恢复|解除|解锁|复位|可以(动|走)了|继续(动|走)",
   "你(现在)?(在)?(做什么|干嘛|干什么|什么姿势|什么动作)",
   # 领域术语
   "anyadance|steamvr|vrchat|osc|npc|avatar",
   "视觉|感知|导航|移动|跟随|身体|姿势|手势|表情",
 ]
-version = "0.13.25"
+version = "0.13.26"
 type = "plugin"
 entry = "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 

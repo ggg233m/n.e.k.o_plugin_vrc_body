@@ -89,8 +89,10 @@ def _boolean(name: str, value: Any) -> bool:
 # 留在共用表里，等于 Agent 可以自己给自己授权自主移动，plugin.toml 的
 # manual_arm = true 和「请用户去调试台启用」那条规则就都被绕过了。
 #
-# body_stop 故意留在 debug_command：急停是降权，Agent 能踩刹车是好事；
-# 而解除急停的 body_reset 在这里，于是「锁」由双方都能做、「解锁」只有用户能做。
+# body_stop 故意留在 debug_command：急停是降权，Agent 能踩刹车是好事。
+# 解除急停按「谁锁的谁能解」分流，不是按入口分流：模型自己下的那次急停由
+# body_stop(scope="unfreeze") 自己解开——否则它有权进入一个自己无权离开的状态，
+# 踩一脚刹车就把自己锁死了。面板按钮下的急停和故障闩锁仍然只认这里的 body_reset。
 _PANEL_SWITCH_NAMES = (
     "body_enable",
     "body_disable",
@@ -160,6 +162,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._osc: Any | None = None
         self._controller_input: Any | None = None
         self._driver_log: Any | None = None
+        # 谁下的急停：模型自己下的("llm")能自己解除，面板按钮下的("panel")和故障
+        # 闩锁(None)只认面板复位。见 body_stop 的 freeze/unfreeze 两段。
+        self._freeze_owner: str | None = None
         self._vmc_idle: Any | None = None
         self._host_vmc: Any | None = None
         # 视觉状态独立于 60 Hz 身体调度器；后端可以发布观测而不改变 VMC 待机路径。
@@ -2244,10 +2249,25 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
     # 三种「停」合成一个入口。分成三个同义工具时，模型选错没有报错——只是人
     # 没停下来，而它已经在回复里说停了。合成之后选错 scope 至少落在同一份返回
     # 结构里，navigation/axes/action 三段都在，能看出哪一层其实还在跑。
+    # unfreeze 也挂在这里而不是单开一个工具：解除急停只对自己下的急停有意义，
+    # 放在同一个 scope 枚举里，模型读到 freeze 的同时就读到了出口。
     @llm_tool(**BODY_STOP)
-    async def body_stop(self, *, scope: Any = "all", reason: Any = "autonomy_stop", **_: Any):
-        normalized_scope = _enum("scope", scope, ("all", "navigation", "axes", "action", "freeze"))
+    async def body_stop(
+        self,
+        *,
+        scope: Any = "all",
+        reason: Any = "autonomy_stop",
+        source: Any = None,
+        **_: Any,
+    ):
+        # source 故意不进 BODY_STOP 的 JSON Schema：模型下的急停永远是它自己的，
+        # 声明出来只会多占上下文，还给它一个把自己锁死的按钮（填 "panel" 就解不开了）。
+        # 面板那颗急停按钮显式带上它，走的是同一个 debug_command 入口。
+        normalized_scope = _enum(
+            "scope", scope, ("all", "navigation", "axes", "action", "freeze", "unfreeze")
+        )
         normalized_reason = str(reason or "autonomy_stop").replace("\x00", "").strip()[:160]
+        normalized_source = "panel" if str(source or "").strip().lower() == "panel" else "llm"
         result: dict[str, Any] = {"accepted": False, "scope": normalized_scope}
 
         # 顺序是有意的：先撤目标再清轴。反过来的话导航器会在下一帧把清掉的轴
@@ -2280,10 +2300,16 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             result["action"] = cancelled
 
         if normalized_scope == "freeze":
-            # 急停是降权，所以它留在共用表里：Agent 能踩刹车是好事。解除急停的
-            # body_reset 只在面板，于是「锁」双方都能做、「解锁」只有用户能做。
+            # 急停是降权，所以它留在共用表里：Agent 能踩刹车是好事。这里记下是谁
+            # 踩的，因为解除是提权，按「谁锁的谁能解」分流——模型自己锁的那次它能
+            # 用 scope="unfreeze" 解开，否则它有权进入一个自己无权离开的状态。
             result["freeze"] = await self._submit_async("stop")
+            if result["freeze"].get("accepted"):
+                self._freeze_owner = normalized_source
             await self._release_osc_inputs()
+
+        if normalized_scope == "unfreeze":
+            result["unfreeze"] = await self._unfreeze()
 
         accepted_parts = [
             bool(part.get("accepted"))
@@ -2293,6 +2319,34 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         result["accepted"] = bool(accepted_parts) and all(accepted_parts)
         return Ok(result)
 
+    async def _unfreeze(self) -> dict[str, Any]:
+        """解除本模型自己下的那次急停。
+
+        调度器这一层早就允许 ``reset`` 穿过闩锁（只有 NORMAL/INPUT 两组命令被
+        stopped_latched 挡住），所以这里唯一要判的是「这把锁是谁下的」。默认拒绝：
+        故障闩锁和面板急停的 ``_freeze_owner`` 都不是 "llm"，仍然只认面板复位。
+        """
+        if not self._scheduler:
+            return await self._invalid("body scheduler is not initialized")
+        snapshot = await asyncio.to_thread(self._scheduler.snapshot)
+        state = str(snapshot.get("state") or "")
+        if state != "stopped_latched":
+            return await self._invalid(f"body is not frozen (state={state}); nothing to release")
+        if self._freeze_owner != "llm":
+            return await self._invalid(
+                "this freeze was latched from the debug panel or by a fault; "
+                "ask the user to press 复位 T Pose in the AnyaDance debug panel"
+            )
+        try:
+            duration = self._duration(None, self._body_config.default_duration_ms)
+        except ValueError as exc:
+            return await self._invalid(str(exc))
+        result = await self._submit_async("reset", {"duration_ms": duration})
+        if result.get("accepted"):
+            self._freeze_owner = None
+            await self._release_osc_inputs()
+        return result
+
     async def body_reset(self, *, duration_ms: Any = None, **_: Any):
         try:
             duration = self._duration(duration_ms, self._body_config.default_duration_ms)
@@ -2300,6 +2354,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             return Ok(await self._invalid(str(exc)))
         result = await self._submit_async("reset", {"duration_ms": duration})
         if result.get("accepted"):
+            self._freeze_owner = None
             await self._release_osc_inputs()
         return Ok(result)
 

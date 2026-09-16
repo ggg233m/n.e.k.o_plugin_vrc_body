@@ -415,7 +415,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             />
             <ButtonGroup>
               <Button tone="info" disabled={busy || !panelAction} onClick={() => runSwitch("body_reset", { duration_ms: 600 })}>复位 T Pose</Button>
-              <Button tone="danger" disabled={busy} onClick={() => run("body_stop", { scope: "freeze" })}>立即急停</Button>
+              <Button tone="danger" disabled={busy} onClick={() => run("body_stop", { scope: "freeze", source: "panel" })}>立即急停</Button>
             </ButtonGroup>
             <KeyValue
               items={[

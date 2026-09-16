@@ -25,7 +25,7 @@
 - `motions/` 目录中的白名单 AnyaDance `.nya` 预制动作由 `body_express` 的状态机自动选片，不再单独暴露枚举/播放入口。
 - 用 `body_status` 读取 LLM 可理解的当前/上一动作、切换关系、完成状态、剩余时间和实际语义姿态；`include` 可只取 `body`/`autonomy`/`vision` 中的某几段。
 - 用 `body_vrchat_input` 安全脉冲 Grab、Use 或 Drop，并自动发送释放值。
-- 用 `body_turn` 发送有时限的 VRChat 转身轴值，或用 `body_stop` 分层停下（`scope=all/navigation/axes/action/freeze`）。
+- 用 `body_turn` 发送有时限的 VRChat 转身轴值，或用 `body_stop` 分层停下（`scope=all/navigation/axes/action/freeze/unfreeze`）。
 - 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
 - 用 `body_status(include=["autonomy"])`、`vrc_autonomy_goal`、`body_stop(scope="navigation")` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
 - 向 N.E.K.O 后台 Agent 暴露正式的“观察当前 VRChat 世界”和“寻找或走向 VRChat 目标”入口；自然语言里的“找 NPC / 走过去 / 跟着它”会进入同一个安全导航接口，而不是被误判成仅有身体姿态能力。唯一语义目标可自动绑定稳定 ID，多个候选仍必须交回主 LLM 选择。
@@ -39,7 +39,7 @@
 ## 安全与运行约束
 
 1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
-2. `body_stop` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作；调用 `body_reset` 才能恢复。
+2. `body_stop(scope="freeze")` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作。解除按「谁锁的谁能解」分流：LLM 自己下的急停可以由它自己调用 `body_stop(scope="unfreeze")` 恢复 T Pose（否则它有权进入一个自己无权离开的状态）；面板「立即急停」按钮下的急停和故障闩锁只能由用户点击面板的「复位 T Pose」解除。
 3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_status` 的 `body.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
 4. 插件假设接管期间 AnyaDance UI 不再向 39570 发送。驱动遥测发现其他活跃来源时会报告冲突、解除自主授权并释放输入；否则为 `unsupported` 或 `detected_unattributed`。
 5. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
@@ -293,7 +293,7 @@ body_chatbox(text="你好", immediate=true)
 - Grab/Use/Drop 输入脉冲测试。
 - 每秒自动刷新、身体状态/OSC JSON 快照和最近调试命令日志。
 
-调试面板调用的是与 LLM 工具相同的校验和调度实现，因此仍受启用状态、范围、安全锁定和动作时长限制。急停后必须点击“复位 T Pose”解除锁定。
+调试面板调用的是与 LLM 工具相同的校验和调度实现，因此仍受启用状态、范围、安全锁定和动作时长限制。面板按下的急停必须点击“复位 T Pose”解除锁定；LLM 自己下的急停由它自己 `body_stop(scope="unfreeze")` 解除。
 
 面板每秒刷新时只扫描动作文件名、大小和修改时间，不读取或解析 `.nya` 正文。新动作在首次播放时由后台线程完成完整校验；首次解析期间命令按钮会显示执行中，但状态刷新和其他插件事件不会被同步文件读取占住。解析结果按文件签名缓存，文件内容变更后会自动失效。当前最多保留两个已解析动作，便于重复播放和动作切换。
 

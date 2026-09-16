@@ -74,7 +74,8 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("agent_auto", panel_source)
         self.assertIn("_PANEL_SWITCH_NAMES", panel_source)
         self.assertIn("ui.action", panel_source)
-        # 急停留在共用表、解除急停只在面板：Agent 能踩刹车，不能自己松刹车。
+        # 急停留在共用表，解除按「谁锁的谁能解」分流：模型自己踩的刹车由
+        # body_stop(scope="unfreeze") 自己松开，面板急停与故障闩锁仍只认 body_reset。
         self.assertIn("body_stop", debug_commands)
         self.assertIn("body_reset", switches)
         # 读取刻意留给 Agent，否则它无从知道能力关着，也就没法提示用户去面板打开。
@@ -85,7 +86,7 @@ class HostedUiTests(unittest.TestCase):
 
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         manifest = self._manifest()
-        self.assertEqual(manifest["plugin"]["version"], "0.13.25")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.26")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -163,6 +164,17 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("autonomy.stop", stop_source)
         self.assertIn("stop_movement", stop_source)
         self.assertLess(stop_source.index("autonomy.stop"), stop_source.index("stop_movement"))
+        # 急停必须能被下急停的人自己解除：模型有权进入 freeze，就得有权离开，
+        # 否则它踩一脚刹车就把自己锁死，只能干等用户去点面板。
+        unfreeze_source = ast.unparse(methods["_unfreeze"])
+        self.assertIn("'unfreeze'", stop_source)
+        self.assertIn("_freeze_owner", stop_source)
+        self.assertIn("_unfreeze", stop_source)
+        # 但「谁锁的谁能解」要真的判来源，而且默认拒绝：故障闩锁的 owner 是 None，
+        # 面板急停是 "panel"，两者都只认面板复位。写成 == "panel" 就反了。
+        self.assertIn("_freeze_owner != 'llm'", unfreeze_source)
+        self.assertIn("stopped_latched", unfreeze_source)
+        self.assertIn("'reset'", unfreeze_source)
 
         world_observe_source = ast.unparse(methods["world_observe"])
         navigate_source = ast.unparse(methods["navigate_vrchat_world"])
@@ -227,7 +239,9 @@ class HostedUiTests(unittest.TestCase):
             self.assertIn(f'run("{command}"', source)
         # 面板的「停止自主目标」和「立即急停」都改走合并后的 body_stop，
         # 两个按钮的差别只剩 scope——写错 scope 会让急停退化成普通停车。
-        self.assertIn('run("body_stop", { scope: "freeze" })', source)
+        # 急停还必须带 source: "panel"：漏了它，用户按下的急停会被记成模型自己
+        # 下的，模型随后一句 unfreeze 就能把用户的刹车松开。
+        self.assertIn('run("body_stop", { scope: "freeze", source: "panel" })', source)
         self.assertIn('run("body_stop", { scope: "navigation" })', source)
         self.assertNotIn('run("vrc_autonomy_stop"', source)
         # 开关类必须走 panel_command，且渲染成滑块而不是按钮——按钮看不出当前
