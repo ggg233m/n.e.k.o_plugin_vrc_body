@@ -103,9 +103,23 @@ class HostVmcController:
     ) -> bool:
         """请求宿主播一次权威静止姿势，受理后立刻让中转交出基准。
 
-        受理凭据就是 ``POST /api/vmc/t_pose`` 的成功返回，它与本次调用一一对应。
-        旧实现绕道轮询 ``t_pose_requested`` 复位才动手，方向是反的：复位代表 T Pose
-        已经播完，那时流里只剩普通动画帧，过不了解剖校验，角色会被永久冻在最后一帧。
+        受理凭据就是 ``POST /api/vmc/t_pose`` 的成功返回：宿主在 ``request_t_pose()``
+        里自增 generation 并置 ``t_pose_requested=True``，返回体即本次请求。
+
+        宿主的 T Pose 时序（``main_logic/vmc_sender.py`` + ``static/vrm/vrm-vmc-sender.js``）：
+
+        * t≈0ms：POST 受理，浏览器下一次 status 轮询看到 requested 后把
+          ``tPoseDeadline`` 设为 now + duration_sec；
+        * t≈16ms：第一帧 ``t_pose=true`` 发出，骨骼取 ``vrm.humanoid.rawRestPose``。
+          宿主 sender 正是在**收到这一帧时**把 ``t_pose_requested`` 复位，所以复位
+          标记的是 T Pose 窗口的**开始**，不是结束；
+        * t≈16ms..duration：持续输出 rawRestPose 帧，全部是合格 T Pose；
+        * t=duration：deadline 到期，恢复普通动画帧。
+
+        两种受理信号（POST 返回、requested 复位）只差一帧，都落在 T Pose 窗口内。
+        这里取 POST 返回，因为它不依赖 status 轮询，握手是一次调用而不是一段等待。
+        窗口早期可能混入过渡帧，中转用 ``_require_t_pose_frame`` 的解剖学校验挡掉，
+        不合格的帧不会被锁成基准。
         """
         if not self.config.enabled or not self.config.manage_host_output:
             return False
@@ -129,15 +143,20 @@ class HostVmcController:
             with self._lock:
                 self._status = dict(status)
 
-            # POST 返回即受理，这就是与本次调用一一对应的凭据。不能改用
-            # t_pose_requested 复位当起点：那个 false 说明静止姿势已经播完，此时流里
-            # 只剩普通动画帧，永远过不了解剖校验，角色会被永久冻在最后一帧。
-            # 也不能拿 t_pose_generation 当受理信号——它是全宿主共享的计数器，别的
-            # 页面或残留重试都能让它自增，会把无关请求认成自己的。
-            on_t_pose_started()
+            # POST 返回即受理，状态从这一刻起就是「已受理」。回调可能抛异常，那时宿主
+            # 那边的 T Pose 已经在播了，把它记成 failed 会让状态与实际不符、并触发上层的
+            # 失败退避（5 秒后才重试），白白错过这个窗口。所以先落状态，再回调；回调失败
+            # 只记日志，不影响受理结果。
             with self._lock:
                 self._calibration_state = "calibrated"
                 self._calibration_error = None
+            try:
+                on_t_pose_started()
+            except Exception as exc:
+                with self._lock:
+                    self._calibration_error = f"on_t_pose_started failed: {exc}"
+                if self.logger:
+                    self.logger.warning("VMC T-pose callback failed after the host accepted the request: %s", exc)
             return True
         except Exception as exc:
             with self._lock:

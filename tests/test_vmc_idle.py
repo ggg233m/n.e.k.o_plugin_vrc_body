@@ -592,9 +592,42 @@ class CalibrationWorkerThrottleTests(unittest.TestCase):
             harness._vmc_calibration_thread.join(timeout=2.0)
         finally:
             service_module._VMC_T_POSE_WINDOW_SECONDS = original
-        # 0.5 秒最多只应发生 window 次握手；无节流时会多出几个数量级。
-        self.assertLessEqual(host_vmc.handshakes, int(0.5 / 0.02) + 2)
+        # 0.5 秒 / 20ms ≈ 25 次上限。无节流时实测 4 万次以上，差 3 个数量级，
+        # 所以这个绝对上限既能挡住紧循环，又不会因为调度抖动而误报。
         self.assertGreater(host_vmc.handshakes, 0)
+        self.assertLessEqual(host_vmc.handshakes, 40)
+
+    def test_the_throttle_window_is_read_from_the_module_constant(self) -> None:
+        """守住上一条测试的前提。
+
+        ``test_successful_handshakes_are_throttled_instead_of_spinning`` 靠改写模块
+        常量来缩短等待。一旦有人把该常量提成局部变量或默认参数（很自然的优化），
+        那条测试会静默变成「真的等满 2 秒」——断言仍可能通过，却再也测不到节流。
+        这里直接对着一份窗口差异极大的常量观察握手次数，把它盯死。
+        """
+        from neko_anyadance_body.backend.service import BackendService
+
+        def handshakes_with_window(window: float, seconds: float = 0.4) -> int:
+            host_vmc = self._RecordingHostVmc()
+            relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile())
+            harness = self._Harness(host_vmc, relay, window_seconds=window)
+            original = service_module._VMC_T_POSE_WINDOW_SECONDS
+            service_module._VMC_T_POSE_WINDOW_SECONDS = window
+            try:
+                BackendService._start_vmc_calibration(harness)
+                time.sleep(seconds)
+                harness._vmc_calibration_stop.set()
+                harness._vmc_calibration_thread.join(timeout=2.0)
+            finally:
+                service_module._VMC_T_POSE_WINDOW_SECONDS = original
+            return host_vmc.handshakes
+
+        slow = handshakes_with_window(0.2)
+        fast = handshakes_with_window(0.02)
+        # 窗口缩短 10 倍，握手次数应当明显变多。若常量不再被读取，两者会趋同，
+        # 或者在 0.0 那种情形下一起爆成紧循环。
+        self.assertGreater(fast, slow)
+        self.assertLessEqual(fast, 40)
 
 
 if __name__ == "__main__":

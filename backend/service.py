@@ -44,9 +44,10 @@ from .world_state import WorldStateStore
 
 
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
-# T Pose 请求被受理后宿主播静止姿势的时长（与 host_vmc 的 duration_sec 默认值一致）。
-# 握手返回即受理，本线程要等过这个窗口才能判断基准有没有真的锁上，否则
-# needs_recalibration() 在帧到达前恒为真，会退化成紧循环。
+# 宿主输出 rawRestPose 帧的时长，与 host_vmc 的 duration_sec 默认值一致。握手返回即
+# 受理，但基准要等合格的 T Pose 帧到达才锁上（vmc_idle 要过解剖学校验），本线程得等过
+# 这个窗口才能判断基准有没有真的锁上；否则 needs_recalibration() 在帧到达前恒为真，
+# 会退化成紧循环。
 _VMC_T_POSE_WINDOW_SECONDS = 2.0
 # 基准已就绪时的空转间隔。宿主暂停或 VMC 输出重启会清空基准，本线程要在那之后
 # 主动补一次 T Pose，所以它必须比首次校准活得久。
@@ -689,10 +690,12 @@ class BackendService:
                 if stop_event.is_set():
                     return
                 if calibrated:
-                    # 握手只是一次 POST，立刻回到循环顶部不会经过任何等待，而基准要等
-                    # 真实的 T Pose 帧到达才算建立。中间这段时间 needs_recalibration()
-                    # 恒为真，不歇一下就会变成一个打满宿主 API 的紧循环。等过 T Pose
-                    # 的时长，让帧有机会到达，再判断基准是否真的锁上。
+                    # 握手只是一次 POST，立刻回到循环顶部不会经过任何等待。而基准要等
+                    # 宿主的 rawRestPose 帧真正到达、并通过 _require_t_pose_frame 的
+                    # 解剖学校验才会锁上（vmc_idle._finalize_pending_locked 里置
+                    # _had_baseline）。在那之前 needs_recalibration() 恒为真，不歇一下
+                    # 就会变成一个打满宿主 API 的紧循环。等过 T Pose 的时长，让帧有机会
+                    # 到达，再判断基准是否真的锁上。
                     stop_event.wait(_VMC_T_POSE_WINDOW_SECONDS)
                     continue
                 if relay.has_baseline():
