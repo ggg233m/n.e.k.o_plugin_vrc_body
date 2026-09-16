@@ -2708,7 +2708,24 @@ class BackendService:
             self.osc.cancel_scheduled_inputs(release=True)
 
     def list_clips(self) -> dict[str, Any]:
-        return self.clip_library.list()
+        """目录清单走 catalog()：只 stat 文件、复用已缓存的摘要，不解析任何片。
+
+        这条路径唯一的消费者是每秒刷新一次的调试面板（``/clips/list`` ←
+        ``RemoteClipLibrary.catalog()``）。``ClipLibrary.list()`` 会 ``load()``
+        目录里的每一个片，而常驻缓存只有 2 个槽位，于是每次刷新都把整个目录
+        重新解析一遍——20 个 10 秒片实测 2.5 s，面板刷新间隔才 1 s。
+
+        返回结构与 ``list()`` 完全一致；差别只在没被解析过的片的
+        ``duration_s``/``frame_count`` 为 null 且 ``indexed=false``，面板已经按
+        「待首次解析」渲染这种状态。
+
+        代价说明：损坏的片在第一次被解析之前会落在 ``clips``（``indexed=false``）
+        而不是 ``invalid_clips``——判断 JSON 坏没坏必须读文件，而不读文件正是这里
+        提速的全部来源。一旦有任何路径 ``load()`` 过它，错误会进摘要缓存，之后
+        每次 catalog() 都照常报进 ``invalid_clips``。把它显示成「还没解析」而不是
+        「有效」，是诚实的降级；为此每秒重读整个目录不值得。
+        """
+        return self.clip_library.catalog()
 
     def semantic_express(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """在后端选择 VMD，然后提交生成的动作。"""

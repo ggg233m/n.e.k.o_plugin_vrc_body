@@ -2499,6 +2499,10 @@ class VisionRuntime:
         self._last_detect_at: float | None = None
         self._detect_skipped = 0
         self._obscured_frames = 0
+        # 遮挡期间既不推理也不写帧缓存，缓存会冻在最后一次可见的帧上。记下最后
+        # 一次遮挡的时刻，``latest_frame`` 才能把「窗口被盖住」和「链路卡住」
+        # 分开报——两者都表现为帧龄超限，但只有后者是故障。
+        self._last_obscured_at: float | None = None
         self._last_error: str | None = None
         # 单槽最新帧缓存。给 agent 看的图不走世界状态，也不进 120 Hz 调度线程：
         # 它只在采集 worker 自己的消费线程里按间隔编码一次，之后所有拉取都命中
@@ -3241,6 +3245,7 @@ class VisionRuntime:
             cached = self._frame_cache
             cached_at = self._frame_cache_at
             error = self._frame_cache_error
+            obscured_at = self._last_obscured_at
         if not capture["active"]:
             return {
                 "available": False,
@@ -3260,9 +3265,19 @@ class VisionRuntime:
             limit_ms = 3000.0
         if limit_ms and age_ms > limit_ms:
             # 过期的画面比没有画面更危险：agent 会拿它当现在。
+            #
+            # 但「为什么过期」决定了调用方该怎么办。遮挡时间晚于缓存时刻，说明
+            # 这一段时间里 ``_observe_obscured`` 一直在拒绝推理——缓存冻住是设计
+            # 意图，不是链路故障。报 ``window_obscured`` 才能让人去找压在 VRChat
+            # 上面的那个窗口，而不是去查采集链路。
+            stale_reason = (
+                "window_obscured"
+                if obscured_at is not None and obscured_at >= cached_at
+                else "frame_stale"
+            )
             return {
                 "available": False,
-                "reason": "frame_stale",
+                "reason": stale_reason,
                 "age_ms": round(age_ms, 1),
                 "capture_active": True,
             }
@@ -3684,6 +3699,7 @@ class VisionRuntime:
         """
         with self._lock:
             self._obscured_frames += 1
+            self._last_obscured_at = processing_now
             due = (
                 self._detect_interval_s <= 0.0
                 or self._last_detect_at is None
@@ -3793,6 +3809,13 @@ class VisionRuntime:
                         observation=detector_observation,
                         world=detector_world,
                     )
+                else:
+                    # 跳过检测不等于跳过预览。检测间隔比 frame_cache_interval_s
+                    # 长时（检测器慢、或配置把间隔调大），只在检测帧写缓存会让
+                    # 缓存帧龄被两个节流窗口叠加着推高，面板于是周期性报过期。
+                    # 这里写的是无配对像素：``_apply_overlay`` 会照实降级成
+                    # ``frame_detection_pair_unavailable``，绝不拿旧框叠新图。
+                    cache_written = self._cache_frame(frame, observation_now)
             else:
                 # 没有可用检测器时仍允许主 LLM 看原图，但 overlay 会明确报告未配对。
                 cache_written = self._cache_frame(frame, observation_now)

@@ -177,6 +177,33 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   // 降级链：每一步失败各记一条。只报 last_error 会把整条链压成最后一个运行时的
   // 错误——OpenVINO 缺 wheel、ORT 为什么没接住，全被 OpenCV 的报错盖掉。
   const detectorFallbacks: string[] = Array.isArray(detector.device_fallbacks) ? detector.device_fallbacks : []
+  // 推理慢有两种成因，给出的建议完全相反：跑在 CPU 上是「换加速器」，跑在 GPU 上
+  // 还慢是「查输入尺寸/别的进程抢卡」。所以先判定算力在哪，再决定提示词。
+  //
+  // 权威字段是 session_providers[0]——ORT 的 provider 列表按优先级排序，真正生效
+  // 的排首位。它比 runtime 名字可信：runtime 叫 onnxruntime_cuda 只说明「试过
+  // CUDA」，CUDA 没激活时后端会抛错回落，但那条降级链要靠 device_fallbacks 才看得
+  // 全。OpenVINO 走另一套命名（resolved_device 形如 GPU/CPU/AUTO 展开后的结果）。
+  const onnxSessionProviders: string[] = Array.isArray(detector.onnxruntime?.session_providers)
+    ? detector.onnxruntime.session_providers : []
+  const activeProvider = onnxSessionProviders[0] || null
+  const resolvedDevice = String(detector.resolved_device || detector.device || "")
+  // opencv_dnn / opencv_hog 没有加速器概念，一律算 CPU；HOG 还是降级路径。
+  const runtimeName = String(detector.runtime || "")
+  // OpenVINO 的 AUTO 通常已被后端展开成具体设备，但注入 core（测试替身、自带运行时
+  // 的调用方）拿不到 available_devices 时会把 AUTO 原样传下去。那种情况下「跑在哪」
+  // 是未知的，不能当成加速器——否则会给出「算力已经用上了」这种错误结论。
+  const deviceIsAccelerator =
+    resolvedDevice !== "" && !/^(CPU|AUTO)\b/i.test(resolvedDevice)
+  const onAccelerator = activeProvider
+    ? activeProvider !== "CPUExecutionProvider"
+    : runtimeName === "openvino"
+      ? deviceIsAccelerator
+      : false
+  // 阈值取 detector_interval_ms 的 CPU 档（500 ms）：单帧推理超过检测间隔，意味着
+  // 检测线程已经追不上自己的节拍，再往上堆就是排队。
+  const inferenceMs = Number(detector.last_inference_ms)
+  const inferenceSlow = Number.isFinite(inferenceMs) && inferenceMs > 500
   const overlayReasons: Record<string, string> = {
     frame_detection_pair_unavailable: "这一帧没有配对的检测结果（检测器未就绪或该帧被限流跳过）",
   }
@@ -187,8 +214,14 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
     capture_stopped: "画面采集已停止",
     no_frame_cached: "等待第一帧画面",
     frame_stale: "画面已过期，等待新画面",
+    window_obscured: "VRChat 窗口被其他窗口遮挡或已最小化，已暂停观测",
     preview_failed: "画面读取失败，请刷新重试",
   }
+  // 面板按 30 s 上限取图，所以旧图会照样显示——判「旧」交给这里，让人看见的是
+  // 「这张图 4.2 秒之前」而不是一块空白。3000 ms 与 agent 侧的硬门槛对齐：越过
+  // 它就说明这张图已经不够 agent 用了，值得去查链路。
+  const previewAgeMs = Number(visionFrame.age_ms)
+  const previewStale = Boolean(previewSrc) && Number.isFinite(previewAgeMs) && previewAgeMs > 3000
   const navigation = autonomy.navigation || {}
   // 卡墙判据的两个数据源：OSC 快照里的实时读数，以及导航器 tick 里的最后一次
   // 采样。后者在解除授权后就冻住了，所以优先用前者。
@@ -368,6 +401,11 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             <Alert tone="warning">{refreshFailed ? "面板刷新失败，等待连接恢复" : previewReasons[visionFrame.reason] || "暂无可用识别画面，请确认视觉采集已启动"}</Alert>
           )}
           {previewSrc ? <Text>画面尺寸 {visionFrame.width} × {visionFrame.height} · 获取时帧龄 {fixed(visionFrame.age_ms, 0)} ms · 检测框 {overlay.drawn ? overlay.boxes_drawn ?? 0 : "未就绪"}</Text> : null}
+          {previewStale ? (
+            <Alert tone="warning">
+              这张画面已有 {fixed(previewAgeMs / 1000, 1)} 秒，不是当前状态。常见原因：VRChat 窗口被遮挡（遮挡期间不推理也不刷新缓存），或采集链路被拖慢。
+            </Alert>
+          ) : null}
           {previewSrc && !overlay.drawn ? (
             <Alert tone="warning">
               检测框尚未就绪，当前仅显示原始画面。原因：{overlayReasons[overlay.reason] || overlay.reason || "未知"}
@@ -384,7 +422,8 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
           <KeyValue items={[
             { key: "detector", label: "检测器", value: detector.available ? `可用${detector.degraded ? "（降级）" : ""}` : `不可用（${detector.reason || detector.last_error || "未报告"}）` },
             // 配的设备和跑起来的设备经常不是一回事，AUTO 掉到 CPU 是 22 倍延迟差。
-            { key: "runtime", label: "推理运行时", value: `${detector.runtime || "—"} · ${detector.resolved_device || detector.device || "—"}` },
+            { key: "runtime", label: "推理运行时", value: `${detector.runtime || "—"} · ${detector.resolved_device || detector.device || "—"}${activeProvider ? ` · ${activeProvider}` : ""}` },
+            { key: "inference", label: "单帧推理", value: Number.isFinite(inferenceMs) ? `${fixed(inferenceMs, 0)} ms · ${onAccelerator ? "加速器" : "CPU"}` : "尚无数据" },
             { key: "model", label: "模型路径", value: detector.model_path || (detector.model_path_configured ? "已配置" : "未配置") },
             { key: "detectAge", label: "最近一次检测", value: visionRuntime.detect_throttle?.age_ms == null ? "从未" : `${fixed(visionRuntime.detect_throttle.age_ms, 0)} ms 前` },
             { key: "pair", label: "帧/检测配对", value: visionRuntime.frame_cache?.paired ? "已配对" : "未配对" },
@@ -392,6 +431,21 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             { key: "captureBackend", label: "采集后端", value: captureBackend ? (captureBackend === "winrt" ? "winrt（WGC，会显示黄色捕获边框）" : String(captureBackend)) : `${captureSource.name || "—"}` },
             { key: "captureFrames", label: "采集帧数", value: `${captureSource.frames ?? 0}（空帧 ${captureSource.empty_grabs ?? 0}）` },
           ]} />
+          {inferenceSlow ? (
+            <Alert tone="warning">
+              单帧推理 {fixed(inferenceMs, 0)} ms，已超过检测间隔，检测线程追不上自己的节拍。
+              {onAccelerator
+                ? `当前跑在加速器上（${activeProvider || resolvedDevice || "未报告"}），`
+                  + "算力已经用上了，请查输入尺寸 "
+                  + `${detector.input_size?.[0] ?? "?"}×${detector.input_size?.[1] ?? "?"}`
+                  + " 是否过大，以及是否有别的进程在抢同一块卡。"
+                : "当前跑在 CPU 上"
+                  + (activeProvider ? `（${activeProvider}）` : runtimeName ? `（${runtimeName}）` : "")
+                  + "——这是最可能的原因。请确认 onnxruntime-gpu / OpenVINO 已安装且被选中；"
+                  + (detectorFallbacks.length ? "下方「检测器降级链」写明了它为什么没走加速器。" : "若从未探测过加速器，请检查配置里的 device 设置。")}
+              {" "}CPU 上还可以调大 plugin.toml 的 detector_interval_ms 来换取稳定，代价是检测变稀。
+            </Alert>
+          ) : null}
           {captureCandidateErrors.length ? (
             <Alert tone="info">
               采集候选回退：{captureCandidateErrors.map(([spec, err]) => `${spec} → ${String(err)}`).join("；")}

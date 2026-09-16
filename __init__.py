@@ -1782,6 +1782,26 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "receiver_listening": False,
             "last_error": "OSC bridge is not initialized",
         }
+        # 面板直接读取带框缓存，不经过 LLM 发图入口，也不触发新的推理。
+        #
+        # 取图必须排在 catalog()/perception() 之前。BackendClient.request 用一把全局
+        # RLock 串行化所有后端调用，所以这条链上谁排在前面谁拿到的数据就新；取图
+        # 排在目录扫描后面时，帧龄里会白算上扫描那一整秒。
+        #
+        # max_age_ms 取 BackendService.vision_frame 的钳位上限 30000 而不是 3000：
+        # 这条路径是给人看的，面板会把帧龄直接印在图下面，一张标着岁数的旧图远比
+        # 一句「画面已过期」有用。硬门槛留给 agent（vrc_vision_frame 与
+        # _fetch_frame_image_part 仍是 3s）——「过期的画面比没有画面更危险」说的是
+        # 模型会把它当成现在，人不会。
+        vision_frame = {"available": False, "reason": "backend_unavailable"}
+        if self._vision:
+            try:
+                vision_frame = await asyncio.to_thread(
+                    self._vision.frame, max_age_ms=30000, overlay=True
+                )
+            except Exception:
+                # 预览失败不能阻断急停等控制按钮的状态刷新。
+                vision_frame = {"available": False, "reason": "preview_failed"}
         # Hosted UI 每秒刷新一次上下文。目录扫描只统计文件并复用缓存元数据，
         # 不能在插件事件循环中解析大型 .nya 内容。
         backend_client = self._backend_client
@@ -1796,16 +1816,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         with self._ui_event_lock:
             events = list(self._ui_events)
-        # 面板直接读取带框缓存，不经过 LLM 发图入口，也不触发新的推理。
-        vision_frame = {"available": False, "reason": "backend_unavailable"}
-        if self._vision:
-            try:
-                vision_frame = await asyncio.to_thread(
-                    self._vision.frame, max_age_ms=3000, overlay=True
-                )
-            except Exception:
-                # 预览失败不能阻断急停等控制按钮的状态刷新。
-                vision_frame = {"available": False, "reason": "preview_failed"}
         # 面板要同时读世界快照和采集 worker 状态：只有 worker 里带 FrameSource 的
         # 后端选择与候选错误（dxgi/winrt），那是「为什么没有检测框」和「为什么屏幕
         # 上有黄框」在插件外唯一能看到的证据。/perception 一次返回两者，不多加一轮
