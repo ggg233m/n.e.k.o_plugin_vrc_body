@@ -24,40 +24,18 @@ from .motion import GESTURE_NAMES
 from .osc import normalize_parameter_value, validate_parameter_name
 from .world_salience import classify as classify_world_delta, delta_signature, describe_entities
 from .tool_defs import (
-    BODY_ARM_POSE,
-    BODY_AVATAR_PARAMETER,
     BODY_AWARENESS,
-    BODY_CANCEL,
     BODY_CHATBOX,
-    BODY_DISABLE,
-    BODY_ENABLE,
     BODY_EXPRESS,
     BODY_GESTURE,
-    BODY_HAND,
-    BODY_LIST_CLIPS,
-    BODY_LOCOMOTION,
-    BODY_MOVE_HAND,
-    BODY_PLAY_CLIP,
-    BODY_REACH_AND_GRAB,
-    BODY_RESET,
-    BODY_SEQUENCE,
-    BODY_STOP,
     BODY_STOP_MOVEMENT,
     BODY_TURN,
-    BODY_VRCHAT_INPUT,
     VRC_AUTONOMY_GOAL,
-    VRC_AUTONOMY_STATUS,
     VRC_AUTONOMY_STOP,
     VRC_WANDER_ROUTE,
     VRC_WANDER_STEP,
-    VRC_JUMP,
-    VRC_MENU_NAVIGATE,
-    VRC_SCAN_SURROUNDINGS,
     VRC_SEMANTIC_COMMIT,
     VRC_VISION_FRAME,
-    VRC_VISION_START,
-    VRC_VISION_STATUS,
-    VRC_VISION_STOP,
     WORLD_OBSERVE,
 )
 
@@ -103,13 +81,36 @@ def _boolean(name: str, value: Any) -> bool:
     return value
 
 
-_DEBUG_COMMAND_NAMES = (
+# 能力开关：只改变「她能做什么」，不产生动作本身。这些命令走 panel_command
+# （metadata.agent_auto=False），宿主的 _agent_visible_plugin_entries 会把该入口
+# 从 Agent 自动路由里摘掉，_find_plugin_entry 也按同一张表校验，所以是真拦截而
+# 不是提示级约束。
+#
+# 必须分开的直接原因：debug_command 是「N.E.K.O Agent 与 Hosted UI 共用」的入口，
+# getattr 派发且拿不到调用方身份，而 Agent 侧只传裸 plugin_args。把 vrc_autonomy_arm
+# 留在共用表里，等于 Agent 可以自己给自己授权自主移动，plugin.toml 的
+# manual_arm = true 和「请用户去调试台启用」那条规则就都被绕过了。
+#
+# body_stop 故意留在 debug_command：急停是降权，Agent 能踩刹车是好事；
+# 而解除急停的 body_reset 在这里，于是「锁」由双方都能做、「解锁」只有用户能做。
+_PANEL_SWITCH_NAMES = (
     "body_enable",
     "body_disable",
-    "body_stop",
     "body_reset",
+    "vrc_autonomy_arm",
+    "vrc_autonomy_disarm",
+    "vrc_vision_start",
+    "vrc_vision_stop",
+)
+
+# 动作与读取：Agent 和面板共用。对应的 *_status 读取刻意留在这里——摘掉它，
+# Agent 就无从知道能力是关着的，也就没法如实提示用户去面板打开。
+_DEBUG_COMMAND_NAMES = (
+    "body_stop",
     "body_status",
     "body_cancel",
+    "body_sequence",
+    "body_list_clips",
     "body_arm_pose",
     "body_move_hand",
     "body_hand",
@@ -131,11 +132,7 @@ _DEBUG_COMMAND_NAMES = (
     "vrc_wander_step",
     "vrc_wander_route",
     "vrc_autonomy_stop",
-    "vrc_autonomy_arm",
-    "vrc_autonomy_disarm",
     "vrc_vision_status",
-    "vrc_vision_start",
-    "vrc_vision_stop",
     "vrc_vision_frame",
     "vrc_semantic_commit",
     "vrc_scan_surroundings",
@@ -153,6 +150,15 @@ _WAKE_FRAME_MAX_AGE_MS = 2000
 # 宿主会先尝试重压过大的图，压不下去才丢。这里先卡一道，免得一帧异常大的画面
 # 占满消息平面——唤醒的正文比配图重要得多。唤醒与主动拉图共用这个上限。
 _FRAME_MAX_BASE64_CHARS = 256 * 1024
+
+# main_server 的固定端口；LLM 工具注册表就挂在它下面的 /api/tools。插件进程里
+# 没有现成的 HTTP 客户端，看门狗只做一次只读探测，为此建连接池不值得。
+_MAIN_SERVER_PORT = 48911
+# 看门狗的探测间隔。宿主重启到注册恢复之间模型都看不到工具，所以不能太长；
+# 一次只读 loopback 请求在 main_server 不在时只吃连接拒绝，所以也不用太短。
+_LLM_TOOL_WATCH_INTERVAL_S = 30.0
+# 单次探测的超时。main_server 在监听但卡住时，不能让看门狗线程跟着卡。
+_LLM_TOOL_WATCH_TIMEOUT_S = 3.0
 
 
 @neko_plugin
@@ -199,6 +205,10 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         self._frame_budget = FrameBudget(self._body_config.vision.frame_max_per_minute)
         self._ui_event_lock = threading.Lock()
         self._ui_events: deque[dict[str, Any]] = deque(maxlen=40)
+        # 宿主注册表丢失后重发 LLM 工具注册的后台看门狗；与 world bridge 同理，
+        # 它比 startup 那次 asyncio.run 活得久，必须有自己的线程。
+        self._llm_tool_watch_thread: threading.Thread | None = None
+        self._llm_tool_watch_stop = threading.Event()
 
     async def _load_config(self) -> PluginConfig:
         self._raw_config = {}
@@ -302,10 +312,14 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 driver_log_status.get("listen_address", f"{self._body_config.driver_log.multicast_group}:{self._body_config.driver_log.listen_port}"),
                 driver_log_status.get("receiver_listening", False),
             )
+        # main_server 可能在插件之前启动、之后重启，重启后宿主内存里的注册表就
+        # 空了。startup 时重发一次，覆盖"插件比 main_server 长寿"这条常见路径。
+        self._start_llm_tool_reassert_loop()
         return Ok({"status": "ready", "output_enabled": False})
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_: Any):
+        await self._stop_llm_tool_reassert_loop()
         await self._stop_world_context_bridge()
         self._unregister_agent_entries()
         if self._backend_client:
@@ -1297,6 +1311,140 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         except Exception as exc:
             self.logger.warning("Could not inject AnyaDance body awareness instructions: %s", exc)
 
+    def _reassert_llm_tools(self) -> int:
+        """重新向宿主广播已注册的 LLM 工具，返回广播条数。
+
+        宿主的 ``ToolRegistry`` 是 ``LLMSessionManager`` 的内存属性，main_server
+        重启或首启竞态（工具先于 main_server 就绪注册）都会让工具从模型上下文里
+        消失，而 ``@llm_tool`` 只在 ``NekoPluginBase.__init__`` 注册一次，插件不
+        主动重发就永远不会恢复。
+
+        SDK 没有提供"重新注册"的公开 API：``register_llm_tool`` 会因重名抛
+        ``EntryConflictError``。所以这里只重发 ``LLM_TOOL_REGISTER`` IPC——本地
+        动态入口和 ``_llm_tools`` 都还在，重发是幂等的，host 侧对同一
+        ``(plugin_id, name)`` 重复注册会走 ``replace=True`` 覆盖。
+        """
+        tools = list(getattr(self, "_llm_tools", {}).values())
+        if not tools:
+            return 0
+        sent = 0
+        for meta in tools:
+            try:
+                self._notify_host_comm(meta.to_ipc_payload(plugin_id=self.plugin_id))
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not re-register LLM tool %s: %s", getattr(meta, "name", "?"), exc
+                )
+                continue
+            sent += 1
+        return sent
+
+    def _start_llm_tool_reassert_loop(self) -> None:
+        """起一个后台线程周期检查宿主是否还认得本插件的 LLM 工具。
+
+        ``_reassert_llm_tools`` 每次都盲发一遍也能用，但那样会在宿主正常时持续
+        刷 IPC 和注册日志。这里改成只在**探测到宿主确实丢了注册**时重发，代价是
+        每隔 ``_LLM_TOOL_WATCH_INTERVAL_S`` 一次只读的 ``GET /api/tools``。
+
+        探测使用标准库 ``urllib``：它是一次短循环的只读请求，为它引入 httpx
+        依赖不值得，而插件进程里没有现成的 HTTP 客户端。
+        """
+        if self._llm_tool_watch_thread is not None:
+            return
+        try:
+            self._llm_tool_watch_once(initial=True)
+        except Exception as exc:
+            self.logger.warning("Initial LLM tool re-registration failed: %s", exc)
+        self._llm_tool_watch_stop.clear()
+        thread = threading.Thread(
+            target=self._llm_tool_watch_loop,
+            name="anyadance.llm_tool_watch",
+            daemon=True,
+        )
+        self._llm_tool_watch_thread = thread
+        thread.start()
+
+    async def _stop_llm_tool_reassert_loop(self) -> None:
+        thread = self._llm_tool_watch_thread
+        self._llm_tool_watch_thread = None
+        self._llm_tool_watch_stop.set()
+        if thread is not None:
+            # 线程只做带超时的只读请求，join 有界，不会拖住 shutdown。
+            await asyncio.to_thread(thread.join, 2.0)
+
+    def _host_tool_registry_names(self) -> set[str] | None:
+        """读取宿主 registry 里的工具名；探测失败返回 ``None``。
+
+        ``None`` 与空集合语义不同：main_server 没起来（或本轮请求失败）时无从判断
+        用户是否重启过它，只有拿到 ``ok=true`` 的响应才认为探测有效。
+        """
+        from urllib.request import urlopen
+
+        url = f"http://127.0.0.1:{_MAIN_SERVER_PORT}/api/tools"
+        with urlopen(url, timeout=_LLM_TOOL_WATCH_TIMEOUT_S) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, Mapping) or not payload.get("ok"):
+            return None
+        by_role = payload.get("tools_by_role")
+        if not isinstance(by_role, Mapping):
+            return None
+        names: set[str] = set()
+        for tools in by_role.values():
+            if not isinstance(tools, list):
+                continue
+            for tool in tools:
+                if isinstance(tool, Mapping):
+                    source = str(tool.get("source") or "")
+                    if source == f"plugin:{self.plugin_id}":
+                        names.add(str(tool.get("name") or ""))
+        return names
+
+    def _llm_tool_watch_once(self, *, initial: bool = False) -> int:
+        """探测一次；只在宿主缺少本插件工具时重发。返回重发条数。
+
+        main_server 全程不在时应保持静默：那是重启窗口或未启动，既然拿不到有效
+        探测结果就无从判断注册是否丢了。但启动时的首次探测例外——用户正是从
+        "工具全部调不动"才来看日志的，让这一次把 main_server 不可达说出来。
+        """
+        expected = {
+            getattr(meta, "name", "")
+            for meta in getattr(self, "_llm_tools", {}).values()
+        }
+        expected.discard("")
+        if not expected:
+            return 0
+        try:
+            actual = self._host_tool_registry_names()
+        except Exception as exc:
+            if initial:
+                self.logger.warning(
+                    "Could not reach host tool registry at startup; LLM tools may be "
+                    "unavailable until it responds: %s",
+                    exc,
+                )
+            else:
+                self.logger.debug("LLM tool presence probe failed: %s", exc)
+            return 0
+        if actual is None or expected.issubset(actual):
+            return 0
+        missing = sorted(expected - actual)
+        count = self._reassert_llm_tools()
+        self.logger.warning(
+            "Host lost %d LLM tool registration(s) (%s); re-broadcast %d",
+            len(missing),
+            ", ".join(missing[:5]) + ("..." if len(missing) > 5 else ""),
+            count,
+        )
+        return count
+
+    def _llm_tool_watch_loop(self) -> None:
+        while not self._llm_tool_watch_stop.wait(_LLM_TOOL_WATCH_INTERVAL_S):
+            try:
+                self._llm_tool_watch_once()
+            except Exception as exc:
+                self.logger.warning("LLM tool watch iteration failed: %s", exc)
+        self.logger.info("LLM tool watch loop stopped")
+
 
     def _submit(
         self,
@@ -1638,46 +1786,39 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "ui_events": events,
         }
 
-    @ui.action(
-        id="debug_command",
-        label="执行调试命令",
-        tone="primary",
-        group="debug",
-        order=10,
-        refresh_context=False,
-    )
-    @plugin_entry(
-        id="debug_command",
-        name="执行 VRChat 身体、观察与导航命令",
-        description=(
-            "N.E.K.O Agent 与 Hosted UI 共用的有界 VRChat 命令入口。"
-            "除身体姿态和 OSC 外，还能观察当前画面、寻找 NPC/玩家，并在用户手动授权后"
-            "走向或跟随唯一的语义确认目标；连续感知和移动由本地后端执行。"
-            "未授权时必须把 manual_arm_required 如实告诉用户，不能声称已经移动。"
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "enum": list(_DEBUG_COMMAND_NAMES)},
-                "arguments": {"type": "object", "default": {}},
-            },
-            "required": ["command"],
-        },
-    )
-    async def debug_command(self, command: Any = "", arguments: Any = None, **_: Any):
+    async def _run_bounded_command(
+        self,
+        command: Any,
+        arguments: Any,
+        allowed: tuple,
+    ):
+        """debug_command 与 panel_command 共用的有界派发。
+
+        两个入口只有 ``allowed`` 白名单不同——这正是「Agent 能做什么」和「只有
+        用户能做什么」的唯一分界线，所以校验必须在这里按传入的白名单做，不能
+        退回去查全集。
+        """
         normalized = str(command or "").strip()
         params = dict(arguments) if isinstance(arguments, Mapping) else {}
-        if normalized not in _DEBUG_COMMAND_NAMES:
+        if normalized not in allowed:
             state = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
                 "state": "shutdown",
                 "safety_state": "fault",
             }
+            # 命令存在但走错入口时说清楚是哪一种，否则 Agent 只会看到
+            # "unsupported" 然后反复重试同一条它永远调不到的开关。
+            reason = (
+                "capability switches are panel-only; ask the user to toggle it in the "
+                "AnyaDance debug panel"
+                if normalized in _PANEL_SWITCH_NAMES
+                else "unsupported debug command"
+            )
             result = Ok({
                 "accepted": False,
                 "action_id": None,
                 "state": state["state"],
                 "normalized_params": {},
-                "reason": "unsupported debug command",
+                "reason": reason,
                 "safety_state": state["safety_state"],
             })
             self._ui_event(normalized or "unknown", params, result)
@@ -1705,6 +1846,65 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             })
         self._ui_event(normalized, params, result)
         return self._execution_result(result)
+
+    @ui.action(
+        id="panel_command",
+        label="切换能力开关",
+        tone="primary",
+        group="debug",
+        order=5,
+        refresh_context=False,
+    )
+    @plugin_entry(
+        id="panel_command",
+        name="AnyaDance 能力开关（仅调试台）",
+        description=(
+            "只有用户能操作的能力开关：身体输出启停与复位、自主移动授权、视觉采集启停。"
+            "metadata.agent_auto=False 使本入口对 Agent 自动路由不可见且不可分派——"
+            "这是 plugin.toml 的 manual_arm=true 在插件侧的落点，不要绕开它。"
+        ),
+        metadata={"agent_auto": False},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "enum": list(_PANEL_SWITCH_NAMES)},
+                "arguments": {"type": "object", "default": {}},
+            },
+            "required": ["command"],
+        },
+    )
+    async def panel_command(self, command: Any = "", arguments: Any = None, **_: Any):
+        return await self._run_bounded_command(command, arguments, _PANEL_SWITCH_NAMES)
+
+    @ui.action(
+        id="debug_command",
+        label="执行调试命令",
+        tone="primary",
+        group="debug",
+        order=10,
+        refresh_context=False,
+    )
+    @plugin_entry(
+        id="debug_command",
+        name="执行 VRChat 身体、观察与导航命令",
+        description=(
+            "N.E.K.O Agent 与 Hosted UI 共用的有界 VRChat 命令入口。"
+            "除身体姿态和 OSC 外，还能观察当前画面、寻找 NPC/玩家，并在用户手动授权后"
+            "走向或跟随唯一的语义确认目标；连续感知和移动由本地后端执行。"
+            "未授权时必须把 manual_arm_required 如实告诉用户，不能声称已经移动，"
+            "也不能试图自己授权——授权开关只在 AnyaDance 调试台里。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "enum": list(_DEBUG_COMMAND_NAMES)},
+                "arguments": {"type": "object", "default": {}},
+            },
+            "required": ["command"],
+        },
+    )
+    async def debug_command(self, command: Any = "", arguments: Any = None, **_: Any):
+        return await self._run_bounded_command(command, arguments, _DEBUG_COMMAND_NAMES)
 
     @plugin_entry(
         id="observe_vrchat_world",
@@ -1873,7 +2073,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "visual_inspection_complete", "inspection_limit",
         ],
     )
-    @llm_tool(**VRC_SCAN_SURROUNDINGS)
     async def vrc_scan_surroundings(self, *, direction: Any = "right", **_: Any):
         normalized_direction = _enum("direction", direction, ("left", "right"))
         if not self._scheduler:
@@ -1934,18 +2133,15 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             ),
         })
 
-    @llm_tool(**BODY_ENABLE)
     async def body_enable(self, **_: Any):
         return Ok(await self._submit_async("enable"))
 
-    @llm_tool(**BODY_DISABLE)
     async def body_disable(self, **_: Any):
         result = await self._submit_async("disable", {"duration_ms": self._body_config.default_duration_ms})
         if result.get("accepted"):
             await self._release_osc_inputs()
         return Ok(result)
 
-    @llm_tool(**BODY_ARM_POSE)
     async def body_arm_pose(
         self,
         *,
@@ -1984,7 +2180,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             return Ok(await self._invalid(str(exc)))
         return Ok(await self._submit_async("arm_pose", params))
 
-    @llm_tool(**BODY_MOVE_HAND)
     async def body_move_hand(
         self,
         *,
@@ -2017,7 +2212,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             return Ok(await self._invalid(str(exc)))
         return Ok(await self._submit_async("move_hand", params))
 
-    @llm_tool(**BODY_HAND)
     async def body_hand(
         self,
         *,
@@ -2038,7 +2232,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             return Ok(await self._invalid(str(exc)))
         return Ok(await self._submit_async("hand", params))
 
-    @llm_tool(**BODY_REACH_AND_GRAB)
     async def body_reach_and_grab(
         self,
         *,
@@ -2181,7 +2374,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "duration_ms": self._duration(raw.get("duration_ms"), self._body_config.default_duration_ms),
         }
 
-    @llm_tool(**BODY_SEQUENCE)
     async def body_sequence(self, *, steps: Any = None, loop_count: Any = 1, **_: Any):
         try:
             if not isinstance(steps, list) or not 1 <= len(steps) <= 16:
@@ -2195,7 +2387,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             return Ok(await self._invalid(str(exc)))
         return Ok(await self._submit_async("sequence", {"steps": normalized_steps, "loop_count": loops}))
 
-    @llm_tool(**BODY_CANCEL)
     async def body_cancel(self, *, action_id: Any = "", **_: Any):
         normalized = str(action_id or "").strip()
         if len(normalized) > 128:
@@ -2205,13 +2396,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             await self._release_osc_inputs()
         return Ok(result)
 
-    @llm_tool(**BODY_LIST_CLIPS)
     async def body_list_clips(self, **_: Any):
         if not self._backend_client:
             return Ok({"clips": [], "invalid_clips": [], "reason": "backend is not initialized"})
         return Ok(await asyncio.to_thread(self._backend_client.list_clips))
 
-    @llm_tool(**BODY_PLAY_CLIP)
     async def body_play_clip(
         self,
         *,
@@ -2250,7 +2439,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         return Ok(result)
 
-    @llm_tool(**BODY_AVATAR_PARAMETER)
     async def body_avatar_parameter(self, *, name: Any = "", value: Any = None, **_: Any):
         try:
             parameter = validate_parameter_name(name)
@@ -2279,7 +2467,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             reason=reason,
         ))
 
-    @llm_tool(**BODY_VRCHAT_INPUT)
     async def body_vrchat_input(
         self,
         *,
@@ -2325,13 +2512,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         result["object_held"] = "unknown"
         return Ok(result)
 
-    @llm_tool(**BODY_STOP)
     async def body_stop(self, **_: Any):
         result = await self._submit_async("stop")
         await self._release_osc_inputs()
         return Ok(result)
 
-    @llm_tool(**BODY_RESET)
     async def body_reset(self, *, duration_ms: Any = None, **_: Any):
         try:
             duration = self._duration(duration_ms, self._body_config.default_duration_ms)
@@ -2466,7 +2651,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         }
         return Ok(result)
 
-    @llm_tool(**VRC_VISION_STATUS)
     async def vrc_vision_status(self, **_: Any):
         """读取采集器/检测器状态，不改变生命周期状态。"""
         if self._vision is None:
@@ -2477,7 +2661,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             })
         return Ok(await asyncio.to_thread(self._vision.perception))
 
-    @llm_tool(**VRC_VISION_START)
     async def vrc_vision_start(self, **_: Any):
         """只启动视觉采集；身体输出仍由独立门控控制。"""
         if self._vision is None:
@@ -2487,7 +2670,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._start_world_context_bridge()
         return Ok(result)
 
-    @llm_tool(**VRC_VISION_STOP)
     async def vrc_vision_stop(self, *, reason: Any = "manual_stop", **_: Any):
         """停止视觉采集并取消主动世界更新。"""
         if self._vision is None:
@@ -2661,7 +2843,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         return Ok(result)
 
-    @llm_tool(**BODY_LOCOMOTION)
     async def body_locomotion(
         self,
         *,
@@ -2859,7 +3040,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             reason=reason,
         ))
 
-    @llm_tool(**VRC_MENU_NAVIGATE)
     async def vrc_menu_navigate(self, *, x: Any = 0.0, y: Any = 0.0, duration_ms: Any = 250, **_: Any):
         return await self.vrc_controller_input(
             side="right",
@@ -2869,7 +3049,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             duration_ms=duration_ms,
         )
 
-    @llm_tool(**VRC_JUMP)
     async def vrc_jump(self, *, hold_ms: Any = 100, **_: Any):
         try:
             normalized = {"hold_ms": _integer("hold_ms", hold_ms, minimum=20, maximum=1000)}
@@ -2895,7 +3074,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             reason=reason,
         ))
 
-    @llm_tool(**VRC_AUTONOMY_STATUS)
     async def vrc_autonomy_status(self, **_: Any):
         if not self._backend_client:
             return Ok({"state": "disarmed", "armed": False, "reason": "backend is not initialized"})

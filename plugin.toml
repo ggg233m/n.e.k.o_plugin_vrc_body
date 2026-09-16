@@ -3,8 +3,36 @@ id = "neko_anyadance_body"
 name = "N.E.K.O AnyaDance Body"
 description = "让 N.E.K.O 感知当前 VRChat 画面，以稳定实体 ID 搜索、接近或跟随 NPC/玩家，并通过 AnyaDance 与 OSC 控制虚拟身体"
 short_description = "VRChat 视觉感知、本地导航与 AnyaDance 身体控制"
-keywords = ["anyadance", "steamvr", "vrchat", "vision", "navigation", "npc", "follow", "osc", "body", "视觉", "感知", "导航", "移动", "跟随"]
-version = "0.13.23"
+# Agent 廉价预门（brain/task_executor.py::_deterministic_action_signal）唯一的零 LLM
+# 放行通道，同时给二阶段入口选择打上 [KEYWORD MATCH] 优先标记。宿主按正则匹配
+# （re.search + IGNORECASE，非法正则回退子串），所以这里写的是说法而不是名词——
+# 只列 "导航"/"跟随" 这类术语时，用户真实说的 "走过去"/"跟着我" 一条都不会命中，
+# external_intent < 0.2 的闲聊语气指令会被预门直接刹掉。
+#
+# 注意：带 keywords 的插件只有命中才放行（没有 keywords 的插件才无条件 fail-open），
+# 因此这张表必须覆盖全，漏写比不写更容易被刹住。覆盖范围对齐 instructions.py 里
+# 列举的真实说法：走/转/转一圈/靠近/跟随/离开/过去看看/随便走走。
+keywords = [
+  # 移动与导航
+  "走(过去|近|向|走|吧|一下)|过去(看看|瞧瞧)?|往(前|后|左|右|这|那)",
+  "靠近|接近|凑(过去|近)|到.{0,6}(那里|这里|旁边|面前|跟前)(去)?",
+  "跟(着|上|随)|别跟丢|跟紧",
+  "离开|走开|退(后|开|一点)|后退",
+  "逛逛|转转|随便走|溜达|闲逛|探索|到处(看看|走走)",
+  # 观察与感知
+  "看看(周围|四周|附近|那边|这边)|周围有(什么|谁|人)|四周",
+  "转(一圈|个圈|圈)|环顾|扫描|扫一圈",
+  "(现在|眼前|画面|屏幕)(里|中|上)?有(什么|谁)|看(得)?到(什么|谁)",
+  "在哪(里|儿|呢)?|哪个方向|找(一下|找)?(人|npc|玩家|他|她|它)",
+  # 身体与姿态
+  "转(身|过来|过去|向)|面(向|对)",
+  "停(下|住|一下)|别动|站住|不要动",
+  "你(现在)?(在)?(做什么|干嘛|干什么|什么姿势|什么动作)",
+  # 领域术语
+  "anyadance|steamvr|vrchat|osc|npc|avatar",
+  "视觉|感知|导航|移动|跟随|身体|姿势|手势|表情",
+]
+version = "0.13.24"
 type = "plugin"
 entry = "plugin.plugins.neko_anyadance_body:NekoAnyadanceBodyPlugin"
 
@@ -13,11 +41,23 @@ name = "N.E.K.O Community"
 
 # 宿主刷新安装信息时不导入 Python。显式保留面板入口，避免清空入口预览后
 # 将已注册的控制按钮误判为非插件入口；参数范围须与 Python 装饰器一致。
+#
+# 两个入口的区别只在 enum 和 metadata：panel_command 带 agent_auto=false，宿主的
+# _agent_visible_plugin_entries 会把它从 Agent 自动路由里摘掉，_find_plugin_entry
+# 也按同一张表校验，所以是真拦截而不是提示级约束。能力开关只放在那一侧，下面
+# 的 [autonomy] manual_arm = true 才有意义——否则 Agent 能经共用入口自行授权。
+[[plugin.entries]]
+id = "panel_command"
+name = "AnyaDance 能力开关（仅调试台）"
+description = "只有用户能操作的能力开关：身体输出、自主授权、视觉采集。Agent 不可分派。"
+metadata = { agent_auto = false }
+input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_reset", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_start", "vrc_vision_stop"] }, arguments = { type = "object", default = {} } } }
+
 [[plugin.entries]]
 id = "debug_command"
 name = "执行 VRChat 身体、观察与导航命令"
-description = "面板共用的有界调试入口；自主移动仍要求手动授权。"
-input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_stop", "body_reset", "body_status", "body_cancel", "body_arm_pose", "body_move_hand", "body_hand", "body_reach_and_grab", "body_gesture", "body_express", "body_play_clip", "body_avatar_parameter", "body_vrchat_input", "body_locomotion", "body_turn", "body_stop_movement", "body_chatbox", "vrc_controller_input", "vrc_menu_navigate", "vrc_jump", "vrc_autonomy_status", "vrc_autonomy_goal", "vrc_wander_step", "vrc_wander_route", "vrc_autonomy_stop", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_status", "vrc_vision_start", "vrc_vision_stop", "vrc_vision_frame", "vrc_semantic_commit", "vrc_scan_surroundings", "observe_vrchat_world", "navigate_vrchat_world"] }, arguments = { type = "object", default = {} } } }
+description = "面板共用的有界调试入口；自主移动仍要求用户在调试台手动授权。"
+input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_stop", "body_status", "body_cancel", "body_sequence", "body_list_clips", "body_arm_pose", "body_move_hand", "body_hand", "body_reach_and_grab", "body_gesture", "body_express", "body_play_clip", "body_avatar_parameter", "body_vrchat_input", "body_locomotion", "body_turn", "body_stop_movement", "body_chatbox", "vrc_controller_input", "vrc_menu_navigate", "vrc_jump", "vrc_autonomy_status", "vrc_autonomy_goal", "vrc_wander_step", "vrc_wander_route", "vrc_autonomy_stop", "vrc_vision_status", "vrc_vision_frame", "vrc_semantic_commit", "vrc_scan_surroundings", "observe_vrchat_world", "navigate_vrchat_world"] }, arguments = { type = "object", default = {} } } }
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"

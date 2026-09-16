@@ -188,6 +188,9 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const clips = Array.isArray(state.clips?.clips) ? state.clips?.clips || [] : []
   const invalidClips = Array.isArray(state.clips?.invalid_clips) ? state.clips?.invalid_clips || [] : []
   const debugAction = (props.actions || []).find((item) => item.id === "debug_command") as HostedAction | undefined
+  // 能力开关单独走 panel_command（metadata.agent_auto=false）。分成两个 action 是
+  // 为了让「只有用户能开关」在宿主路由层成立，而不是靠提示词约束 Agent。
+  const panelAction = (props.actions || []).find((item) => item.id === "panel_command") as HostedAction | undefined
   const toast = useToast()
 
   const [autoRefresh, setAutoRefresh] = props.useLocalState("autoRefresh", true)
@@ -258,14 +261,19 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
     setClientLog((previous) => [...previous.slice(-39), line])
   }
 
-  const run = async (command: string, args: Record<string, any> = {}) => {
-    if (!debugAction) {
-      toast.error("调试 action 尚未注册，请重启插件。")
+  const dispatch = async (
+    action: HostedAction | undefined,
+    missingHint: string,
+    command: string,
+    args: Record<string, any> = {},
+  ) => {
+    if (!action) {
+      toast.error(missingHint)
       return null
     }
     setBusy(true)
     try {
-      const response = await props.api.call(debugAction.id, { command, arguments: args })
+      const response = await props.api.call(action.id, { command, arguments: args })
       const serialized = JSON.stringify(response)
       appendLog(`${new Date().toLocaleTimeString()}  ${command}  ${serialized.slice(0, 1400)}`)
       await props.api.refresh()
@@ -280,6 +288,18 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
       setBusy(false)
     }
   }
+
+  const run = (command: string, args: Record<string, any> = {}) =>
+    dispatch(debugAction, "调试 action 尚未注册，请重启插件。", command, args)
+
+  const runSwitch = (command: string, args: Record<string, any> = {}) =>
+    dispatch(panelAction, "开关 action 尚未注册，请重启插件并确认版本不低于 0.13.24。", command, args)
+
+  // 开关滑块不保留本地乐观态：命令返回后 dispatch 里的 props.api.refresh() 会把
+  // 后端真实状态拉回来，checked 始终绑定那份真相。授权失败、采集起不来这类情况
+  // 下，滑块会自己弹回去，而不是停在一个假的「已开启」上。
+  const toggle = (onCommand: string, offCommand: string, onArgs: Record<string, any> = {}) =>
+    (next: boolean) => { void runSwitch(next ? onCommand : offCommand, next ? onArgs : {}) }
 
   const parameterPayload = () => {
     if (parameterType === "bool") return String(parameterValue).trim().toLowerCase() === "true"
@@ -332,7 +352,8 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         </ToolbarGroup>
       </Toolbar>
 
-      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.21。</Alert> : null}
+      {!debugAction ? <Alert tone="danger">调试 action 不可用。请确认插件已经重启并加载 0.13.24。</Alert> : null}
+      {debugAction && !panelAction ? <Alert tone="danger">开关 action（panel_command）不可用。能力开关需要 0.13.24 及以上版本，请重启插件。</Alert> : null}
       {osc.last_error ? <Alert tone="warning">OSC：{String(osc.last_error)}</Alert> : null}
       {idleRelay.last_error ? <Alert tone="warning">VMC 待机中转：{String(idleRelay.last_error)}</Alert> : null}
       {idleRelay.frame_error ? <Alert tone="warning">VMC 待机帧：{String(idleRelay.frame_error)}</Alert> : null}
@@ -341,6 +362,14 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
 
       <Card title="YOLO 识别画面">
         <Stack>
+          {/* 采集开关此前只能靠 Agent 或工具调 vrc_vision_start，面板上一个入口都没有，
+              于是下面「画面采集未在运行」那条提示指向了一个不存在的按钮。 */}
+          <Switch
+            checked={Boolean(visionWorker.running)}
+            disabled={busy || !panelAction}
+            label={visionWorker.running ? "视觉采集：运行中" : `视觉采集：已停止${visionWorker.reason ? `（${visionWorker.reason}）` : ""}`}
+            onChange={toggle("vrc_vision_start", "vrc_vision_stop")}
+          />
           <Text>{autoRefresh ? "随面板自动刷新（约每秒一次）" : "自动刷新已暂停，当前为历史快照"}</Text>
           {previewSrc ? (
             <ImagePreview src={previewSrc} alt="VRChat 画面与 YOLO 检测框" />
@@ -359,7 +388,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             </Alert>
           ) : null}
           {!visionRuntime.capture_active ? (
-            <Alert tone="warning">画面采集未在运行（{visionRuntime.capture_reason || "未报告"}），请点击「启动采集」。</Alert>
+            <Alert tone="warning">画面采集未在运行（{visionRuntime.capture_reason || "未报告"}），请打开本卡片顶部的「视觉采集」开关。</Alert>
           ) : null}
           <KeyValue items={[
             { key: "detector", label: "检测器", value: detector.available ? `可用${detector.degraded ? "（降级）" : ""}` : `不可用（${detector.reason || detector.last_error || "未报告"}）` },
@@ -401,10 +430,14 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         <Card title="运行控制">
           <Stack>
             <Text>{awareness.summary || "暂无身体自知摘要。"}</Text>
+            <Switch
+              checked={Boolean(body.output_enabled)}
+              disabled={busy || !panelAction}
+              label={body.output_enabled ? "身体输出：已启用" : "身体输出：已关闭"}
+              onChange={toggle("body_enable", "body_disable")}
+            />
             <ButtonGroup>
-              <Button tone="success" disabled={busy} onClick={() => run("body_enable")}>启用输出</Button>
-              <Button tone="warning" disabled={busy} onClick={() => run("body_disable")}>平滑禁用</Button>
-              <Button tone="info" disabled={busy} onClick={() => run("body_reset", { duration_ms: 600 })}>复位 T Pose</Button>
+              <Button tone="info" disabled={busy || !panelAction} onClick={() => runSwitch("body_reset", { duration_ms: 600 })}>复位 T Pose</Button>
               <Button tone="danger" disabled={busy} onClick={() => run("body_stop")}>立即急停</Button>
             </ButtonGroup>
             <KeyValue
@@ -476,9 +509,13 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
                     : `正常 ${stall.consecutive_ticks ?? 0}/${stall.threshold_ticks ?? 0}`,
               },
             ]} />
+            <Switch
+              checked={Boolean(autonomy.armed)}
+              disabled={busy || !panelAction}
+              label={autonomy.armed ? "自主移动授权：已授权（永久有效）" : "自主移动授权：未授权"}
+              onChange={toggle("vrc_autonomy_arm", "vrc_autonomy_disarm")}
+            />
             <ButtonGroup>
-              <Button tone="success" disabled={busy || autonomy.armed} onClick={() => run("vrc_autonomy_arm")}>手动授权（永久有效）</Button>
-              <Button tone="danger" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_disarm")}>解除授权并释放</Button>
               <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_stop")}>停止自主目标</Button>
             </ButtonGroup>
           </Stack>

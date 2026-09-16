@@ -460,8 +460,7 @@ VRC_WANDER_ROUTE = {
         "选择 left/forward/right 才真正开始移动。"
         "若你已经看过画面并确定了相对角度，可以直接用 vrc_autonomy_goal 提交 wander"
         "并填 constraints.turn_deg，不需要本工具。"
-        "两条路都走本地闭环：会读取速度回传、检测撞墙、有限绕行并记录死路方向；"
-        "绝不能改用 body_locomotion 这类开环遥控代替。"
+        "两条路都走本地闭环：会读取速度回传、检测撞墙、有限绕行并记录死路方向。"
         "需要用户先在插件面板手动启用自主控制。"
     ),
     "parameters": {
@@ -612,8 +611,8 @@ VRC_VISION_FRAME = {
     "description": (
         "取最近一帧 VRChat 画面来亲眼看看。适合确认检测器没有识别出的东西："
         "对方是谁、菜单开着没、界面上写了什么。看到的一切都是画面猜测，只能用来理解，"
-        "不能写进 world_state，也不能拿来满足 body_reach_and_grab 的 preconditions——"
-        "那条路必须用 world_observe 给出的 entity_id 与置信度。画面过期或采集已停止时"
+        "不能写进 world_state，也不能替代 world_observe 给出的 entity_id 与置信度去锁定"
+        "移动目标。画面过期或采集已停止时"
         "返回 available=false，此时按看不见处理，不要沿用上一次看到的内容。overlay=true"
         "时图中 T1/T2 与结果 overlay.candidates 一一对应；选择后把短 target_ref 和同次"
         "frame_revision 交给 vrc_autonomy_goal，稳定 ID 由后端解析。"
@@ -675,7 +674,7 @@ BODY_TURN = {
         "转身：直接旋转虚拟 HMD 的朝向。符号与 wander 的 turn_deg 一致——"
         "正值向左转，负值向右转（例：用户说“向右转”填 horizontal=-0.5）。"
         "不走摇杆——VR 模式下 VRChat 的右摇杆转向不可靠，照样会回 accepted=true 却不动。"
-        "转身同时就是转视角：转完之后画面朝向变了，body_locomotion 的前后左右也随之改变，"
+        "转身同时就是转视角：转完之后画面朝向变了，wander 的前进方向也随之改变，"
         "所以「先转向再前进」是改变行进方向的正确做法。"
         "accepted=true 只代表本机发送成功，要确认真的转了得用 vrc_vision_frame 看画面。"
     ),

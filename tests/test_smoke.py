@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import tomllib
 import unittest
 
@@ -56,15 +57,12 @@ class PluginSmokeTests(unittest.TestCase):
             condition_kinds,
             {"world_available", "entity_visible", "event_recent"},
         )
-        self.assertIn("preconditions", BODY_AI_INSTRUCTIONS)
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
         self.assertIn("body_awareness", BODY_AI_INSTRUCTIONS)
         self.assertIn("accepted=true", BODY_AI_INSTRUCTIONS)
         self.assertIn("unsupported_spatial_navigation", BODY_AI_INSTRUCTIONS)
-        self.assertIn("visual_inspection_complete=false", BODY_AI_INSTRUCTIONS)
         self.assertEqual(tool_defs.VRC_SCAN_SURROUNDINGS["name"], "vrc_scan_surroundings")
         self.assertIn("target_ref", BODY_AI_INSTRUCTIONS)
-        self.assertIn("real_avatar", BODY_AI_INSTRUCTIONS)
         self.assertIn("overlay.candidates", tool_defs.VRC_VISION_FRAME["description"])
         goal_properties = tool_defs.VRC_AUTONOMY_GOAL["parameters"]["properties"]
         self.assertIn("target_ref", goal_properties)
@@ -93,6 +91,43 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertIn("不接受 target_id", wander_step["description"])
         declared_gestures = tool_defs.BODY_GESTURE["parameters"]["properties"]["name"]["enum"]
         self.assertEqual(set(declared_gestures), set(GESTURE_NAMES))
+
+    def test_instructions_never_name_a_tool_the_main_model_cannot_call(self) -> None:
+        # 注入的规则和工具 Schema 抢同一份注意力预算，而主模型只能看到 @llm_tool
+        # 那一张表。规则里提一个它没有的工具名，就是在诱导它去调一个调不到的工具
+        # ——这正是「tool 调用不积极」的成因之一，所以用测试钉住。
+        source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        live: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                if "llm_tool" not in ast.unparse(decorator.func):
+                    continue
+                # 实际写法是 @llm_tool(**BODY_GESTURE)，也兼容 tool_defs.X 形式。
+                for name in re.findall(r"(?:tool_defs\.)?\b([A-Z][A-Z_]{3,})\b", ast.unparse(decorator)):
+                    definition = getattr(tool_defs, name, None)
+                    if isinstance(definition, dict) and definition.get("name"):
+                        live.add(str(definition["name"]))
+        self.assertTrue(live, "未能解析出任何 @llm_tool 工具，测试本身失效了")
+
+        # 面板与 Agent 专属的命令也是「主模型没有的工具」。
+        all_tools = {
+            value["name"]
+            for key, value in vars(tool_defs).items()
+            if key.isupper() and isinstance(value, dict) and isinstance(value.get("name"), str)
+        }
+        stripped = sorted(all_tools - live)
+        mentioned = [name for name in stripped if re.search(rf"(?<![a-z_]){re.escape(name)}(?![a-z_])", BODY_AI_INSTRUCTIONS)]
+        self.assertEqual(mentioned, [], f"instructions.py 提到了主模型调不到的工具：{mentioned}")
+
+        # 反向：留在工具表里的移动/观察闭环工具必须被规则覆盖，否则等于没有指引。
+        for required in ("body_awareness", "world_observe", "vrc_autonomy_goal", "vrc_semantic_commit"):
+            self.assertIn(required, live)
+            self.assertIn(required, BODY_AI_INSTRUCTIONS)
 
     def test_behavior_config_is_bounded(self) -> None:
         config = PluginConfig.from_mapping({
