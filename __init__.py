@@ -6,10 +6,13 @@ import asyncio
 import base64
 from collections import deque
 from collections.abc import Mapping
+from functools import lru_cache
 import json
 import math
+from pathlib import Path
 import threading
 import time
+import tomllib
 from typing import Any, Iterable
 import uuid
 
@@ -37,6 +40,26 @@ from .tool_defs import (
     VRC_VISION_FRAME,
     WORLD_OBSERVE,
 )
+
+
+@lru_cache(maxsize=1)
+def _plugin_version() -> str:
+    """从 plugin.toml 读一次版本号，给面板副标题用。
+
+    写死字面量的那份已经漏了七个版本没跟上（面板显示 0.13.22，清单是
+    0.13.29）——版本号有两处真值时，漏掉的永远是没人看的那处。这里按
+    模块路径找同目录的清单，而不是走 ``self.plugin_dir``：这个值只用于
+    显示，读不到时退回 "unknown" 比让面板上下文整个抛异常好。
+
+    清单在插件生命周期内不会变，所以缓存一次即可——面板每秒刷新一次
+    上下文，不能每次都去解析 TOML。
+    """
+    try:
+        with (Path(__file__).resolve().parent / "plugin.toml").open("rb") as handle:
+            version = tomllib.load(handle).get("plugin", {}).get("version")
+    except Exception:
+        return "unknown"
+    return str(version) if version else "unknown"
 
 
 def _enum(name: str, value: Any, allowed: Iterable[str]) -> str:
@@ -1816,7 +1839,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "semantic_push_last_reason": self._semantic_push_last_reason,
         }
         return {
-            "version": "0.13.22",
+            "version": _plugin_version(),
             "updated_at_unix": time.time(),
             "body": body,
             "awareness": awareness,

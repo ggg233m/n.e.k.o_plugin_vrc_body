@@ -115,6 +115,39 @@ class HostedUiTests(unittest.TestCase):
         self.assertEqual(panel["context"], "debug_dashboard")
         self.assertEqual(panel["permissions"], ["state:read", "action:call"])
 
+    def test_debug_context_version_reads_from_manifest(self) -> None:
+        # 面板副标题按清单显示当前版本。写死字面量的那份已经漏了七个版本没跟上
+        # （显示 0.13.22，清单是 0.13.29）——版本号有两处真值时，漏掉的永远是
+        # 没人看的那处。这条测试锁住这一对，将来发版时只要这里挂了，就意味着
+        # _plugin_version() 要么返回了过期值，要么读不到清单。
+        manifest = self._manifest()
+        expected_version = manifest["plugin"]["version"]
+        tree = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
+        plugin_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "NekoAnyadanceBodyPlugin"
+        )
+        methods = {node.name: node for node in plugin_class.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        context_source = ast.unparse(methods["debug_dashboard_context"])
+        # 上下文里必须调用 _plugin_version()，而不是写死字面量或拿别的变量凑。
+        self.assertIn("_plugin_version()", context_source)
+        self.assertNotIn('"0.13.22"', context_source)
+        self.assertNotIn('"0.13.23"', context_source)
+        # 再确认辅助函数真的读得到清单里那个值。插件模块本身导入宿主 SDK，测试
+        # 环境里导不进来（其余插件级断言也因此都是 AST 的），所以这里把函数源码
+        # 单独取出来执行，并按真实模块路径设 __file__。
+        helper = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_plugin_version"
+        )
+        namespace: dict = {"__file__": str(ROOT / "__init__.py")}
+        exec(
+            "from functools import lru_cache\nfrom pathlib import Path\nimport tomllib\n"
+            + ast.unparse(helper),
+            namespace,
+        )
+        self.assertEqual(namespace["_plugin_version"](), expected_version)
+
     def test_backend_exposes_context_and_one_bounded_debug_action(self) -> None:
         tree = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
         commands = set(self._command_tuple("_DEBUG_COMMAND_NAMES"))
