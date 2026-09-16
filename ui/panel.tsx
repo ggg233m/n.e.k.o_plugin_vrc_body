@@ -6,7 +6,6 @@ import {
   Divider,
   Field,
   Grid,
-  Input,
   ImagePreview,
   JsonView,
   KeyValue,
@@ -224,15 +223,6 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const [reachDistance, setReachDistance] = props.useLocalState("reachDistance", 0.35)
   const [reachDuration, setReachDuration] = props.useLocalState("reachDuration", 700)
 
-  const [clipName, setClipName] = props.useLocalState("clipName", "")
-  const [clipSpeed, setClipSpeed] = props.useLocalState("clipSpeed", 1)
-  const [clipLoops, setClipLoops] = props.useLocalState("clipLoops", 1)
-  const [clipTransition, setClipTransition] = props.useLocalState("clipTransition", 400)
-  const [clipRestore, setClipRestore] = props.useLocalState("clipRestore", false)
-
-  const [parameterName, setParameterName] = props.useLocalState("parameterName", "NEKO_Action")
-  const [parameterType, setParameterType] = props.useLocalState("parameterType", "int")
-  const [parameterValue, setParameterValue] = props.useLocalState("parameterValue", "1")
   const [inputAction, setInputAction] = props.useLocalState("inputAction", "grab")
   const [inputSide, setInputSide] = props.useLocalState("inputSide", "right")
   const [inputHold, setInputHold] = props.useLocalState("inputHold", 100)
@@ -301,19 +291,6 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const toggle = (onCommand: string, offCommand: string, onArgs: Record<string, any> = {}) =>
     (next: boolean) => { void runSwitch(next ? onCommand : offCommand, next ? onArgs : {}) }
 
-  const parameterPayload = () => {
-    if (parameterType === "bool") return String(parameterValue).trim().toLowerCase() === "true"
-    if (parameterType === "int") return Math.trunc(Number(parameterValue))
-    return Number(parameterValue)
-  }
-
-  const effectiveClip = clipName || clips[0]?.name || ""
-  const clipOptions = clips.map((clip) => ({
-    value: clip.name || "",
-    label: clip.indexed === false
-      ? `${clip.metadata?.label || clip.name || "未命名"} · 未索引 · ${fixed((clip.file_size_bytes || 0) / 1048576, 1)} MiB`
-      : `${clip.metadata?.label || clip.name || "未命名"} · ${fixed(clip.duration_s, 2)}s · ${clip.frame_count || 0}帧`,
-  }))
   const backendLines = (state.ui_events || []).map((event) => {
     const status = event.accepted ? "OK" : "REJECT"
     const reason = event.reason ? ` · ${event.reason}` : ""
@@ -438,7 +415,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             />
             <ButtonGroup>
               <Button tone="info" disabled={busy || !panelAction} onClick={() => runSwitch("body_reset", { duration_ms: 600 })}>复位 T Pose</Button>
-              <Button tone="danger" disabled={busy} onClick={() => run("body_stop")}>立即急停</Button>
+              <Button tone="danger" disabled={busy} onClick={() => run("body_stop", { scope: "freeze" })}>立即急停</Button>
             </ButtonGroup>
             <KeyValue
               items={[
@@ -516,7 +493,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
               onChange={toggle("vrc_autonomy_arm", "vrc_autonomy_disarm")}
             />
             <ButtonGroup>
-              <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("vrc_autonomy_stop")}>停止自主目标</Button>
+              <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("body_stop", { scope: "navigation" })}>停止自主目标</Button>
             </ButtonGroup>
           </Stack>
         </Card>
@@ -553,6 +530,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
           </Field>
         </Grid>
         <Button tone="primary" disabled={busy} onClick={() => run("body_arm_pose", {
+          mode: "polar",
           side: armSide,
           elevation_deg: elevation,
           azimuth_deg: azimuth,
@@ -665,34 +643,15 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
         </Card>
       </Grid>
 
-      <Card title=".nya 预制动作">
+      {/* 播放按钮已经去掉：动作选片交给 body_express 的状态机，面板不再手点片段。
+          但目录诊断留着——body_express 挑不到片会静默回退到程序化覆盖层，
+          只有这里的「未烘焙」「元数据错误」能说明它为什么挑不到。 */}
+      <Card title=".nya 动作目录">
         {clips.length > 0 ? (
           <Stack>
-            <Grid cols={3}>
-              <Field label="动作片段">
-                <Select value={effectiveClip} options={clipOptions} onChange={setClipName} />
-              </Field>
-              <Field label={`速度 ${fixed(clipSpeed, 2)}x`}>
-                <Slider value={clipSpeed} min={0.25} max={3} step={0.05} showValue onChange={setClipSpeed} />
-              </Field>
-              <Field label="循环次数">
-                <NumberInput value={clipLoops} min={1} max={10} step={1} onChange={(value) => setClipLoops(Number(value))} />
-              </Field>
-              <Field label="切换时间 ms">
-                <NumberInput value={clipTransition} min={0} max={5000} step={50} onChange={(value) => setClipTransition(Number(value))} />
-              </Field>
-              <Switch checked={clipRestore} label="结束后恢复原姿态" onChange={setClipRestore} />
-            </Grid>
-            <Button tone="success" disabled={busy || !effectiveClip} onClick={() => run("body_play_clip", {
-              clip_name: effectiveClip,
-              speed: clipSpeed,
-              loop_count: clipLoops,
-              transition_ms: clipTransition,
-              anchor: true,
-              restore_after: clipRestore,
-            })}>播放动作</Button>
             <KeyValue
               items={[
+                { key: "total", label: "可用动作", value: clips.length },
                 { key: "indexed", label: "已索引", value: state.clips?.indexed_count || 0 },
                 { key: "unindexed", label: "待首次解析", value: state.clips?.unindexed_count || 0 },
                 { key: "resident", label: "内存缓存", value: (state.clips?.cache?.resident_clips || []).join(", ") || "无" },
@@ -700,77 +659,41 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
                 { key: "metadata", label: "语义元数据", value: state.clips?.motion_catalog?.entries?.length || 0 },
               ]}
             />
-            {clips.find((clip) => clip.name === effectiveClip)?.metadata ? (
-              <Text>{clips.find((clip) => clip.name === effectiveClip)?.metadata?.description} · 意图：{(clips.find((clip) => clip.name === effectiveClip)?.metadata?.intents || []).join(", ")}</Text>
-            ) : null}
             <Text>未索引的大动作会在首次播放时后台解析；期间界面仍可刷新，后续播放直接使用缓存。</Text>
           </Stack>
         ) : (
-          <Alert tone="warning">motions 目录中没有有效动作。</Alert>
+          <Alert tone="warning">motions 目录中没有有效动作，body_express 只能走程序化覆盖层。</Alert>
         )}
         {invalidClips.length > 0 ? <Alert tone="danger">无效动作：{invalidClips.map((clip) => `${clip.name}: ${clip.error}`).join("；")}</Alert> : null}
         {(state.clips?.motion_catalog?.errors || []).length > 0 ? <Alert tone="danger">动作元数据错误：{state.clips?.motion_catalog?.errors?.join("；")}</Alert> : null}
         {(state.clips?.motion_catalog?.missing_clips || []).length > 0 ? <Alert tone="warning">尚未烘焙：{state.clips?.motion_catalog?.missing_clips?.join("、")}</Alert> : null}
       </Card>
 
-      <Grid cols={2}>
-        <Card title="Avatar Parameter">
-          <Stack>
-            <Field label="参数名">
-              <Input value={parameterName} placeholder="NEKO_Action" onChange={setParameterName} />
+      <Card title="VRChat 输入脉冲">
+        <Stack>
+          <Grid cols={3}>
+            <Field label="输入">
+              <Select value={inputAction} options={[
+                { value: "grab", label: "Grab" },
+                { value: "use", label: "Use" },
+                { value: "drop", label: "Drop" },
+              ]} onChange={setInputAction} />
             </Field>
-            <Grid cols={2}>
-              <Field label="类型">
-                <Select value={parameterType} options={[
-                  { value: "bool", label: "Bool" },
-                  { value: "int", label: "Int" },
-                  { value: "float", label: "Float" },
-                ]} onChange={setParameterType} />
-              </Field>
-              <Field label="值">
-                {parameterType === "bool" ? (
-                  <Select value={parameterValue} options={[
-                    { value: "true", label: "true" },
-                    { value: "false", label: "false" },
-                  ]} onChange={setParameterValue} />
-                ) : (
-                  <Input value={parameterValue} placeholder="1" onChange={setParameterValue} />
-                )}
-              </Field>
-            </Grid>
-            <Button tone="primary" disabled={busy || !parameterName.trim()} onClick={() => run("body_avatar_parameter", {
-              name: parameterName,
-              value: parameterPayload(),
-            })}>发送 Avatar 参数</Button>
-          </Stack>
-        </Card>
-
-        <Card title="VRChat 输入脉冲">
-          <Stack>
-            <Grid cols={3}>
-              <Field label="输入">
-                <Select value={inputAction} options={[
-                  { value: "grab", label: "Grab" },
-                  { value: "use", label: "Use" },
-                  { value: "drop", label: "Drop" },
-                ]} onChange={setInputAction} />
-              </Field>
-              <Field label="手部">
-                <Select value={inputSide} options={sideOptions.slice(0, 2)} onChange={setInputSide} />
-              </Field>
-              <Field label="按住 ms">
-                <NumberInput value={inputHold} min={20} max={1000} step={10} onChange={(value) => setInputHold(Number(value))} />
-              </Field>
-            </Grid>
-            <Button tone="warning" disabled={busy} onClick={() => run("body_vrchat_input", {
-              action: inputAction,
-              side: inputSide,
-              hold_ms: inputHold,
-            })}>发送并自动释放</Button>
-            <Text>VRChat 必须启用 OSC；Grab、Use、Drop 的部分行为只在 VR 模式有效。</Text>
-          </Stack>
-        </Card>
-      </Grid>
+            <Field label="手部">
+              <Select value={inputSide} options={sideOptions.slice(0, 2)} onChange={setInputSide} />
+            </Field>
+            <Field label="按住 ms">
+              <NumberInput value={inputHold} min={20} max={1000} step={10} onChange={(value) => setInputHold(Number(value))} />
+            </Field>
+          </Grid>
+          <Button tone="warning" disabled={busy} onClick={() => run("body_vrchat_input", {
+            action: inputAction,
+            side: inputSide,
+            hold_ms: inputHold,
+          })}>发送并自动释放</Button>
+          <Text>VRChat 必须启用 OSC；Grab、Use、Drop 的部分行为只在 VR 模式有效。</Text>
+        </Stack>
+      </Card>
 
       <Grid cols={2}>
         <Card title="身体自知快照">

@@ -205,6 +205,7 @@ class VmcIdleRelay:
         self._latest_frame: FrameState | None = None
         self._last_packet_at: float | None = None
         self._last_frame_at: float | None = None
+        self._last_message_at: float | None = None
         self._source_available = False
         self._receiver_listening = False
         self._received_packets = 0
@@ -223,6 +224,9 @@ class VmcIdleRelay:
         self._calibration_held = False
         self._require_t_pose_frame = False
         self._rejected_calibration_frames = 0
+        # 是否曾经成功锁定过基准。用于区分「首次校准」与「宿主暂停/重载后重建」：
+        # 后者绝不能退化成把任意动画帧当作腕部朝向和手指弯曲的零点。
+        self._had_baseline = False
 
     def _clear_calibration_locked(self) -> None:
         self._root = _ROOT
@@ -259,6 +263,34 @@ class VmcIdleRelay:
             self._calibration_reason = str(reason or "manual")[:64]
             self._calibration_held = False
             self._require_t_pose_frame = self._calibration_reason == "host_t_pose"
+
+    def require_rest_baseline(self, *, reason: str = "t_pose_unavailable") -> None:
+        """丢弃当前姿势，并持续拒绝普通帧直到重新拿到权威静止姿势。
+
+        与 ``reset_calibration`` 的差别是基准要求不会因为一次失败而解除：宿主
+        临时给不出 T Pose 时角色停在最后一帧，而不是用动画帧自锁出错误零点。
+        """
+        with self._lock:
+            self._clear_calibration_locked()
+            self._calibration_reason = str(reason or "t_pose_unavailable")[:64]
+            self._calibration_held = False
+            self._require_t_pose_frame = True
+
+    def _needs_recalibration_locked(self) -> bool:
+        if self._calibration_held:
+            return False
+        # 还没有基准，且要么被明确要求补一次权威静止姿势，要么从未成功校准过。
+        return self._origin is None and (self._require_t_pose_frame or not self._had_baseline)
+
+    def needs_recalibration(self) -> bool:
+        """是否需要重新请求一次权威静止姿势才能重建基准。"""
+        with self._lock:
+            return self._needs_recalibration_locked()
+
+    def has_baseline(self) -> bool:
+        """是否曾经成功锁定过基准。"""
+        with self._lock:
+            return self._had_baseline
 
     def start(self) -> None:
         if not self.config.enabled or (self._thread and self._thread.is_alive()):
@@ -357,12 +389,27 @@ class VmcIdleRelay:
     ) -> None:
         timestamp = self._clock() if now is None else now
         with self._lock:
+            if (
+                self._last_message_at is not None
+                and timestamp - self._last_message_at > self.config.stale_after_ms / 1000.0
+            ):
+                # 传输中断：卡顿前残留的半帧若与恢复后的新帧拼接，会得到一个
+                # 跨卡顿的混合帧。整帧丢弃，等恢复后的完整帧重新成帧。
+                self._pending_bones.clear()
+            self._last_message_at = timestamp
             for address, arguments in messages:
                 if address == "/VMC/Ext/OK" and arguments:
                     available = bool(arguments[0])
                     self._source_available = available
                     if not available:
                         self._clear_calibration_locked()
+                        # 宿主暂停、页面冻结或 VMC 输出重新握手后，N.E.K.O 会重新
+                        # 发 OK=1。此时若没有权威静止姿势就重建基准，恢复后的第一个
+                        # 动画姿势会被当成手腕朝向与手指弯曲的零点，整套骨骼永久错位。
+                        # 只有托管宿主输出时才有办法主动补一次 T Pose。
+                        if self.config.manage_host_output and self._had_baseline:
+                            self._require_t_pose_frame = True
+                            self._calibration_reason = "host_output_restarted"
                     continue
                 if address == "/VMC/Ext/T":
                     self._finalize_pending_locked(timestamp)
@@ -441,6 +488,7 @@ class VmcIdleRelay:
         self._accepted_frames += 1
         self._last_error = None
         self._require_t_pose_frame = False
+        self._had_baseline = True
 
     def _is_t_pose_candidate_locked(self, world: dict[str, Transform]) -> bool:
         """Return whether a complete frame has a credible humanoid rest pose.
@@ -658,6 +706,8 @@ class VmcIdleRelay:
                     "calibrated": self._calibrated_at is not None,
                     "calibrated_at_monotonic": self._calibrated_at,
                     "waiting_for_t_pose_frame": self._require_t_pose_frame,
+                    "needs_recalibration": self._needs_recalibration_locked(),
+                    "baseline_established": self._had_baseline,
                     "rejected_frames": self._rejected_calibration_frames,
                     "position_mount_offsets_m": {
                         device: [round(value, 4) for value in offset]

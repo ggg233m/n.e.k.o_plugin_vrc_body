@@ -28,7 +28,7 @@ agent 也不会有结构性障碍——所以不为某一个模型做特化。
 
 ### 第 6 行原本为什么是缺口
 
-`tool_defs.py` 里 30+ 个工具，曾经没有一个返回像素。`world_observe` 给 agent 的是压平后
+`tool_defs.py` 里二十来个工具，曾经没有一个返回像素。`world_observe` 给 agent 的是压平后
 的结构化快照（label / bbox / confidence / bearing_deg / apparent_height），连 VLM 的理解
 也在后端就被压成 entity/event 才送出去。
 
@@ -107,7 +107,7 @@ P0 补上的是这条并行通道——`vrc_vision_frame` 与唤醒配图让 age
 
 - [x] 白名单加入六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、
       `Upright`、`Grounded`），`config.py` 默认值与 `plugin.toml` 同步
-- [x] `VrchatOscBridge.motion_feedback()` → `body_awareness.vrchat_osc.motion` 与
+- [x] `VrchatOscBridge.motion_feedback()` → `body_status` 的 `body.vrchat_osc.motion` 与
       `GET /snapshot` 的 `vrchat_osc.motion`。收不到时 `available=false` 并给出
       `reason`，**不退化成「速度为零」**
 - [x] **新鲜度按链路年龄判，不按取值年龄判**。VRChat 参数是变化驱动的：站着不动时
@@ -361,5 +361,5 @@ P0 补上的是这条并行通道——`vrc_vision_frame` 与唤醒配图让 age
 3. **感知不进 120 Hz 调度线程。** worker 用有界 latest-frame 队列，掉帧优先于堆积。
 4. **手动 arm 门禁不绕过。** 自主动作需要用户显式授权当前会话 + 会话 TTL。
 5. **`accepted=true` 只代表已入队/已发送**，不代表已到达、已移动、已拿到。
-   唯一的例外通路是 `body_awareness.vrchat_osc.motion`——它是 VRChat 回传的实测速度，
+   唯一的例外通路是 `body_status` 的 `body.vrchat_osc.motion`——它是 VRChat 回传的实测速度，
    但它自己也遵守第 1 条：收不到就是 `available=false`，不是「速度为零」。

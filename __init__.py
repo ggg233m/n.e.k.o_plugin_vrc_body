@@ -24,15 +24,13 @@ from .motion import GESTURE_NAMES
 from .osc import normalize_parameter_value, validate_parameter_name
 from .world_salience import classify as classify_world_delta, delta_signature, describe_entities
 from .tool_defs import (
-    BODY_AWARENESS,
     BODY_CHATBOX,
     BODY_EXPRESS,
     BODY_GESTURE,
-    BODY_STOP_MOVEMENT,
+    BODY_STATUS,
+    BODY_STOP,
     BODY_TURN,
     VRC_AUTONOMY_GOAL,
-    VRC_AUTONOMY_STOP,
-    VRC_WANDER_ROUTE,
     VRC_WANDER_STEP,
     VRC_SEMANTIC_COMMIT,
     VRC_VISION_FRAME,
@@ -103,40 +101,29 @@ _PANEL_SWITCH_NAMES = (
     "vrc_vision_stop",
 )
 
-# 动作与读取：Agent 和面板共用。对应的 *_status 读取刻意留在这里——摘掉它，
+# 动作与读取：Agent 和面板共用。能力状态的读取刻意留在这里——摘掉它，
 # Agent 就无从知道能力是关着的，也就没法如实提示用户去面板打开。
+#
+# 这张表按「一件事只有一个入口」收敛过：状态读取全部并进 body_status(include=…)，
+# 三种停止（清移动轴 / 取消当前动作 / 停自主目标）并进 body_stop(scope=…)。
+# 拆成同义的多个工具，模型每次都要先选工具再选参数，而选错工具没有报错、
+# 只是没停下来；并进一个入口之后选错至少会落在同一份返回结构里。
 _DEBUG_COMMAND_NAMES = (
     "body_stop",
     "body_status",
-    "body_cancel",
-    "body_sequence",
-    "body_list_clips",
     "body_arm_pose",
-    "body_move_hand",
     "body_hand",
     "body_reach_and_grab",
     "body_gesture",
     "body_express",
-    "body_play_clip",
-    "body_avatar_parameter",
     "body_vrchat_input",
-    "body_locomotion",
     "body_turn",
-    "body_stop_movement",
     "body_chatbox",
-    "vrc_controller_input",
-    "vrc_menu_navigate",
-    "vrc_jump",
-    "vrc_autonomy_status",
     "vrc_autonomy_goal",
     "vrc_wander_step",
-    "vrc_wander_route",
-    "vrc_autonomy_stop",
-    "vrc_vision_status",
     "vrc_vision_frame",
     "vrc_semantic_commit",
-    "vrc_scan_surroundings",
-    "observe_vrchat_world",
+    "world_observe",
     "navigate_vrchat_world",
 )
 
@@ -268,7 +255,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             self._host_vmc = None
             self._vision = None
         # 安装包里的静态 entry 索引可能落后于热更新源码。给 Agent 注册独立的
-        # 任务级别名，避免它把“走到墙后”误塞给 body_move_hand 之类的低层命令。
+        # 任务级别名，避免它把“走到墙后”误塞给 body_arm_pose 之类的低层命令。
         self._register_agent_entries()
         self._inject_ai_instructions()
         self.logger.info(
@@ -359,10 +346,12 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 {
                     "type": "object",
                     "properties": {
-                        "direction": {
-                            "type": "string",
-                            "enum": ["left", "right"],
-                            "default": "right",
+                        "degrees": {
+                            "type": "number",
+                            "minimum": -360.0,
+                            "maximum": 360.0,
+                            "default": 360.0,
+                            "description": "相对当前朝向的转角，正数左转、负数右转。整圈填 360 或 -360。",
                         },
                     },
                     "additionalProperties": False,
@@ -507,10 +496,14 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
 
     async def _agent_observe_vrchat_world(self, **kwargs: Any):
-        return await self.observe_vrchat_world(**kwargs)
+        return await self.world_observe(**kwargs)
 
     async def _agent_scan_vrchat_surroundings(self, **kwargs: Any):
-        result = await self.vrc_scan_surroundings(**kwargs)
+        # Agent 侧的"转一圈"是一次带完成校验的整圈转向；本地等待由 body_turn 负责。
+        params = dict(kwargs)
+        params["wait_complete"] = True
+        params.setdefault("degrees", 360.0)
+        result = await self.body_turn(**params)
         return self._execution_result(result, require_completed=True)
 
     async def _agent_navigate_vrchat_world(self, **kwargs: Any):
@@ -1527,28 +1520,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "delivery_confirmed": False,
         }
 
-    async def _controller_result(
-        self,
-        *,
-        accepted: bool,
-        normalized_params: dict[str, Any],
-        reason: str | None,
-    ) -> dict[str, Any]:
-        snapshot = await asyncio.to_thread(self._scheduler.snapshot) if self._scheduler else {
-            "state": "shutdown",
-            "safety_state": "fault",
-        }
-        return {
-            "accepted": accepted,
-            "action_id": str(uuid.uuid4()),
-            "state": "queued" if accepted else snapshot["state"],
-            "normalized_params": normalized_params,
-            "reason": reason,
-            "safety_state": snapshot["safety_state"],
-            "transport": "anyadance_virtual_controller",
-            "delivery_confirmed": False,
-        }
-
     async def _release_osc_inputs(self) -> None:
         if self._osc:
             await asyncio.to_thread(self._osc.cancel_scheduled_inputs, release=True)
@@ -1907,23 +1878,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         return await self._run_bounded_command(command, arguments, _DEBUG_COMMAND_NAMES)
 
     @plugin_entry(
-        id="observe_vrchat_world",
-        name="观察当前 VRChat 世界",
-        description=(
-            "读取当前 VRChat 视觉检测、稳定实体 ID、方位、可见性和自主导航状态。"
-            "当用户询问当前画面、周围角色、NPC 在哪里或为什么没有移动时使用；"
-            "这是实时结构化观察能力，不只是身体姿态或 OSC 调试。"
-        ),
-        input_schema={"type": "object", "properties": {}},
-        llm_result_fields=[
-            "available", "entities", "uncertainties", "status", "capture_active",
-            "decision_context",
-        ],
-    )
-    async def observe_vrchat_world(self, **_: Any):
-        return await self.world_observe()
-
-    @plugin_entry(
         id="navigate_vrchat_world",
         name="寻找或走向 VRChat 目标",
         description=(
@@ -2060,79 +2014,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         # route_request_accepted/semantic_request_accepted 当成已经开始移动。
         return self._execution_result(Ok(result))
 
-    @plugin_entry(
-        id="scan_vrchat_surroundings",
-        name="让 VRChat 视角原地转一圈",
-        description=(
-            "执行一次有本地完成校验的 360 度原地转向。completed=true 只证明转向调度"
-            "完成，visual_inspection_complete=false 表示不能声称已经检查沿途道具或暗格。"
-        ),
-        input_schema=VRC_SCAN_SURROUNDINGS["parameters"],
-        llm_result_fields=[
-            "accepted", "completed", "reason", "verification",
-            "visual_inspection_complete", "inspection_limit",
-        ],
-    )
-    async def vrc_scan_surroundings(self, *, direction: Any = "right", **_: Any):
-        normalized_direction = _enum("direction", direction, ("left", "right"))
-        if not self._scheduler:
-            return Ok({
-                "accepted": False,
-                "completed": False,
-                "reason_code": "backend_unavailable",
-                "reason": "body scheduler is not initialized",
-                "visual_inspection_complete": False,
-            })
-
-        before = await asyncio.to_thread(self._scheduler.snapshot)
-        before_heading = before.get("heading") if isinstance(before.get("heading"), Mapping) else {}
-        before_commands = int(before_heading.get("turn_commands", 0) or 0)
-        delta_deg = -360.0 if normalized_direction == "left" else 360.0
-        submitted = await self._submit_async("turn", {"delta_deg": delta_deg})
-        if not submitted.get("accepted"):
-            return Ok({
-                **submitted,
-                "completed": False,
-                "visual_inspection_complete": False,
-                "inspection_limit": "转向未被调度，不能描述沿途环境。",
-            })
-
-        deadline = time.monotonic() + 4.0
-        latest = before
-        applied = False
-        settled = False
-        while time.monotonic() < deadline:
-            latest = await asyncio.to_thread(self._scheduler.snapshot)
-            heading = latest.get("heading") if isinstance(latest.get("heading"), Mapping) else {}
-            applied = int(heading.get("turn_commands", 0) or 0) > before_commands
-            settled = applied and not bool(heading.get("turning"))
-            if settled:
-                break
-            await asyncio.sleep(0.05)
-
-        heading = latest.get("heading") if isinstance(latest.get("heading"), Mapping) else {}
-        completed = bool(applied and settled)
-        return Ok({
-            **submitted,
-            "completed": completed,
-            "reason": None if completed else "turn_completion_unverified",
-            "verification": {
-                "scheduler_command_applied": applied,
-                "scheduler_settled": settled,
-                "turn_commands_before": before_commands,
-                "turn_commands_after": int(heading.get("turn_commands", 0) or 0),
-                "heading_yaw_deg": heading.get("yaw_deg"),
-                "direction": normalized_direction,
-                "requested_delta_deg": delta_deg,
-            },
-            # 转向期间没有把每个方位的图片送给 VLM；严禁据此下“没有道具”的结论。
-            "visual_inspection_complete": False,
-            "inspection_limit": (
-                "只验证了原地转向。没有逐方位视觉证据，不能确认沿途是否存在任务道具、"
-                "暗格、遮挡痕迹或墙后空间。"
-            ),
-        })
-
     async def body_enable(self, **_: Any):
         return Ok(await self._submit_async("enable"))
 
@@ -2142,48 +2023,18 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             await self._release_osc_inputs()
         return Ok(result)
 
+    # 两种手臂姿态描述方式合成一个入口：mode="polar" 用抬升角+方位角（原
+    # body_arm_pose），mode="anchor" 用相对 HMD/胸口/髋部的直角坐标（原
+    # body_move_hand）。两者提交到同一个调度器，只是参数化方式不同。
     async def body_arm_pose(
         self,
         *,
+        mode: Any = "polar",
         side: Any = "",
         elevation_deg: Any = None,
         azimuth_deg: Any = None,
         plane: Any = None,
         reach: Any = 0.9,
-        palm: Any = "neutral",
-        wrist_pitch_deg: Any = 0.0,
-        wrist_yaw_deg: Any = 0.0,
-        wrist_roll_deg: Any = 0.0,
-        duration_ms: Any = None,
-        **_: Any,
-    ):
-        try:
-            normalized_azimuth = None if azimuth_deg is None else _number(
-                "azimuth_deg", azimuth_deg, minimum=-180.0, maximum=180.0
-            )
-            normalized_plane = None if normalized_azimuth is not None else _enum(
-                "plane", "front" if plane is None else plane, ("front", "side")
-            )
-            params = {
-                "side": _enum("side", side, ("left", "right", "both")),
-                "elevation_deg": _number("elevation_deg", elevation_deg, minimum=0.0, maximum=180.0),
-                "azimuth_deg": normalized_azimuth,
-                "plane": normalized_plane,
-                "reach": _number("reach", reach, minimum=0.3, maximum=1.0),
-                "palm": _enum("palm", palm, ("neutral", "forward", "down", "inward")),
-                "wrist_pitch_deg": _number("wrist_pitch_deg", wrist_pitch_deg, minimum=-90.0, maximum=90.0),
-                "wrist_yaw_deg": _number("wrist_yaw_deg", wrist_yaw_deg, minimum=-180.0, maximum=180.0),
-                "wrist_roll_deg": _number("wrist_roll_deg", wrist_roll_deg, minimum=-180.0, maximum=180.0),
-                "duration_ms": self._duration(duration_ms, self._body_config.default_duration_ms),
-            }
-        except ValueError as exc:
-            return Ok(await self._invalid(str(exc)))
-        return Ok(await self._submit_async("arm_pose", params))
-
-    async def body_move_hand(
-        self,
-        *,
-        side: Any = "",
         relative_to: Any = "chest",
         x_m: Any = None,
         y_m: Any = None,
@@ -2196,21 +2047,43 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         **_: Any,
     ):
         try:
-            params = {
-                "side": _enum("side", side, ("left", "right")),
-                "relative_to": _enum("relative_to", relative_to, ("hmd", "chest", "hip")),
-                "x_m": _number("x_m", x_m, minimum=-1.0, maximum=1.0),
-                "y_m": _number("y_m", y_m, minimum=-1.0, maximum=1.0),
-                "z_m": _number("z_m", z_m, minimum=-1.0, maximum=1.0),
+            normalized_mode = _enum("mode", mode, ("polar", "anchor"))
+            wrist = {
                 "palm": _enum("palm", palm, ("neutral", "forward", "down", "inward")),
                 "wrist_pitch_deg": _number("wrist_pitch_deg", wrist_pitch_deg, minimum=-90.0, maximum=90.0),
                 "wrist_yaw_deg": _number("wrist_yaw_deg", wrist_yaw_deg, minimum=-180.0, maximum=180.0),
                 "wrist_roll_deg": _number("wrist_roll_deg", wrist_roll_deg, minimum=-180.0, maximum=180.0),
                 "duration_ms": self._duration(duration_ms, self._body_config.default_duration_ms),
             }
+            if normalized_mode == "anchor":
+                kind = "move_hand"
+                params = {
+                    "side": _enum("side", side, ("left", "right")),
+                    "relative_to": _enum("relative_to", relative_to, ("hmd", "chest", "hip")),
+                    "x_m": _number("x_m", x_m, minimum=-1.0, maximum=1.0),
+                    "y_m": _number("y_m", y_m, minimum=-1.0, maximum=1.0),
+                    "z_m": _number("z_m", z_m, minimum=-1.0, maximum=1.0),
+                    **wrist,
+                }
+            else:
+                kind = "arm_pose"
+                normalized_azimuth = None if azimuth_deg is None else _number(
+                    "azimuth_deg", azimuth_deg, minimum=-180.0, maximum=180.0
+                )
+                normalized_plane = None if normalized_azimuth is not None else _enum(
+                    "plane", "front" if plane is None else plane, ("front", "side")
+                )
+                params = {
+                    "side": _enum("side", side, ("left", "right", "both")),
+                    "elevation_deg": _number("elevation_deg", elevation_deg, minimum=0.0, maximum=180.0),
+                    "azimuth_deg": normalized_azimuth,
+                    "plane": normalized_plane,
+                    "reach": _number("reach", reach, minimum=0.3, maximum=1.0),
+                    **wrist,
+                }
         except ValueError as exc:
             return Ok(await self._invalid(str(exc)))
-        return Ok(await self._submit_async("move_hand", params))
+        return Ok(await self._submit_async(kind, params))
 
     async def body_hand(
         self,
@@ -2323,150 +2196,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         return Ok(result)
 
-    def _normalize_sequence_step(self, raw: Any, index: int) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            raise ValueError(f"steps[{index}] must be an object")
-        kind = _enum(f"steps[{index}].type", raw.get("type"), ("arm_pose", "hand", "move_hand", "gesture", "wait"))
-        prefix = f"steps[{index}]"
-        if kind == "wait":
-            return {"type": kind, "duration_ms": self._duration(raw.get("duration_ms"), 500)}
-        if kind == "gesture":
-            return {
-                "type": kind,
-                "name": _enum(f"{prefix}.name", raw.get("name"), GESTURE_NAMES),
-                "side": _enum(f"{prefix}.side", raw.get("side", "right"), ("left", "right", "both")),
-                "intensity": _number(f"{prefix}.intensity", raw.get("intensity", 0.8), minimum=0.0, maximum=1.0),
-                "duration_ms": self._duration(raw.get("duration_ms"), 1200),
-            }
-        if kind == "hand":
-            return {
-                "type": kind,
-                "side": _enum(f"{prefix}.side", raw.get("side"), ("left", "right", "both")),
-                "pose": _enum(f"{prefix}.pose", raw.get("pose"), ("open", "fist", "grip", "point")),
-                "strength": _number(f"{prefix}.strength", raw.get("strength", 1.0), minimum=0.0, maximum=1.0),
-                "duration_ms": self._duration(raw.get("duration_ms"), 300),
-            }
-        wrist = {
-            "palm": _enum(f"{prefix}.palm", raw.get("palm", "neutral"), ("neutral", "forward", "down", "inward")),
-            "wrist_pitch_deg": _number(f"{prefix}.wrist_pitch_deg", raw.get("wrist_pitch_deg", 0.0), minimum=-90.0, maximum=90.0),
-            "wrist_yaw_deg": _number(f"{prefix}.wrist_yaw_deg", raw.get("wrist_yaw_deg", 0.0), minimum=-180.0, maximum=180.0),
-            "wrist_roll_deg": _number(f"{prefix}.wrist_roll_deg", raw.get("wrist_roll_deg", 0.0), minimum=-180.0, maximum=180.0),
-        }
-        if kind == "move_hand":
-            return {
-                "type": kind,
-                "side": _enum(f"{prefix}.side", raw.get("side"), ("left", "right")),
-                "relative_to": _enum(f"{prefix}.relative_to", raw.get("relative_to", "chest"), ("hmd", "chest", "hip")),
-                "x_m": _number(f"{prefix}.x_m", raw.get("x_m"), minimum=-1.0, maximum=1.0),
-                "y_m": _number(f"{prefix}.y_m", raw.get("y_m"), minimum=-1.0, maximum=1.0),
-                "z_m": _number(f"{prefix}.z_m", raw.get("z_m"), minimum=-1.0, maximum=1.0),
-                **wrist,
-                "duration_ms": self._duration(raw.get("duration_ms"), self._body_config.default_duration_ms),
-            }
-        return {
-            "type": kind,
-            "side": _enum(f"{prefix}.side", raw.get("side"), ("left", "right", "both")),
-            "elevation_deg": _number(f"{prefix}.elevation_deg", raw.get("elevation_deg"), minimum=0.0, maximum=180.0),
-            "azimuth_deg": _number(f"{prefix}.azimuth_deg", raw.get("azimuth_deg", 0.0), minimum=-180.0, maximum=180.0),
-            "plane": None,
-            "reach": _number(f"{prefix}.reach", raw.get("reach", 0.9), minimum=0.3, maximum=1.0),
-            **wrist,
-            "duration_ms": self._duration(raw.get("duration_ms"), self._body_config.default_duration_ms),
-        }
-
-    async def body_sequence(self, *, steps: Any = None, loop_count: Any = 1, **_: Any):
-        try:
-            if not isinstance(steps, list) or not 1 <= len(steps) <= 16:
-                raise ValueError("steps must contain between 1 and 16 action objects")
-            loops = _integer("loop_count", loop_count, minimum=1, maximum=4)
-            normalized_steps = [self._normalize_sequence_step(step, index) for index, step in enumerate(steps)]
-            requested_total = sum(step["duration_ms"] for step in normalized_steps) * loops
-            if requested_total > 30000:
-                raise ValueError("sequence requested duration must not exceed 30000 ms")
-        except ValueError as exc:
-            return Ok(await self._invalid(str(exc)))
-        return Ok(await self._submit_async("sequence", {"steps": normalized_steps, "loop_count": loops}))
-
-    async def body_cancel(self, *, action_id: Any = "", **_: Any):
-        normalized = str(action_id or "").strip()
-        if len(normalized) > 128:
-            return Ok(await self._invalid("action_id must be at most 128 characters"))
-        result = await self._submit_async("cancel", {"action_id": normalized or None})
-        if result.get("accepted"):
-            await self._release_osc_inputs()
-        return Ok(result)
-
-    async def body_list_clips(self, **_: Any):
-        if not self._backend_client:
-            return Ok({"clips": [], "invalid_clips": [], "reason": "backend is not initialized"})
-        return Ok(await asyncio.to_thread(self._backend_client.list_clips))
-
-    async def body_play_clip(
-        self,
-        *,
-        clip_name: Any = "",
-        speed: Any = 1.0,
-        loop_count: Any = 1,
-        transition_ms: Any = None,
-        anchor: Any = True,
-        restore_after: Any = False,
-        **_: Any,
-    ):
-        try:
-            name = str(clip_name or "").strip()
-            if not name or len(name) > 256:
-                raise ValueError("clip_name must not be empty and must be at most 256 characters")
-            normalized_speed = _number("speed", speed, minimum=0.25, maximum=3.0)
-            loops = _integer("loop_count", loop_count, minimum=1, maximum=10)
-            transition = self._body_config.behavior.default_crossfade_ms if transition_ms is None else _integer(
-                "transition_ms", transition_ms, minimum=0, maximum=5000
-            )
-            anchored = _boolean("anchor", anchor)
-            restore = _boolean("restore_after", restore_after)
-        except ValueError as exc:
-            return Ok(await self._invalid(str(exc)))
-        result = await asyncio.to_thread(
-            self._submit,
-            "play_clip",
-            {
-                "clip_name": name,
-                "speed": normalized_speed,
-                "loop_count": loops,
-                "transition_ms": transition,
-                "anchor": anchored,
-                "restore_after": restore,
-            },
-        )
-        return Ok(result)
-
-    async def body_avatar_parameter(self, *, name: Any = "", value: Any = None, **_: Any):
-        try:
-            parameter = validate_parameter_name(name)
-            normalized_value = normalize_parameter_value(value)
-        except ValueError as exc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params={},
-                reason=str(exc),
-            ))
-        normalized = {"name": parameter, "value": normalized_value}
-        if not self._osc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params=normalized,
-                reason="VRChat OSC bridge is not initialized",
-            ))
-        accepted, reason = await asyncio.to_thread(
-            self._osc.send_parameter,
-            parameter,
-            normalized_value,
-        )
-        return Ok(await self._osc_result(
-            accepted=accepted,
-            normalized_params=normalized,
-            reason=reason,
-        ))
-
     async def body_vrchat_input(
         self,
         *,
@@ -2512,9 +2241,56 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         result["object_held"] = "unknown"
         return Ok(result)
 
-    async def body_stop(self, **_: Any):
-        result = await self._submit_async("stop")
-        await self._release_osc_inputs()
+    # 三种「停」合成一个入口。分成三个同义工具时，模型选错没有报错——只是人
+    # 没停下来，而它已经在回复里说停了。合成之后选错 scope 至少落在同一份返回
+    # 结构里，navigation/axes/action 三段都在，能看出哪一层其实还在跑。
+    @llm_tool(**BODY_STOP)
+    async def body_stop(self, *, scope: Any = "all", reason: Any = "autonomy_stop", **_: Any):
+        normalized_scope = _enum("scope", scope, ("all", "navigation", "axes", "action", "freeze"))
+        normalized_reason = str(reason or "autonomy_stop").replace("\x00", "").strip()[:160]
+        result: dict[str, Any] = {"accepted": False, "scope": normalized_scope}
+
+        # 顺序是有意的：先撤目标再清轴。反过来的话导航器会在下一帧把清掉的轴
+        # 重新推回去，于是「停了一下又自己走了」。
+        if normalized_scope in ("all", "navigation"):
+            if self._backend_client:
+                result["navigation"] = await asyncio.to_thread(
+                    self._backend_client.autonomy.stop, normalized_reason
+                )
+            else:
+                result["navigation"] = {"accepted": False, "reason": "backend is not initialized"}
+
+        if normalized_scope in ("all", "axes"):
+            if self._osc:
+                accepted, axes_reason = await asyncio.to_thread(self._osc.stop_movement)
+                result["axes"] = await self._osc_result(
+                    accepted=accepted, normalized_params={}, reason=axes_reason
+                )
+            else:
+                result["axes"] = await self._osc_result(
+                    accepted=False,
+                    normalized_params={},
+                    reason="VRChat OSC bridge is not initialized",
+                )
+
+        if normalized_scope == "action":
+            cancelled = await self._submit_async("cancel", {"action_id": None})
+            if cancelled.get("accepted"):
+                await self._release_osc_inputs()
+            result["action"] = cancelled
+
+        if normalized_scope == "freeze":
+            # 急停是降权，所以它留在共用表里：Agent 能踩刹车是好事。解除急停的
+            # body_reset 只在面板，于是「锁」双方都能做、「解锁」只有用户能做。
+            result["freeze"] = await self._submit_async("stop")
+            await self._release_osc_inputs()
+
+        accepted_parts = [
+            bool(part.get("accepted"))
+            for key, part in result.items()
+            if key != "scope" and isinstance(part, Mapping)
+        ]
+        result["accepted"] = bool(accepted_parts) and all(accepted_parts)
         return Ok(result)
 
     async def body_reset(self, *, duration_ms: Any = None, **_: Any):
@@ -2527,34 +2303,47 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             await self._release_osc_inputs()
         return Ok(result)
 
-    # 不注册为 LLM 工具：body_awareness 是它的超集（多 motion、safety_state、
-    # driver_delivery），只差 driver_log 原始快照，而调试台的 debug_dashboard_context
-    # 自己直接取 scheduler/osc/driver_log 快照，不经过本工具。
-    async def body_status(self, **_: Any):
-        if not self._scheduler:
-            return Ok({
-                "state": "shutdown",
-                "output_enabled": False,
-                "reason": "scheduler is not initialized",
-                "idle_relay": await asyncio.to_thread(self._vmc_idle.snapshot) if self._vmc_idle else {"enabled": False},
-                "vrchat_osc": await asyncio.to_thread(self._osc.snapshot) if self._osc else {"enabled": False},
-                "driver_log": await asyncio.to_thread(self._driver_log_snapshot),
-            })
-        snapshot = await asyncio.to_thread(self._scheduler.snapshot)
-        snapshot["vrchat_osc"] = await asyncio.to_thread(self._osc.snapshot) if self._osc else {
-            "enabled": False,
-            "connection": "unknown",
-            "last_error": "OSC bridge is not initialized",
-        }
-        driver_log = await asyncio.to_thread(self._driver_log_snapshot)
-        snapshot["driver_log"] = driver_log
-        self._apply_driver_log_to_udp(snapshot, driver_log)
-        return Ok(snapshot)
+    # 身体、自主移动和视觉三份状态合成一个入口。分开时模型要先猜「这个问题属于
+    # 哪个子系统」才能选对工具，而它恰恰在不知道状态时才需要读状态。
+    @llm_tool(**BODY_STATUS)
+    async def body_status(self, *, include: Any = None, **_: Any):
+        sections = ("body", "autonomy", "vision")
+        if include is None:
+            requested = sections
+        else:
+            if isinstance(include, str):
+                include = [include]
+            if not isinstance(include, (list, tuple)):
+                return Ok({"accepted": False, "reason": "include must be an array of strings"})
+            requested = tuple(_enum("include", item, sections) for item in include) or sections
 
-    @llm_tool(**BODY_AWARENESS)
-    async def body_awareness(self, **_: Any):
+        result: dict[str, Any] = {}
+        if "body" in requested:
+            result["body"] = await self._body_snapshot()
+        if "autonomy" in requested:
+            if self._backend_client:
+                result["autonomy"] = await asyncio.to_thread(self._backend_client.autonomy.snapshot)
+            else:
+                result["autonomy"] = {
+                    "state": "disarmed",
+                    "armed": False,
+                    "reason": "backend is not initialized",
+                }
+        if "vision" in requested:
+            if self._vision is None:
+                result["vision"] = {
+                    "available": False,
+                    "worker": {"enabled": False, "running": False, "reason": "backend_unavailable"},
+                    "uncertainties": ["backend_unavailable"],
+                }
+            else:
+                result["vision"] = await asyncio.to_thread(self._vision.perception)
+        return Ok(result)
+
+    async def _body_snapshot(self) -> dict[str, Any]:
+        """语义化的身体自知快照，附带调试台要用的 driver_log 原始数据。"""
         if not self._scheduler:
-            return Ok({
+            return {
                 "state": "shutdown",
                 "output_enabled": False,
                 "safety_state": "fault",
@@ -2565,17 +2354,19 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "pose": {},
                 "idle_relay": await asyncio.to_thread(self._vmc_idle.snapshot) if self._vmc_idle else {"enabled": False},
                 "vrchat_osc": await asyncio.to_thread(self._osc.awareness) if self._osc else {"enabled": False},
-            })
+                "driver_log": await asyncio.to_thread(self._driver_log_snapshot),
+            }
         snapshot = await asyncio.to_thread(self._scheduler.snapshot)
         driver_log = await asyncio.to_thread(self._driver_log_snapshot)
         self._apply_driver_log_to_udp(snapshot, driver_log)
-        return Ok({
+        return {
             "state": snapshot["state"],
             "output_enabled": snapshot["output_enabled"],
             "safety_state": snapshot["safety_state"],
             "queue_length": snapshot["queue_length"],
             **snapshot["awareness"],
             "driver_delivery": self._driver_delivery_awareness(snapshot, driver_log),
+            "driver_log": driver_log,
             "vrchat_osc": await asyncio.to_thread(self._osc.awareness) if self._osc else {
                 "enabled": False,
                 "connection": "unknown",
@@ -2585,7 +2376,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "pose_feedback_available": False,
                 "pickup_confirmation_available": False,
             },
-        })
+        }
 
     @llm_tool(**WORLD_OBSERVE)
     async def world_observe(self, **_: Any):
@@ -2650,16 +2441,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             },
         }
         return Ok(result)
-
-    async def vrc_vision_status(self, **_: Any):
-        """读取采集器/检测器状态，不改变生命周期状态。"""
-        if self._vision is None:
-            return Ok({
-                "available": False,
-                "worker": {"enabled": False, "running": False, "reason": "backend_unavailable"},
-                "uncertainties": ["backend_unavailable"],
-            })
-        return Ok(await asyncio.to_thread(self._vision.perception))
 
     async def vrc_vision_start(self, **_: Any):
         """只启动视觉采集；身体输出仍由独立门控控制。"""
@@ -2843,96 +2624,70 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         return Ok(result)
 
-    async def body_locomotion(
-        self,
-        *,
-        vertical: Any = 0.0,
-        horizontal: Any = 0.0,
-        duration_ms: Any = 1000,
-        **_: Any,
-    ):
-        try:
-            normalized = {
-                "vertical": _number("vertical", vertical, minimum=-1.0, maximum=1.0),
-                "horizontal": _number("horizontal", horizontal, minimum=-1.0, maximum=1.0),
-                "duration_ms": _integer("duration_ms", duration_ms, minimum=100, maximum=10000),
-            }
-        except ValueError as exc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params={},
-                reason=str(exc),
-            ))
-        if not self._osc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params=normalized,
-                reason="VRChat OSC bridge is not initialized",
-            ))
-        accepted, reason = await asyncio.to_thread(
-            self._osc.set_locomotion,
-            normalized["vertical"],
-            normalized["horizontal"],
-            normalized["duration_ms"],
-        )
-        return Ok(await self._osc_result(
-            accepted=accepted,
-            normalized_params=normalized,
-            reason=reason,
-        ))
-
     @llm_tool(**BODY_TURN)
     async def body_turn(
         self,
         *,
-        horizontal: Any = None,
-        duration_ms: Any = 500,
+        degrees: Any = None,
+        wait_complete: Any = False,
         **_: Any,
     ):
+        # 角度而不是摇杆轴：set_turn 内部也只是把 horizontal×速度×时长 折算成
+        # delta_deg 再交给同一个调度器，多一层折算只会让模型要同时猜轴值和时长。
+        # 符号跟 constraints.turn_deg、navigator._turn_direction_by_contract 对齐：
+        # 正数左转、负数右转。原先 scan 那条路径写反过，合并时以导航契约为准。
         try:
-            if horizontal is None:
-                raise ValueError("horizontal is required")
-            normalized = {
-                "horizontal": _number("horizontal", horizontal, minimum=-1.0, maximum=1.0),
-                "duration_ms": _integer("duration_ms", duration_ms, minimum=100, maximum=10000),
-            }
+            if degrees is None:
+                raise ValueError("degrees is required")
+            normalized_degrees = _number("degrees", degrees, minimum=-360.0, maximum=360.0)
+            awaited = _boolean("wait_complete", wait_complete)
         except ValueError as exc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params={},
-                reason=str(exc),
-            ))
-        if not self._osc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params=normalized,
-                reason="VRChat OSC bridge is not initialized",
-            ))
-        accepted, reason = await asyncio.to_thread(
-            self._osc.set_turn,
-            normalized["horizontal"],
-            normalized["duration_ms"],
-        )
-        return Ok(await self._osc_result(
-            accepted=accepted,
-            normalized_params=normalized,
-            reason=reason,
-        ))
+            return Ok(await self._invalid(str(exc)))
+        if not self._scheduler:
+            return Ok(await self._invalid("body scheduler is not initialized"))
 
-    @llm_tool(**BODY_STOP_MOVEMENT)
-    async def body_stop_movement(self, **_: Any):
-        if not self._osc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params={},
-                reason="VRChat OSC bridge is not initialized",
-            ))
-        accepted, reason = await asyncio.to_thread(self._osc.stop_movement)
-        return Ok(await self._osc_result(
-            accepted=accepted,
-            normalized_params={},
-            reason=reason,
-        ))
+        before = await asyncio.to_thread(self._scheduler.snapshot)
+        before_heading = before.get("heading") if isinstance(before.get("heading"), Mapping) else {}
+        before_commands = int(before_heading.get("turn_commands", 0) or 0)
+        submitted = await self._submit_async("turn", {"delta_deg": normalized_degrees})
+        submitted["normalized_params"] = {"degrees": normalized_degrees, "wait_complete": awaited}
+        if not awaited or not submitted.get("accepted"):
+            return Ok({**submitted, "completed": None if submitted.get("accepted") else False})
+
+        deadline = time.monotonic() + 4.0
+        latest = before
+        applied = False
+        settled = False
+        while time.monotonic() < deadline:
+            latest = await asyncio.to_thread(self._scheduler.snapshot)
+            heading = latest.get("heading") if isinstance(latest.get("heading"), Mapping) else {}
+            applied = int(heading.get("turn_commands", 0) or 0) > before_commands
+            settled = applied and not bool(heading.get("turning"))
+            if settled:
+                break
+            await asyncio.sleep(0.05)
+
+        heading = latest.get("heading") if isinstance(latest.get("heading"), Mapping) else {}
+        completed = bool(applied and settled)
+        return Ok({
+            **submitted,
+            "completed": completed,
+            "reason": None if completed else "turn_completion_unverified",
+            "verification": {
+                "scheduler_command_applied": applied,
+                "scheduler_settled": settled,
+                "turn_commands_before": before_commands,
+                "turn_commands_after": int(heading.get("turn_commands", 0) or 0),
+                "heading_yaw_deg": heading.get("yaw_deg"),
+                "requested_delta_deg": normalized_degrees,
+            },
+            # 转向期间没有把每个方位的图片送给 VLM；严禁据此下"没有道具"的结论。
+            "visual_inspection_complete": False,
+            "inspection_limit": (
+                "只验证了原地转向。没有逐方位视觉证据，不能确认沿途是否存在任务道具、"
+                "暗格、遮挡痕迹或墙后空间。"
+            ),
+        })
 
     @llm_tool(**BODY_CHATBOX)
     async def body_chatbox(
@@ -2974,110 +2729,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             normalized_params=normalized,
             reason=reason,
         ))
-
-    # 不注册为 LLM 工具：语义化的 vrc_menu_navigate 已覆盖唯一实际用途（右摇杆导航
-    # 快捷菜单），而这里的 6 种 control × 7 个参数会诱导模型自己拼移动输入，绕过
-    # body_locomotion 描述里的开环警告。调试台仍可通过 _DEBUG_COMMAND_NAMES 调用。
-    async def vrc_controller_input(
-        self,
-        *,
-        side: Any = "",
-        control: Any = "",
-        x: Any = 0.0,
-        y: Any = 0.0,
-        pressed: Any = True,
-        value: Any = 1.0,
-        duration_ms: Any = 250,
-        **_: Any,
-    ):
-        try:
-            normalized_side = _enum("side", side, ("left", "right"))
-            normalized_control = _enum(
-                "control", control, ("stick", "trigger", "grip", "menu", "a", "b")
-            )
-            normalized_pressed = _boolean("pressed", pressed)
-            normalized_value = _number("value", value, minimum=0.0, maximum=1.0)
-            normalized_duration = _integer("duration_ms", duration_ms, minimum=20, maximum=self._body_config.input.max_hold_ms)
-            normalized_x = _number("x", x, minimum=-1.0, maximum=1.0)
-            normalized_y = _number("y", y, minimum=-1.0, maximum=1.0)
-        except ValueError as exc:
-            return Ok(await self._controller_result(accepted=False, normalized_params={}, reason=str(exc)))
-        if not self._controller_input:
-            return Ok(await self._controller_result(
-                accepted=False,
-                normalized_params={"side": normalized_side, "control": normalized_control},
-                reason="AnyaDance controller input is not initialized",
-            ))
-        normalized = {
-            "side": normalized_side,
-            "control": normalized_control,
-            "x": normalized_x,
-            "y": normalized_y,
-            "pressed": normalized_pressed,
-            "value": normalized_value,
-            "duration_ms": normalized_duration,
-        }
-        if normalized_control == "stick":
-            accepted, reason = await asyncio.to_thread(
-                self._controller_input.set_axes,
-                normalized_side,
-                normalized_x,
-                normalized_y,
-                normalized_duration,
-            )
-        else:
-            accepted, reason = await asyncio.to_thread(
-                self._controller_input.set_button,
-                normalized_side,
-                normalized_control,
-                normalized_pressed,
-                normalized_duration,
-                normalized_value,
-            )
-        return Ok(await self._controller_result(
-            accepted=accepted,
-            normalized_params=normalized,
-            reason=reason,
-        ))
-
-    async def vrc_menu_navigate(self, *, x: Any = 0.0, y: Any = 0.0, duration_ms: Any = 250, **_: Any):
-        return await self.vrc_controller_input(
-            side="right",
-            control="stick",
-            x=x,
-            y=y,
-            duration_ms=duration_ms,
-        )
-
-    async def vrc_jump(self, *, hold_ms: Any = 100, **_: Any):
-        try:
-            normalized = {"hold_ms": _integer("hold_ms", hold_ms, minimum=20, maximum=1000)}
-        except ValueError as exc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params={},
-                reason=str(exc),
-            ))
-        if not self._osc:
-            return Ok(await self._osc_result(
-                accepted=False,
-                normalized_params=normalized,
-                reason="VRChat OSC bridge is not initialized",
-            ))
-        accepted, reason = await asyncio.to_thread(
-            self._osc.pulse_jump,
-            normalized["hold_ms"],
-        )
-        return Ok(await self._osc_result(
-            accepted=accepted,
-            normalized_params=normalized,
-            reason=reason,
-        ))
-
-    async def vrc_autonomy_status(self, **_: Any):
-        if not self._backend_client:
-            return Ok({"state": "disarmed", "armed": False, "reason": "backend is not initialized"})
-        return Ok(await asyncio.to_thread(self._backend_client.autonomy.snapshot))
 
     @llm_tool(**VRC_AUTONOMY_GOAL)
     async def vrc_autonomy_goal(
@@ -3139,6 +2790,23 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             )
         if not self._backend_client:
             return Ok({"accepted": False, "reason": "backend is not initialized"})
+        # 闲逛而方向未定时走 /autonomy/intent：后端的 submit_goal 硬性要求
+        # constraints.turn_deg，而「把最新画面交回主模型选路」这条链路只存在于
+        # autonomy_intent 里。少了这一跳，方向未定的闲逛只会拿到一条硬拒绝。
+        if normalized_kind == "wander" and (
+            constraints is None or dict(constraints).get("turn_deg") is None
+        ):
+            result = await asyncio.to_thread(
+                self._backend_client.autonomy.intent,
+                "wander",
+                text=normalized_text,
+                target_id=None,
+                target_type="object",
+                target_label=None,
+                min_confidence=0.0,
+                constraints=None,
+            )
+            return self._execution_result(Ok(result))
         result = await asyncio.to_thread(
             self._backend_client.autonomy.goal,
             normalized_text,
@@ -3219,38 +2887,6 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         ):
             self._semantic_request_id = None
         return self._execution_result(Ok(result))
-
-    @llm_tool(**VRC_WANDER_ROUTE)
-    async def vrc_wander_route(self, *, text: Any = None, **_: Any):
-        normalized_text = str(text or "").replace("\x00", "").strip()[:256] or "在附近随便逛逛"
-        if not self._backend_client:
-            return self._execution_result(Ok({
-                "accepted": False,
-                "movement_started": False,
-                "reason_code": "backend_unavailable",
-                "reason": "backend is not initialized",
-            }))
-        # 不带 turn_deg 走 intent：后端据此建立路线请求并把画面交回主模型。
-        # 这里刻意不复用 vrc_autonomy_goal——它是「方向已定」入口，缺 turn_deg 会
-        # 被直接拒绝且不建任务，模型收到拒绝后就会退回开环遥控。
-        result = await asyncio.to_thread(
-            self._backend_client.autonomy.intent,
-            "wander",
-            text=normalized_text,
-            target_id=None,
-            target_type="object",
-            target_label=None,
-            min_confidence=0.0,
-            constraints=None,
-        )
-        return self._execution_result(Ok(result))
-
-    @llm_tool(**VRC_AUTONOMY_STOP)
-    async def vrc_autonomy_stop(self, *, reason: Any = "autonomy_stop", **_: Any):
-        normalized_reason = str(reason or "autonomy_stop").replace("\x00", "").strip()[:160]
-        if not self._backend_client:
-            return Ok({"accepted": False, "reason": "backend is not initialized"})
-        return Ok(await asyncio.to_thread(self._backend_client.autonomy.stop, normalized_reason))
 
     async def vrc_autonomy_arm(self, *, ttl_s: Any = None, **_: Any):
         if not self._backend_client:

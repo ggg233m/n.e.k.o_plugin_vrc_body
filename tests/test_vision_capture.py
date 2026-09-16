@@ -184,8 +184,9 @@ class DxcamSilentFailureTests(unittest.TestCase):
     真机复现：窗口被拖出屏幕右边缘后 GetWindowRect 返回越界矩形，DXcam 的每个
     candidate 都抛 ``ValueError: Invalid Region``，但旧代码里
     ``_activate_candidate_locked`` 一构造出相机就把 ``_last_error`` 清空，于是
-    ``available`` 恒为 True、``last_error`` 恒为 None，agent 从 vrc_vision_status
-    看到的是 awaiting_first_frame——「还没开始」而不是「已经彻底坏了」。
+    ``available`` 恒为 True、``last_error`` 恒为 None，agent 从
+    ``body_status(include=["vision"])`` 看到的是 awaiting_first_frame
+    ——「还没开始」而不是「已经彻底坏了」。
     """
 
     def _source(self, *, specs, camera=None):

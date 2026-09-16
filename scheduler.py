@@ -625,7 +625,8 @@ class BodyScheduler:
                 ):
                     self._clear_current_action(now, "cancelled")
                 # 表达层动作位于独立的低优先级通道，不会记录在 _active 或
-                # _current_action 中，因此 body_cancel 仍需淡出匹配的表达层动作。
+                # _current_action 中，因此取消（body_stop(scope="action")）
+                # 仍需淡出匹配的表达层动作。
                 self._cancel_expression_overlays(now, action_id=target_id)
                 return
             if kind in {"express", "semantic_clip"} and self.config.behavior.protect_full_body_motion:

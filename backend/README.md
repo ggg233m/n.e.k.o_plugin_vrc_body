@@ -215,7 +215,7 @@ OpenVINO 的 person/player/avatar 检测在短期 IoU 跟踪之上启用了会�
 
 检测器只看画面，永远不会报告「前面有堵墙」；VRChat 内置 Velocity 参数是唯一能区分
 「正在前进」和「顶着墙推摇杆」的回传。`VrchatOscBridge.motion_feedback()` 把这些内置
-参数汇总成 `body_awareness.vrchat_osc.motion`（`GET /snapshot` 的 `vrchat_osc.motion`
+参数汇总成 `body_status` 的 `body.vrchat_osc.motion`（`GET /snapshot` 的 `vrchat_osc.motion`
 也带同一份读数）。`VelocityX/Z` 只有角色移动时才回传，所以导航器只接受本次前进命令
 之后的新样本，并给起步保留 450 ms；静止或停包会显示 `velocity_feedback_quiet`，OSC 层
 不会把历史 0 伪装成当前速度。当前 Avatar 的 X/Z 都曾成功回传后，导航器会设置

@@ -78,12 +78,14 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("body_stop", debug_commands)
         self.assertIn("body_reset", switches)
         # 读取刻意留给 Agent，否则它无从知道能力关着，也就没法提示用户去面板打开。
-        self.assertIn("vrc_autonomy_status", debug_commands)
-        self.assertIn("vrc_vision_status", debug_commands)
+        # 三份状态已经并进 body_status(include=…)，共用表里只剩这一个入口。
+        self.assertIn("body_status", debug_commands)
+        self.assertNotIn("vrc_autonomy_status", debug_commands)
+        self.assertNotIn("vrc_vision_status", debug_commands)
 
     def test_manifest_declares_hosted_debug_panel(self) -> None:
         manifest = self._manifest()
-        self.assertEqual(manifest["plugin"]["version"], "0.13.24")
+        self.assertEqual(manifest["plugin"]["version"], "0.13.25")
         self.assertTrue(manifest["plugin"]["ui"]["enabled"])
         panel = manifest["plugin"]["ui"]["panel"][0]
         self.assertEqual(panel["id"], "debug")
@@ -95,18 +97,36 @@ class HostedUiTests(unittest.TestCase):
         tree = ast.parse((ROOT / "__init__.py").read_text(encoding="utf-8"))
         commands = set(self._command_tuple("_DEBUG_COMMAND_NAMES"))
         self.assertIn("body_stop", commands)
-        self.assertIn("body_play_clip", commands)
+        self.assertIn("body_status", commands)
         self.assertIn("body_express", commands)
-        self.assertIn("body_avatar_parameter", commands)
         self.assertIn("body_vrchat_input", commands)
-        self.assertIn("body_locomotion", commands)
         self.assertIn("body_turn", commands)
-        self.assertIn("body_stop_movement", commands)
         self.assertIn("body_chatbox", commands)
-        self.assertIn("observe_vrchat_world", commands)
+        self.assertIn("world_observe", commands)
         self.assertIn("navigate_vrchat_world", commands)
-        self.assertIn("vrc_scan_surroundings", commands)
         self.assertIn("vrc_wander_step", commands)
+        # 合并掉的同义入口不能再回到白名单里——一件事只留一个入口是这轮收敛的前提。
+        for retired in (
+            "body_awareness",
+            "body_stop_movement",
+            "body_cancel",
+            "body_move_hand",
+            "body_sequence",
+            "body_locomotion",
+            "body_play_clip",
+            "body_list_clips",
+            "body_avatar_parameter",
+            "vrc_autonomy_status",
+            "vrc_autonomy_stop",
+            "vrc_vision_status",
+            "vrc_wander_route",
+            "vrc_scan_surroundings",
+            "vrc_controller_input",
+            "vrc_menu_navigate",
+            "vrc_jump",
+            "observe_vrchat_world",
+        ):
+            self.assertNotIn(retired, commands)
 
         plugin_class = next(
             node for node in tree.body
@@ -118,8 +138,8 @@ class HostedUiTests(unittest.TestCase):
         # 两个入口只是白名单不同，派发体共用；断言跟着搬到共用体上。
         dispatch_source = ast.unparse(methods["_run_bounded_command"])
         context_source = ast.unparse(methods["debug_dashboard_context"])
-        list_source = ast.unparse(methods["body_list_clips"])
-        play_source = ast.unparse(methods["body_play_clip"])
+        status_source = ast.unparse(methods["body_status"])
+        stop_source = ast.unparse(methods["body_stop"])
         self.assertIn("ui.context", context_decorators)
         self.assertIn("ui.action", action_source)
         self.assertIn("plugin_entry", action_source)
@@ -135,10 +155,16 @@ class HostedUiTests(unittest.TestCase):
         self.assertIn("semantic_push_rejected", context_source)
         self.assertIn("_world_bridge_thread", context_source)
         self.assertNotIn(".list()", context_source)
-        self.assertIn("asyncio.to_thread", list_source)
-        self.assertIn("asyncio.to_thread", play_source)
+        # 合并后的读取入口必须真的把三段都取到，否则 include 只是个空壳参数。
+        self.assertIn("autonomy.snapshot", status_source)
+        self.assertIn("_vision.perception", status_source)
+        self.assertIn("_body_snapshot", status_source)
+        # 合并后的停止入口同理：撤目标和清轴都要在，且撤目标必须排在清轴之前。
+        self.assertIn("autonomy.stop", stop_source)
+        self.assertIn("stop_movement", stop_source)
+        self.assertLess(stop_source.index("autonomy.stop"), stop_source.index("stop_movement"))
 
-        observe_source = ast.unparse(methods["observe_vrchat_world"])
+        world_observe_source = ast.unparse(methods["world_observe"])
         navigate_source = ast.unparse(methods["navigate_vrchat_world"])
         cancel_source = ast.unparse(methods["_replace_cancelled_semantic_push"])
         navigation_outcome_source = ast.unparse(methods["_push_navigation_outcome"])
@@ -147,14 +173,15 @@ class HostedUiTests(unittest.TestCase):
         world_loop_source = ast.unparse(methods["_world_context_loop_run"])
         semantic_text_source = ast.unparse(methods["_semantic_request_text"])
         semantic_push_source = ast.unparse(methods["_push_passive_semantic_parts"])
-        self.assertIn("plugin_entry", observe_source)
-        self.assertIn("当前 VRChat 视觉检测", observe_source)
+        self.assertIn("llm_tool", world_observe_source)
         self.assertIn("plugin_entry", navigate_source)
         self.assertIn("manual_arm_required", navigate_source)
         self.assertIn("autonomy.intent", navigate_source)
         self.assertIn("unsupported_spatial_navigation", navigate_source)
         self.assertIn("'depart'", autonomy_goal_source)
         self.assertIn("'wander'", autonomy_goal_source)
+        # 方向未定的闲逛必须改走 /autonomy/intent：submit_goal 硬性要求 turn_deg。
+        self.assertIn("autonomy.intent", autonomy_goal_source)
         self.assertIn("_semantic_request_id", wander_step_source)
         self.assertIn("autonomy.wander_step", wander_step_source)
         self.assertNotIn("target_id", wander_step_source)
@@ -195,11 +222,14 @@ class HostedUiTests(unittest.TestCase):
             "body_reach_and_grab",
             "body_gesture",
             "body_express",
-            "body_play_clip",
-            "body_avatar_parameter",
             "body_vrchat_input",
         ):
             self.assertIn(f'run("{command}"', source)
+        # 面板的「停止自主目标」和「立即急停」都改走合并后的 body_stop，
+        # 两个按钮的差别只剩 scope——写错 scope 会让急停退化成普通停车。
+        self.assertIn('run("body_stop", { scope: "freeze" })', source)
+        self.assertIn('run("body_stop", { scope: "navigation" })', source)
+        self.assertNotIn('run("vrc_autonomy_stop"', source)
         # 开关类必须走 panel_command，且渲染成滑块而不是按钮——按钮看不出当前
         # 状态，开关滑块的 checked 直接绑定后端真值。
         self.assertIn('item.id === "panel_command"', source)

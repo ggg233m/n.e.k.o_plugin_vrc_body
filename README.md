@@ -22,18 +22,15 @@
 - 向腰部、胸部或头部高度伸手，并在轨迹末段发送 grip。
 - 挥手、点头、鞠躬、急停、复位和显式启停输出。
 - 用 `body_express` 提交“问候、同意、解释、思考、庆祝”等语义意图，由分层状态机选择自然表达动作。
-- 用 `body_sequence` 组合最多 16 步动作，支持等待、1–4 次循环与 action ID 取消。
-- 枚举并播放白名单 `motions/` 目录中的 AnyaDance `.nya` 预制动作。
-- 用 `body_awareness` 读取 LLM 可理解的当前/上一动作、切换关系、完成状态、剩余时间和实际语义姿态。
-- 用 `body_avatar_parameter` 触发当前 Avatar 已配置的 Bool、Int 或 Float Animator 参数。
+- `motions/` 目录中的白名单 AnyaDance `.nya` 预制动作由 `body_express` 的状态机自动选片，不再单独暴露枚举/播放入口。
+- 用 `body_status` 读取 LLM 可理解的当前/上一动作、切换关系、完成状态、剩余时间和实际语义姿态；`include` 可只取 `body`/`autonomy`/`vision` 中的某几段。
 - 用 `body_vrchat_input` 安全脉冲 Grab、Use 或 Drop，并自动发送释放值。
-- 用 `body_locomotion`、`body_turn` 发送有时限的 VRChat 移动/转身轴值，或用 `body_stop_movement` 立即归零。
+- 用 `body_turn` 发送有时限的 VRChat 转身轴值，或用 `body_stop` 分层停下（`scope=all/navigation/axes/action/freeze`）。
 - 用 `body_chatbox` 发送附近玩家可见的 VRChat 聊天框文本（最多 144 字符）。
-- 用 `vrc_controller_input`、`vrc_menu_navigate` 和 `vrc_jump` 发送有限时长的虚拟 Index 摇杆、按钮和跳跃脉冲。
-- 用 `vrc_autonomy_status`、`vrc_autonomy_goal`、`vrc_autonomy_stop` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
+- 用 `body_status(include=["autonomy"])`、`vrc_autonomy_goal`、`body_stop(scope="navigation")` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
 - 向 N.E.K.O 后台 Agent 暴露正式的“观察当前 VRChat 世界”和“寻找或走向 VRChat 目标”入口；自然语言里的“找 NPC / 走过去 / 跟着它”会进入同一个安全导航接口，而不是被误判成仅有身体姿态能力。唯一语义目标可自动绑定稳定 ID，多个候选仍必须交回主 LLM 选择。
-- 用 `vrc_scan_surroundings` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。当前没有深度、碰撞地图或 SLAM，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
-- 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status` 与 `body_awareness`。
+- 用 `body_turn(degrees=360, wait_complete=true)` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。当前没有深度、碰撞地图或 SLAM，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
+- 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
 - 单一发送线程以配置的 120 Hz（默认）向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
 
@@ -43,7 +40,7 @@
 
 1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
 2. `body_stop` 会冻结当前合法姿态、释放所有控制器输入，并锁定后续动作；调用 `body_reset` 才能恢复。
-3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_awareness.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
+3. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_status` 的 `body.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
 4. 插件假设接管期间 AnyaDance UI 不再向 39570 发送。驱动遥测发现其他活跃来源时会报告冲突、解除自主授权并释放输入；否则为 `unsupported` 或 `detected_unattributed`。
 5. AnyaDance 虚拟驱动可能影响真实 SteamVR 设备追踪。实机测试应从私人 VRChat 实例、小幅度和低速度动作开始。
 6. OSC 同样使用 UDP。`delivery_confirmed=false` 只表示本机完成发送；只有收到 9001 回传时 `connection` 才显示 `detected`，没有回传时为 `unknown`，不能据此断言 VRChat 离线。
@@ -52,20 +49,20 @@
 
 ## 身体自知
 
-插件启动时会向 LLM 注入身体工具使用规则：聊天历史不是可靠的实时姿态来源；回答当前动作，以及执行“继续、换一个、另一只手也”等相对命令前，应先调用 `body_awareness`。
+插件启动时会向 LLM 注入身体工具使用规则：聊天历史不是可靠的实时姿态来源；回答当前动作，以及执行“继续、换一个、另一只手也”等相对命令前，应先调用 `body_status`。
 
-`body_awareness` 提供：
+`body_status` 的 `body` 段提供：
 
 - `motion`：当前动作来源、阶段、进度、已用/剩余时间及是否已经到达目标。
 - `previous_action` 和 `transition`：上一动作的结束原因，以及刚从什么动作切换到什么动作。
 - `pose`：由当前输出帧反推的双臂抬升角、方向、伸展、双手姿态/握持和头部旋转。
 - `summary`：可直接用于自然语言判断的中文摘要。
 
-每个成功受理的动作还会返回 `target_pose_summary`。其中 `completion_confirmed=false`，明确表示这只是目标意图；动作实际是否完成仍以 `body_awareness.motion` 为准。
+每个成功受理的动作还会返回 `target_pose_summary`。其中 `completion_confirmed=false`，明确表示这只是目标意图；动作实际是否完成仍以 `body_status` 的 `body.motion` 为准。
 
 ## 分层动作状态机
 
-调度器把动作分为安全层、基础动作层、手部层和表达层，并在 `body_status.behavior` 与 `body_awareness.behavior` 中公开当前模式、活动层、优先级、上一基础动作、切换策略和最近决策。
+调度器把动作分为安全层、基础动作层、手部层和表达层，并在 `body_status` 的 `body.behavior` 中公开当前模式、活动层、优先级、上一基础动作、切换策略和最近决策。
 
 优先关系为：急停/复位/禁用 > 抓取交互 > 序列 > 精确姿态 > 手动预制片段 > 显式手势 > 语义 VMD/程序化表达 > VMC 待机基础层。精确工具属于显式控制，仍可替换当前动作；`body_express` 会先查询 `motions/catalog.json`，命中时播放低优先级真实 VMD，未命中时才使用程序化覆盖层。舞蹈、序列、抓取或完整手势移动期间，状态机会拒绝新的全身表达，但允许点头、摇头和歪头等头部表达。
 
@@ -82,9 +79,9 @@ body_express(intent="celebrate", side="both", intensity=0.7)
 
 支持 `greet | agree | disagree | explain | present | think | celebrate | question | emphasize | beckon | comfort | apologize | surprise | shrug | clap | laugh | sigh | idle | pose | stretch | playful`。省略侧别、强度或时长时使用动作目录的自然默认值；同一意图有多个 VMD 时会轮换并参考强度选择。
 
-`body_awareness.vrchat_osc` 只报告 VRChat 实际发回的 Avatar ID 和配置参数，不提供实时骨骼角度，也不能确认 Pickup 是否附着。默认关注 `NEKO_Action`、`NEKO_ActionActive`、`NEKO_ActionPhase` 和 `NEKO_Holding`；这些参数需要先在 Avatar 的 Expression Parameters/Animator 中创建并驱动。
+`body_status` 的 `body.vrchat_osc` 只报告 VRChat 实际发回的 Avatar ID 和配置参数，不提供实时骨骼角度，也不能确认 Pickup 是否附着。默认关注 `NEKO_Action`、`NEKO_ActionActive`、`NEKO_ActionPhase` 和 `NEKO_Holding`；这些参数需要先在 Avatar 的 Expression Parameters/Animator 中创建并驱动。
 
-白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_awareness.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
+白名单还包含六个 VRChat 内置 Avatar 参数（`VelocityX/Y/Z`、`AngularY`、`Upright`、`Grounded`），`body_status` 的 `body.vrchat_osc.motion` 由它们算出实测移动反馈——这是全仓库唯一能说明“我是不是真的动了”的回传，所有工具的 `accepted=true` 都只代表本机 UDP 发送成功。
 
 > ✅ **参数名已实机验证（2026-08-23）。** 实测 `VelocityX/Y/Z`、`AngularY`、`Grounded` 均会回传，且 `VelocityX/Z` 是 **avatar 本地坐标系**——转 90° 后仍是 Z 主导，因此 `velocity_z` 直接就是前进分量，不需要先按 HMD yaw 旋转。该 Avatar 实测跑满速度为 `2.6667 m/s`。`VelocityX/Z` 只有角色移动时才回传，因此每条速度记录只是短时样本；静止沉默是正常现象，旧的 0 或移动速度超过时限后都会变成 `motion.available=false` / `velocity_feedback_quiet`，OSC 层不会把它伪装成当前零速度。当前 Avatar 已成功回传过 X/Z 后，导航器会确认反馈能力；前进超过 450 ms 起步宽限仍然沉默时，才将沉默作为零速度累计，默认连续 4 tick 后进入绕行。Avatar 切换会清空能力确认。
 
@@ -244,7 +241,9 @@ host_output_host = "127.0.0.1"
 host_send_rate_hz = 60
 ```
 
-只有调度器处于 `idle` 且 VMC 帧未过期时才应用中转。精确动作、VMD、序列、保持姿态和急停不会被 VMC 覆盖；动作结束回到 `idle` 后自动恢复最新宿主姿态。`body_status.idle_relay` 和 `body_awareness.idle_relay` 会报告监听状态、帧龄和当前是否正在应用。
+只有调度器处于 `idle` 且 VMC 帧未过期时才应用中转。精确动作、VMD、序列、保持姿态和急停不会被 VMC 覆盖；动作结束回到 `idle` 后自动恢复最新宿主姿态。`body_status` 的 `body.idle_relay` 会报告监听状态、帧龄和当前是否正在应用。
+
+宿主暂停、页面冻结或 VMC 输出重新握手时会发 `/VMC/Ext/OK = 0`，插件随即作废六点基准并停止应用中转（VRChat 角色停在最后一帧）。恢复后**不会**用彼时的动画姿势重新自锁手腕朝向与手指弯曲零点——那会让整套骨骼永久错位；插件改为自动重新请求一次 T Pose，拿到权威静止姿势后才重建基准。帧间隔超过 `stale_after_ms` 时丢弃卡顿前残留的半帧，避免与恢复后的新帧拼成跨卡顿的混合帧。校准状态见 `body_status.idle_relay.calibration` 的 `needs_recalibration`、`baseline_established` 与 `rejected_frames`。
 
 ## VRChat OSC
 
@@ -271,16 +270,13 @@ awareness_parameters = [
 参数工具示例：
 
 ```text
-body_avatar_parameter(name="NEKO_Action", value=2)
-body_avatar_parameter(name="NEKO_ActionActive", value=true)
 body_vrchat_input(action="grab", side="right", hold_ms=100)
-body_locomotion(vertical=1.0, horizontal=0.0, duration_ms=1000)
-body_turn(horizontal=-0.5, duration_ms=500)
-body_stop_movement()
+body_turn(degrees=-45)
+body_stop(scope="axes")
 body_chatbox(text="你好", immediate=true)
 ```
 
-传入不存在的 Avatar 参数时，OSC 数据报仍可能成功发送，但 VRChat 不会产生对应动作。VRChat 的移动轴必须使用 -1..1 的浮点数并在结束时归零；本插件对每次移动/转身设置 100–10000 ms 的自动归零超时，`body_stop_movement` 会同时归零三条轴。`accepted=true` 只代表本机 UDP 发送成功，不代表 VRChat 已移动或转身。`body_reach_and_grab` 会在动作最后 15% 自动安排同侧 `/input/GrabLeft` 或 `/input/GrabRight` 脉冲；动作被替换时守卫会阻止尚未发生的按下，急停、取消、复位、禁用和插件关闭都会清空定时输入并发送释放值。聊天框不是私密通道，附近玩家可能看到。
+传入不存在的 Avatar 参数时，OSC 数据报仍可能成功发送，但 VRChat 不会产生对应动作。VRChat 的移动轴必须使用 -1..1 的浮点数并在结束时归零；本插件对每次移动/转身设置 100–10000 ms 的自动归零超时，`body_stop(scope="axes")` 会同时归零三条轴（但只清轴不撤自主目标，导航器下一帧还会把她推回去——用户喊“停下”要用默认的 `scope="all"`）。`accepted=true` 只代表本机 UDP 发送成功，不代表 VRChat 已移动或转身。`body_reach_and_grab` 会在动作最后 15% 自动安排同侧 `/input/GrabLeft` 或 `/input/GrabRight` 脉冲；动作被替换时守卫会阻止尚未发生的按下，急停、取消、复位、禁用和插件关闭都会清空定时输入并发送释放值。聊天框不是私密通道，附近玩家可能看到。
 
 ## 调试 UI
 
@@ -293,13 +289,13 @@ body_chatbox(text="你好", immediate=true)
 - 启用、平滑禁用、复位与急停。
 - 手臂角度/方位/伸展/掌心调节，手型、程序化手势和伸手抓取测试。
 - 语义表达意图、状态机模式、活动层和优先级保护调试。
-- `.nya` 动作选择、速度、循环、切换时间与结束恢复。
-- Avatar Parameter 以及 Grab/Use/Drop 输入测试。
-- 每秒自动刷新、身体自知/OSC JSON 快照和最近调试命令日志。
+- `.nya` 动作目录诊断（可用/已索引/待解析/缓存/元数据错误）；选片交给 `body_express` 的状态机，面板不再手点片段。
+- Grab/Use/Drop 输入脉冲测试。
+- 每秒自动刷新、身体状态/OSC JSON 快照和最近调试命令日志。
 
 调试面板调用的是与 LLM 工具相同的校验和调度实现，因此仍受启用状态、范围、安全锁定和动作时长限制。急停后必须点击“复位 T Pose”解除锁定。
 
-面板每秒刷新时只扫描动作文件名、大小和修改时间，不读取或解析 `.nya` 正文。新动作在首次播放或显式调用 `body_list_clips` 时由后台线程完成完整校验；首次解析期间命令按钮会显示执行中，但状态刷新和其他插件事件不会被同步文件读取占住。解析结果按文件签名缓存，文件内容变更后会自动失效。当前最多保留两个已解析动作，便于重复播放和动作切换。
+面板每秒刷新时只扫描动作文件名、大小和修改时间，不读取或解析 `.nya` 正文。新动作在首次播放时由后台线程完成完整校验；首次解析期间命令按钮会显示执行中，但状态刷新和其他插件事件不会被同步文件读取占住。解析结果按文件签名缓存，文件内容变更后会自动失效。当前最多保留两个已解析动作，便于重复播放和动作切换。
 
 ## 安装与验证
 
@@ -317,12 +313,11 @@ python -m plugin.neko_plugin_cli.cli build H:\AI\neko-music\vrc\neko_anyadance_b
 
 ```text
 body_enable()
-body_arm_pose(side="right", elevation_deg=130, azimuth_deg=-25, reach=0.9, wrist_roll_deg=45)
-body_move_hand(side="right", relative_to="chest", x_m=0.30, y_m=0.10, z_m=-0.45, palm="down")
+body_arm_pose(mode="polar", side="right", elevation_deg=130, azimuth_deg=-25, reach=0.9, wrist_roll_deg=45)
+body_arm_pose(mode="anchor", side="right", relative_to="chest", x_m=0.30, y_m=0.10, z_m=-0.45, palm="down")
 body_hand(side="right", pose="grip", strength=1.0)
-body_avatar_parameter(name="NEKO_Action", value=1)
 body_vrchat_input(action="use", side="right")
-body_awareness()
+body_status()
 body_stop()
 body_reset()
 body_disable()
@@ -338,15 +333,7 @@ body_disable()
 
 动作目录的文件名就是调用时使用的逻辑名称（不含 `.nya` 扩展名），支持中文名称，但不接受绝对路径、子目录或 Windows 非法文件名字符。
 
-调用示例：
-
-```text
-body_list_clips()
-body_play_clip(clip_name="my_greeting", speed=1.0, loop_count=1, restore_after=true)
-body_play_clip(clip_name="my_idle", speed=1.0, loop_count=1, restore_after=false)
-```
-
-播放默认把片段第一帧 HMD 的 X/Z 对齐到当前姿态；`body_stop` 和 `body_cancel` 可随时中断。
+动作选片不再有独立的枚举/播放工具：`body_express` 命中 `motions/catalog.json` 时直接播放对应片段，面板只保留目录诊断。播放默认把片段第一帧 HMD 的 X/Z 对齐到当前姿态；`body_stop()` 与 `body_stop(scope="action")` 可随时中断。
 
 `vmd_bake.py` 提供离线烘焙命令。它让 Blender/MMD Tools 完成真实骨架的 FK、IK 和约束求值，再复用 AnyaDance 的六设备重定向算法生成 `.nya`，不会在插件实时调度线程中运行：
 
@@ -362,19 +349,7 @@ VMD 和 PMX/PMD 都是独立的第三方作品；导入前应确认各自授权�
 
 大型动作在面板中最初会标为“未索引”。首次播放需要真实的 JSON 解码和逐帧安全校验时间；完成后会显示帧数/时长并进入内存缓存，之后再次播放无需重复解析。目录自动刷新不会触发这项重活。
 
-动作序列示例：
-
-```json
-{
-  "steps": [
-    {"type": "arm_pose", "side": "right", "elevation_deg": 120, "azimuth_deg": 0, "duration_ms": 500},
-    {"type": "move_hand", "side": "right", "relative_to": "chest", "x_m": 0.3, "y_m": 0.0, "z_m": -0.45, "duration_ms": 400},
-    {"type": "hand", "side": "right", "pose": "grip", "strength": 1.0, "duration_ms": 250},
-    {"type": "wait", "duration_ms": 800}
-  ],
-  "loop_count": 1
-}
-```
+调度器内部仍保留多步动作序列这一层（优先级高于精确姿态、低于抓取交互），但它不再有对外入口：`body_sequence` 工具和后端路由都已移除，组合动作改由 `body_express` 的状态机在片段层完成。
 
 ## 致谢
 

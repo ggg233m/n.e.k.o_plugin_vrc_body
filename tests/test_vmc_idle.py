@@ -353,6 +353,70 @@ class VmcIdleRelayTests(unittest.TestCase):
         self.assertEqual(accepted.devices["left_controller"].position, (-0.68, 1.33, -0.10))
         self.assertFalse(relay.snapshot()["calibration"]["waiting_for_t_pose_frame"])
 
+    def test_host_output_restart_requires_authoritative_rest_pose(self) -> None:
+        """宿主暂停后不得用恢复时的动画姿势重新自锁腕部与手指零点。"""
+        current = [10.0]
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile(), clock=lambda: current[0])
+        relay.reset_calibration(reason="host_t_pose")
+        relay.ingest_messages(_complete_frame_messages(), now=current[0])
+        self.assertIsNotNone(relay.latest_frame())
+        self.assertTrue(relay.has_baseline())
+        self.assertFalse(relay.needs_recalibration())
+
+        # 页面冻结 / VMC 输出重新握手：宿主发 OK=0，基准与姿态一起作废。
+        relay.ingest_messages([("/VMC/Ext/OK", (0,))], now=current[0])
+        self.assertIsNone(relay.latest_frame())
+        self.assertTrue(relay.needs_recalibration())
+
+        # 恢复后的第一个完整帧是动画姿势，它不能成为新的静止基准。
+        current[0] += 3.0
+        half_sqrt = 2.0 ** -0.5
+        animated = []
+        for address, arguments in _complete_frame_messages():
+            if address == "/VMC/Ext/Bone/Pos" and arguments[0] == "LeftUpperArm":
+                arguments = (*arguments[:4], 0.0, 0.0, half_sqrt, half_sqrt)
+            animated.append((address, arguments))
+        animated[0] = ("/VMC/Ext/OK", (1,))
+        relay.ingest_messages(animated, now=current[0])
+        self.assertIsNone(relay.latest_frame())
+        self.assertFalse(relay.snapshot()["calibration"]["calibrated"])
+        self.assertTrue(relay.needs_recalibration())
+
+        # 补一次 T Pose 之后才允许重建基准，且重建结果必须是正确的腕部零点。
+        current[0] += 1.0 / 60.0
+        relay.ingest_messages(_complete_frame_messages(), now=current[0])
+        calibrated = relay.latest_frame()
+        self.assertIsNotNone(calibrated)
+        assert calibrated is not None
+        for actual, expected in zip(
+            calibrated.devices["left_controller"].rotation, LEFT_CANONICAL_QUAT
+        ):
+            self.assertAlmostEqual(actual, expected, places=12)
+        self.assertFalse(relay.needs_recalibration())
+
+    def test_stall_discards_partial_frame_instead_of_mixing_across_gap(self) -> None:
+        """卡顿前的半帧不得与恢复后的新帧拼成一个跨卡顿的混合帧。"""
+        current = [10.0]
+        relay = VmcIdleRelay(VmcIdleConfig(), BodyProfile(), clock=lambda: current[0])
+        partial = [
+            message
+            for message in _complete_frame_messages()
+            if message[0] != "/VMC/Ext/T"
+            and not (message[0] == "/VMC/Ext/Bone/Pos" and message[1][0] == "Neck")
+        ]
+        relay.ingest_messages(partial, now=current[0])
+
+        # 卡顿 3 秒后恢复，新帧仍然缺 Neck；旧帧残留的 Neck 不能补上这个缺口。
+        current[0] += 3.0
+        resumed = [
+            message
+            for message in _complete_frame_messages()
+            if not (message[0] == "/VMC/Ext/Bone/Pos" and message[1][0] == "Neck")
+        ]
+        relay.ingest_messages(resumed, now=current[0])
+        self.assertIsNone(relay.latest_frame())
+        self.assertEqual(relay.snapshot()["incomplete_frames"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

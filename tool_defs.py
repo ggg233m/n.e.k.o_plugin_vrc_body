@@ -40,43 +40,32 @@ BODY_DISABLE = {
 
 BODY_ARM_POSE = {
     "name": "body_arm_pose",
-    "description": "用抬升角和方位角设置任意方向的手臂姿态；手会随手臂方向旋转，再叠加掌心和手腕偏移。姿态保持到下一条命令。",
+    "description": (
+        "设置手臂姿态，姿态保持到下一条命令。"
+        "mode=polar 用抬升角和方位角指向任意方向（要 side + elevation_deg）；"
+        "mode=anchor 把一只手放到 HMD、胸口或髋部锚点附近的偏移处（要 side + x_m/y_m/z_m）。"
+        "两种模式下手都会随手臂方向旋转，再叠加掌心和手腕偏移。"
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "side": {"type": "string", "enum": ["left", "right", "both"]},
-            "elevation_deg": {"type": "number", "minimum": 0, "maximum": 180},
-            "azimuth_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0, "description": "0 向前，90 向右，-90 向左，180 向后"},
+            "mode": {"type": "string", "enum": ["polar", "anchor"], "default": "polar", "description": "polar=角度指向；anchor=相对身体锚点的位置"},
+            "side": {"type": "string", "enum": ["left", "right", "both"], "description": "anchor 模式只接受 left/right"},
+            "elevation_deg": {"type": "number", "minimum": 0, "maximum": 180, "description": "polar 模式必填"},
+            "azimuth_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0, "description": "polar：0 向前，90 向右，-90 向左，180 向后"},
             "plane": {"type": "string", "enum": ["front", "side"], "description": "旧版兼容参数；仅在未提供 azimuth_deg 时使用"},
             "reach": {"type": "number", "minimum": 0.3, "maximum": 1.0, "default": 0.9},
+            "relative_to": {"type": "string", "enum": ["hmd", "chest", "hip"], "default": "chest", "description": "anchor 模式的参考锚点"},
+            "x_m": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "anchor 模式必填"},
+            "y_m": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "anchor 模式必填"},
+            "z_m": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "anchor 模式必填"},
             "palm": {"type": "string", "enum": ["neutral", "forward", "down", "inward"], "default": "neutral"},
             "wrist_pitch_deg": {"type": "number", "minimum": -90, "maximum": 90, "default": 0},
             "wrist_yaw_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0},
             "wrist_roll_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0},
             "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 600},
         },
-        "required": ["side", "elevation_deg"],
-    },
-}
-
-BODY_MOVE_HAND = {
-    "name": "body_move_hand",
-    "description": "把一只手移动到 HMD、胸口或髋部锚点附近；手会随肩到目标的方向旋转，再叠加掌心和手腕偏移。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "side": {"type": "string", "enum": ["left", "right"]},
-            "relative_to": {"type": "string", "enum": ["hmd", "chest", "hip"], "default": "chest"},
-            "x_m": {"type": "number", "minimum": -1.0, "maximum": 1.0},
-            "y_m": {"type": "number", "minimum": -1.0, "maximum": 1.0},
-            "z_m": {"type": "number", "minimum": -1.0, "maximum": 1.0},
-            "palm": {"type": "string", "enum": ["neutral", "forward", "down", "inward"], "default": "neutral"},
-            "wrist_pitch_deg": {"type": "number", "minimum": -90, "maximum": 90, "default": 0},
-            "wrist_yaw_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0},
-            "wrist_roll_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0},
-            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000, "default": 600},
-        },
-        "required": ["side", "x_m", "y_m", "z_m"],
+        "required": ["side"],
     },
 }
 
@@ -155,99 +144,6 @@ BODY_EXPRESS = {
     },
 }
 
-BODY_SEQUENCE = {
-    "name": "body_sequence",
-    "description": "异步执行由 arm_pose、hand、move_hand、gesture 和 wait 组成的动作序列。最多 16 步、4 次循环、总时长 30 秒。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "steps": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 16,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string", "enum": ["arm_pose", "hand", "move_hand", "gesture", "wait"]},
-                        "side": {"type": "string"},
-                        "elevation_deg": {"type": "number"},
-                        "azimuth_deg": {"type": "number"},
-                        "reach": {"type": "number"},
-                        "palm": {"type": "string"},
-                        "wrist_pitch_deg": {"type": "number"},
-                        "wrist_yaw_deg": {"type": "number"},
-                        "wrist_roll_deg": {"type": "number"},
-                        "pose": {"type": "string"},
-                        "strength": {"type": "number"},
-                        "relative_to": {"type": "string"},
-                        "x_m": {"type": "number"},
-                        "y_m": {"type": "number"},
-                        "z_m": {"type": "number"},
-                        "name": {"type": "string"},
-                        "intensity": {"type": "number"},
-                        "duration_ms": {"type": "integer"},
-                    },
-                    "required": ["type"],
-                },
-            },
-            "loop_count": {"type": "integer", "minimum": 1, "maximum": 4, "default": 1},
-        },
-        "required": ["steps"],
-    },
-}
-
-BODY_CANCEL = {
-    "name": "body_cancel",
-    "description": "取消当前动作或指定 action_id 的当前动作，停在已经到达的合法姿态。",
-    "parameters": {
-        "type": "object",
-        "properties": {"action_id": {"type": "string", "description": "省略时取消任意当前动作"}},
-        "required": [],
-    },
-}
-
-BODY_LIST_CLIPS = {
-    "name": "body_list_clips",
-    "description": "列出 motions 白名单目录内可播放的 AnyaDance .nya 预制动作及无效文件。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-BODY_PLAY_CLIP = {
-    "name": "body_play_clip",
-    "description": "按逻辑名称播放 motions 目录内的 .nya 预制动作，支持速度、有限循环、HMD 锚定、过渡和结束恢复。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "clip_name": {"type": "string", "description": "不含路径或扩展名的预制动作名称，支持中文"},
-            "speed": {"type": "number", "minimum": 0.25, "maximum": 3.0, "default": 1.0},
-            "loop_count": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
-            "transition_ms": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 400},
-            "anchor": {"type": "boolean", "default": True, "description": "把片段第一帧 HMD 的 X/Z 对齐到当前姿态"},
-            "restore_after": {"type": "boolean", "default": False, "description": "播放结束后回到播放前姿态"},
-        },
-        "required": ["clip_name"],
-    },
-}
-
-BODY_AVATAR_PARAMETER = {
-    "name": "body_avatar_parameter",
-    "description": "通过 VRChat OSC 设置当前 Avatar 的 Bool、Int 或 Float 参数。参数必须已存在于该 Avatar；UDP 发送成功不代表 VRChat 已应用。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string", "minLength": 1, "maxLength": 128},
-            "value": {
-                "anyOf": [
-                    {"type": "boolean"},
-                    {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
-                    {"type": "number"},
-                ]
-            },
-        },
-        "required": ["name", "value"],
-    },
-}
-
 BODY_VRCHAT_INPUT = {
     "name": "body_vrchat_input",
     "description": "通过 AnyaDance 虚拟 Index 控制器优先发送一次左/右手 Grab、Use 或 Drop 输入；没有可用驱动时回退到 VRChat OSC，并自动释放按钮。无法确认 Pickup 结果。",
@@ -260,57 +156,6 @@ BODY_VRCHAT_INPUT = {
         },
         "required": ["action", "side"],
     },
-}
-
-VRC_CONTROLLER_INPUT = {
-    "name": "vrc_controller_input",
-    "description": "直接设置 AnyaDance 虚拟 Index 控制器的摇杆或按钮。输入经过有限时长和范围保护，返回的是本机调度接受结果，不代表 VRChat 已执行绑定动作。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "side": {"type": "string", "enum": ["left", "right"]},
-            "control": {"type": "string", "enum": ["stick", "trigger", "grip", "menu", "a", "b"]},
-            "x": {"type": "number", "minimum": -1, "maximum": 1},
-            "y": {"type": "number", "minimum": -1, "maximum": 1},
-            "pressed": {"type": "boolean", "default": True},
-            "value": {"type": "number", "minimum": 0, "maximum": 1, "default": 1},
-            "duration_ms": {"type": "integer", "minimum": 20, "maximum": 10000, "default": 250},
-        },
-        "required": ["side", "control"],
-    },
-}
-
-VRC_MENU_NAVIGATE = {
-    "name": "vrc_menu_navigate",
-    "description": "用右侧虚拟 Index 摇杆短暂导航 VRChat 快捷菜单；x/y 为 -1 到 1，超时自动回中。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "x": {"type": "number", "minimum": -1, "maximum": 1, "default": 0},
-            "y": {"type": "number", "minimum": -1, "maximum": 1, "default": 0},
-            "duration_ms": {"type": "integer", "minimum": 50, "maximum": 2000, "default": 250},
-        },
-        "required": [],
-    },
-}
-
-VRC_JUMP = {
-    "name": "vrc_jump",
-    "description": (
-        "通过 VRChat OSC /input/Jump 发送一次跳跃脉冲；这是语义地址，与用户的按键绑定无关。"
-        "accepted=true 只代表本机发送成功，不代表角色真的离地（当前世界可能禁跳，或人卡在低天花板下）。"
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"hold_ms": {"type": "integer", "minimum": 20, "maximum": 1000, "default": 100}},
-        "required": [],
-    },
-}
-
-VRC_AUTONOMY_STATUS = {
-    "name": "vrc_autonomy_status",
-    "description": "读取 VRChat 自主控制授权、降级原因、当前目标和世界 revision。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 VRC_AUTONOMY_GOAL = {
@@ -449,40 +294,6 @@ VRC_WANDER_STEP = {
     },
 }
 
-VRC_WANDER_ROUTE = {
-    "name": "vrc_wander_route",
-    "description": (
-        "在方向尚未决定时开始一次闲逛：把最新配对画面作为"
-        " `[VRChat 主模型闲逛路线任务]` 交回给你选路。"
-        "用户说“随便走走/去逛逛/往前走一小段”而你还没有看图决定方向时用它。"
-        "本次调用不会移动，返回 accepted=false 且 reason_code=wander_direction_pending"
-        "才是成功建立路线任务，此时不得声称已经出发；紧接着必须用 vrc_wander_step"
-        "选择 left/forward/right 才真正开始移动。"
-        "若你已经看过画面并确定了相对角度，可以直接用 vrc_autonomy_goal 提交 wander"
-        "并填 constraints.turn_deg，不需要本工具。"
-        "两条路都走本地闭环：会读取速度回传、检测撞墙、有限绕行并记录死路方向。"
-        "需要用户先在插件面板手动启用自主控制。"
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "maxLength": 256,
-                "description": "用户的原始意图描述，例如“往前走一小段”。",
-            },
-        },
-        "required": [],
-        "additionalProperties": False,
-    },
-}
-
-VRC_AUTONOMY_STOP = {
-    "name": "vrc_autonomy_stop",
-    "description": "停止自主目标并释放 AnyaDance 控制器输入。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
 VRC_SEMANTIC_COMMIT = {
     "name": "vrc_semantic_commit",
     "description": (
@@ -543,8 +354,32 @@ VRC_SEMANTIC_COMMIT = {
 
 BODY_STOP = {
     "name": "body_stop",
-    "description": "最高优先级急停：冻结当前合法姿态、释放所有输入、清空队列并锁定后续动作。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "description": (
+        "停下来。用 scope 选停哪一层，默认 all（先撤自主目标再清移动轴，这是"
+        "用户喊「停下/别动」时要的那个）。"
+        "navigation=只取消正在跑的自主目标；axes=只把移动与转向轴归零；"
+        "action=取消当前手臂动作，停在已经到达的合法姿态；"
+        "freeze=最高优先级急停，冻结姿态并锁定后续动作，解除需要用户去面板复位。"
+        "只清轴不撤目标的话导航器会在下一帧把她推回去，所以别单用 axes。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "enum": ["all", "navigation", "axes", "action", "freeze"],
+                "default": "all",
+                "description": "停哪一层；不确定就用 all。",
+            },
+            "reason": {
+                "type": "string",
+                "maxLength": 160,
+                "default": "autonomy_stop",
+                "description": "撤销自主目标时记录的原因。",
+            },
+        },
+        "required": [],
+    },
 }
 
 BODY_RESET = {
@@ -559,14 +394,26 @@ BODY_RESET = {
 
 BODY_STATUS = {
     "name": "body_status",
-    "description": "读取 AnyaDance 发送状态、当前动作、手臂和手部状态、安全锁定、队列及调度指标。UDP 本身没有响应；启用并收到驱动遥测时，driver_log 可确认 AnyaDance 是否实际处理了命令。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-BODY_AWARENESS = {
-    "name": "body_awareness",
-    "description": "读取 LLM 可理解的实时身体自知：当前/上一动作、切换关系、进度与剩余时间，以及双臂、双手和头部的语义姿态。连续动作、切换动作或回答当前在做什么之前应先调用。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "description": (
+        "读取实时状态。默认三段全给：body=当前/上一动作、切换关系、进度与剩余时间、"
+        "双臂双手和头部的语义姿态、安全锁定与驱动投递确认；"
+        "autonomy=自主移动授权、降级原因、当前目标和世界 revision；"
+        "vision=采集器与检测器运行情况。"
+        "连续动作、切换动作、回答当前在做什么，或者要解释「为什么没动」之前先调用它——"
+        "没动通常是 autonomy.armed=false，这时应如实请用户去调试台启用，不要自己重试。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["body", "autonomy", "vision"]},
+                "maxItems": 3,
+                "description": "只读其中几段；省略则三段全读。",
+            },
+        },
+        "required": [],
+    },
 }
 
 WORLD_OBSERVE = {
@@ -581,12 +428,6 @@ WORLD_OBSERVE = {
         "traversability_prediction.ground_extent 是单帧地面可见范围，advisory_only；"
         "它只给方向之间的相对开阔度排序，不触发停车，extent_ratio 是画面跨度比例而非米制。"
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-VRC_VISION_STATUS = {
-    "name": "vrc_vision_status",
-    "description": "读取本地视觉采集器、检测器和世界状态的运行情况；没有帧或检测器时必须按 unknown 处理。",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
@@ -644,76 +485,37 @@ VRC_VISION_FRAME = {
     },
 }
 
-BODY_LOCOMOTION = {
-    "name": "body_locomotion",
-    "description": (
-        "开环遥控摇杆：直接通过 VRChat OSC 推移动轴，保持到超时或下一次调用。"
-        "前后左右对应游戏摇杆输入：forward=1.0, backward=-1.0, left=-1.0, right=1.0；"
-        "可同时设置斜向移动。移动方向相对角色当前朝向，不是世界方向。"
-        "它不读速度回传、不检测撞墙、不会绕行、也不记录死路方向，accepted=true 只代表"
-        "本机发送成功，不能证明角色真的移动了。因此只用于用户明确要求的一次性微调"
-        "（挪一点、退半步、对齐位置）。"
-        "凡是“走走/逛逛/往前走/过去/离开”这类导航意图一律改用闭环："
-        "已看图定好方向用 vrc_autonomy_goal(kind=\"wander\") 并填 constraints.turn_deg，"
-        "尚未定方向用 vrc_wander_route 取回路线任务后再 vrc_wander_step。"
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "vertical": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0, "description": "前后轴：1.0=前进，-1.0=后退"},
-            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0, "description": "左右轴：-1.0=左移，1.0=右移"},
-            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 1000, "description": "持续时间；超时后自动归零"},
-        },
-        "required": [],
-    },
-}
-
 BODY_TURN = {
     "name": "body_turn",
     "description": (
-        "转身：直接旋转虚拟 HMD 的朝向。符号与 wander 的 turn_deg 一致——"
-        "正值向左转，负值向右转（例：用户说“向右转”填 horizontal=-0.5）。"
+        "转身：直接旋转虚拟 HMD 的朝向，按角度给。符号与 wander 的 turn_deg 一致——"
+        "正数左转、负数右转（用户说“向右转 30 度”填 degrees=-30）。"
         "不走摇杆——VR 模式下 VRChat 的右摇杆转向不可靠，照样会回 accepted=true 却不动。"
         "转身同时就是转视角：转完之后画面朝向变了，wander 的前进方向也随之改变，"
         "所以「先转向再前进」是改变行进方向的正确做法。"
+        "要原地看一圈就填 ±360 并置 wait_complete=true；"
+        "此时 completed=true 只证明转向调度完成，"
+        "visual_inspection_complete 始终为 false——转的过程中没有逐方位看图，"
+        "不得据此声称沿途没有道具、暗格或遮挡痕迹。"
         "accepted=true 只代表本机发送成功，要确认真的转了得用 vrc_vision_frame 看画面。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "horizontal": {"type": "number", "minimum": -1.0, "maximum": 1.0, "description": "转身速度：1.0=最快左转，-1.0=最快右转（正左负右，与 turn_deg 同）"},
-            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 500, "description": "持续时间；超时后自动归零"},
-        },
-        "required": ["horizontal"],
-    },
-}
-
-VRC_SCAN_SURROUNDINGS = {
-    "name": "vrc_scan_surroundings",
-    "description": (
-        "按用户明确要求让 VRChat 视角原地完整转一圈，并等待本地转向调度结束。"
-        "completed=true 只证明一整圈转向在本地调度器中完成，不证明已经看清沿途物体；"
-        "visual_inspection_complete=false 时不得声称没有任务道具、暗格或遮挡痕迹。"
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "direction": {
-                "type": "string",
-                "enum": ["left", "right"],
-                "default": "right",
-                "description": "转圈方向。",
+            "degrees": {
+                "type": "number",
+                "minimum": -360.0,
+                "maximum": 360.0,
+                "description": "相对当前朝向的转角，正左负右。整圈填 360 或 -360。",
+            },
+            "wait_complete": {
+                "type": "boolean",
+                "default": False,
+                "description": "等待本地转向调度结束并回报 completed；整圈扫视时用。",
             },
         },
-        "required": [],
-        "additionalProperties": False,
+        "required": ["degrees"],
     },
-}
-
-BODY_STOP_MOVEMENT = {
-    "name": "body_stop_movement",
-    "description": "立即停止所有移动和转身轴，将所有 locomotion 轴归零。不影响手臂姿态和手部动作。",
-    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 BODY_CHATBOX = {

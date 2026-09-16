@@ -55,7 +55,9 @@ def main():
         s = snapshot()
         elapsed = time.time() - t0
 
-        motion = s.get("body_awareness", {}).get("vrchat_osc", {}).get("motion", {})
+        # /snapshot 的 vrchat_osc 就在顶层（body_status 工具把它折进 body 段，
+        # 但这个脚本直连后端，读的是原始形状）。
+        motion = s.get("vrchat_osc", {}).get("motion", {})
         hspd = motion.get("speed_mps")
 
         decision = s.get("autonomy", {}).get("navigation", {}).get("decision", {})

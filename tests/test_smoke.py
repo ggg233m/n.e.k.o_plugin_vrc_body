@@ -38,13 +38,9 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(project["dependencies"], [])
 
     def test_all_tool_definition_modules_execute(self) -> None:
-        self.assertEqual(tool_defs.BODY_PLAY_CLIP["parameters"]["properties"]["anchor"]["default"], True)
-        self.assertEqual(tool_defs.BODY_PLAY_CLIP["parameters"]["properties"]["restore_after"]["default"], False)
-        self.assertEqual(tool_defs.BODY_AWARENESS["name"], "body_awareness")
-        self.assertEqual(tool_defs.BODY_AVATAR_PARAMETER["name"], "body_avatar_parameter")
+        self.assertEqual(tool_defs.BODY_STATUS["name"], "body_status")
         self.assertEqual(tool_defs.BODY_VRCHAT_INPUT["name"], "body_vrchat_input")
         self.assertEqual(tool_defs.WORLD_OBSERVE["name"], "world_observe")
-        self.assertEqual(tool_defs.VRC_VISION_STATUS["name"], "vrc_vision_status")
         self.assertEqual(tool_defs.VRC_VISION_START["name"], "vrc_vision_start")
         self.assertEqual(tool_defs.VRC_VISION_STOP["name"], "vrc_vision_stop")
         self.assertEqual(tool_defs.BODY_EXPRESS["name"], "body_express")
@@ -58,10 +54,9 @@ class PluginSmokeTests(unittest.TestCase):
             {"world_available", "entity_visible", "event_recent"},
         )
         self.assertIn("idle", tool_defs.BODY_EXPRESS["parameters"]["properties"]["intent"]["enum"])
-        self.assertIn("body_awareness", BODY_AI_INSTRUCTIONS)
+        self.assertIn("body_status", BODY_AI_INSTRUCTIONS)
         self.assertIn("accepted=true", BODY_AI_INSTRUCTIONS)
         self.assertIn("unsupported_spatial_navigation", BODY_AI_INSTRUCTIONS)
-        self.assertEqual(tool_defs.VRC_SCAN_SURROUNDINGS["name"], "vrc_scan_surroundings")
         self.assertIn("target_ref", BODY_AI_INSTRUCTIONS)
         self.assertIn("overlay.candidates", tool_defs.VRC_VISION_FRAME["description"])
         goal_properties = tool_defs.VRC_AUTONOMY_GOAL["parameters"]["properties"]
@@ -125,7 +120,7 @@ class PluginSmokeTests(unittest.TestCase):
         self.assertEqual(mentioned, [], f"instructions.py 提到了主模型调不到的工具：{mentioned}")
 
         # 反向：留在工具表里的移动/观察闭环工具必须被规则覆盖，否则等于没有指引。
-        for required in ("body_awareness", "world_observe", "vrc_autonomy_goal", "vrc_semantic_commit"):
+        for required in ("body_status", "world_observe", "vrc_autonomy_goal", "vrc_semantic_commit"):
             self.assertIn(required, live)
             self.assertIn(required, BODY_AI_INSTRUCTIONS)
 

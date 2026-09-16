@@ -45,6 +45,9 @@ from .world_state import WorldStateStore
 
 _VMC_CALIBRATION_TIMEOUT_SECONDS = 8.0
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
+# 基准已就绪时的空转间隔。宿主暂停或 VMC 输出重启会清空基准，本线程要在那之后
+# 主动补一次 T Pose，所以它必须比首次校准活得久。
+_VMC_CALIBRATION_IDLE_POLL_SECONDS = 1.0
 _WORLD_GATE_BYPASS_ACTIONS = frozenset({"stop", "disable", "reset", "cancel"})
 # 手掌朝向由 motion.palm_rotation 解析，非法值在调度线程上抛 ValueError。
 # 那时 submit() 早已返回 accepted=true，所以要在入队前挡下来。
@@ -669,15 +672,30 @@ class BackendService:
                         continue
                     if stop_event.is_set():
                         return
+                # 首次启动要给基准，宿主暂停或 VMC 输出重启后丢掉的基准也要补。
+                # 后者如果放任普通帧自锁，恢复后的第一个动画姿势就会成为手腕
+                # 朝向与手指弯曲的零点，整套骨骼会一直错位。
+                if not relay.needs_recalibration():
+                    stop_event.wait(_VMC_CALIBRATION_IDLE_POLL_SECONDS)
+                    continue
                 relay.hold_calibration(reason="waiting_for_host_t_pose")
                 calibrated = host_vmc.calibrate_rest_pose(
                     lambda: relay.reset_calibration(reason="host_t_pose"),
                     timeout_seconds=_VMC_CALIBRATION_TIMEOUT_SECONDS,
                     stop_event=stop_event,
                 )
-                if calibrated or stop_event.is_set():
+                if stop_event.is_set():
                     return
-                relay.reset_calibration(reason="t_pose_unavailable")
+                if calibrated:
+                    continue
+                if relay.has_baseline():
+                    # 曾经有过基准：保持拒绝普通帧并继续重试，角色停在最后一帧，
+                    # 而不是拿动画帧重新自锁出一个错误的静止姿势。
+                    relay.require_rest_baseline(reason="t_pose_unavailable")
+                else:
+                    # 首次校准就失败：宿主可能没有可用的 T Pose 接口，退化为
+                    # 由普通帧自锁，至少让待机中转可用。
+                    relay.reset_calibration(reason="t_pose_unavailable")
                 stop_event.wait(_VMC_CALIBRATION_RETRY_SECONDS)
 
         self._vmc_calibration_thread = threading.Thread(
