@@ -3503,9 +3503,19 @@ class VisionRuntime:
                 "capture_active": False,
             }
         if cached is None or cached_at is None:
+            # 首帧之前也可能一直被遮挡，不能把明确的暂停原因写成仍在预热。
+            missing_reason = error or "no_frame_cached"
+            try:
+                source_status = dict(self.source.status()) if self.source else {}
+                if source_status.get("window_minimized"):
+                    missing_reason = "window_minimized"
+                elif source_status.get("window_obscured"):
+                    missing_reason = "window_obscured"
+            except Exception:
+                pass
             return {
                 "available": False,
-                "reason": error or "no_frame_cached",
+                "reason": missing_reason,
                 "capture_active": True,
             }
         age_ms = max(0.0, (now - cached_at) * 1000.0)

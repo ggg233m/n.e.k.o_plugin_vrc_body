@@ -45,6 +45,23 @@ class _Clock:
 class VisionRuntimeStaleReasonTests(unittest.TestCase):
     """测试 latest_frame 在窗口被遮挡/最小化时返回不同的 reason。"""
 
+    def test_missing_first_frame_reports_known_window_state(self) -> None:
+        """首帧被门控拒绝时，应显示真实原因，不能无限提示预热。"""
+        for minimized, obscured, reason in (
+            (True, True, "window_minimized"),
+            (False, True, "window_obscured"),
+            (False, False, "no_frame_cached"),
+        ):
+            with self.subTest(reason=reason):
+                source = _FakeFrameSource(window_minimized=minimized)
+                source.window_obscured = obscured
+                runtime = VisionRuntime(store=WorldStateStore())
+                runtime.source = source
+                result = runtime.latest_frame()
+                self.assertFalse(result["available"])
+                self.assertEqual(result["reason"], reason)
+                self.assertNotIn("data", result)
+
     def test_window_minimized_reason_when_source_reports_minimized(self) -> None:
         """源报 window_minimized=True 时,latest_frame 应返回 window_minimized reason。"""
         store = WorldStateStore()

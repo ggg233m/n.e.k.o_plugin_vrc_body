@@ -212,6 +212,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const previewReasons: Record<string, string> = {
     backend_unavailable: "视觉后端尚未连接",
     capture_stopped: "画面采集已停止",
+    awaiting_first_frame: "采集已启动，等待第一帧画面；若持续等待，请查看下方采集来源错误",
     no_frame_cached: "等待第一帧画面",
     frame_stale: "画面已过期，等待新画面",
     window_minimized: "VRChat 窗口已最小化，已暂停观测",
