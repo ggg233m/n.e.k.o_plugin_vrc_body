@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from functools import lru_cache
 import json
 import math
+import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -287,14 +289,83 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         SDK 返回的 BusList 摊成普通列表，真正的过滤在 ChatboxRelay 里做。
         """
         client = getattr(self.bus, "conversations", None)
-        if client is None:
-            return []
-        records = client.get(max_count=int(max_count), since_ts=since_ts)
+        result: list[Any] = []
+        records = client.get(max_count=int(max_count), since_ts=since_ts) if client is not None else []
         # Hosted 侧可能返回 BusList（可迭代），也可能是协程（在事件循环里调用）。
         # 轮询线程里拿到协程没有意义，只能如实报错而不是静默丢弃整轮记录。
         if asyncio.iscoroutine(records):
             raise RuntimeError("conversation bus returned a coroutine from a worker thread")
-        return list(records)
+        result.extend(list(records))
+        # 普通聊天回复由宿主消息总线承载；主动对话仍在 conversations 总线。
+        messages = getattr(self.bus, "messages", None)
+        if messages is not None:
+            try:
+                message_records = messages.get(max_count=int(max_count), since_ts=since_ts)
+                if asyncio.iscoroutine(message_records):
+                    raise RuntimeError("message bus returned a coroutine from a worker thread")
+                result.extend(list(message_records))
+            except Exception as exc:
+                self.logger.warning("chatbox relay message source failed: %s", exc)
+        result.extend(self._read_disk_chat_records(since_ts))
+        return sorted(
+            result,
+            key=lambda item: float(getattr(item, "timestamp", 0.0) or 0.0),
+        )[-int(max_count):]
+
+    def _read_disk_chat_records(self, since_ts: float | None) -> list[dict[str, Any]]:
+        """读取宿主落盘的普通聊天尾记录，作为总线不可见时的插件侧回退。"""
+        # 不绑定具体用户名或盘符：部署器可用 NEKO_DATA_DIR/NEKO_HOME 指定数据根，
+        # Windows 默认从 LOCALAPPDATA 推导，便携环境再回退到当前用户目录。
+        configured_root = os.environ.get("NEKO_DATA_DIR") or os.environ.get("NEKO_HOME")
+        if configured_root:
+            root = Path(configured_root).expanduser() / "memory"
+        else:
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+            root = base / "N.E.K.O" / "memory"
+        found: list[dict[str, Any]] = []
+        try:
+            paths = root.glob("*/recent.json")
+        except OSError:
+            return found
+        for path in paths:
+            try:
+                stat = path.stat()
+                if since_ts is not None and stat.st_mtime <= float(since_ts):
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, list):
+                    continue
+                for item in reversed(payload):
+                    if not isinstance(item, Mapping) or str(item.get("type") or "").lower() not in {"ai", "assistant", "model"}:
+                        continue
+                    data = item.get("data")
+                    content: Any = data.get("content") if isinstance(data, Mapping) else data
+                    if isinstance(content, list):
+                        content = " ".join(
+                            str(part.get("text") or "") for part in content
+                            if isinstance(part, Mapping) and part.get("type") == "text"
+                        )
+                    if isinstance(content, str) and content.strip():
+                        # recent.json 的普通聊天会在正文前附带历史时间标签，
+                        # 这是存档格式，不应原样显示到 VRChat 聊天框。
+                        content = re.sub(
+                            r"^\s*\[\d{8}\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{2}:\d{2}(?::\d{2})?\]\s*",
+                            "",
+                            content,
+                            count=1,
+                        ).strip()
+                    if isinstance(content, str) and content.strip():
+                        found.append({
+                            "type": "ai",
+                            "content": content,
+                            "timestamp": stat.st_mtime,
+                            "message_id": f"disk:{path}:{stat.st_mtime_ns}:{hash(content)}",
+                        })
+                    break
+            except (OSError, ValueError, TypeError, UnicodeError):
+                continue
+        return found
 
     def _send_chatbox_line(self, text: str) -> tuple[bool, str | None]:
         """把一行文本发进 VRChat 聊天框。"""

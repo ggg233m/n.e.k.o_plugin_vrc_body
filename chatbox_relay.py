@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import hashlib
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -26,7 +27,7 @@ from .config import ChatboxRelayConfig
 # 只有角色真正说出口的记录才允许进聊天框。宿主的 proactive 链路一次性写两条：
 # 收到指令时写 ``proactive_instruction``，回复提交后写 ``proactive_reply``。
 # 两者共用同一个 conversation_id，成对出现。
-_SPEAKER_TURN_TYPES = frozenset({"proactive_reply"})
+_SPEAKER_TURN_TYPES = frozenset({"proactive_reply", "assistant", "ai", "model"})
 
 
 @dataclass(frozen=True)
@@ -47,8 +48,39 @@ def _record_field(record: Any, name: str) -> Any:
     两种都认，避免版本差异把整条链路变成静默丢弃。
     """
     if isinstance(record, Mapping):
-        return record.get(name)
-    return getattr(record, name, None)
+        value = record.get(name)
+        if value is not None:
+            return value
+        metadata = record.get("metadata")
+        if isinstance(metadata, Mapping):
+            return metadata.get(name)
+        return None
+    value = getattr(record, name, None)
+    if value is not None:
+        return value
+    metadata = getattr(record, "metadata", None)
+    if isinstance(metadata, Mapping):
+        return metadata.get(name)
+    return None
+
+
+def _record_id(record: Any, *, text: str, timestamp: Any) -> str | None:
+    """取得记录 ID；旧版宿主没有 id 时生成稳定指纹用于去重。"""
+    explicit = (
+        _record_field(record, "message_id")
+        or _record_field(record, "id")
+    )
+    if explicit:
+        return str(explicit)
+    if not text:
+        return None
+    # ConversationRecord 只保证 conversation_id/timestamp/content，三者足以
+    # 在同一轮对话内区分发言；哈希避免把正文直接放进诊断状态。
+    seed = "|".join(
+        str(value or "")
+        for value in (_record_field(record, "conversation_id"), timestamp, text)
+    )
+    return "conversation:" + hashlib.sha1(seed.encode("utf-8")).hexdigest()
 
 
 def _normalize_text(value: Any) -> str:
@@ -151,6 +183,8 @@ class ChatboxRelay:
             target=self._run, name="neko-chatbox-relay", daemon=True
         )
         self._thread.start()
+        if self.logger is not None:
+            self.logger.info("Chatbox relay started (interval=%.2fs)", float(self.config.poll_interval_s))
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop_event.set()
@@ -190,18 +224,29 @@ class ChatboxRelay:
 
     def _extract(self, record: Any) -> ChatboxLine | None:
         turn_type = _record_field(record, "turn_type")
-        if turn_type not in _SPEAKER_TURN_TYPES:
+        message_type = str(_record_field(record, "message_type") or _record_field(record, "type") or "").lower()
+        role = str(_record_field(record, "role") or "").lower()
+        normalized_type = str(turn_type or "").lower()
+        # 普通聊天记录来自 messages 总线，旧版字段通常是 role/message_type；
+        # proactive_reply 仍沿用 conversations 总线的明确标记。
+        is_speaker = (
+            normalized_type in _SPEAKER_TURN_TYPES
+            or role in {"assistant", "ai", "model"}
+            or message_type in {"assistant", "ai", "model"}
+        )
+        if not is_speaker:
             return None
         text = _normalize_text(_record_field(record, "content"))
         if not text:
             return None
-        record_id = _record_field(record, "message_id") or _record_field(record, "id")
+        timestamp = _record_field(record, "timestamp")
+        record_id = _record_id(record, text=text, timestamp=timestamp)
         return ChatboxLine(
             text=text,
             record_id=str(record_id) if record_id else None,
-            turn_type=str(turn_type),
+            turn_type=str(turn_type or role or message_type or "assistant"),
             lanlan_name=_record_field(record, "lanlan_name"),
-            timestamp=_record_field(record, "timestamp"),
+            timestamp=timestamp,
         )
 
     def _poll_once(self) -> None:
@@ -215,10 +260,14 @@ class ChatboxRelay:
             # 宿主不可用（未连上 / RPC 超时）不是错误状态，下一轮重试即可。
             with self._lock:
                 self._last_source_error = str(exc)[:500]
+            if self.logger is not None:
+                self.logger.warning("Chatbox relay conversation source failed: %s", exc)
             return
         with self._lock:
             self._last_source_error = None
             self._poll_count += 1
+        if records and self.logger is not None:
+            self.logger.info("Chatbox relay received %d conversation records", len(records))
         if not records:
             return
         for record in records:
