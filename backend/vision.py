@@ -347,6 +347,7 @@ def find_window_region(title: str) -> dict[str, int] | None:
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32.FindWindowW.restype = wintypes.HWND
         hwnd = user32.FindWindowW(None, title)
         if not hwnd:
             return None
@@ -1048,6 +1049,19 @@ class DxcamFrameSource:
         self._release_camera(camera)
 
 
+#: 连续多少次空帧后重建捕获会话。@10Hz 约 3 秒。
+#: 不能太小：空帧是正常现象（帧池没新内容时就返回空），而重建实测 226 ms，
+#: 比 100 ms 的帧预算还贵，抖动一次就重建会得不偿失。
+_WGC_EMPTY_READS_BEFORE_REBUILD = 30
+
+#: 会话建不起来时，两次重试之间至少隔多久（秒）。
+#: 重建实测 226 ms，而 ``read()`` 按 ``interval_ms`` 每 100 ms 就来一次。不退避的话
+#: VRChat 没开着的整段时间里，采集线程会一直卡在建 D3D 设备上——那比没有画面更糟，
+#: 因为它会把本该用于别处的时间全吃掉。窗口不存在时 FindWindow 只要 0.2 ms，
+#: 所以退避只针对**建会话失败**，不针对找不到窗口。
+_WGC_REOPEN_BACKOFF_S = 1.0
+
+
 class WgcWindowFrameSource:
     """按窗口捕获的采集源；遮挡与它无关。
 
@@ -1075,12 +1089,14 @@ class WgcWindowFrameSource:
         capture_cursor: bool = False,
         resolver: Callable[[str], int | None] | None = None,
         minimized: Callable[[int], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._lock = threading.Lock()
         self._title = str(title)[:256]
         self._capture_cursor = bool(capture_cursor)
         self._resolver = resolver or _find_window_handle
         self._minimized_probe = minimized or _window_minimized
+        self._clock = clock
         self._session: Any = None
         self._hwnd: int | None = None
         self._closed = False
@@ -1089,21 +1105,25 @@ class WgcWindowFrameSource:
         self._empty_reads = 0
         self._rebuilds = 0
         self._minimized = False
+        self._blocked_until = 0.0
         self._open()
 
     def _open(self) -> None:
         """建立捕获会话。失败只记录，不抛异常——采集不该让后端起不来。"""
         hwnd: int | None = None
+        should_backoff = False
         try:
             from .wgc_capture import WgcSession, wgc_supported
 
             if not wgc_supported():
+                should_backoff = True
                 raise RuntimeError(
                     "Windows.Graphics.Capture is unavailable (needs Win10 1903+ and the winrt wheel)"
                 )
             hwnd = self._resolver(self._title)
             if not hwnd:
                 raise RuntimeError(f"window not found: {self._title!r}")
+            should_backoff = True
             session = WgcSession(hwnd, capture_cursor=self._capture_cursor)
         except Exception as exc:
             with self._lock:
@@ -1112,6 +1132,10 @@ class WgcWindowFrameSource:
                 # 报 window_found=True，否则 status 会把人往「VRChat 没开」的方向带。
                 self._hwnd = int(hwnd) if hwnd else None
                 self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+                # wgc_supported() 失败或真去建了会话才退避。窗口不存在时失败在
+                # FindWindow 上,那只要 0.2 ms,退避反而会拖慢游戏启动后的恢复。
+                if should_backoff:
+                    self._blocked_until = self._clock() + _WGC_REOPEN_BACKOFF_S
             return
         with self._lock:
             if self._closed:
@@ -1120,6 +1144,7 @@ class WgcWindowFrameSource:
                 self._session = session
                 self._hwnd = hwnd
                 self._last_error = None
+                self._blocked_until = 0.0
                 stale = None
         if stale is not None:
             stale.close()
@@ -1136,10 +1161,13 @@ class WgcWindowFrameSource:
     def read(self) -> Any:
         with self._lock:
             session = None if self._closed else self._session
+            blocked = self._blocked_until > 0.0 and self._clock() < self._blocked_until
         if session is None:
-            if not self._closed:
-                # 会话没建起来（VRChat 还没启动、或上一次窗口关掉了）。每次读都
-                # 重试一遍：这条路径只有 FindWindow 的成本，失败时不会有 D3D 开销。
+            # 会话没建起来（VRChat 还没启动、或上一次窗口关掉了）就每次读都重试。
+            # 窗口不存在时这只花 0.2 ms 的 FindWindow；但**建会话**失败要 5.9 ms、
+            # 成功要 226 ms，都够得上 100 ms 的帧预算，所以那条路径由 _open() 打
+            # 退避标记，这里据此跳过。
+            if not self._closed and not blocked:
                 self._open()
                 with self._lock:
                     session = None if self._closed else self._session
@@ -1162,10 +1190,30 @@ class WgcWindowFrameSource:
         with self._lock:
             if frame is None:
                 self._empty_reads += 1
+                # 连续空帧到达上限就重建会话。这不是保守起见——窗口改分辨率后
+                # ``WgcSession._frame_to_array`` 会因尺寸不符**一直**返回 None 且
+                # 不抛异常，光靠异常路径永远等不到重建，画面会永久卡死而 status
+                # 还显示 available=True。空帧本身是正常的（帧池没新内容），所以
+                # 门槛取得比一次抖动高：@10Hz 约 3 秒。
+                stale = self._empty_reads >= _WGC_EMPTY_READS_BEFORE_REBUILD
             else:
                 self._frames += 1
+                # 拿到真帧后才重置空帧计数。重建失败时 _empty_reads 会继续累积，
+                # 避免反复触发重建循环；只有会话真的恢复了才清零。
                 self._empty_reads = 0
                 self._last_error = None
+                stale = False
+        if stale:
+            with self._lock:
+                self._last_error = (
+                    f"no frame for {self._empty_reads} reads; rebuilding session"
+                )
+                # 重建后重置计数,让下次 read() 重新累积。退避机制在 _open 里会阻止
+                # 重建失败时的无限循环。不重置的话,一旦 _empty_reads >= 30,之后
+                # 每次 read() 都会重建——比「每 30 帧重建一次」更糟。
+                self._empty_reads = 0
+            self._reopen()
+            return None
         return frame
 
     def _reopen(self) -> None:
@@ -1197,6 +1245,8 @@ class WgcWindowFrameSource:
                 "frames": self._frames,
                 "empty_reads": self._empty_reads,
                 "rebuilds": self._rebuilds,
+                "reopen_backoff": self._blocked_until > 0.0
+                and self._clock() < self._blocked_until,
                 "last_error": self._last_error,
             }
             if session is not None:
@@ -3468,13 +3518,24 @@ class VisionRuntime:
             #
             # 但「为什么过期」决定了调用方该怎么办。遮挡时间晚于缓存时刻，说明
             # 这一段时间里 ``_observe_obscured`` 一直在拒绝推理——缓存冻住是设计
-            # 意图，不是链路故障。报 ``window_obscured`` 才能让人去找压在 VRChat
-            # 上面的那个窗口，而不是去查采集链路。
-            stale_reason = (
-                "window_obscured"
-                if obscured_at is not None and obscured_at >= cached_at
-                else "frame_stale"
-            )
+            # 意图，不是链路故障。
+            #
+            # WGC 路径下窗口被遮挡时 window_obscured 与 window_minimized 同真，
+            # 这里按后者更精确的那个报；桌面镜像路径下只有 window_obscured。
+            # reason 字符串应反映真实故障，否则 UI 提示会误导。
+            if obscured_at is not None and obscured_at >= cached_at:
+                # 遮挡/最小化时间晚于缓存时刻，说明这段时间 _observe_obscured 在拒绝
+                # 推理——缓存冻住是设计意图，不是链路故障。
+                try:
+                    source_status = dict(self.source.status()) if self.source else {}
+                    if source_status.get("window_minimized"):
+                        stale_reason = "window_minimized"
+                    else:
+                        stale_reason = "window_obscured"
+                except Exception:
+                    stale_reason = "window_obscured"
+            else:
+                stale_reason = "frame_stale"
             return {
                 "available": False,
                 "reason": stale_reason,
@@ -3886,11 +3947,15 @@ class VisionRuntime:
         return result
 
     def _observe_obscured(self, processing_now: float, observation_now: float) -> dict[str, Any]:
-        """窗口被盖住时只声明看不见，不对这一帧做任何推理。
+        """窗口被盖住或最小化时只声明看不见，不对这一帧做任何推理。
 
         DXGI 抓的是合成后的桌面，VRChat 被别的窗口压住时采集依旧"成功"，拿到的
         却是上层窗口的像素。对它推理会把浏览器或聊天窗里的人形当成世界里的玩家
         写进世界状态——那比没有观测危险得多，因为下游分不出真假。
+
+        WGC 路径下不存在遮挡问题（DWM 只给窗口自己的合成内容），但最小化时帧池
+        会冻结，因此 ``WgcWindowFrameSource`` 把 ``window_obscured`` 设为与
+        ``window_minimized`` 相同，统一走这条拒绝推理的路径。
 
         因此这里既不写实体也不删实体：已有实体按各自 TTL 自然老化，
         ``visual_capture_occluded`` 则明确告诉消费者「观测缺失是有原因的」。它不在

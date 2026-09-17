@@ -18,17 +18,23 @@ class _FakeSource:
 
     name = "fake"
 
-    def __init__(self, region) -> None:
+    def __init__(self, region, *, window_minimized: bool = False) -> None:
         self.region = dict(region) if region else None
         self.closed = False
         self.reads = 0
+        self.window_minimized = window_minimized
 
     def read(self):
         self.reads += 1
         return f"frame@{self.region}"
 
     def status(self):
-        return {"available": not self.closed, "name": self.name}
+        return {
+            "available": not self.closed,
+            "name": self.name,
+            "window_obscured": self.window_minimized,
+            "window_minimized": self.window_minimized,
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -530,8 +536,8 @@ class WindowOcclusionReportingTests(unittest.TestCase):
             {"found": True, "minimized": False, "visible_ratio": 0.0, "occluded_by": "Chrome"},
         ]
 
-        def factory(region):
-            source = _FakeSource(region)
+        def factory(region, **kwargs):
+            source = _FakeSource(region, **kwargs)
             built.append(source)
             return source
 
@@ -726,6 +732,85 @@ class WgcWindowFrameSourceTests(unittest.TestCase):
         self.assertTrue(status["available"], "空帧不代表会话作废")
         self.assertEqual(status["empty_reads"], 1)
         self.assertIsNone(status["last_error"])
+
+    def test_a_window_resize_does_not_freeze_capture_forever(self) -> None:
+        """改分辨率后 WgcSession 因尺寸不符一直返回 None 且不抛异常。
+
+        光靠异常路径永远等不到重建：画面会永久卡死，而 status 还显示
+        available=True、last_error=None——最难查的那种故障。所以连续空帧到达
+        上限必须主动重建。
+        """
+        created = self._patch(
+            session_factory=lambda hwnd, **kw: _FakeWgcSession(hwnd, frames=[], **kw)
+        )
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        for _ in range(200):
+            source.read()
+        self.assertGreater(len(created), 1, "持续空帧必须触发重建，否则画面永久卡死")
+        status = source.status()
+        self.assertGreater(status["rebuilds"], 0)
+
+    def test_a_brief_gap_in_frames_does_not_rebuild(self) -> None:
+        """空帧本身是正常的，重建实测 226 ms 比帧预算还贵，不能抖一下就重建。"""
+        created = self._patch(
+            session_factory=lambda hwnd, **kw: _FakeWgcSession(
+                hwnd, frames=[None, None, "frame"], **kw
+            )
+        )
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        for _ in range(3):
+            source.read()
+        self.assertEqual(len(created), 1, "短暂空帧不该重建会话")
+        self.assertEqual(source.status()["rebuilds"], 0)
+
+    def test_a_failing_session_build_backs_off_instead_of_retrying_every_frame(self) -> None:
+        """建会话失败实测 5.9 ms、成功 226 ms，都够得上 100 ms 的帧预算。
+
+        VRChat 没开着的整段时间里每帧都重试，会把采集线程一直卡在建 D3D 设备上。
+        """
+        attempts = []
+
+        def explode(hwnd, *, capture_cursor=False):
+            attempts.append(1)
+            raise RuntimeError("D3D11CreateDevice failed")
+
+        self._patch(session_factory=explode)
+        clock = _Clock()
+        source = WgcWindowFrameSource(
+            title="VRChat",
+            resolver=lambda _t: 0x1234,
+            clock=clock,
+        )
+        self.addCleanup(source.close)
+        attempts.clear()
+        for _ in range(10):
+            source.read()
+        self.assertEqual(attempts, [], "退避期内不该反复建会话")
+        self.assertTrue(source.status()["reopen_backoff"])
+        clock.now += 2.0
+        source.read()
+        self.assertEqual(len(attempts), 1, "退避到期后必须再试一次")
+
+    def test_a_missing_window_retries_every_read_without_backoff(self) -> None:
+        """找不到窗口只花 0.2 ms 的 FindWindow，退避反而会拖慢游戏启动后的恢复。"""
+        self._patch()
+        looked_up = []
+
+        def resolver(_title):
+            looked_up.append(1)
+            return None
+
+        source = WgcWindowFrameSource(
+            title="VRChat", resolver=resolver, clock=_Clock()
+        )
+        self.addCleanup(source.close)
+        looked_up.clear()
+        for _ in range(5):
+            source.read()
+        self.assertEqual(len(looked_up), 5, "窗口不存在时应每次都便宜地重试")
+        self.assertFalse(source.status()["reopen_backoff"])
 
     def test_a_dead_session_is_rebuilt_on_the_next_read(self) -> None:
         """窗口改分辨率或设备丢失后会话就作废了，必须自己重建。"""

@@ -214,9 +214,8 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
     capture_stopped: "画面采集已停止",
     no_frame_cached: "等待第一帧画面",
     frame_stale: "画面已过期，等待新画面",
-    // 按窗口捕获（capture = "wgc"）下只剩最小化这一种可能：DWM 不再为最小化窗口
-    // 合成，别的窗口压在上面则不影响。退回 desktop_mirror 时才会真的因遮挡触发。
-    window_obscured: "VRChat 画面不可用：窗口已最小化（或采集回退到桌面镜像且被其他窗口遮挡），已暂停观测",
+    window_minimized: "VRChat 窗口已最小化，已暂停观测",
+    window_obscured: "VRChat 窗口被其他窗口遮挡（桌面镜像采集模式），已暂停观测",
     preview_failed: "画面读取失败，请刷新重试",
   }
   // 面板按 30 s 上限取图，所以旧图会照样显示——判「旧」交给这里，让人看见的是
