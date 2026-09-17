@@ -1377,12 +1377,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                     ai_behavior="respond" if wake else "read",
                     parts=parts,
                     priority=0 if wake else 1,
-                    # 同键的新提示会顶掉尚未送达的旧提示：过期的「有人靠近」
-                    # 比没有更糟。
+                    # 普通观测只保留尚未消费的最新状态，避免逐帧更新挤满队列。
+                    # 社交唤醒和语义任务使用独立槽位，不能被普通观测覆盖。
                     coalesce_key=(
                         "neko_anyadance_body.semantic.latest"
                         if semantic_request_id else (
-                            "neko_anyadance_body.world.social" if wake else None
+                            "neko_anyadance_body.world.social"
+                            if wake else "neko_anyadance_body.world.latest"
                         )
                     ),
                 )

@@ -6,6 +6,7 @@ from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend import vision
 from neko_anyadance_body.backend.vision import (
     DxcamFrameSource,
+    WgcWindowFrameSource,
     WindowTrackedFrameSource,
     _normalize_region,
     optional_dependency_status,
@@ -550,6 +551,227 @@ class WindowOcclusionReportingTests(unittest.TestCase):
         self.assertEqual(len(built), 1)
         self.assertEqual(tracked.status()["window_rebuilds"], 0)
         self.assertTrue(tracked.status()["window_obscured"])
+
+
+class _FakeWgcSession:
+    """替身 WgcSession：不碰 D3D11，只按脚本交还帧。"""
+
+    def __init__(self, hwnd, *, capture_cursor=False, frames=None, fail_on_read=None) -> None:
+        self.hwnd = hwnd
+        self.capture_cursor = capture_cursor
+        self.size = (1922, 1041)
+        self.closed = 0
+        self._frames = list(frames if frames is not None else ["frame"])
+        self._fail_on_read = fail_on_read
+        self.reads = 0
+
+    def read(self):
+        self.reads += 1
+        if self._fail_on_read is not None and self.reads >= self._fail_on_read:
+            raise RuntimeError("device removed")
+        if not self._frames:
+            return None
+        return self._frames.pop(0)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class WgcWindowFrameSourceTests(unittest.TestCase):
+    """按窗口捕获：遮挡不再是失效条件，但窗口缺失/最小化/会话作废仍然是。"""
+
+    def _patch(self, *, supported=True, session_factory=None):
+        """把 ``backend.wgc_capture`` 换成替身模块。
+
+        采集源是在 ``_open`` 里 ``from .wgc_capture import ...`` 的，所以只能在
+        ``sys.modules`` 这一层拦——真模块会去建 D3D11 设备，CI 上没有。
+        """
+        import sys
+        import types
+
+        created: list[_FakeWgcSession] = []
+
+        def build(hwnd, *, capture_cursor=False):
+            session = (session_factory or _FakeWgcSession)(hwnd, capture_cursor=capture_cursor)
+            created.append(session)
+            return session
+
+        module = types.ModuleType("neko_anyadance_body.backend.wgc_capture")
+        module.WgcSession = build
+        module.wgc_supported = lambda: supported
+        key = "neko_anyadance_body.backend.wgc_capture"
+        previous = sys.modules.get(key)
+        sys.modules[key] = module
+        self.addCleanup(
+            lambda: sys.modules.__setitem__(key, previous)
+            if previous is not None
+            else sys.modules.pop(key, None)
+        )
+        return created
+
+    def test_it_captures_without_a_window_rect(self) -> None:
+        """这条路径不需要屏幕坐标：捕获项自己就是那个窗口。"""
+        created = self._patch()
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        self.assertEqual(source.read(), "frame")
+        self.assertEqual(created[0].hwnd, 0x1234)
+        status = source.status()
+        self.assertTrue(status["available"])
+        self.assertEqual(status["name"], "wgc_window")
+        self.assertEqual(status["capture_size"], {"width": 1922, "height": 1041})
+        self.assertEqual(status["frames"], 1)
+        self.assertIsNone(status["last_error"])
+
+    def test_occlusion_is_not_a_failure_mode_on_this_path(self) -> None:
+        """整个采集源里没有可见比例的概念——遮挡在 DWM 按窗口合成下不成立。
+
+        这是本采集源存在的全部理由，所以值得单独钉住：``window_obscured`` 只跟
+        最小化走，不会因为别的窗口压在上面而变 True。
+        """
+        self._patch()
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234, minimized=lambda _h: False)
+        self.addCleanup(source.close)
+        source.read()
+        status = source.status()
+        self.assertFalse(status["window_obscured"])
+        self.assertNotIn("window_visible_ratio", status)
+        self.assertNotIn("window_occluded_by", status)
+
+    def test_a_missing_window_is_reported_not_raised(self) -> None:
+        """VRChat 还没启动不该让后端起不来。"""
+        self._patch()
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: None)
+        self.addCleanup(source.close)
+        status = source.status()
+        self.assertFalse(status["available"])
+        self.assertFalse(status["window_found"])
+        self.assertIn("window not found", status["last_error"])
+        self.assertIsNone(source.read())
+
+    def test_a_window_that_appears_later_is_picked_up_without_a_restart(self) -> None:
+        """先起后端后起游戏是常态，不能要求用户重启插件。"""
+        self._patch()
+        handles = [None, None, 0x99]
+
+        def resolver(_title):
+            return handles.pop(0) if handles else 0x99
+
+        source = WgcWindowFrameSource(title="VRChat", resolver=resolver)
+        self.addCleanup(source.close)
+        self.assertIsNone(source.read())
+        self.assertEqual(source.read(), "frame")
+        self.assertTrue(source.status()["available"])
+
+    def test_a_failed_session_still_reports_the_window_as_found(self) -> None:
+        """窗口在、但 WGC 建不起来，是和「游戏没开」完全不同的故障。"""
+
+        def explode(hwnd, *, capture_cursor=False):
+            raise RuntimeError("D3D11CreateDevice failed")
+
+        self._patch(session_factory=explode)
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        status = source.status()
+        self.assertFalse(status["available"])
+        self.assertTrue(status["window_found"], "窗口找到了，问题出在捕获会话上")
+        self.assertIn("D3D11CreateDevice failed", status["last_error"])
+
+    def test_an_unsupported_platform_degrades_instead_of_crashing(self) -> None:
+        self._patch(supported=False)
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        self.assertIsNone(source.read())
+        self.assertIn("unavailable", source.status()["last_error"])
+
+    def test_a_minimized_window_yields_no_frame_rather_than_a_frozen_one(self) -> None:
+        """最小化时 DWM 不再合成，帧池只会交还旧帧。冻帧会被下游当成「现在」。"""
+        created = self._patch()
+        minimized = {"value": False}
+        source = WgcWindowFrameSource(
+            title="VRChat",
+            resolver=lambda _t: 0x1234,
+            minimized=lambda _h: minimized["value"],
+        )
+        self.addCleanup(source.close)
+        source.read()
+        minimized["value"] = True
+        self.assertIsNone(source.read())
+        self.assertEqual(created[0].reads, 1, "最小化时根本不该去读帧池")
+        status = source.status()
+        self.assertTrue(status["window_minimized"])
+        self.assertTrue(status["window_obscured"], "最小化是这条路径上唯一剩下的失效模式")
+
+    def test_a_probe_that_explodes_is_treated_as_not_minimized(self) -> None:
+        """探测失败宁可错判成没最小化：丢掉本可用的画面代价更大。"""
+        self._patch()
+
+        def explode(_hwnd):
+            raise OSError("user32 exploded")
+
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234, minimized=explode)
+        self.addCleanup(source.close)
+        self.assertEqual(source.read(), "frame")
+        self.assertFalse(source.status()["window_minimized"])
+
+    def test_no_new_frame_is_not_an_error(self) -> None:
+        """帧池没新帧时返回 None，不该被记成故障。"""
+        self._patch(
+            session_factory=lambda hwnd, **kw: _FakeWgcSession(hwnd, frames=[], **kw)
+        )
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        self.assertIsNone(source.read())
+        status = source.status()
+        self.assertTrue(status["available"], "空帧不代表会话作废")
+        self.assertEqual(status["empty_reads"], 1)
+        self.assertIsNone(status["last_error"])
+
+    def test_a_dead_session_is_rebuilt_on_the_next_read(self) -> None:
+        """窗口改分辨率或设备丢失后会话就作废了，必须自己重建。"""
+        created = self._patch(
+            session_factory=lambda hwnd, **kw: _FakeWgcSession(hwnd, fail_on_read=1, **kw)
+        )
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        self.assertIsNone(source.read())
+        self.assertEqual(len(created), 2, "读失败后应重建会话")
+        self.assertEqual(created[0].closed, 1, "旧会话必须关掉，否则句柄泄漏")
+        status = source.status()
+        self.assertEqual(status["rebuilds"], 1)
+        # 重建成功后 last_error 归零：它描述的是当下能不能用，不是历史。抖动的
+        # 痕迹由 rebuilds 计数保留，那才是长期可观测的信号。
+        self.assertTrue(status["available"])
+        self.assertIsNone(status["last_error"])
+
+    def test_a_rebuild_that_also_fails_keeps_the_error_visible(self) -> None:
+        """窗口真没了的时候，重建会再失败一次，那条错误必须留在 status 上。"""
+        states = {"fail_open": False}
+
+        def factory(hwnd, **kw):
+            if states["fail_open"]:
+                raise RuntimeError("window vanished")
+            states["fail_open"] = True
+            return _FakeWgcSession(hwnd, fail_on_read=1, **kw)
+
+        self._patch(session_factory=factory)
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        self.addCleanup(source.close)
+        self.assertIsNone(source.read())
+        status = source.status()
+        self.assertFalse(status["available"])
+        self.assertEqual(status["rebuilds"], 1)
+        self.assertIn("window vanished", status["last_error"])
+
+    def test_close_is_idempotent_and_stops_serving_frames(self) -> None:
+        created = self._patch()
+        source = WgcWindowFrameSource(title="VRChat", resolver=lambda _t: 0x1234)
+        source.read()
+        source.close()
+        source.close()
+        self.assertEqual(created[0].closed, 1, "重复 close 不该重复释放 COM 对象")
+        self.assertIsNone(source.read(), "关闭后不能再返回帧")
+        self.assertFalse(source.status()["available"])
 
 
 class WindowVisibilityProbeTests(unittest.TestCase):

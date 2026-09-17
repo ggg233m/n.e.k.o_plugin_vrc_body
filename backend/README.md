@@ -22,13 +22,16 @@
 - `adapters.py` 是唯一的宿主项目集成接缝，负责把后端映射到当前项目的调度器、
   VMC、OSC、遥测、配置和动作片段库。
 - `vision.py` 与 `world_state.py` 是无模型依赖的感知状态基础模块；其中
-  `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。`DesktopMirrorFrameSource`
+  `FrameSource`/`FrameDetector`/`VisionWorker` 组成后端内采集接缝。默认的
+  `WgcWindowFrameSource`（`capture = "wgc"`）走 Windows.Graphics.Capture 按**窗口**
+  捕获，DWM 直接交出该窗口自己的合成内容，因此遮挡与采集无关，也不需要窗口矩形；
+  唯一的失效模式是窗口最小化。`DesktopMirrorFrameSource`
   会自动探测 DXGI 适配器/输出，失败后按物理显示器回退 MSS；DXcam 还会在可用时尝试
   WinRT 后端。每个候选输出的错误会出现在 `/perception` 的 `source.backends` 和
-  `candidate_errors` 中，不再把所有失败压缩成一个 BitBlt 错误。配置 `window_title`
-  后，`WindowTrackedFrameSource` 会按 `window_track_interval_ms` 重新解析窗口矩形，
-  只在矩形真的变化时重建内部采集源（DXcam/MSS 的区域在构造时固定，没有改区域的
-  接口）；窗口暂时找不到时保留上一次的矩形，不回退全屏。真正的本地检测器是
+  `candidate_errors` 中，不再把所有失败压缩成一个 BitBlt 错误。桌面镜像类采集配置
+  `window_title` 后，`WindowTrackedFrameSource` 会按 `window_track_interval_ms` 重新
+  解析窗口矩形，只在矩形真的变化时重建内部采集源（DXcam/MSS 的区域在构造时固定，
+  没有改区域的接口）；窗口暂时找不到时保留上一次的矩形，不回退全屏。真正的本地检测器是
   `local_perception.OpenVinoLocalDetector`；`vision.OpenVinoLocalDetector` 只是注入式
   `infer` 的适配壳，自己不加载任何图，其 `status()` 因此不声明模型列表。
   `OpenAICompatibleSemanticBackend` 是可插拔的 VLM 接缝，不会在缺少
@@ -371,8 +374,8 @@ onnxruntime 不可用时回落颜色/布局直方图（阈值 `identity_reid_sim
 ```toml
 [vision]
 enabled = false
-source = "none" # none / mss / dxcam / desktop_mirror / external
-capture = "desktop_mirror"
+source = "none" # none / mss / dxcam / desktop_mirror / wgc / external
+capture = "desktop_mirror" # 随插件部署的 plugin.toml 用 wgc
 local_backend = "openvino"
 model_path = "models/yolox.xml" # 可选 XML/ONNX 路径，相对于配置目录
 labels_path = "models/labels.txt" # 可选；留空时使用 COCO 名称
@@ -407,9 +410,10 @@ dxcam_backend = "auto" # auto / dxgi / winrt
 interval_ms = 100
 queue_size = 1
 lifecycle_watermark_limit = 4096
-# 非空时只采集该标题窗口的屏幕矩形，而不是整块显示器；仅限 Windows。
+# capture = "wgc" 时用它取窗口句柄后按窗口捕获（留空等于关闭采集）；桌面镜像类
+# 采集则只采集该标题窗口的屏幕矩形，而不是整块显示器。仅限 Windows。
 window_title = ""
-# 重新解析窗口矩形的间隔（毫秒）；0 表示只在启动时解析一次。
+# 重新解析窗口矩形的间隔（毫秒）；0 表示只在启动时解析一次。对 wgc 无效。
 window_track_interval_ms = 5000
 ```
 

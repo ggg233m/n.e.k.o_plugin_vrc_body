@@ -38,6 +38,7 @@ from .vision import (
     VisionObservation,
     VisionRuntime,
     VisionWorker,
+    WgcWindowFrameSource,
     WindowTrackedFrameSource,
 )
 from .world_state import WorldStateStore
@@ -469,6 +470,14 @@ class BackendService:
         vision = self.config.vision
         if not vision.enabled or vision.source == "external" or vision.capture == "external":
             return None
+
+        if vision.capture == "wgc" or vision.source == "wgc":
+            # 按窗口捕获：不经桌面合成，因此既不需要窗口矩形，也不需要
+            # WindowTrackedFrameSource 那层 TTL 重解析——窗口被拖动或改分辨率时
+            # 捕获项自己跟着走。没有 window_title 就无从捕获，直接放弃。
+            if not vision.window_title:
+                return None
+            return WgcWindowFrameSource(title=vision.window_title)
 
         if vision.capture == "mss" or vision.source == "mss":
             def build(region: Mapping[str, int] | None) -> FrameSource:

@@ -188,9 +188,13 @@ history_size = 64
 # 发布配置启用桌面采集和随插件携带的人物检测模型。
 [vision]
 enabled = true
-# 直接从桌面镜像采集 VRChat；window_title 会在多屏环境中跟踪窗口区域。
-source = "desktop_mirror"
-capture = "desktop_mirror"
+# 按窗口捕获 VRChat（Windows.Graphics.Capture）。它从 DWM 取该窗口自己的合成
+# 内容，压在上面的窗口不参与，因此别的窗口盖住 VRChat 时画面依然是游戏本身。
+# 桌面镜像做不到这点：它抓的是合成后的桌面，被盖住时采集照样「成功」，内容却
+# 是上层窗口的像素——那正是遮挡检测必须存在的原因。实测同一时刻两者相关系数
+# 仅 0.065。改回 "desktop_mirror" 可退到旧行为（需要 Win10 1903+）。
+source = "wgc"
+capture = "wgc"
 local_backend = "openvino"
 # OpenVINO IR XML/ONNX 模型和可选标签文件。留空表示未部署本地模型；此时感知
 # 会报告 unavailable，而不是进行猜测。
@@ -340,11 +344,13 @@ detector_interval_ms = 500
 # 无关。GPU 也没有随帧率上升——推理只占 11.7 ms，剩下的是预处理，跑在 CPU 上。
 detector_accelerator_interval_ms = 100
 lifecycle_watermark_limit = 4096
-# 按窗口标题限定采集区域。非空时通过 FindWindow 取窗口坐标后只采集该矩形
-# 区域，而不是整块显示器。窗口未找到时回落到全屏采集。
+# 采集目标窗口的标题。capture = "wgc" 时用它 FindWindow 取句柄后按窗口捕获，
+# 不涉及屏幕坐标；capture = "desktop_mirror"/"dxcam"/"mss" 时则取窗口矩形只采集
+# 该区域。留空在 wgc 下等于关闭采集（无从确定捕获哪个窗口）。
 window_title = "VRChat"
 # 重新解析窗口矩形的间隔（毫秒）。窗口被拖动、改分辨率或全屏切换后，启动时
 # 解析的坐标就过期了；矩形真的变了才会重建采集源。0 表示只在启动时解析一次。
+# 仅对桌面镜像类采集生效：wgc 的捕获项跟着窗口走，不需要重新解析坐标。
 window_track_interval_ms = 5000
 
 [clips]

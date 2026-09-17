@@ -480,11 +480,11 @@ class PluginConfig:
             persist_players=_boolean(world_memory.get("persist_players"), False, name="world_memory.persist_players"),
         )
         vision_source = str(vision.get("source", "none")).strip().lower() or "none"
-        if vision_source not in {"none", "mss", "dxcam", "desktop_mirror", "external"}:
-            raise ValueError("vision.source must be none, mss, dxcam, desktop_mirror, or external")
+        if vision_source not in {"none", "mss", "dxcam", "desktop_mirror", "wgc", "external"}:
+            raise ValueError("vision.source must be none, mss, dxcam, desktop_mirror, wgc, or external")
         capture_backend = str(vision.get("capture", "desktop_mirror")).strip().lower() or "desktop_mirror"
-        if capture_backend not in {"desktop_mirror", "mss", "dxcam", "external"}:
-            raise ValueError("vision.capture must be desktop_mirror, mss, dxcam, or external")
+        if capture_backend not in {"desktop_mirror", "mss", "dxcam", "wgc", "external"}:
+            raise ValueError("vision.capture must be desktop_mirror, mss, dxcam, wgc, or external")
         local_backend = str(vision.get("local_backend", "openvino")).strip().lower() or "openvino"
         if local_backend not in {"openvino", "none", "external"}:
             raise ValueError("vision.local_backend must be openvino, none, or external")

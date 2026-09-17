@@ -396,6 +396,38 @@ def find_window_region(title: str) -> dict[str, int] | None:
         return None
 
 
+def _find_window_handle(title: str) -> int | None:
+    """按标题取顶层窗口句柄。非 Windows、找不到或调用失败时返回 ``None``。
+
+    与 ``find_window_region`` 分开：那个返回屏幕矩形给桌面复制用，这个返回 HWND
+    给按窗口捕获用。后者不需要坐标，也不该被虚拟桌面夹取逻辑影响。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+        user32.FindWindowW.restype = wintypes.HWND
+        hwnd = user32.FindWindowW(None, str(title)[:256])
+        return int(hwnd) if hwnd else None
+    except Exception:
+        return None
+
+
+def _window_minimized(hwnd: int) -> bool:
+    """窗口是否已最小化。非 Windows 或调用失败时按「没最小化」处理。
+
+    宁可错判成没最小化：真最小化时按窗口捕获自己会停在无新帧上，读到的是
+    ``None``；反过来错判成最小化会白白丢掉本可用的画面。
+    """
+    try:
+        import ctypes
+
+        return bool(ctypes.WinDLL("user32").IsIconic(int(hwnd)))
+    except Exception:
+        return False
+
+
 #: 可见比例低于此值就算「画面已经不是目标窗口了」。留一点余量：任务栏、输入法
 #: 候选框、Steam 通知都会盖掉窗口边角，那不该报警。
 _WINDOW_OBSCURED_BELOW = 0.6
@@ -1014,6 +1046,174 @@ class DxcamFrameSource:
             camera = self._camera
             self._camera = None
         self._release_camera(camera)
+
+
+class WgcWindowFrameSource:
+    """按窗口捕获的采集源；遮挡与它无关。
+
+    其余采集器（DXcam/MSS）都走桌面复制：抓的是**合成后的桌面**，VRChat 被别的
+    窗口盖住时采集照样成功，内容却是压在上面那个窗口的像素。那正是
+    ``window_visibility`` 必须存在的原因——它在补救一个采集层的缺陷。
+
+    Windows.Graphics.Capture 按**窗口**交付 DWM 的合成内容，压在上面的窗口不参与，
+    因此遮挡这件事在这条路径上根本不成立。实测同一时刻：本采集源拿到 VRChat 画面，
+    DXGI 桌面复制拿到的是覆盖窗口的界面（两者相关系数 0.065）。
+
+    仍然抓不到的唯一情形是**最小化**：DWM 不再为最小化窗口合成。这种情况下
+    ``read()`` 返回 ``None``、``status()`` 报 ``minimized=True``，由上层照旧处理。
+
+    区域裁剪不在这里做。捕获项的原点就是窗口左上角，本来就不含桌面上的其它内容；
+    再套一层 ``region`` 只会让 FOV→``bearing_deg`` 的基准多一次无谓的偏移。
+    """
+
+    name = "wgc_window"
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        capture_cursor: bool = False,
+        resolver: Callable[[str], int | None] | None = None,
+        minimized: Callable[[int], bool] | None = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._title = str(title)[:256]
+        self._capture_cursor = bool(capture_cursor)
+        self._resolver = resolver or _find_window_handle
+        self._minimized_probe = minimized or _window_minimized
+        self._session: Any = None
+        self._hwnd: int | None = None
+        self._closed = False
+        self._last_error: str | None = None
+        self._frames = 0
+        self._empty_reads = 0
+        self._rebuilds = 0
+        self._minimized = False
+        self._open()
+
+    def _open(self) -> None:
+        """建立捕获会话。失败只记录，不抛异常——采集不该让后端起不来。"""
+        hwnd: int | None = None
+        try:
+            from .wgc_capture import WgcSession, wgc_supported
+
+            if not wgc_supported():
+                raise RuntimeError(
+                    "Windows.Graphics.Capture is unavailable (needs Win10 1903+ and the winrt wheel)"
+                )
+            hwnd = self._resolver(self._title)
+            if not hwnd:
+                raise RuntimeError(f"window not found: {self._title!r}")
+            session = WgcSession(hwnd, capture_cursor=self._capture_cursor)
+        except Exception as exc:
+            with self._lock:
+                self._session = None
+                # 窗口找到了但会话没建起来，和压根没找到窗口是两种故障。前者该继续
+                # 报 window_found=True，否则 status 会把人往「VRChat 没开」的方向带。
+                self._hwnd = int(hwnd) if hwnd else None
+                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            return
+        with self._lock:
+            if self._closed:
+                stale = session
+            else:
+                self._session = session
+                self._hwnd = hwnd
+                self._last_error = None
+                stale = None
+        if stale is not None:
+            stale.close()
+
+    def _is_minimized(self) -> bool:
+        hwnd = self._hwnd
+        if not hwnd:
+            return False
+        try:
+            return bool(self._minimized_probe(hwnd))
+        except Exception:
+            return False
+
+    def read(self) -> Any:
+        with self._lock:
+            session = None if self._closed else self._session
+        if session is None:
+            if not self._closed:
+                # 会话没建起来（VRChat 还没启动、或上一次窗口关掉了）。每次读都
+                # 重试一遍：这条路径只有 FindWindow 的成本，失败时不会有 D3D 开销。
+                self._open()
+                with self._lock:
+                    session = None if self._closed else self._session
+            if session is None:
+                return None
+        minimized = self._is_minimized()
+        with self._lock:
+            self._minimized = minimized
+        if minimized:
+            # 最小化时 DWM 不再合成该窗口，帧池只会一直交还旧帧或空帧。不读比
+            # 读到冻结画面安全：冻帧会被下游当成「现在」。
+            return None
+        try:
+            frame = session.read()
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"[:256]
+            self._reopen()
+            return None
+        with self._lock:
+            if frame is None:
+                self._empty_reads += 1
+            else:
+                self._frames += 1
+                self._empty_reads = 0
+                self._last_error = None
+        return frame
+
+    def _reopen(self) -> None:
+        """丢弃当前会话并重建。窗口被关掉或分辨率改变后会话就作废了。"""
+        with self._lock:
+            session = self._session
+            self._session = None
+            self._rebuilds += 1
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if not self._closed:
+            self._open()
+
+    def status(self) -> Mapping[str, Any]:
+        with self._lock:
+            session = self._session
+            result: dict[str, Any] = {
+                "available": session is not None and not self._closed,
+                "name": self.name,
+                "window_title": self._title,
+                "window_found": self._hwnd is not None,
+                "window_minimized": self._minimized,
+                # 这条路径不经桌面合成，所以「被别的窗口盖住」不再是失效条件。
+                # 键保留是为了让读 status 的消费者不必分情况写。
+                "window_obscured": self._minimized,
+                "frames": self._frames,
+                "empty_reads": self._empty_reads,
+                "rebuilds": self._rebuilds,
+                "last_error": self._last_error,
+            }
+            if session is not None:
+                width, height = session.size
+                result["capture_size"] = {"width": width, "height": height}
+        return result
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            session = self._session
+            self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 class DesktopMirrorFrameSource:
@@ -3890,6 +4090,7 @@ __all__ = [
     "VisionObservation",
     "VisionRuntime",
     "VisionWorker",
+    "WgcWindowFrameSource",
     "WindowTrackedFrameSource",
     "window_visibility",
     "optional_dependency_status",
