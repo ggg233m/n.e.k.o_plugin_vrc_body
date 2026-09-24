@@ -2,8 +2,7 @@
 
 - [N.E.K.O 宿主一键安装包说明](INSTALL.md)：导入 `.neko-plugin` 即可安装模型和运行依赖。
 
-- 2026-08-29：将在yui-npc-controller分支进行地图NPC开发
-- [当前主要开发分支](https://github.com/ggg233m/n.e.k.o_plugin_vrc_body/tree/codex/yui-npc-controller)
+- 2026-09-20：正在制作世界模型
 
 - [开发进度](ROADMAP.md)
 - [独立后端](backend/README.md)
