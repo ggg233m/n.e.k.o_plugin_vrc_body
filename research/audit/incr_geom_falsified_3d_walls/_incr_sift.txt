@@ -1,0 +1,59 @@
+cache: nF=1788  fps=20  WxH=448x252  fx=179.95  cam_h=1.50
+video=F:/obs/2026-09-20 23-34-57.mkv  offset=2.45
+DR pose span: x 0.00..20.99  z -1.09..16.50  path n=895
+frames with finite depth-scale K: 1753/1788
+[frames] 命中缓存 f_5fa80fb0f48fa840.npy（2054 帧 @ 20 fps，448x252）
+grabbed 2054 frames (0.2s, 12.73)  usable(cache)=1788  usable(recomputed)=1788
+  feat 400/1788  median=514  14s
+  feat 800/1788  median=482  28s
+  feat 1200/1788  median=451  41s
+  feat 1600/1788  median=452  55s
+features: sift nfeatures=1500  frames=1753  median kp=469  (63s)
+  pairs 60/220  655 pts  1s
+  pairs 120/220  1581 pts  1s
+  pairs 180/220  2545 pts  1s
+
+pair scan: bases=220  rows=157  skip={'no_match': 53, 'no_pass': 421, 'zrange': 52506, 'reproj': 52502, 'par': 48667, 'cheir': 0}  total_tri_pts=2545
+
+=== per-k pair diagnostics (metric pose) ===
+    k  pairs med_mtch    pass%   par_deg     Z_tri reproj_px Ztri/Zdep
+   20     73    103.0    10.7%     4.44      4.96     0.730       nan
+   40     63     61.0     9.1%     6.37      7.93     0.762     0.406
+   80     21     32.0     8.0%    14.06      9.54     0.508     0.502
+
+=== triangulated depth vs DA-V2 depth model, at the SAME matched pixels ===
+matched px compared=2525 ; depth model NaN here=20 ; depth model >12 m (out of range)=1337
+overall  Z_tri/Z_dep: p25=0.237  median=0.407  p75=0.665   (1.0 = agree)
+Z_dep bucket         n med_ratio  med_Zdep  med_Ztri
+[3.0,6.0)          247     1.030      4.99      4.68
+[6.0,9.0)          456     0.643      8.06      5.24
+[9.0,12.0)         472     0.491     10.34      5.03
+note: ratio<1 => triangulation puts the point CLOSER than DA-V2 (pose baseline too large or DA says too far)
+
+--- separates 'depth model degrades at range' from 'baseline k error grows' ---
+    k Z_dep bucket       n med_ratio
+   20 [3,6)            224     1.084
+   20 [6,9)            406     0.647
+   20 [9,12)           316     0.479
+   40 [6,9)             49     0.538
+   40 [9,12)           137     0.648
+
+=== surface flatness (0.40 m neighbourhood, same metric as prior eval) ===
+reference floors: depth-fusion single-frame ~0.0291 m ; fused 0.070 (4Hz&20Hz) ; optimised pose 0.0788
+triangulated(ORB,metric pose)  pts=   2545 valid=   790 plan_med=0.0466 plan_p90=0.0961 RANSAC_inl=    66 (2.6%)
+depth-route(same pixels)       pts=   1188 valid=   213 plan_med=0.0053 plan_p90=0.0463 RANSAC_inl=    53 (4.5%)
+  tri cloud height: p05=0.12 p50=1.40 p95=3.33 m (cam_h=1.50)
+
+=== decomposition ===
+within-pair triangulated flatness: n_pairs=31  median=0.0161 m  p25=0.0099  p75=0.0419
+across-pair (whole cloud) triangulated flatness = see table above
+=> if within-pair << across-pair, the wall smear is CROSS-PAIR POSE INCONSISTENCY, not ORB noise
+done
+
+---STDERR---
+H:\AI\neko-music\vrc\pc-vr\n.e.k.o_plugin_vrc_body\.tmp\_incr_geom.py:184: RuntimeWarning: divide by zero encountered in divide
+  uv2 = q[:2] / q[2]
+H:\AI\neko-music\vrc\pc-vr\n.e.k.o_plugin_vrc_body\.tmp\_incr_geom.py:184: RuntimeWarning: invalid value encountered in divide
+  uv2 = q[:2] / q[2]
+H:\AI\neko-music\vrc\pc-vr\n.e.k.o_plugin_vrc_body\.tmp\_incr_geom.py:232: RuntimeWarning: All-NaN slice encountered
+  float(np.nanmedian(ratio[m]))))

@@ -34,7 +34,7 @@ class FakeDirectionMemory:
         pass
 
 # 导入 navigator（作为包导入避免相对导入错误）
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.navigator import LocalNavigator
 
 def main():

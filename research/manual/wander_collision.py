@@ -1,15 +1,21 @@
 #!/usr/bin/env python
-"""直接测试 wander 撞墙行为，绕过 HTTP 和工具层配对检查。"""
+"""直接测试 wander 撞墙行为，绕过 HTTP 和工具层配对检查。
+
+后端端口和 token 每次启动都随机生成，从调试面板或后端日志里取：
+    python research/manual/wander_collision.py --port <端口> --token <token>
+也可用环境变量 NEKO_BACKEND_PORT / NEKO_BACKEND_TOKEN。
+"""
+import argparse
 import json
+import os
 import time
 from pathlib import Path
 
 # 需要先启动后端进程，这个脚本只是客户端
 import requests
 
-BASE = "http://127.0.0.1:14670"
-TOKEN = "O6say2hTx5H_-EXrH_7W-N7UQq-eeCKZ"
-HEADERS = {"X-Neko-Backend-Token": TOKEN}
+BASE = ""
+HEADERS: dict[str, str] = {}
 
 def snapshot():
     return requests.get(f"{BASE}/snapshot", headers=HEADERS, timeout=5).json()
@@ -109,4 +115,12 @@ def main():
         print(json.dumps(summary, ensure_ascii=False, indent=1))
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=int(os.environ.get("NEKO_BACKEND_PORT", "0")) or None)
+    ap.add_argument("--token", default=os.environ.get("NEKO_BACKEND_TOKEN"))
+    a = ap.parse_args()
+    if not a.port or not a.token:
+        ap.error("需要 --port 与 --token（或 NEKO_BACKEND_PORT / NEKO_BACKEND_TOKEN）")
+    BASE = f"http://127.0.0.1:{a.port}"
+    HEADERS = {"X-Neko-Backend-Token": a.token}
     main()

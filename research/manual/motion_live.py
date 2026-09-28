@@ -7,7 +7,7 @@
 3. 站立/移动时的实测速度值
 
 运行方式：
-    python test_motion_live.py
+    python research/manual/motion_live.py
 
 按 Ctrl+C 退出。
 """
@@ -16,6 +16,14 @@ from __future__ import annotations
 
 import sys
 import time
+import types
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[2]
+if "neko_anyadance_body" not in sys.modules:  # 与 tests/_bootstrap.py 相同的合成包
+    _pkg = types.ModuleType("neko_anyadance_body")
+    _pkg.__path__ = [str(_REPO)]  # type: ignore[attr-defined]
+    sys.modules["neko_anyadance_body"] = _pkg
 
 from neko_anyadance_body.config import VrchatOscConfig
 from neko_anyadance_body.osc import VrchatOscBridge
