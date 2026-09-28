@@ -407,7 +407,8 @@ monitor_index = -1
 dxcam_device_idx = -1
 dxcam_output_idx = -1
 dxcam_backend = "auto" # auto / dxgi / winrt
-interval_ms = 100
+# 约 30 Hz 的 WGC/视觉采集轮询；队列为单槽，处理跟不上时丢弃旧帧。
+interval_ms = 33
 queue_size = 1
 lifecycle_watermark_limit = 4096
 # capture = "wgc" 时用它取窗口句柄后按窗口捕获（留空等于关闭采集）；桌面镜像类
@@ -464,6 +465,21 @@ endpoint 可用 `VRC_VLM_ENDPOINT`、模型用 `VRC_VLM_MODEL`），没有运行
 （`capture_stopped` / `no_frame_cached` / `frame_stale`），不会退而求其次给旧画面。
 编码失败只记进 `frame_cache.last_error` 并让这次拉取报不可用，绝不打断采集——看不到
 图是降级，掉帧才是故障。
+
+### 在线 navmesh（`/worldmodel/navmesh`）
+
+`POST /worldmodel/navmesh/start` 打开 OpenVR 会话（SteamVR 镜像双目 + HMD 朝向），
+边走边建二维可行走栅格；`stop` 关闭会话。显式 start 之前不占用 SteamVR。
+
+* 位姿：OSC `VelocityX/Z` 零阶保持积分 × HMD 朝向（航位推算，20 Hz），再由
+  `nav_loop.LoopCloser` 做回环（ORB + 双目 PnP，只修平移；PnP 相对 yaw 必须与 HMD 一致）。
+* 地图：`nav_mapping.KeyframeGridMapper` 按关键帧融合双目点云，三态 free / occupied / unknown；
+  unknown 永远不当作可通行。
+* 控制：`goto`（地图系 `x/y`）、`explore`（前沿探索）、`cancel`。未 arm、双目或位姿过期、
+  其它自主目标在执行时一律不动；双目断了就停（没有近距急停不能盲走）。
+
+`GET /worldmodel/navmesh` 返回状态，`?grid=1` 附带栅格。全部沿用后端 token 鉴权。
+地图坐标是自建地图系（追踪米），不是 VRChat 世界坐标。
 
 ### 合并到当前对话的主 LLM 语义任务
 
@@ -572,3 +588,9 @@ python -m pip install --user "dxcam[winrt]"
 及逐项 `precondition_check.failures`。门禁只读取世界状态快照，不进入或阻塞 120 Hz
 身体调度线程。多步计划在创建时只预检当前第一步；后续每一步仍须在提交执行时携带
 自身的 `preconditions`，以免把前一步尚未产生的世界变化误判为失败。
+### WGC/OSC 时间对齐
+
+视觉帧使用 `VisionWorker` 采集时记录的 `captured_at`（`time.monotonic()`）。
+OSC 接收器保存每个 `VelocityX/Z` 样本的接收单调时间，光流处理该帧时按
+`captured_at` 插值或在有界间隔内保持；超过 `0.25 s` 的旧样本和断档返回
+`available=false`，不会伪造静止速度。两轴不在同一小窗口内到达时同样按 unknown 处理。

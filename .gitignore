@@ -16,3 +16,12 @@ world_memory.json
 backend.settings.json
 memory/
 vendor/
+.slam_probe/
+
+models/depth_anything_v2_small/
+# 根目录临时输出
+/tmp_*
+/.nav_*.txt
+/__*.txt
+/_clean.log
+/_wm_out.txt

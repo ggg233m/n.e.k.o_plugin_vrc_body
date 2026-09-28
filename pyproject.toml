@@ -12,11 +12,20 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "dxcam[winrt]>=0.0.5,<1; sys_platform == 'win32'",
     "websocket-client>=1.8,<2",
+    # scipy 被 backend/nav_loop.py 的稀疏求解用到，代码里是
+    # 惰性导入 + 缺失自动回退稠密解（_have_scipy/_DENSE_SOLVER），所以缺了也
+    # 能跑、只是慢 4~5 倍。这里正式声明是为了保证安装包一定带上它，不再赌宿主
+    # 环境。注意宿主 HOST_PROVIDED_REQUIREMENT_NAMES 只认 n-e-k-o，声明即会被
+    # vendor：安装包体积 +约 60~80MB，并多带一份 scipy 的 BLAS 动态库。
+    "scipy>=1.13,<2",
+    # backend/openvr_mirror.py 取 SteamVR 镜像双目（在线建图/急停），缺了就没有双目。
+    "openvr>=1.26,<2; sys_platform == 'win32'",
 ]
 
 [tool.neko.build]
 # 安装包保留运行源码、界面和模型，排除开发及本机运行数据。
-exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory", "packaging"]
+# research/ = 离线研究工具、录制器与其测试，运行时代码不得 import 它。
+exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory", "packaging", "research"]
 exclude_files = [".git", "test_*.py", "backend.settings.json", "world_memory.json", "store.db"]
 
 [tool.pytest.ini_options]

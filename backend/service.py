@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import (
+    ActionTimeline,
     BodyCommand,
     BodyScheduler,
     ClipLibrary,
@@ -42,6 +43,9 @@ from .vision import (
     WindowTrackedFrameSource,
 )
 from .world_state import WorldStateStore
+from .world_model import WorldModel
+from .time_alignment import TimeAlignmentBuffer
+from .nav_online import OnlineNavigator
 
 
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
@@ -343,6 +347,14 @@ class BackendService:
                     max_per_minute=self.config.vision.semantic_max_per_minute,
                 )
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
+        # W1 世界身份子系统。世界身份不自动跨进程恢复：重启后 world_key 为 unknown，
+        # 等待用户再次手动输入，因此这里不读取任何持久化身份文件。具体启停由
+        # /worldmodel/start|stop 接口驱动，不随后端 service.start() 自动拉起。
+        self.world_model = WorldModel(
+            enabled=self.config.world_model.enabled,
+            persist=self.config.world_model.persist,
+            state_dir=self.state_dir,
+        )
         self.world_state = WorldStateStore(
             lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
             persistence_path=self.state_dir / "world_memory.json",
@@ -380,6 +392,9 @@ class BackendService:
         self.scheduler: BodyScheduler | None = None
         self.osc: VrchatOscBridge | None = None
         self.driver_log: DriverLogListener | None = None
+        # 动作时间轴（路线历史通道）。默认不启用：config.driver_log.action_timeline_enabled
+        # 为 False 时它就是 None，所有接线点退化成 no-op，行为与它出现之前完全一致。
+        self.action_timeline: ActionTimeline | None = None
         self.vmc_idle: VmcIdleRelay | None = None
         self.host_vmc: HostVmcController | None = None
         self._vmc_calibration_stop = threading.Event()
@@ -415,6 +430,17 @@ class BackendService:
             complete_goal=self._navigator_complete_goal,
             turn_retarget_supported=True,
         )
+        # 光流按 WGC 帧时刻取对齐后的 OSC 速度；只保留有界样本。
+        self.time_alignment = TimeAlignmentBuffer()
+        self._last_osc_alignment_timestamp: float | None = None
+        # 在线增量 navmesh：显式 start 才开 OpenVR 会话，默认不占 SteamVR。
+        self.navmesh = OnlineNavigator(
+            motion_history=self._navmesh_motion_history,
+            send_move=lambda forward, ms: self.set_locomotion(forward, 0.0, ms),
+            send_turn=self._navigator_send_turn,
+            stop_motion=self.stop_movement,
+            drive_block_reason=self._navmesh_drive_block,
+        )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
             "count": 0,
@@ -427,6 +453,98 @@ class BackendService:
             self._cognition_sources,
             world_provider=lambda: self.vision.snapshot(),
         )
+
+    def _sync_osc_alignment_samples(self) -> None:
+        """把 OSC 接收线程产生的新速度样本复制到视觉对齐缓冲。"""
+        if self.osc is None:
+            return
+        try:
+            samples = self.osc.motion_history()
+        except Exception:
+            return
+        for sample in samples:
+            try:
+                timestamp = float(sample.get("timestamp"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (self._last_osc_alignment_timestamp is not None
+                    and timestamp <= self._last_osc_alignment_timestamp):
+                continue
+            # VelocityX/Z 是变化驱动参数，不能用相隔很久的两条轴拼成一个“当前”
+            # 速度。两轴没有在同一小窗口内到达时，宁可让当前 WGC 帧得到 unknown。
+            try:
+                x_at = float(sample.get("velocity_x_timestamp", timestamp))
+                z_at = float(sample.get("velocity_z_timestamp", timestamp))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if abs(x_at - z_at) > self.time_alignment.max_gap_s:
+                continue
+            if self.time_alignment.add_motion(
+                timestamp, sample.get("velocity_x"), sample.get("velocity_z")
+            ):
+                self._last_osc_alignment_timestamp = timestamp
+
+    def _vision_motion_feedback(self, captured_at: float | None = None) -> Mapping[str, Any]:
+        """给光流使用与当前 WGC 帧配对的 OSC 速度；不给时刻时读最新值。"""
+        self._sync_osc_alignment_samples()
+        if captured_at is None:
+            if self.osc is None:
+                return {"available": False, "reason": "osc_unavailable"}
+            try:
+                return self.osc.motion_feedback()
+            except Exception:
+                return {"available": False, "reason": "osc_feedback_error"}
+        result = self.time_alignment.sample_motion(captured_at)
+        # 保留可读的 OSC 缺失原因，同时明确这不是静止速度。
+        if not result.get("available") and self.osc is None:
+            result["reason"] = "osc_unavailable"
+        return result
+
+    # ---- 在线增量 navmesh（航位推算 + 镜像双目）----
+    def _navmesh_motion_history(self) -> list[dict[str, Any]]:
+        osc = self.osc
+        return [] if osc is None else osc.motion_history(limit=64)
+
+    def _navmesh_drive_block(self) -> str | None:
+        """None = 可以驾驶；否则是不能动的原因。与自主目标互斥。"""
+        if not self._started or self.osc is None or self.scheduler is None:
+            return "backend_not_started"
+        autonomy = self.autonomy.snapshot()
+        if not autonomy.get("armed"):
+            return "autonomy_not_armed"
+        if autonomy.get("goal"):
+            # 本地导航器正在执行自主目标，两个控制环不能同时发轴。
+            return "autonomy_goal_active"
+        return None
+
+    def navmesh_status(self, include_grid: bool = False) -> dict[str, Any]:
+        status = self.navmesh.status()
+        if include_grid:
+            view = self.navmesh.grid_view()
+            status["grid_png_base64"] = None if view is None else view.pop("png_base64")
+            status["grid_meta"] = view
+        return status
+
+    def navmesh_start(self) -> dict[str, Any]:
+        if not self._started:
+            return {**self.navmesh.status(), "ok": False, "reason": "backend_not_started"}
+        return {**self.navmesh.start(), "ok": True}
+
+    def navmesh_stop(self) -> dict[str, Any]:
+        return {**self.navmesh.stop(), "ok": True}
+
+    def navmesh_goto(self, x: Any, y: Any) -> dict[str, Any]:
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "x_y_must_be_numbers"}
+        return self.navmesh.goto(fx, fy)
+
+    def navmesh_explore(self) -> dict[str, Any]:
+        return self.navmesh.explore()
+
+    def navmesh_cancel(self) -> dict[str, Any]:
+        return self.navmesh.cancel()
 
     def _new_vision_worker(self, source: FrameSource) -> VisionWorker:
         # 已配置的检测器对象可能存在，但可选模型不可用（例如未部署 OpenVINO
@@ -452,7 +570,7 @@ class BackendService:
             capture_only=not backend_available,
             # 光流只需要读取现有 OSC/scheduler 状态，不向控制线程反向发送命令。
             # provider 在 worker 真正启动后才调用，此时 scheduler/OSC 已完成初始化。
-            motion_provider=self._navigator_motion_feedback,
+            motion_provider=self._vision_motion_feedback,
             turning_provider=self._navigator_turn_state,
         )
 
@@ -648,7 +766,24 @@ class BackendService:
                 self.scheduler.start()
                 self.osc = VrchatOscBridge(self.config.vrchat_osc, logger=self.logger)
                 self.osc.start()
-                self.driver_log = DriverLogListener(self.config.driver_log, logger=self.logger)
+                # 动作时间轴（路线历史通道）：必须在监听器之前构造，因为它同时是
+                # 监听器的 on_action sink。关闭时保持 None，监听器只做统计。
+                if self.config.driver_log.action_timeline_enabled:
+                    self.action_timeline = ActionTimeline(
+                        self.config.driver_log.action_timeline_path,
+                        self.config.driver_log.action_timeline_fps,
+                        enabled=True,
+                    )
+                    # 服务启动即视为动作时间轴原点。若录像由外部（OBS）启动，录制侧
+                    # 应在真正开录时调用 action_timeline_begin() 重新锚定——只允许在
+                    # 还没有任何动作行落盘前重锚（见该方法），否则帧号会整体错位。
+                    self.action_timeline.begin()
+                self.driver_log = DriverLogListener(
+                    self.config.driver_log,
+                    logger=self.logger,
+                    on_action=(self.action_timeline.ingest_driver_event
+                               if self.action_timeline is not None else None),
+                )
                 self.driver_log.start()
                 if self.vision_worker is None and self.config.vision.enabled:
                     source = self._fresh_vision_source()
@@ -824,6 +959,11 @@ class BackendService:
         )
 
     def stop(self) -> None:
+        # 先停 navmesh 控制环（它会在 OSC/scheduler 拆除前发一次停车）。
+        try:
+            self.navmesh.stop()
+        except Exception:
+            pass
         with self._lock:
             # 先解除授权，释放虚拟控制器叠加层和 OSC 回退，再拆除 worker/套接字。
             try:
@@ -837,6 +977,8 @@ class BackendService:
             self.vision.close()
             if self.driver_log:
                 self.driver_log.stop()
+            if self.action_timeline:
+                self.action_timeline.close()
             if self.osc:
                 self.osc.stop()
             if self.scheduler:
@@ -846,6 +988,7 @@ class BackendService:
             if self.vmc_idle:
                 self.vmc_idle.stop()
             self.driver_log = None
+            self.action_timeline = None
             self.osc = None
             self.scheduler = None
             self.host_vmc = None
@@ -1874,6 +2017,56 @@ class BackendService:
                 "worker": self._vision_worker_status(),
             }
 
+    # ---- W1 世界身份子系统（world_model） ----------------------------------
+
+    def world_model_status(self) -> dict[str, Any]:
+        """GET /worldmodel/status 的契约字段。永不抛异常。"""
+        return self.world_model.status()
+
+    def world_model_start(self) -> dict[str, Any]:
+        """POST /worldmodel/start：请求立即返回，真正初始化在后台线程做。"""
+        return self.world_model.start()
+
+    def world_model_stop(self, reason: Any = "manual_stop") -> dict[str, Any]:
+        """POST /worldmodel/stop。"""
+        return self.world_model.stop(reason=reason)
+
+    def world_model_set_world(
+        self, world_key: Any, world_name: Any = None
+    ) -> dict[str, Any]:
+        """POST /worldmodel/world：手动设置当前世界标识。
+
+        世界身份不依赖子系统运行：即使未 start() 甚至 disabled 也允许设置，
+        因为「知道自己在哪个世界」是记忆分区的根，比子系统是否跑起来更底层。
+        """
+        return self.world_model.set_world(world_key, world_name)
+
+    # ---- 动作时间轴（路线历史通道） ----------------------------------------
+
+    def action_timeline_status(self) -> dict[str, Any]:
+        """动作时间轴：是否启用 / 是否已锚定 / 已写多少行。"""
+        timeline = self.action_timeline
+        return timeline.status() if timeline is not None else {
+            "enabled": False, "active": False,
+        }
+
+    def action_timeline_begin(self) -> dict[str, Any]:
+        """让**录像侧**在真正开录时重新锚定时间基准。
+
+        只允许在还没有任何动作行落盘前调用：一旦写过行，帧号已按旧锚点换算，
+        再改锚点会让前后两段 ``frame_index`` 落在不同基准上。
+        未启用时返回 ``{"ok": False, "reason": "disabled"}``，绝不静默成功——
+        调用方必须能区分"锚成功了"和"这个通道根本没开"。
+        """
+        timeline = self.action_timeline
+        if timeline is None:
+            return {"ok": False, "reason": "disabled"}
+        if timeline.written > 0:
+            return {"ok": False, "reason": "already_recording",
+                    "records": timeline.written}
+        ok = timeline.begin()
+        return {"ok": ok, **timeline.status()}
+
     def submit(
         self,
         kind: str,
@@ -2040,6 +2233,7 @@ class BackendService:
             "body": body,
             "vrchat_osc": self.osc.snapshot() if self.osc else {"enabled": False},
             "driver_log": driver_log,
+            "action_timeline": self.action_timeline_status(),
             "idle_relay": self.vmc_idle.snapshot() if self.vmc_idle else {"enabled": False},
             "host_vmc": self.host_vmc.snapshot() if self.host_vmc else {"managed": False, "active": False},
             "world": self.vision.snapshot(),
@@ -2333,7 +2527,13 @@ class BackendService:
             "input_axes",
             {"side": side, "x": x, "y": y, "duration_ms": duration_ms},
         )
-        return bool(result.get("accepted"))
+        accepted = bool(result.get("accepted"))
+        timeline = self.action_timeline
+        if timeline is not None:
+            # 记录"想发什么"(forward=y 前进 / strafe=x 横移) 与"本机是否真的发出"。
+            # driver_ack 不由这里写：本机发送成功推不出驱动回执（见 ActionTimeline）。
+            timeline.record_command(forward=y, strafe=x, sent=accepted)
+        return accepted
 
     def _navigator_send_turn(self, delta_deg: float) -> bool:
         """转向直接进调度器，不经 set_turn。
@@ -2349,7 +2549,12 @@ class BackendService:
         # 超调。correction_deg 则由 scheduler 基于未归一化的当前实际 yaw 计算目标，
         # 既能连续重定向，也不会在 0/360° 边界误转一整圈。
         result = scheduler.submit("turn", {"correction_deg": float(delta_deg)})
-        return bool(result.get("accepted"))
+        accepted = bool(result.get("accepted"))
+        timeline = self.action_timeline
+        if timeline is not None:
+            # turn_intent 记录的是**输入意图**（要求转多少度），不是实际转过的角度。
+            timeline.record_turn(yaw_delta=delta_deg, sent=accepted)
+        return accepted
 
     def _navigator_release_inputs(self, side: str = "all") -> None:
         scheduler = self.scheduler
@@ -2365,7 +2570,18 @@ class BackendService:
         osc = self.osc
         if osc is None:
             return {"available": False, "reason": "osc_unavailable"}
-        return osc.motion_feedback()
+        feedback = osc.motion_feedback()
+        timeline = self.action_timeline
+        if timeline is not None and isinstance(feedback, dict):
+            # 只有"确实取到了样本"才记速度；读不到时保持上一份，绝不把不可观测
+            # 当成零速度写进路线历史。
+            if feedback.get("available"):
+                timeline.note_velocity(
+                    feedback.get("velocity_x") or 0.0,
+                    0.0,
+                    feedback.get("velocity_z") or 0.0,
+                )
+        return feedback
 
     def _navigator_turn_state(self) -> dict[str, Any]:
         """给导航器返回虚拟 HMD 转向是否仍在执行或收尾。"""
@@ -2463,15 +2679,23 @@ class BackendService:
         if self.osc is None:
             return False, "VRChat OSC bridge is unavailable"
         duration_s = normalized_duration / 1000.0
+        def record(sent: bool) -> None:
+            if self.action_timeline is not None:
+                # 路线执行和手动 OSC 都统一进入动作时间轴；失败也要留痕。
+                self.action_timeline.record_command(
+                    forward=normalized_vertical, strafe=normalized_horizontal, sent=sent
+                )
         set_axes = getattr(self.osc, "set_axes", None)
         if callable(set_axes):
-            return set_axes(
+            result = set_axes(
                 {
                     "move_vertical": normalized_vertical,
                     "move_horizontal": normalized_horizontal,
                 },
                 duration_s,
             )
+            record(bool(result[0]))
+            return result
         vertical_result = self.osc.set_axis("move_vertical", normalized_vertical, duration_s)
         if not vertical_result[0]:
             rollback = getattr(self.osc, "stop_axes", None)
@@ -2479,9 +2703,11 @@ class BackendService:
                 rollback(("move_vertical", "move_horizontal"))
             else:
                 self.osc.stop_all_axes()
+            record(False)
             return False, vertical_result[1] or "VRChat OSC locomotion send failed"
         horizontal_result = self.osc.set_axis("move_horizontal", normalized_horizontal, duration_s)
         if horizontal_result[0]:
+            record(True)
             return True, None
         # 部分移动命令不安全：释放两个移动轴，避免调用方收到看似成功的半条命令。
         rollback = getattr(self.osc, "stop_axes", None)
@@ -2489,6 +2715,7 @@ class BackendService:
             rollback(("move_vertical", "move_horizontal"))
         else:
             self.osc.stop_all_axes()
+        record(False)
         return False, horizontal_result[1] or "VRChat OSC locomotion send failed"
 
     def set_turn(self, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
@@ -2511,6 +2738,8 @@ class BackendService:
             return False, "AnyaDance scheduler is not initialized"
         delta_deg = normalized_horizontal * TURN_SPEED_DPS * (normalized_duration / 1000.0)
         result = self.scheduler.submit("turn", {"delta_deg": delta_deg})
+        if self.action_timeline is not None:
+            self.action_timeline.record_turn(yaw_delta=delta_deg, sent=bool(result.get("accepted")))
         return bool(result.get("accepted")), result.get("reason")
 
     def stop_movement(self) -> tuple[bool, str | None]:

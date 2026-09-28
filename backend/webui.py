@@ -34,6 +34,7 @@ _EDITABLE_FIELDS = {
     }),
     "autonomy": frozenset({"manual_arm", "session_ttl_minutes"}),
     "world_memory": frozenset({"persist_world", "persist_players"}),
+    "world_model": frozenset({"enabled", "persist"}),
     "vision": frozenset({
         "enabled", "source", "capture", "local_backend", "model_path",
         "labels_path", "device", "onnxruntime_cuda",

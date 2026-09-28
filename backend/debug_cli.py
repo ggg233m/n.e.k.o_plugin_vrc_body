@@ -275,6 +275,13 @@ def main() -> int:
     vision_stop = sub.add_parser("vision-stop", help="stop capture and release capture handles")
     vision_stop.add_argument("--reason", default="manual_stop")
     sub.add_parser("vision-start", help="recreate the frame source and start the capture worker")
+    worldmodel_status = sub.add_parser("worldmodel-status", help="show W1 world identity subsystem status")
+    worldmodel_start = sub.add_parser("worldmodel-start", help="start the world identity subsystem")
+    worldmodel_stop = sub.add_parser("worldmodel-stop", help="stop the world identity subsystem")
+    worldmodel_stop.add_argument("--reason", default="manual_stop")
+    worldmodel_world = sub.add_parser("worldmodel-world", help="manually set the current world identity")
+    worldmodel_world.add_argument("--key", required=True, help="wrld_* id or a world name")
+    worldmodel_world.add_argument("--name", default=None, help="optional human-readable world name")
     args = parser.parse_args()
     if args.command == "shell":
         return _run_shell(args.host, args.port, args.token)
@@ -417,6 +424,19 @@ def main() -> int:
             result = request(
                 args.host, args.port, args.token, "POST", "/vision/stop", {"reason": args.reason}
             )
+        elif args.command == "worldmodel-status":
+            result = request(args.host, args.port, args.token, "GET", "/worldmodel/status")
+        elif args.command == "worldmodel-start":
+            result = request(args.host, args.port, args.token, "POST", "/worldmodel/start", {})
+        elif args.command == "worldmodel-stop":
+            result = request(
+                args.host, args.port, args.token, "POST", "/worldmodel/stop", {"reason": args.reason}
+            )
+        elif args.command == "worldmodel-world":
+            payload = {"world_key": args.key}
+            if args.name is not None:
+                payload["world_name"] = args.name
+            result = request(args.host, args.port, args.token, "POST", "/worldmodel/world", payload)
         elif args.command == "vision-frame":
             query = f"/vision/frame?max_age_ms={args.max_age_ms}"
             if args.overlay:

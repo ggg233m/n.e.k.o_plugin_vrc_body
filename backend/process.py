@@ -12,6 +12,7 @@ import copy
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
+import math
 import os
 from pathlib import Path
 import secrets
@@ -21,9 +22,10 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Mapping
 from typing import Any
 import types
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -86,12 +88,27 @@ deep_merge = webui_module.deep_merge
 load_settings_file = webui_module.load_settings_file
 
 
+def _json_safe(value: Any) -> Any:
+    """递归把非有限浮点数转换为 JSON 标准允许的 null。"""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 _UI_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/ui": ("index.html", "text/html; charset=utf-8"),
     "/ui/": ("index.html", "text/html; charset=utf-8"),
     "/ui/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/ui/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/ui/navmesh.js": ("navmesh.js", "text/javascript; charset=utf-8"),
+    "/ui/navmesh.css": ("navmesh.css", "text/css; charset=utf-8"),
+    # 在线增量 navmesh：镜像双目 + 航位推算 + 回环；goto 需点击后确认，驾驶另需自主武装。
+    "/navmesh": ("navmesh.html", "text/html; charset=utf-8"),
 }
 
 
@@ -104,10 +121,48 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _authorized(self) -> bool:
-        return self.headers.get("X-Neko-Backend-Token") == self.server.token
+        if self.headers.get("X-Neko-Backend-Token") == self.server.token:
+            return True
+        # <img> 无法附加自定义 header；仅对回环 MJPEG 预览允许查询参数令牌，
+        # 其他接口仍必须使用 header，避免扩大控制 API 的认证面。
+        if urlsplit(self.path).path == "/vision/mjpeg":
+            return parse_qs(urlsplit(self.path).query).get("token", [None])[0] == self.server.token
+        return False
 
-    def _json(self, status: int, payload: MappingLike) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    def _mjpeg(self) -> None:
+        """以最新帧单槽输出 30 FPS MJPEG，避免 JSON/base64 轮询卡住页面。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Connection", "close")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            while True:
+                result = self.server.service.vision.latest_frame(max_age_ms=1000, overlay=False)
+                data = result.get("data") if isinstance(result, dict) else None
+                if isinstance(result, dict) and result.get("available") and isinstance(data, bytes):
+                    packet = (
+                        b"--frame\r\nContent-Type: image/jpeg\r\n"
+                        + f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
+                        + data + b"\r\n"
+                    )
+                    self.wfile.write(packet)
+                    self.wfile.flush()
+                time.sleep(1.0 / 30.0)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+
+    def _json(self, status: int, payload: Mapping[str, Any]) -> None:
+        # JSON 标准不允许 NaN/Infinity；深度模型在“没有非地面点”时可能产生
+        # nearest_nonfloor_m=NaN，统一在 HTTP 边界降级为 null，不能让整个页面
+        # 因 JSON.parse 失败而不可用。
+        body = json.dumps(
+            _json_safe(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -164,8 +219,19 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._json(401, {"error": "unauthorized"})
             return
+        if path == "/vision/mjpeg":
+            self._mjpeg()
+            return
         if path == "/health":
             self._json(200, {"ok": True, "pid": os.getpid()})
+            return
+        if path == "/worldmodel/status":
+            self._json(200, self.server.service.world_model_status())
+            return
+        if path == "/worldmodel/navmesh":
+            grid = parse_qs(urlsplit(self.path).query).get("grid", ["0"])[0]
+            self._json(200, self.server.service.navmesh_status(
+                include_grid=str(grid).lower() in {"1", "true", "yes"}))
             return
         if path == "/config":
             self._json(200, self.server.config_store.snapshot())
@@ -186,7 +252,6 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._json(200, self.server.service.autonomy_snapshot())
             return
         if path == "/world/delta":
-            from urllib.parse import parse_qs
             query = parse_qs(urlsplit(self.path).query)
             def query_int(name: str, default: int) -> int:
                 try:
@@ -203,7 +268,6 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/vision/frame":
-            from urllib.parse import parse_qs
             frame_query = parse_qs(urlsplit(self.path).query)
             try:
                 max_age_ms = int(frame_query.get("max_age_ms", [3000])[0])
@@ -216,7 +280,6 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/semantic/request":
-            from urllib.parse import parse_qs
             semantic_query = parse_qs(urlsplit(self.path).query)
             after_request_id = semantic_query.get("after_request_id", [None])[0]
             self._json(
@@ -334,6 +397,24 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.vision_start()
             elif self.path == "/vision/stop":
                 result = self.server.service.vision_stop(value.get("reason"))
+            elif self.path == "/worldmodel/start":
+                result = self.server.service.world_model_start()
+            elif self.path == "/worldmodel/stop":
+                result = self.server.service.world_model_stop(value.get("reason"))
+            elif self.path == "/worldmodel/world":
+                result = self.server.service.world_model_set_world(
+                    value.get("world_key"), value.get("world_name")
+                )
+            elif self.path == "/worldmodel/navmesh/start":
+                result = self.server.service.navmesh_start()
+            elif self.path == "/worldmodel/navmesh/stop":
+                result = self.server.service.navmesh_stop()
+            elif self.path == "/worldmodel/navmesh/goto":
+                result = self.server.service.navmesh_goto(value.get("x"), value.get("y"))
+            elif self.path == "/worldmodel/navmesh/explore":
+                result = self.server.service.navmesh_explore()
+            elif self.path == "/worldmodel/navmesh/cancel":
+                result = self.server.service.navmesh_cancel()
             elif self.path == "/vmc/recalibrate":
                 result = self.server.service.vmc_recalibrate(
                     value.get("reason"),
@@ -369,6 +450,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 or self.path.startswith("/input/")
                 or self.path.startswith("/autonomy/")
                 or self.path.startswith("/vision/")
+                or self.path.startswith("/worldmodel/")
             ):
                 dispatch_latency_ms = self.server.service.record_control_dispatch(self.path, started_at)
                 if isinstance(result, dict):
@@ -377,9 +459,6 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._json(200, result)
         except Exception as exc:
             self._json(400, {"error": f"{type(exc).__name__}: {exc}"[:500]})
-
-
-MappingLike = dict[str, Any]
 
 
 class BackendHttpServer(ThreadingHTTPServer):

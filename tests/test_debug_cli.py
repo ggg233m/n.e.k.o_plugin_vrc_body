@@ -135,6 +135,30 @@ class DebugCliTests(unittest.TestCase):
         self.assertTrue(fake.closed)
         self.assertIn('"ready": true', output.getvalue())
 
+    def test_worldmodel_world_forwards_key_and_name(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        def fake_request(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"accepted": True, "world_key": "wrld_abc", "world_source": "manual_id", "world_conflict_risk": False}
+
+        argv = [
+            "debug_cli.py",
+            "--token",
+            "dev",
+            "worldmodel-world",
+            "--key",
+            "wrld_abc",
+            "--name",
+            "The Club",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(debug_cli, "request", fake_request):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(debug_cli.main(), 0)
+
+        self.assertEqual(calls[0][0][4], "/worldmodel/world")
+        self.assertEqual(calls[0][0][5], {"world_key": "wrld_abc", "world_name": "The Club"})
+
 
 if __name__ == "__main__":
     unittest.main()

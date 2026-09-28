@@ -1,0 +1,28 @@
+:root { color-scheme: dark; --bg:#0d1117; --card:#161b22; --line:#30363d; --muted:#8b949e; --good:#3fb950; --warn:#d29922; --bad:#f85149; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:#e6edf3; font:14px "Segoe UI","Microsoft YaHei",sans-serif; }
+header { padding:16px 22px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; }
+h1 { font-size:18px; margin:0; } header span,.muted { color:var(--muted); }
+main { display:grid; grid-template-columns:minmax(420px,2fr) minmax(280px,1fr); gap:14px; padding:14px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+.title { color:var(--muted); font-weight:600; margin-bottom:10px; }
+.live img { display:block; width:100%; min-height:240px; object-fit:contain; background:#05070a; border-radius:6px; }
+.live .muted { margin-top:8px; }
+.state { font-size:24px; font-weight:700; margin:12px 0; color:var(--warn); }
+.state.localized { color:var(--good); } .state.lost { color:var(--bad); }
+.state.mapping { color:#58a6ff; }
+.controls { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; }
+.controls button { background:#21262d; color:#e6edf3; border:1px solid var(--line); border-radius:6px; padding:7px 10px; cursor:pointer; }
+.controls button:hover { border-color:#58a6ff; }
+.grid { display:grid; grid-template-columns:1fr auto; gap:8px 14px; align-items:center; }
+.grid span { color:var(--muted); } .grid b { font-variant-numeric:tabular-nums; }
+.reason { min-height:38px; color:#f0f6fc; overflow-wrap:anywhere; }
+.map-inline { margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
+.map-inline .title { font-size:12px; line-height:1.35; }
+canvas { display:block; width:100%; height:auto; background:#080b10; border:1px solid var(--line); border-radius:6px; }
+.target-controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.target-controls button { background:#21262d; color:#e6edf3; border:1px solid var(--line); border-radius:6px; padding:7px 10px; cursor:pointer; }
+.target-controls button:disabled { opacity:.45; cursor:not-allowed; }
+.target-controls button:hover:not(:disabled) { border-color:#58a6ff; }
+.map-inline canvas { cursor:crosshair; }
+@media (max-width:760px) { main { grid-template-columns:1fr; } .map { grid-column:auto; } }

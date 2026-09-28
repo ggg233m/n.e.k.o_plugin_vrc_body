@@ -10,6 +10,7 @@
     "packaging": "26.3",
     "pillow": "12.3.0",
     "protobuf": "7.36.1",
+    "scipy": "1.17.1",
     "typing_extensions": "4.16.0",
     "websocket-client": "1.9.2",
     "winrt-Windows.Foundation": "3.2.1",

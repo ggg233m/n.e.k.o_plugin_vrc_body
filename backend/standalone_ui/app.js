@@ -7,6 +7,7 @@ const state = {
   config: null,
   configInitialized: false,
   frameRevision: null,
+  worldmodel: null,
   timer: null,
 };
 
@@ -168,6 +169,60 @@ function renderAutonomy(autonomy, navigation) {
   text("llmLoopFact", Math.max(explorer.llm_calls_in_loop ?? 0, behavior.llm_calls_in_loop ?? 0));
 }
 
+function wmMapLocalization(value) {
+  switch (value) {
+    case "confirmed": return "已确认";
+    case "hypothesis": return "假设命中";
+    case "unknown": return "未知";
+    case "not_running": return "未运行";
+    default: return null;
+  }
+}
+function wmMapSource(value) {
+  switch (value) {
+    case "manual_id": return "手动 ID";
+    case "manual_name": return "手动名称（可能重名）";
+    case "unknown": return "未知";
+    default: return null;
+  }
+}
+function setInputUnlessFocused(id, value) {
+  const element = byId(id);
+  if (document.activeElement === element) return;
+  element.value = value == null ? "" : String(value);
+}
+
+function renderWorldModel() {
+  const wm = state.worldmodel || {};
+  const badge = byId("wmStateBadge");
+  let badgeText, badgeClass;
+  if (wm.starting) { badgeText = "启动中…"; badgeClass = "badge starting"; }
+  else if (wm.running) { badgeText = "运行中"; badgeClass = "badge ok"; }
+  else if (wm.available) { badgeText = "已停止"; badgeClass = "badge muted"; }
+  else { badgeText = "未启用"; badgeClass = "badge bad"; }
+  badge.textContent = badgeText;
+  badge.className = badgeClass;
+
+  const noWorld = wm.world_key == null;
+  byId("wmNoWorldBanner").classList.toggle("hidden", !noWorld);
+  byId("wmConflictBanner").classList.toggle("hidden", !wm.world_conflict_risk);
+
+  text("wmAvailable", wm.available == null ? "—" : (wm.available ? "已启用" : "未启用"));
+  text("wmRunning", wm.running == null ? "—" : (wm.running ? "运行中" : (wm.starting ? "启动中…" : "已停止")));
+  text("wmWorldKey", wm.world_key);
+  text("wmWorldName", wm.world_name);
+  text("wmWorldSource", wmMapSource(wm.world_source));
+  text("wmMemoryPartition", wm.memory_partition == null ? "拒绝加载记忆" : wm.memory_partition);
+  text("wmPlaces", wm.places);
+  text("wmEdges", wm.edges);
+  text("wmLocalization", wmMapLocalization(wm.localization));
+  text("wmLastError", wm.last_error);
+
+  // 仅在不聚焦时回填输入框，避免每 1 秒的刷新覆盖用户正在输入的内容。
+  setInputUnlessFocused("wmWorldKeyInput", wm.world_key);
+  setInputUnlessFocused("wmWorldNameInput", wm.world_name);
+}
+
 function value(id, fallback = "") { return byId(id).value.trim() || fallback; }
 function numericValue(id) { return Number(byId(id).value); }
 
@@ -186,7 +241,7 @@ function populateConfig() {
   byId("cfgModelPath").value = vision.model_path || "";
   byId("cfgLabelsPath").value = vision.labels_path || "";
   byId("cfgConfidence").value = vision.confidence_threshold ?? 0.25;
-  byId("cfgInterval").value = vision.interval_ms ?? 100;
+  byId("cfgInterval").value = vision.interval_ms ?? 33;
   byId("cfgDetectorInterval").value = vision.detector_interval_ms ?? 500;
   byId("cfgAcceleratorInterval").value = vision.detector_accelerator_interval_ms ?? 100;
   byId("cfgSemanticBackend").value = vision.semantic_backend || "main_llm";
@@ -271,6 +326,14 @@ async function refresh({ includeConfig = false } = {}) {
   } catch (error) {
     setConnection(false);
     toast(error.message || String(error), true);
+    return;
+  }
+  // 世界模型是独立子系统；即使后端尚未实现该接口，也不应中断主面板刷新。
+  try {
+    state.worldmodel = await api("/worldmodel/status");
+    renderWorldModel();
+  } catch (error) {
+    // 保留上一次状态，不弹错误刷屏。
   }
 }
 
@@ -297,6 +360,26 @@ function bind() {
   byId("emergencyStop").addEventListener("click", () => command("急停", "/action", { kind: "stop", params: {} }));
   byId("startVision").addEventListener("click", () => command("启动视觉", "/vision/start"));
   byId("stopVision").addEventListener("click", () => command("停止视觉", "/vision/stop", { reason: "standalone_ui" }));
+  byId("wmStart").addEventListener("click", () => command("启动世界模型", "/worldmodel/start"));
+  byId("wmStop").addEventListener("click", () => command("停止世界模型", "/worldmodel/stop", { reason: "standalone_ui" }));
+  byId("wmSaveWorld").addEventListener("click", async () => {
+    const worldKey = value("wmWorldKeyInput");
+    if (!worldKey) { toast("请先填写世界标识", true); return; }
+    const payload = { world_key: worldKey };
+    const name = value("wmWorldNameInput");
+    if (name) payload.world_name = name;
+    try {
+      const result = await post("/worldmodel/world", payload);
+      if (result.accepted === false) {
+        toast(`保存世界标识：${result.reason || "被拒绝"}`, true);
+      } else {
+        toast("世界标识已保存。");
+      }
+      await refresh();
+    } catch (error) {
+      toast(`保存世界标识：${error.message || error}`, true);
+    }
+  });
   byId("armAutonomy").addEventListener("click", () => command("自主授权", "/autonomy/arm"));
   byId("stopAutonomy").addEventListener("click", () => command("停止自主目标", "/autonomy/stop", { reason: "standalone_ui" }));
   byId("disarmAutonomy").addEventListener("click", () => command("解除自主授权", "/autonomy/disarm", { reason: "standalone_ui" }));

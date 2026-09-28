@@ -57,6 +57,8 @@ code { color: var(--cyan); }
 .badge { display: inline-flex; align-items: center; min-height: 29px; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 750; color: var(--muted); background: rgba(255,255,255,.06); border: 1px solid var(--line); }
 .badge.ok { color: var(--success); background: rgba(109,229,165,.09); border-color: rgba(109,229,165,.25); }
 .badge.bad { color: var(--danger); background: rgba(255,107,125,.09); border-color: rgba(255,107,125,.25); }
+.badge.starting { color: var(--warning); background: rgba(242,189,91,.09); border-color: rgba(242,189,91,.32); animation: wmPulse 1.1s ease-in-out infinite; }
+@keyframes wmPulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .button { min-height: 39px; padding: 9px 14px; border: 1px solid transparent; border-radius: 10px; color: var(--text); background: #252a38; font-weight: 720; }
 .button:hover { filter: brightness(1.12); }
 .button:disabled { cursor: not-allowed; opacity: .42; }

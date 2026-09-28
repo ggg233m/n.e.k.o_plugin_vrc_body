@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 import heapq
@@ -279,6 +280,8 @@ class VrchatOscBridge:
         self._pulse_sequence = itertools.count()
         self._started_pulses: set[int] = set()
         self._parameters: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # 速度必须按接收时刻保存，不能只读取最后一个参数再与较早的 WGC 帧配对。
+        self._motion_history: deque[dict[str, float]] = deque(maxlen=512)
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
         self._held_inputs: set[tuple[str, str]] = set()
@@ -774,6 +777,7 @@ class VrchatOscBridge:
             with self._lock:
                 if avatar_id != self._avatar_id:
                     self._parameters.clear()
+                    self._motion_history.clear()
                 self._avatar_id = avatar_id
                 self._avatar_changed_at_unix = now_wall
             return
@@ -793,6 +797,21 @@ class VrchatOscBridge:
                 self._parameters[name] = record
                 while len(self._parameters) > self.config.parameter_cache_size:
                     self._parameters.popitem(last=False)
+                if name in {"VelocityX", "VelocityZ"}:
+                    x = _numeric((self._parameters.get("VelocityX") or {}).get("value"))
+                    z = _numeric((self._parameters.get("VelocityZ") or {}).get("value"))
+                    x_at = _numeric((self._parameters.get("VelocityX") or {}).get("received_at_monotonic"))
+                    z_at = _numeric((self._parameters.get("VelocityZ") or {}).get("received_at_monotonic"))
+                    if x is not None and z is not None and x_at is not None and z_at is not None:
+                        self._motion_history.append({
+                            # 两轴时间差在服务端再次校验；这里保留各自时间，
+                            # 不让一条旧轴值冒充当前帧的完整速度。
+                            "timestamp": max(x_at, z_at),
+                            "velocity_x": x,
+                            "velocity_z": z,
+                            "velocity_x_timestamp": x_at,
+                            "velocity_z_timestamp": z_at,
+                        })
 
     def _receive_once(self) -> None:
         receiver = self._receive_socket
@@ -1043,6 +1062,15 @@ class VrchatOscBridge:
         if isinstance(grounded, bool):
             result["grounded"] = grounded
         return result
+
+    def motion_history(self, *, limit: int = 512) -> list[dict[str, float]]:
+        """返回带 OSC 接收单调时间的速度样本，供视觉帧对齐。"""
+        try:
+            size = max(1, min(512, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            size = 512
+        with self._lock:
+            return [dict(item) for item in list(self._motion_history)[-size:]]
 
     def awareness(self) -> dict[str, Any]:
         with self._lock:

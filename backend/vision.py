@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 from .world_state import WorldEntity, WorldEvent, WorldStateStore
 from .traversability import GroundExtentEstimator, OpticalFlowTraversability
+from .stage_profile import StageProfiler
 
 
 @dataclass(frozen=True)
@@ -999,7 +1000,7 @@ class DxcamFrameSource:
             }
 
     # 连续拿到 ``None`` 多少次算「相机在线但不产帧」。默认采集间隔是 100 ms
-    # （``VisionConfig.interval_ms``），所以 30 次约等于 3 秒——足够跨过切场景、
+    # （``VisionConfig.interval_ms``），所以 30 次约等于 1 秒（默认 33 ms）；足够跨过切场景、
     # Alt-Tab 这类正常的短暂无新帧，又不至于让真正的故障沉默太久。
     _EMPTY_GRAB_LIMIT = 30
 
@@ -1049,13 +1050,13 @@ class DxcamFrameSource:
         self._release_camera(camera)
 
 
-#: 连续多少次空帧后重建捕获会话。@10Hz 约 3 秒。
+#: 连续多少次空帧后重建捕获会话。@30Hz 约 1 秒。
 #: 不能太小：空帧是正常现象（帧池没新内容时就返回空），而重建实测 226 ms，
-#: 比 100 ms 的帧预算还贵，抖动一次就重建会得不偿失。
+#: 比 33 ms 的帧预算还贵，抖动一次就重建会得不偿失。
 _WGC_EMPTY_READS_BEFORE_REBUILD = 30
 
 #: 会话建不起来时，两次重试之间至少隔多久（秒）。
-#: 重建实测 226 ms，而 ``read()`` 按 ``interval_ms`` 每 100 ms 就来一次。不退避的话
+#: 重建实测 226 ms，而 ``read()`` 按 ``interval_ms`` 每 33 ms 就来一次。不退避的话
 #: VRChat 没开着的整段时间里，采集线程会一直卡在建 D3D 设备上——那比没有画面更糟，
 #: 因为它会把本该用于别处的时间全吃掉。窗口不存在时 FindWindow 只要 0.2 ms，
 #: 所以退避只针对**建会话失败**，不针对找不到窗口。
@@ -2356,7 +2357,7 @@ class VisionWorker:
         capture_only: bool = False,
         traversability: OpticalFlowTraversability | None = None,
         ground_extent: "GroundExtentEstimator | None" = None,
-        motion_provider: Callable[[], Mapping[str, Any]] | None = None,
+        motion_provider: Callable[..., Mapping[str, Any]] | None = None,
         turning_provider: Callable[[], Mapping[str, Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -2372,6 +2373,7 @@ class VisionWorker:
         self._ground_extent = ground_extent or GroundExtentEstimator(clock=clock)
         self._motion_provider = motion_provider
         self._turning_provider = turning_provider
+        # 只读视觉定位回调；它只接收当前帧和采集时间，不拥有动作发送能力。
         self._clock = clock
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -2385,6 +2387,11 @@ class VisionWorker:
         self._last_capture_at: float | None = None
         self._last_processed_at: float | None = None
         self._last_error: str | None = None
+        # 消费循环的阶段耗时。实测该循环只能跑 0.97 Hz，而同期采集是
+        # 8.83 Hz（掉帧 88.9%）。没有这份分布就只能猜"是等帧还是算不完"，
+        # 而这两者的修法完全相反：等帧要动采集，算不完要动本模块的重路径。
+        self.profiler = StageProfiler()
+        self._last_dequeued_at: float | None = None
 
     def start(self) -> bool:
         with self._lock:
@@ -2486,6 +2493,13 @@ class VisionWorker:
                         sequence = self._sequence
                         self._captured += 1
                         self._last_capture_at = captured_at
+                    # 预览画面与检测/SLAM 解耦：消费者可能被 OpenVINO 或深度
+                    # 推理拖慢，但单槽缓存仍按采集节拍更新（循环末尾
+                    # ``_stop.wait(self.interval_s)``，默认 0.1 秒 => 采集上限
+                    # 10 Hz；要更高必须先确认采集线程（WGC + JPEG 编码）有余量，
+                    # 这里是帧率上限的单一来源）。
+                    # 这里只保存最新 JPEG，不保存历史帧，也不改变世界状态。
+                    self.runtime.cache_frame_only(frame, observed_at=captured_at)
                     packet = CapturedFrame(frame, captured_at, sequence)
                     try:
                         self.queue.put_nowait(packet)
@@ -2518,36 +2532,49 @@ class VisionWorker:
 
     def _process_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                packet = self.queue.get(timeout=min(0.2, self.interval_s))
-            except Empty:
-                continue
+            # 等帧与算帧必须分开记账：queue_wait 高说明输入不够，各阶段高说明
+            # 本模块自己太重。两者混在一个数字里就无法判断该动哪一边。
+            with self.profiler.measure("queue_wait"):
+                try:
+                    packet = self.queue.get(timeout=min(0.2, self.interval_s))
+                except Empty:
+                    continue
+            dequeued_at = self._clock()
+            if self._last_dequeued_at is not None:
+                self.profiler.record(
+                    "frame_period",
+                    max(0.0, dequeued_at - self._last_dequeued_at) * 1000.0,
+                )
+            self._last_dequeued_at = dequeued_at
             try:
                 source_obscured = self._obscured()
-                prediction = self._estimate_traversability(
-                    packet.frame,
-                    captured_at=packet.captured_at,
-                    source_obscured=source_obscured,
-                )
+                with self.profiler.measure("traversability"):
+                    prediction = self._estimate_traversability(
+                        packet.frame,
+                        captured_at=packet.captured_at,
+                        source_obscured=source_obscured,
+                    )
                 # 地面范围挂在同一份预测里，而不是另开一条通道：这样它自动
                 # 继承既有的 TTL、过期屏蔽和采集停止语义，不必再复制一套。
-                prediction["ground_extent"] = self._estimate_ground_extent(
-                    packet.frame,
-                    captured_at=packet.captured_at,
-                    source_obscured=source_obscured,
-                )
+                with self.profiler.measure("ground_extent"):
+                    prediction["ground_extent"] = self._estimate_ground_extent(
+                        packet.frame,
+                        captured_at=packet.captured_at,
+                        source_obscured=source_obscured,
+                    )
                 # 即使窗口被遮挡，也要把本次 unknown 写入易失摘要，避免上一帧
                 # 的几何结论在遮挡期间继续被导航器使用。
                 self.runtime.set_traversability_prediction(
                     prediction,
                     observed_at=packet.captured_at,
                 )
-                self.runtime.process_frame(
-                    packet.frame,
-                    observed_at=packet.captured_at,
-                    source_obscured=source_obscured,
-                    traversability=prediction,
-                )
+                with self.profiler.measure("runtime_process"):
+                    self.runtime.process_frame(
+                        packet.frame,
+                        observed_at=packet.captured_at,
+                        source_obscured=source_obscured,
+                        traversability=prediction,
+                    )
                 with self._lock:
                     self._processed += 1
                     self._last_processed_at = self._clock()
@@ -2611,7 +2638,10 @@ class VisionWorker:
         motion: Mapping[str, Any] = {}
         if self._motion_provider is not None:
             try:
-                value = self._motion_provider()
+                try:
+                    value = self._motion_provider(captured_at)
+                except TypeError:
+                    value = self._motion_provider()
                 if isinstance(value, Mapping):
                     motion = value
             except Exception:
@@ -2693,6 +2723,8 @@ class VisionWorker:
                     None if self._last_processed_at is None
                     else round(max(0.0, now - self._last_processed_at) * 1000.0, 1)
                 ),
+                # 消费循环的阶段耗时分布。只观测，不影响任何判定。
+                "profile": self.profiler.snapshot(),
                 "last_error": self._last_error,
             }
 
@@ -4000,6 +4032,17 @@ class VisionRuntime:
         result["vision"] = self.status()
         result["traversability_prediction"] = self.traversability_prediction()
         return result
+
+    def cache_frame_only(self, frame: Any, *, observed_at: float | None = None) -> bool:
+        """只更新最新画面缓存，不运行目标检测/语义推理。"""
+        if not self.capture_state()["active"]:
+            return False
+        now = self._clock()
+        try:
+            captured_at = min(now, float(observed_at)) if observed_at is not None else now
+        except (TypeError, ValueError, OverflowError):
+            captured_at = now
+        return self._cache_frame(frame, captured_at)
 
     def process_frame(
         self,

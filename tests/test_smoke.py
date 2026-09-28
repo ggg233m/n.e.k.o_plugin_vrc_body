@@ -32,10 +32,14 @@ class PluginSmokeTests(unittest.TestCase):
         classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
         self.assertIn("NekoAnyadanceBodyPlugin", classes)
 
-    def test_plugin_declares_no_runtime_dependencies(self) -> None:
+    def test_runtime_dependencies_are_bounded_and_exclude_onnxruntime(self) -> None:
         with (ROOT / "pyproject.toml").open("rb") as handle:
             project = tomllib.load(handle)["project"]
-        self.assertEqual(project["dependencies"], [])
+        for requirement in project["dependencies"]:
+            spec = requirement.split(";", 1)[0]
+            # 宿主已钉 onnxruntime；声明就会被 vendor，同进程两份 DLL 互相打架。
+            self.assertFalse(spec.strip().lower().startswith("onnxruntime"), requirement)
+            self.assertIn("<", spec, f"{requirement} 缺上界")
 
     def test_all_tool_definition_modules_execute(self) -> None:
         self.assertEqual(tool_defs.BODY_STATUS["name"], "body_status")

@@ -26,6 +26,7 @@
       <button class="tab" data-tab="perception">视觉与语义</button>
       <button class="tab" data-tab="autonomy">自主控制</button>
       <button class="tab" data-tab="settings">配置</button>
+      <button class="tab" data-tab="worldmodel">世界模型</button>
     </nav>
 
     <main>
@@ -201,6 +202,51 @@
             <button id="saveSettings" type="submit" class="button primary">校验并保存配置</button>
           </div>
         </form>
+      </section>
+
+      <section id="worldmodel" class="page">
+        <article class="panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">WORLD MODEL</p><h2>世界模型导航</h2></div>
+            <span id="wmStateBadge" class="badge muted">未连接</span>
+          </div>
+
+          <div id="wmNoWorldBanner" class="notice warning hidden">
+            ⚠ 尚未设置世界标识：记忆<strong>不会加载</strong>，去过的路线也<strong>不会被记录</strong>。请在下方填入 <code>wrld_…</code> 世界 ID（或世界名）后立即保存。
+          </div>
+          <div id="wmConflictBanner" class="notice warning hidden">
+            当前以「世界名」作为标识，同名世界会共用同一份记忆——可能把 A 世界记住的路线用错到 B 世界。建议改用 <code>wrld_</code> 开头的稳定 ID。
+          </div>
+
+          <dl class="facts">
+            <div><dt>子系统</dt><dd id="wmAvailable">—</dd></div>
+            <div><dt>运行状态</dt><dd id="wmRunning">—</dd></div>
+            <div><dt>世界标识</dt><dd id="wmWorldKey">—</dd></div>
+            <div><dt>世界名</dt><dd id="wmWorldName">—</dd></div>
+            <div><dt>标识来源</dt><dd id="wmWorldSource">—</dd></div>
+            <div><dt>记忆分区</dt><dd id="wmMemoryPartition">—</dd></div>
+            <div><dt>地点数</dt><dd id="wmPlaces">—</dd></div>
+            <div><dt>路线数</dt><dd id="wmEdges">—</dd></div>
+            <div><dt>定位状态</dt><dd id="wmLocalization">—</dd></div>
+            <div><dt>最后错误</dt><dd id="wmLastError">—</dd></div>
+          </dl>
+
+          <div class="button-row">
+            <button id="wmStart" class="button primary">启动世界模型</button>
+            <button id="wmStop" class="button secondary">停止世界模型</button>
+          </div>
+          <small class="muted">启动可能耗时数秒到数十秒（将来包含模型编译）。</small>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">IDENTITY</p><h2>世界标识</h2></div></div>
+          <p class="help">VRChat 的 OSC 拿不到世界标识，必须由你手动填写。优先填 <code>wrld_</code> 开头的稳定 ID；只填世界名时同名世界会冲突。</p>
+          <div class="form-grid">
+            <label class="field span-2"><span>世界标识（wrld_xxx… 或世界名）</span><input id="wmWorldKeyInput" placeholder="wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 或 世界名称"></label>
+            <label class="field span-2"><span>世界名称（可选，便于识别）</span><input id="wmWorldNameInput" placeholder="例如：My Cool World"></label>
+          </div>
+          <button id="wmSaveWorld" class="button primary wide">保存世界标识</button>
+        </article>
       </section>
     </main>
   </div>

@@ -25,6 +25,13 @@ from neko_anyadance_body.config import PluginConfig
 
 
 class LocalPerceptionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # import_onnxruntime 在进程内缓存导入结果；用例往 sys.modules 塞假 ORT，
+        # 不清缓存的话后面的用例拿到的是前一个用例的假模块。
+        guard = patch.dict(_lp._ORT_IMPORT, clear=True)
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_missing_model_is_explicitly_unavailable_and_does_not_fabricate(self) -> None:
         detector = OpenVinoLocalDetector()
         status = detector.status()
@@ -727,7 +734,8 @@ class LocalPerceptionTests(unittest.TestCase):
                 InferenceSession=_Session,
             )
             core = _Core(openvino_devices or ["CPU"])
-            with patch.dict(sys.modules, {"onnxruntime": fake_ort}):
+            with patch.dict(sys.modules, {"onnxruntime": fake_ort}), \
+                    patch.dict(_lp._ORT_IMPORT, clear=True):
                 detector = OpenVinoLocalDetector(
                     model_path=str(model),
                     openvino_core=core,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ..behavior import resolve_expression
 from ..config import PluginConfig
-from ..driver_log import DriverLogListener
+from ..driver_log import ActionTimeline, DriverLogListener
 from ..host_vmc import HostVmcController
 from ..nya import ClipLibrary
 from ..osc import VrchatOscBridge
@@ -20,6 +20,7 @@ __all__ = [
     "BodyCommand",
     "BodyScheduler",
     "ClipLibrary",
+    "ActionTimeline",
     "DriverLogListener",
     "HostVmcController",
     "PluginConfig",

@@ -93,12 +93,12 @@ class ChatboxRelayFilterTests(unittest.TestCase):
         harness.relay._poll_once()
         self.assertEqual(harness.sent, ["第一行 第二行 第三行"])
 
-    def test_record_without_id_is_skipped(self) -> None:
-        """没有 id 就无法去重，发出去会在每个轮询周期重复刷屏。"""
+    def test_record_without_id_is_fingerprinted_and_sent_once(self) -> None:
+        """旧版宿主没有 id：按 conversation_id/时间戳/正文生成指纹去重，只发一次。"""
         harness = _Harness([_Record(content="没有 id", message_id=None)])
         harness.relay._poll_once()
-        self.assertEqual(harness.sent, [])
-        self.assertEqual(harness.relay.snapshot()["skipped_count"], 1)
+        harness.relay._poll_once()
+        self.assertEqual(harness.sent, ["没有 id"])
 
 
 class ChatboxRelayDedupTests(unittest.TestCase):

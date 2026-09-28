@@ -29,6 +29,12 @@ if TYPE_CHECKING:
 from .avatar_identity import AvatarIdentityRegistry
 from .world_state import stable_track_entity_id
 
+# 单一真值源：目标方位估计与 SLAM 内参、可通行扇区共用同一个相机视场。
+try:
+    from ..config import CAMERA_HORIZONTAL_FOV_DEG
+except ImportError:  # pragma: no cover - 直接以脚本方式导入本模块时
+    CAMERA_HORIZONTAL_FOV_DEG = 102.45
+
 
 # 可能被载入的 OpenMP 运行时。numpy 的 scipy-openblas 用 OpenMP 线程模型，
 # 具体是哪个 DLL 取决于 wheel 怎么构建，所以按序探测而不是假定一个。
@@ -396,7 +402,7 @@ class OpenVinoLocalDetector:
         confidence_threshold: float = 0.35,
         input_width: int = 640,
         input_height: int = 640,
-        horizontal_fov_deg: float = 90.0,
+        horizontal_fov_deg: float = CAMERA_HORIZONTAL_FOV_DEG,
         max_detections: int = 64,
         nms_iou_threshold: float = 0.45,
         min_box_ratio: float = 0.02,

@@ -13,6 +13,15 @@ def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+# 相机水平视场的单一真值源。同一台相机的消费者（目标方位估计、可通行扇区）
+# 必须共用同一个值，否则同一个像素在不同模块里被解释成不同方向。
+# 来源：正交性自标定，f@960x540 = 385.61 px（良态帧对中位数，20 对，标准差
+# 1.76 px）=> fx@640 = 257.07 px => 102.45 度。旧值 90 度把焦距高估 24.5%。
+# 注意 .tmp/_manual_run/fov_calibration2.json 顶层的 266.14/121.99 度不可用：它把
+# 20 个焦距撞下界 152 的解算失败样本一并聚合，失败样本全是 |dyaw| >= 16.7 度。
+CAMERA_HORIZONTAL_FOV_DEG = 102.45
+
+
 def _finite_float(value: Any, default: float, *, minimum: float, maximum: float, name: str) -> float:
     if value is None:
         # 某些边界由其他配置段派生，因此内置默认值可能落在有效范围之外。
@@ -166,6 +175,13 @@ class DriverLogConfig:
     interface_host: str = "127.0.0.1"
     stale_after_ms: int = 3000
     history_size: int = 64
+    # 动作时间轴（路线历史通道的唯一数据来源）。默认关闭：它要落盘，必须显式开启。
+    # 关闭时行为与本字段出现之前完全一致。
+    action_timeline_enabled: bool = False
+    action_timeline_path: str = "logs/action_timeline.jsonl"
+    # 动作时间轴的帧率：只用于把 monotonic 时刻换算成帧号。必须与录像帧率一致，
+    # 否则每一行的 frame_index 都会整体偏移。钳 1–240（见 from_mapping）。
+    action_timeline_fps: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -199,6 +215,21 @@ class WorldMemoryConfig:
 
 
 @dataclass(frozen=True)
+class WorldModelConfig:
+    """W1 世界身份：仅手动设置世界标识，不自动探测、不持久化身份。
+
+    VRChat OSC/OSCQuery 拿不到世界标识，日志解析也刻意不做，所以 world_key
+    只能靠用户手动输入。默认关闭：本期只是「当前在哪个世界」+ 启停骨架。
+
+    ``enabled`` 默认 false —— 默认不启动这个子系统。
+    ``persist`` 默认 true —— 门控后续阶段才落盘的记忆分区（W1 阶段尚无记忆可写）。
+    """
+
+    enabled: bool = False
+    persist: bool = True
+
+
+@dataclass(frozen=True)
 class VisionConfig:
     """模型无关的感知 worker 配置；具体 detector 由后端注入。"""
 
@@ -219,7 +250,7 @@ class VisionConfig:
     confidence_threshold: float = 0.35
     input_width: int = 640
     input_height: int = 640
-    horizontal_fov_deg: float = 90.0
+    horizontal_fov_deg: float = CAMERA_HORIZONTAL_FOV_DEG
     max_detections: int = 64
     # 检测框宽/高占画面的最小比例，用于滤掉几十像素级别的高分假阳性。
     # ``min_box_ratio`` 是两轴的共同默认值；站立的人是高而窄的，单一阈值下
@@ -265,7 +296,8 @@ class VisionConfig:
     dxcam_device_idx: int = -1
     dxcam_output_idx: int = -1
     dxcam_backend: str = "auto"
-    interval_ms: int = 100
+    # 约 30 Hz 的采集轮询；队列仍只保留最新帧，避免处理跟不上时积压延迟。
+    interval_ms: int = 33
     queue_size: int = 1
     # 检测器的 CPU 上限。``detector_threads`` 同时拧两个池子：ONNX Runtime 自己的
     # ``SessionOptions``，以及 numpy/BLAS 的进程级 OpenMP 池（见
@@ -308,6 +340,7 @@ class PluginConfig:
     input: ControllerInputConfig = ControllerInputConfig()
     autonomy: AutonomyConfig = AutonomyConfig()
     world_memory: WorldMemoryConfig = WorldMemoryConfig()
+    world_model: WorldModelConfig = WorldModelConfig()
     vision: VisionConfig = VisionConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
@@ -327,6 +360,7 @@ class PluginConfig:
         input_config = _section(root, "input")
         autonomy = _section(root, "autonomy")
         world_memory = _section(root, "world_memory")
+        world_model = _section(root, "world_model")
         vision = _section(root, "vision")
         safety = _section(root, "safety")
 
@@ -436,6 +470,16 @@ class PluginConfig:
             interface_host=interface_host,
             stale_after_ms=_bounded_int(driver_log.get("stale_after_ms"), 3000, minimum=100, maximum=60000, name="driver_log.stale_after_ms"),
             history_size=_bounded_int(driver_log.get("history_size"), 64, minimum=8, maximum=512, name="driver_log.history_size"),
+            action_timeline_enabled=_boolean(
+                driver_log.get("action_timeline_enabled"), False,
+                name="driver_log.action_timeline_enabled"),
+            action_timeline_path=(
+                str(driver_log.get("action_timeline_path", "logs/action_timeline.jsonl")).strip()
+                or "logs/action_timeline.jsonl"
+            ),
+            action_timeline_fps=_finite_float(
+                driver_log.get("action_timeline_fps"), 20.0,
+                minimum=1.0, maximum=240.0, name="driver_log.action_timeline_fps"),
         )
         primary_input = str(input_config.get("primary", "anyadance")).strip().lower() or "anyadance"
         if primary_input not in {"anyadance", "osc"}:
@@ -478,6 +522,10 @@ class PluginConfig:
         world_memory_config = WorldMemoryConfig(
             persist_world=_boolean(world_memory.get("persist_world"), True, name="world_memory.persist_world"),
             persist_players=_boolean(world_memory.get("persist_players"), False, name="world_memory.persist_players"),
+        )
+        world_model_config = WorldModelConfig(
+            enabled=_boolean(world_model.get("enabled"), False, name="world_model.enabled"),
+            persist=_boolean(world_model.get("persist"), True, name="world_model.persist"),
         )
         vision_source = str(vision.get("source", "none")).strip().lower() or "none"
         if vision_source not in {"none", "mss", "dxcam", "desktop_mirror", "wgc", "external"}:
@@ -579,7 +627,7 @@ class PluginConfig:
             ),
             horizontal_fov_deg=_finite_float(
                 vision.get("horizontal_fov_deg"),
-                90.0,
+                CAMERA_HORIZONTAL_FOV_DEG,
                 minimum=1.0,
                 maximum=180.0,
                 name="vision.horizontal_fov_deg",
@@ -714,7 +762,7 @@ class PluginConfig:
             dxcam_backend=dxcam_backend,
             interval_ms=_bounded_int(
                 vision.get("interval_ms"),
-                100,
+                33,
                 minimum=10,
                 maximum=2000,
                 name="vision.interval_ms",
@@ -854,6 +902,7 @@ class PluginConfig:
             input=controller_input_config,
             autonomy=autonomy_config,
             world_memory=world_memory_config,
+            world_model=world_model_config,
             vision=vision_config,
             profile=body_profile,
             safety=safety_config,

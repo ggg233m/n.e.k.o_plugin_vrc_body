@@ -55,6 +55,20 @@ class DriverLogParseTests(unittest.TestCase):
         self.assertEqual(event["command"]["devices"], ["hmd", "left_controller"])
         self.assertEqual(event["command"]["y_clamped"], ["hmd"])
 
+    def test_command_payload_exposes_hmd_yaw(self) -> None:
+        payload = json.dumps({
+            "version": 1,
+            "devices": {"hmd": {"pose": {
+                "rotation_xyzw": [0.0, 0.3826834, 0.0, 0.9238795]
+            }}}
+        })
+        event = parse_driver_log_event(datagram(
+            COMMAND_EVENT,
+            command={**COMMAND_EVENT["command"], "payload": payload},
+        ))
+        assert event is not None
+        self.assertAlmostEqual(event["hmd_yaw_deg"], 45.0, places=3)
+
     def test_documented_haptic_event_parses(self) -> None:
         event = parse_driver_log_event(datagram(HAPTIC_EVENT))
         assert event is not None
@@ -118,6 +132,47 @@ class DriverLogListenerTests(unittest.TestCase):
         self.assertEqual(status["decoded_events"], 1)
         self.assertEqual(status["last_command"]["source"], "127.0.0.1:54321")
         self.assertEqual(status["connection"], "detected")
+
+    def test_hmd_sink_receives_driver_arrival_monotonic_time(self) -> None:
+        payload = json.dumps({
+            "version": 1,
+            "devices": {"hmd": {"pose": {
+                "rotation_xyzw": [0.0, 0.3826834, 0.0, 0.9238795]
+            }}}
+        })
+        seen = []
+        listener = DriverLogListener(
+            DriverLogConfig(enabled=False),
+            on_hmd=lambda sample, received_at: seen.append((sample, received_at)),
+        )
+        self.assertTrue(listener.ingest_packet(datagram(
+            COMMAND_EVENT,
+            command={**COMMAND_EVENT["command"], "payload": payload},
+        ), now=12.5))
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0][0]["yaw_deg"], 45.0, places=3)
+        self.assertEqual(seen[0][1], 12.5)
+
+    def test_hmd_sink_preserves_full_pose(self) -> None:
+        payload = json.dumps({
+            "version": 1,
+            "devices": {"hmd": {"pose": {
+                "position": [0.1, 1.5, -0.2],
+                "rotation_xyzw": [0.0, 0.3826834, 0.0, 0.9238795]
+            }}}
+        })
+        seen = []
+        listener = DriverLogListener(
+            DriverLogConfig(enabled=False),
+            on_hmd=lambda sample, received_at: seen.append(sample),
+        )
+        self.assertTrue(listener.ingest_packet(datagram(
+            COMMAND_EVENT,
+            command={**COMMAND_EVENT["command"], "payload": payload},
+        ), now=12.5))
+        self.assertEqual(seen[0]["position_xyz"], [0.1, 1.5, -0.2])
+        self.assertEqual(len(seen[0]["rotation_xyzw"]), 4)
+        self.assertEqual(listener.snapshot()["last_hmd_position_xyz"], [0.1, 1.5, -0.2])
 
     def test_rejected_command_is_counted_separately(self) -> None:
         listener = self.listener()

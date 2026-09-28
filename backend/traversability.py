@@ -24,13 +24,21 @@ from typing import Any, Callable, Mapping
 _DEFAULT_SECTORS = (-30.0, 0.0, 30.0)
 
 
+# 单一真值源：同一台相机的水平视场只有一个值，SLAM 内参、目标方位和可通行
+# 扇区必须共用它。取不到配置层常量时退回同一个标定值，不退回 90。
+try:
+    from ..config import CAMERA_HORIZONTAL_FOV_DEG
+except ImportError:  # pragma: no cover - 直接以脚本方式导入本模块时
+    CAMERA_HORIZONTAL_FOV_DEG = 102.45
+
+
 @dataclass(frozen=True)
 class TraversabilityConfig:
     """光流估计的有界参数；数值是相对风险阈值，不是米制距离。"""
 
     width: int = 160
     height: int = 90
-    horizontal_fov_deg: float = 90.0
+    horizontal_fov_deg: float = CAMERA_HORIZONTAL_FOV_DEG
     roi_top_ratio: float = 0.18
     roi_bottom_ratio: float = 0.96
     min_feature_count: int = 8
@@ -61,7 +69,7 @@ class GroundExtentConfig:
     # 采集区域，真实 FOV 只有一个值。此前这里写 120 是为了让 ±60° 扇区收到列，
     # 那是**为迁就扇区表而假造 FOV**，代价是每一列的 bearing_deg 都偏大 1/3
     # ——扇区收缩到 ±30 之后这条理由不再存在。
-    horizontal_fov_deg: float = 90.0
+    horizontal_fov_deg: float = CAMERA_HORIZONTAL_FOV_DEG
     # 只扫画面下半部分。地平线以上不可能是脚下的地面，扫进去只会让天空、
     # 远景墙面这些大片同质区域伪装成「很远的地板」。
     scan_top_ratio: float = 0.52
