@@ -440,6 +440,8 @@ class BackendService:
             send_turn=self._navigator_send_turn,
             stop_motion=self.stop_movement,
             drive_block_reason=self._navmesh_drive_block,
+            # 录制默认不开；开了落到 state_dir（或 VRC_NAVMESH_RECORD_DIR），不写安装目录。
+            record_root=Path(os.getenv("VRC_NAVMESH_RECORD_DIR") or (self.state_dir / "navmesh_recordings")),
         )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
@@ -525,10 +527,10 @@ class BackendService:
             status["grid_meta"] = view
         return status
 
-    def navmesh_start(self) -> dict[str, Any]:
+    def navmesh_start(self, record: bool = False) -> dict[str, Any]:
         if not self._started:
             return {**self.navmesh.status(), "ok": False, "reason": "backend_not_started"}
-        return {**self.navmesh.start(), "ok": True}
+        return {**self.navmesh.start(record=record), "ok": True}
 
     def navmesh_stop(self) -> dict[str, Any]:
         return {**self.navmesh.stop(), "ok": True}

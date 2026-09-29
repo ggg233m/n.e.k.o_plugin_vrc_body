@@ -406,7 +406,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     value.get("world_key"), value.get("world_name")
                 )
             elif self.path == "/worldmodel/navmesh/start":
-                result = self.server.service.navmesh_start()
+                result = self.server.service.navmesh_start(record=value.get("record") is True)
             elif self.path == "/worldmodel/navmesh/stop":
                 result = self.server.service.navmesh_stop()
             elif self.path == "/worldmodel/navmesh/goto":

@@ -16,10 +16,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import cv2
@@ -39,7 +41,7 @@ def hmd_to_base_rotation(r_hmd: np.ndarray) -> np.ndarray:
 
 @dataclass
 class OnlineNavConfig:
-    osc_lag_s: float = 0.13          # OSC 速度比画面晚到 0.13 s（run6 互相关）
+    osc_lag_s: float = 0.18          # OSC 速度比画面晚到约 0.18 s（run5/run6 局部窗口回放扫描最优 0.175–0.2）
     pose_hz: float = 20.0
     # 每帧双目只看得到脚前 ~1.6 m 到 range_m 那一条带（约 0.7 m 深）：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
@@ -62,17 +64,139 @@ class OnlineNavConfig:
     mapper: MapperConfig = field(default_factory=MapperConfig)
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
+    record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
+
+
+class SessionRecorder:
+    """默认不开。把一次在线会话的原始输入落盘，离线能按同样顺序重放建图/回环（长时间场景复现）。
+
+    目录内容：``meta.json``（配置、传感器）、``hmd.jsonl``（每个位姿周期的 HMD 旋转，base 系）、
+    ``osc.jsonl``（新到的 OSC 速度样本）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
+    ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）。
+
+    感知线程只往内存缓冲里追加（``line``），所有磁盘写都在建图线程（``flush`` / ``keyframe``）里做。
+    写失败或超出上限就停录并留痕，不影响导航。
+    """
+
+    def __init__(self, root: Path, max_bytes: float, meta: dict[str, Any]) -> None:
+        self.dir = Path(root)
+        (self.dir / "kf").mkdir(parents=True, exist_ok=True)
+        self.max_bytes = float(max_bytes)
+        self.bytes = 0
+        self.keyframes = 0
+        self.stopped: str | None = None
+        self._lock = threading.Lock()
+        self._buf: list[tuple[str, str]] = []
+        self._files: dict[str, Any] = {}
+        self._write("meta.json", json.dumps(meta, ensure_ascii=False, indent=1, default=_json_default))
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {"dir": str(self.dir), "keyframes": self.keyframes, "mb": round(self.bytes / 1e6, 1),
+                    "stopped": self.stopped}
+
+    def line(self, name: str, obj: dict[str, Any]) -> None:
+        text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=_json_default)
+        with self._lock:
+            if self.stopped is None:
+                self._buf.append((name, text))
+
+    def flush(self) -> None:
+        with self._lock:
+            buf, self._buf = self._buf, []
+            if self.stopped is not None:
+                return
+            try:
+                for name, text in buf:
+                    f = self._files.get(name)
+                    if f is None:
+                        f = self._files[name] = open(self.dir / f"{name}.jsonl", "a", encoding="utf-8")
+                    f.write(text + "\n")
+                    self.bytes += len(text) + 1
+                for f in self._files.values():
+                    f.flush()
+            except OSError as exc:
+                self._halt_locked(f"write_failed: {exc}")
+            self._check_size_locked()
+
+    def keyframe(self, k: int, pts: np.ndarray, T_dr: np.ndarray, T_map: np.ndarray, dist_m: float,
+                 feat: Any) -> None:
+        arrays: dict[str, np.ndarray] = {"pts": np.asarray(pts, np.float32), "T_dr": np.asarray(T_dr, float),
+                                         "T_map": np.asarray(T_map, float), "dist_m": np.array(float(dist_m))}
+        if feat is not None:
+            arrays.update(uv=feat.uv, des=feat.des, xyz=feat.xyz, des3d=feat.des3d, K=feat.K,
+                          size=np.array(feat.size), eye_y=np.array(feat.eye_y))
+        with self._lock:
+            if self.stopped is not None:
+                return
+            path = self.dir / "kf" / f"{int(k):06d}.npz"
+            try:
+                np.savez(path, **arrays)   # 不压缩：点云压不了多少，还占建图线程
+                self.bytes += path.stat().st_size
+                self.keyframes += 1
+            except OSError as exc:
+                self._halt_locked(f"write_failed: {exc}")
+            self._check_size_locked()
+
+    def close(self, final_poses: dict[int, np.ndarray] | None) -> None:
+        self.flush()
+        with self._lock:
+            if final_poses and self.stopped is None:
+                ids = sorted(final_poses)
+                try:
+                    np.savez_compressed(self.dir / "final_poses.npz", ids=np.array(ids),
+                                        T=np.stack([np.asarray(final_poses[k], float) for k in ids]))
+                except OSError as exc:
+                    self._halt_locked(f"write_failed: {exc}")
+            if self.stopped is None:
+                self.stopped = "closed"
+            self._close_files_locked()
+
+    def _write(self, name: str, text: str) -> None:
+        (self.dir / name).write_text(text, encoding="utf-8")
+        self.bytes += len(text.encode("utf-8"))
+
+    def _check_size_locked(self) -> None:
+        if self.stopped is None and self.bytes >= self.max_bytes:
+            self._halt_locked("size_limit")
+
+    def _halt_locked(self, reason: str) -> None:
+        self.stopped = reason
+        self._buf = []
+        self._close_files_locked()
+
+    def _close_files_locked(self) -> None:
+        for f in self._files.values():
+            try:
+                f.close()
+            except OSError:
+                pass
+        self._files = {}
+
+
+def _json_default(o: Any) -> Any:
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, Path):
+        return str(o)
+    raise TypeError(type(o).__name__)
 
 
 class DeadReckoner:
     """OSC 本地速度（ZOH 前值保持）× HMD 朝向 → 地图系位姿（追踪米）。
 
-    ``osc_lag_s``：t 时刻身体的运动在 t+lag 才由 OSC 报出，所以积分到 now+lag；
-    超出最后一个样本的部分按前值外推（VRChat 速度是变化驱动的，静默 = 没变）。
+    积分到 now，超出最后一个样本的部分按前值外推（VRChat 速度是变化驱动的，静默 = 没变）。
     迟到样本（时间戳早于已积分时刻）只从现在起生效，不回改历史。
+
+    ``osc_lag_s``：t 时刻身体的运动在 t+lag 才由 OSC 报出，积分结果是 lag 之前的位置，
+    所以输出 = 积分位置 + 当前速度 × lag（只加在输出上，不写回积分）。旧实现把积分终点
+    推到 now+lag，但迟到样本同样从 now+lag 起生效，两者相互抵消，等于没补。
+    代价：起步/停下时输出沿运动方向跳 v×lag（跑步约 0.5 m）。
     """
 
-    def __init__(self, world_scale: float, osc_lag_s: float = 0.13) -> None:
+    def __init__(self, world_scale: float, osc_lag_s: float = 0.18) -> None:
         self.s = float(world_scale)
         self.lag = float(osc_lag_s)
         self.xy = np.zeros(2)
@@ -87,7 +211,7 @@ class DeadReckoner:
         n = float(np.hypot(*fwd))
         fwd = fwd / n if n > 1e-6 else np.array([1.0, 0.0])
         right = np.array([fwd[1], -fwd[0]])
-        target = float(t_now) + self.lag
+        target = float(t_now)
         if self._t is None:
             self._t = target
         for item in osc:
@@ -104,7 +228,8 @@ class DeadReckoner:
         self._advance(target, fwd, right)
         T = np.eye(4)
         T[:3, :3] = r_ob
-        T[:2, 3] = self.xy
+        vx, vz = self._v
+        T[:2, 3] = self.xy + (vz * fwd + vx * right) * self.lag / self.s
         return T
 
     def _advance(self, t: float, fwd: np.ndarray, right: np.ndarray) -> None:
@@ -232,8 +357,11 @@ class OnlineNavigator:
                  send_move: Callable[[float, int], Any], send_turn: Callable[[float], Any],
                  stop_motion: Callable[[], Any], drive_block_reason: Callable[[], str | None],
                  sensors_factory: Callable[[], Any] = OpenVRSensors,
-                 cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+                 cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
+                 record_root: Path | None = None) -> None:
         self.cfg = cfg or OnlineNavConfig()
+        self._record_root = None if record_root is None else Path(record_root)
+        self.recorder: SessionRecorder | None = None
         self._motion_history = motion_history
         self._send_move = send_move
         self._send_turn = send_turn
@@ -283,12 +411,24 @@ class OnlineNavigator:
     def running(self) -> bool:
         return any(t.is_alive() for t in self._threads)
 
-    def start(self) -> dict[str, Any]:
+    def start(self, record: bool = False) -> dict[str, Any]:
+        """``record=True``：把这次会话的原始输入录到 ``record_root/<时间>/``（默认不录）。"""
         if self.running:
             return self.status()
         self._stop.clear()
         self._reset()
         self._started_at = self._clock()
+        self.recorder = None
+        if record:
+            if self._record_root is None:
+                self._fail("recorder", RuntimeError("record_root_not_configured"))
+            else:
+                try:
+                    self.recorder = SessionRecorder(
+                        self._record_root / time.strftime("%Y%m%d_%H%M%S"), self.cfg.record_max_mb * 1e6,
+                        {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at})
+                except (OSError, TypeError) as exc:
+                    self._fail("recorder", exc)
         self._threads = [threading.Thread(target=fn, name=f"navmesh-{name}", daemon=True)
                          for name, fn in (("perception", self._perception_loop),
                                           ("mapping", self._mapping_loop),
@@ -306,6 +446,8 @@ class OnlineNavigator:
         self._halt()
         with self._nav_lock:
             self.session.cancel()
+        if self.recorder is not None:
+            self.recorder.close(None if self.loops is None else self.loops.poses())
         return self.status()
 
     def _fail(self, where: str, exc: BaseException) -> None:
@@ -343,6 +485,11 @@ class OnlineNavigator:
             return
         with self._state_lock:
             self._sensor_info = info
+        rec = self.recorder
+        if rec is not None:
+            rec.line("events", {"kind": "sensors", "t": self._clock(), "info": info, "fx": sensors.fx,
+                                "cx": sensors.cx, "cy": sensors.cy, "baseline_m": sensors.baseline_m})
+        osc_seen = -math.inf
         matcher = None
         orb = None
         kf_id = -1
@@ -359,7 +506,15 @@ class OnlineNavigator:
                 r = sensors.hmd_rotation()
                 if r is not None:
                     r_ob = hmd_to_base_rotation(r)
-                    T = self.dr.update(tick, r_ob, self._motion_history())
+                    hist = self._motion_history()
+                    if rec is not None:
+                        for o in hist:
+                            ts = float(o.get("timestamp", -math.inf))
+                            if ts > osc_seen:
+                                osc_seen = ts
+                                rec.line("osc", {"t": ts, "vx": o.get("velocity_x"), "vz": o.get("velocity_z")})
+                        rec.line("hmd", {"t": tick, "R": np.round(r_ob, 6)})
+                    T = self.dr.update(tick, r_ob, hist)
                     yaw_now = math.atan2(T[1, 0], T[0, 0])
                     if prev_yaw is not None:
                         dyaw = math.degrees(_wrap(yaw_now - prev_yaw))
@@ -375,7 +530,7 @@ class OnlineNavigator:
                     if kf_id >= 0 and tick >= next_trail:
                         next_trail = tick + c.trail_period_s
                         with self._state_lock:
-                            self._pending.append(("trail", (kf_id, T.copy(), self.dr.dist_m)))
+                            self._pending.append(("trail", (kf_id, T.copy(), self.dr.dist_m, tick)))
                     if tick >= next_stereo:
                         next_stereo = tick + c.stereo_period_s
                         t0 = time.perf_counter()
@@ -409,7 +564,7 @@ class OnlineNavigator:
                                 self._stereo_ms = (time.perf_counter() - t0) * 1000.0
                                 if new_kf:
                                     kf_id += 1
-                                    self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat)))
+                                    self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick)))
                             if new_kf:
                                 kf_xy, kf_yaw, kf_at = T[:2, 3].copy(), yaw, tick
                                 self._map_event.set()
@@ -428,6 +583,7 @@ class OnlineNavigator:
         dirty = False
         last_update = -math.inf
         timeout = c.map_min_interval_s
+        rec = self.recorder
         while not self._stop.is_set():
             self._map_event.wait(timeout=timeout)
             self._map_event.clear()
@@ -441,14 +597,19 @@ class OnlineNavigator:
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
                 for kind, item in pending:
                     if kind == "kf":
-                        k, pts, T, dist, feat = item
+                        k, pts, T, dist, feat, t_kf = item
                         dirty = True
+                        found = []
                         if self.loops is None:
                             self.mapper.add_keyframe(k, pts, T, osc_dist_m=dist)
                         else:
                             found = self.loops.add_keyframe(k, T, dist, feat)
                             # 关键帧按修正后的位姿入图；回环后所有关键帧整体换位姿。
                             self.mapper.add_keyframe(k, pts, self.loops.pose(k), osc_dist_m=dist)
+                        if rec is not None:
+                            rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat)
+                            rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found})
+                        if self.loops is not None:
                             if found:
                                 moved = self.mapper.update_poses(self.loops.poses())
                                 self._last_loop = {"keyframe": k, "loops": found,
@@ -459,13 +620,17 @@ class OnlineNavigator:
                                 self._loop_status = loop_status
                         self._keyframes += 1
                     elif kind == "trail":
-                        k, T, dist = item
+                        k, T, dist, t_tr = item
+                        if rec is not None:
+                            rec.line("events", {"kind": "trail", "k": k, "t": t_tr, "dist_m": dist, "T_dr": T})
                         if self.loops is not None and k in self.loops:
                             # trail 存成相对关键帧的位姿，用该关键帧的修正量换系即可。
                             T = self.loops.correct_at(k, T)
                         self.mapper.add_trail(k, T, osc_dist_m=dist)
                     else:                   # kick：换了目标，立刻重规划
                         dirty = True
+                if rec is not None:
+                    rec.flush()
                 if dirty and len(self.mapper):
                     wait = c.map_min_interval_s - (self._clock() - last_update)
                     if wait > 0.0:
@@ -610,6 +775,7 @@ class OnlineNavigator:
             "sensors": info,
             "errors": errors,
             "uptime_s": None if self._started_at is None else round(now - self._started_at, 1),
+            "recording": None if self.recorder is None else self.recorder.status(),
         }
 
     def grid_png(self) -> str | None:

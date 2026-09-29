@@ -47,8 +47,23 @@ class MapperConfig:
     # 限幅 ±ground_offset_max_m；众数不够突出（< 25% 点）就不修。
     ground_offset_max_m: float = 0.5
     ground_offset_min_range_m: float = 1.2
+    # 常数偏移之外再拟合一个斜面：run6 另有 5 帧地面斜 12–20°（远处比近处高 0.3–0.4 m），常数修不掉，
+    # 走过的路上 12 格假障碍里 8 格来自它们。坡度限幅 max_deg：拟合只取偏移众数 ±band 内的点，
+    # 墙和箱子进不来；限幅防止少量点把平面掰到把墙根也吞进地面。
+    ground_plane_max_deg: float = 15.0
+    ground_plane_band_m: float = 0.12
     # 障碍点数还须 ≥ 地面点数 × 这个比例：单帧视差噪声打出的几个高点压不过几十帧看到的地面。
     occ_ground_ratio: float = 0.3   # run6：路径上的障碍格 25→12
+    # 射线清除：相机到每个观测点的视线穿过的障碍高度体素记一次"看穿"。一个体素被看穿的关键帧数
+    # ≥ ray_beta × 被打中的关键帧数，就不再算障碍。没有它，障碍只增不减：定位误差、回环挪位每次
+    # 都在旁边再画一份墙，旧的那份没有任何机制清掉（21 min 实测 150 块障碍里 94 块是空地中间的孤岛）。
+    # 身体走过的中心线每格额外算 ray_walk_w 次看穿。run6：路径上假障碍 8→0，多帧障碍一格不丢。
+    ray_clear: bool = True
+    ray_beta: float = 2.0
+    ray_z_m: float = 0.10           # 障碍高度带 (ground_tol, obst_top) 的分层
+    ray_step_m: float = 0.05        # 视线水平采样步长
+    ray_stop_m: float = 0.20        # 离端点这么近就不算看穿（端点本身的深度噪声）
+    ray_walk_w: float = 3.0
 
 
 def _voxelize(p: np.ndarray, xy_m: float, z_m: float) -> tuple[np.ndarray, np.ndarray]:
@@ -78,6 +93,86 @@ def _ground_offset(h: np.ndarray, cnt: np.ndarray, rxy: np.ndarray, lim: float, 
     if sm[i] < 0.25 * tot:
         return 0.0
     return float(np.clip((i + 0.5) * 0.02 - lim - 0.1, -lim, lim))
+
+
+def _ground_correction(h: np.ndarray, cnt: np.ndarray, rxy: np.ndarray, lim: float, min_r: float,
+                       max_deg: float, band: float) -> np.ndarray | float:
+    """关键帧地面的逐点高度修正（追踪米）：先取常数偏移众数，再在它 ±band 内加权拟合 h = a + b·x + c·y，
+    两轮剔除残差 > 6 cm 的点。点不够就只用常数偏移；坡度超过 max_deg 按比例压回；总修正限幅 ±lim。"""
+    return _ground_model(h, cnt, rxy, lim, min_r, max_deg, band)[0]
+
+
+def _ground_model(h: np.ndarray, cnt: np.ndarray, rxy: np.ndarray, lim: float, min_r: float,
+                  max_deg: float, band: float) -> tuple[np.ndarray | float, float]:
+    """(逐点修正, 关键帧正下方的修正)。后者给射线清除定相机离地高度。"""
+    off = _ground_offset(h, cnt, rxy, lim, min_r)
+    if max_deg <= 0.0:
+        return off, off
+    sel = np.flatnonzero((np.abs(h - off) <= band) & (np.hypot(rxy[:, 0], rxy[:, 1]) >= min_r))
+    if float(cnt[sel].sum()) < 300:
+        return off, off
+    sol = None
+    for _ in range(3):
+        if len(sel) < 50:
+            return off, off
+        A = np.column_stack([np.ones(len(sel)), rxy[sel].astype(np.float64)])
+        w = np.sqrt(cnt[sel].astype(np.float64))
+        sol = np.linalg.lstsq(A * w[:, None], (h[sel] - off) * w, rcond=None)[0]
+        sel = sel[np.abs(h[sel] - off - A @ sol) <= 0.06]
+    grad = math.hypot(sol[1], sol[2])
+    cap = math.tan(math.radians(max_deg))
+    if grad > cap:
+        sol[1:] *= cap / grad
+    corr = off + sol[0] + sol[1] * rxy[:, 0] + sol[2] * rxy[:, 1]
+    return np.clip(corr, -lim, lim).astype(np.float32), float(np.clip(off + sol[0], -lim, lim))
+
+
+def _ray_voxels(rxy: np.ndarray, h: np.ndarray, t: np.ndarray, cam_h: float, cfg: "MapperConfig"
+                ) -> tuple[np.ndarray, np.ndarray]:
+    """一个关键帧的 (打中, 看穿) 障碍高度体素，各为 K×3 (ix, iy, iz)，地图系按平移 t 定格，iz 从 ground_tol 起。
+
+    看穿 = 相机（离地 cam_h）到每个端点的视线在障碍高度带内经过、且离端点 > ray_stop_m 的体素，
+    扣掉本帧自己打中的。端点先按 10 cm 去重：同一方向的一簇点只追一条线。"""
+    res, tol, top, zb = cfg.res_m, cfg.ground_tol_m, cfg.obst_top_m, cfg.ray_z_m
+    empty = np.zeros((0, 3), np.int64)
+
+    def cells(xy: np.ndarray, hh: np.ndarray) -> np.ndarray:
+        return np.column_stack([np.floor((xy[:, 0] + t[0]) / res), np.floor((xy[:, 1] + t[1]) / res),
+                                np.floor((hh - tol) / zb)]).astype(np.int64)
+
+    def unique_rows(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        lo = v.min(axis=0)
+        span = v.max(axis=0) - lo + 1
+        key = ((v[:, 0] - lo[0]) * span[1] + (v[:, 1] - lo[1])) * span[2] + (v[:, 2] - lo[2])
+        _u, first = np.unique(key, return_index=True)
+        return v[first], key
+
+    o = (h > tol) & (h < top)
+    hits = unique_rows(cells(rxy[o].astype(np.float64), h[o].astype(np.float64)))[0] if o.any() else empty
+    sel = (h >= -tol) & (h < top)
+    if not sel.any():
+        return hits, empty
+    exy, eh = rxy[sel].astype(np.float64), h[sel].astype(np.float64)
+    q = np.column_stack([np.floor(exy / 0.1), np.floor(eh / 0.1)]).astype(np.int64)
+    first = np.unique(unique_rows(q)[1], return_index=True)[1]
+    exy, eh = exy[first], eh[first]
+    r = np.hypot(exy[:, 0], exy[:, 1])
+    n = np.maximum(0, np.floor((r - cfg.ray_stop_m) / cfg.ray_step_m).astype(np.int64))
+    if not n.sum():
+        return hits, empty
+    idx = np.repeat(np.arange(len(r)), n)
+    j = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n) + 1
+    f = j * cfg.ray_step_m / r[idx]
+    sh = cam_h + f * (eh[idx] - cam_h)
+    ok = (sh > tol) & (sh < top)
+    if not ok.any():
+        return hits, empty
+    miss = unique_rows(cells(exy[idx[ok]] * f[ok, None], sh[ok]))[0]
+    if len(hits):
+        both = np.vstack([hits, miss])
+        key = unique_rows(both)[1]
+        miss = miss[~np.isin(key[len(hits):], key[:len(hits)])]
+    return hits, miss
 
 
 def make_sgbm() -> Any:
@@ -135,7 +230,18 @@ class KeyframeGridMapper:
         self._acc_lo = (0, 0)
         self._acc_cam_h: float | None = None
         self._applied: dict[int, tuple[tuple, int, int]] = {}
+        # 上次 rasterize 之后新增或换过位姿的关键帧；只有它们要重查缓存（1200 帧时逐帧查一遍要十几 ms）。
         self._dirty: set[int] = set()
+        self._walked_cache: tuple[int, list[np.ndarray]] | None = None
+        self._ver = 0                            # 关键帧/位姿/轨迹任一变了就 +1，walked() 按它缓存
+        # 射线清除：[iz, iy − lo_y, ix − lo_x] 的打中/看穿关键帧数，与 _acc_* 同原点同大小。
+        # _ray[k] = [算它用的 _rot 条目, t0, t0 下的格包围盒, 打中, 看穿, 编码布局]：只依赖朝向（HMD 给的，回环不改），
+        # 每个关键帧一辈子只追一次线；cam_h 变了也不重追——逐帧地面修正已吸收掉它。
+        self._ray: dict[int, list] = {}
+        self._ray_applied: dict[int, tuple[tuple, int, int]] = {}
+        self._ray_hit: np.ndarray | None = None
+        self._ray_mis: np.ndarray | None = None
+        self.ray_cleared_cells = 0
 
     def __len__(self) -> int:
         return len(self._pts)
@@ -147,8 +253,10 @@ class KeyframeGridMapper:
         p = np.asarray(points_base, np.float32).reshape(-1, 3)
         p = p[np.hypot(p[:, 0], p[:, 1]) <= self.cfg.range_m]
         self._pts[k], self._cnt[k] = _voxelize(p, self.cfg.vox_xy_m, self.cfg.vox_z_m)
-        self._pose[k] = np.asarray(pose_map_base, np.float64).reshape(4, 4)
+        self._pose[k] = np.array(pose_map_base, np.float64).reshape(4, 4)
         self._drop_cache(k)
+        self._dirty.add(k)
+        self._ver += 1
         if osc_dist_m is not None:
             self._osc[k] = float(osc_dist_m)
 
@@ -195,7 +303,8 @@ class KeyframeGridMapper:
         t = self._pose[k][:2, 3].copy()
         rxy, rel, cnt, _R = self._rot[k]
         h = rel + np.float32(self.cam_h)
-        h = h - np.float32(_ground_offset(h, cnt, rxy, c.ground_offset_max_m, c.ground_offset_min_range_m))
+        h = h - np.float32(_ground_correction(h, cnt, rxy, c.ground_offset_max_m, c.ground_offset_min_range_m,
+                                              c.ground_plane_max_deg, c.ground_plane_band_m))
         g = np.abs(h) <= c.ground_tol_m
         o = (h > c.ground_tol_m) & (h < c.obst_top_m)
         sel = g | o
@@ -226,14 +335,17 @@ class KeyframeGridMapper:
         d = (self._pose[k][:2, 3] - base[4]) / self.cfg.res_m
         return int(round(float(d[0]))), int(round(float(d[1])))
 
-    def _sync_acc(self) -> None:
-        """全局累加器只处理 (base, 整格平移) 变了的关键帧：旧贡献负权、新贡献正权，一次 bincount。"""
+    def _sync_acc(self, keys: set[int]) -> set[int]:
+        """全局累加器只处理 (base, 整格平移) 变了的关键帧：旧贡献负权、新贡献正权，一次 bincount。
+        ``keys``：要重查的关键帧；cam_h 变了会清空重建，此时改查全部。返回实际查过的集合（射线同用）。"""
         if self._acc_cam_h != self.cam_h:
-            self._acc_g = self._acc_o = None
+            self._acc_g = self._acc_o = self._ray_hit = self._ray_mis = None
             self._applied.clear()
+            self._ray_applied.clear()
             self._acc_cam_h = self.cam_h
+            keys = set(self._pts)
         work: list[tuple[tuple, int, int, float]] = []
-        for k in self._pts:
+        for k in keys:
             base = self._kf_base(k)
             sx, sy = self._shift(k, base)
             prev = self._applied.get(k)
@@ -249,7 +361,7 @@ class KeyframeGridMapper:
             if len(prev[0][0]):
                 work.append((*prev, -1.0))
         if not work:
-            return
+            return keys
         ix = np.concatenate([b[0] + sx for b, sx, _sy, _g in work])
         iy = np.concatenate([b[1] + sy for b, _sx, sy, _g in work])
         wg = np.concatenate([b[2] * sg for b, _sx, _sy, sg in work])
@@ -259,6 +371,11 @@ class KeyframeGridMapper:
         flat = (iy - y0) * W + (ix - x0)
         self._acc_g += np.bincount(flat, wg, minlength=H * W).reshape(H, W)
         self._acc_o += np.bincount(flat, wo, minlength=H * W).reshape(H, W)
+        return keys
+
+    def _ray_z(self) -> int:
+        c = self.cfg
+        return int(math.ceil((c.obst_top_m - c.ground_tol_m) / c.ray_z_m))
 
     def _grow_acc(self, xmin: int, ymin: int, xmax: int, ymax: int) -> None:
         m = 64                                   # 每次多留 6.4 m，边走边长不必每帧重分配
@@ -266,6 +383,9 @@ class KeyframeGridMapper:
             x0, y0 = xmin - m, ymin - m
             shape = (ymax + 1 + m - y0, xmax + 1 + m - x0)
             self._acc_g, self._acc_o, self._acc_lo = np.zeros(shape), np.zeros(shape), (x0, y0)
+            if self.cfg.ray_clear:
+                self._ray_hit = np.zeros((self._ray_z(), *shape), np.int32)
+                self._ray_mis = np.zeros((self._ray_z(), *shape), np.int32)
             return
         (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
         if xmin >= x0 and ymin >= y0 and xmax < x0 + W and ymax < y0 + H:
@@ -274,11 +394,133 @@ class KeyframeGridMapper:
         ny0 = ymin - m if ymin < y0 else y0
         nx1 = xmax + 1 + m if xmax >= x0 + W else x0 + W
         ny1 = ymax + 1 + m if ymax >= y0 + H else y0 + H
-        for name in ("_acc_g", "_acc_o"):
-            new = np.zeros((ny1 - ny0, nx1 - nx0))
-            new[y0 - ny0:y0 - ny0 + H, x0 - nx0:x0 - nx0 + W] = getattr(self, name)
+        for name in ("_acc_g", "_acc_o", "_ray_hit", "_ray_mis"):
+            old = getattr(self, name)
+            if old is None:
+                continue
+            new = np.zeros((*old.shape[:-2], ny1 - ny0, nx1 - nx0), old.dtype)
+            new[..., y0 - ny0:y0 - ny0 + H, x0 - nx0:x0 - nx0 + W] = old
             setattr(self, name, new)
         self._acc_lo = (nx0, ny0)
+
+    def _kf_ray(self, k: int) -> list:
+        """关键帧 k 的射线体素；只依赖朝向，缓存到 _rot 条目换掉为止。新算的先存 K×3 原始体素
+        （布局 None），累加器长够之后由 ``_encode_ray`` 换成一维下标。"""
+        rot = self._rot[k]
+        c = self._ray.get(k)
+        if c is not None and c[0] is rot:
+            return c
+        cfg = self.cfg
+        rxy, rel, cnt, _R = rot
+        h = rel + np.float32(self.cam_h)
+        corr, under = _ground_model(h, cnt, rxy, cfg.ground_offset_max_m, cfg.ground_offset_min_range_m,
+                                    cfg.ground_plane_max_deg, cfg.ground_plane_band_m)
+        h = h - np.float32(corr)
+        t = self._pose[k][:2, 3].copy()
+        hits, miss = _ray_voxels(rxy, h, t, self.cam_h - under, cfg)
+        Z = self._ray_z()
+        hits = hits[(hits[:, 2] >= 0) & (hits[:, 2] < Z)]
+        miss = miss[(miss[:, 2] >= 0) & (miss[:, 2] < Z)]
+        both = np.vstack([hits, miss])
+        box = (int(both[:, 0].min()), int(both[:, 1].min()), int(both[:, 0].max()), int(both[:, 1].max()))             if len(both) else None
+        c = [rot, t, box, hits, miss, None]
+        self._ray[k] = c
+        return c
+
+    def _acc_layout(self) -> tuple[int, int, int, int]:
+        (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
+        return x0, y0, H, W
+
+    def _encode_ray(self, c: list) -> None:
+        """把射线体素存成当前累加器布局下、平移为 0 时的 int32 一维下标（4 B/体素），整格平移只是加常数。
+        累加器长大换布局时按旧布局解码再编一次（很少发生）；_sync_ray 保证 t0 包围盒一直在累加器里，解码不越界。"""
+        x0, y0, H, W = lay = self._acc_layout()
+        if c[5] is None:
+            for i in (3, 4):
+                v = c[i]
+                c[i] = ((v[:, 2] * H + v[:, 1] - y0) * W + v[:, 0] - x0).astype(np.int32)
+            c[5] = lay
+            return
+        if c[5] == lay:
+            return
+        ox0, oy0, oH, oW = c[5]
+        for i in (3, 4):
+            f = c[i].astype(np.int64)
+            iz, r = np.divmod(f, oH * oW)
+            iy, ix = np.divmod(r, oW)
+            c[i] = ((iz * H + iy + oy0 - y0) * W + ix + ox0 - x0).astype(np.int32)
+        c[5] = lay
+
+    def _sync_ray(self, keys: set[int]) -> None:
+        """与 _sync_acc 同一套增量：只处理 (射线缓存, 整格平移) 变了的关键帧。必须在 _sync_acc 之后调，
+        ``keys`` 用它的返回值（累加器重建过时是全部关键帧）。"""
+        if not self.cfg.ray_clear or self._ray_hit is None:
+            return
+        res = self.cfg.res_m
+        work: list[tuple[list, int, int, int]] = []
+        for k in keys:
+            if k not in self._pts:
+                continue
+            ray = self._kf_ray(k)
+            d = (self._pose[k][:2, 3] - ray[1]) / res
+            sx, sy = int(round(float(d[0]))), int(round(float(d[1])))
+            prev = self._ray_applied.get(k)
+            if prev is not None and prev[0] is ray and prev[1] == sx and prev[2] == sy:
+                continue
+            if prev is not None:
+                work.append((*prev, -1))
+            work.append((ray, sx, sy, 1))
+            self._ray_applied[k] = (ray, sx, sy)
+        for k in [k for k in self._ray_applied if k not in self._pts]:
+            work.append((*self._ray_applied.pop(k), -1))
+            self._ray.pop(k, None)
+        if not work:
+            return
+        if len(work) > len(self._ray_applied):
+            # 大半关键帧都挪了（回环）：清零后只加一遍，比逐个"减旧加新"少一半写入。
+            self._ray_hit[...] = 0
+            self._ray_mis[...] = 0
+            work = [(*v, 1) for v in self._ray_applied.values()]
+        # 平移后的包围盒要装得下；t0 的也要（编码下标以 t0 为准，换布局解码要求它在累加器内）。
+        boxes = np.array([(r[2][0] + min(sx, 0), r[2][1] + min(sy, 0), r[2][2] + max(sx, 0), r[2][3] + max(sy, 0))
+                          for r, sx, sy, g in work if g > 0 and r[2] is not None], np.int64).reshape(-1, 4)
+        if len(boxes):
+            self._grow_acc(int(boxes[:, 0].min()), int(boxes[:, 1].min()),
+                           int(boxes[:, 2].max()), int(boxes[:, 3].max()))
+        W = self._acc_g.shape[1]
+        for r, _sx, _sy, _g in work:
+            self._encode_ray(r)
+        for i, acc in ((3, self._ray_hit), (4, self._ray_mis)):
+            parts = [(r[i], sy * W + sx, g) for r, sx, sy, g in work if len(r[i])]
+            if not parts:
+                continue
+            idx = np.concatenate([f + off for f, off, _g in parts])
+            sg = np.repeat(np.array([g for _f, _o, g in parts], np.int32), [len(f) for f, _o, _g in parts])
+            # 一维下标 np.add.at（numpy ≥2 已向量化）：比 np.unique 去重快一个量级，也不用分配整块三维 bincount。
+            np.add.at(acc.reshape(-1), idx, sg)
+
+    def _ray_veto(self, walked: list[np.ndarray] | None) -> np.ndarray | None:
+        """累加器坐标下"障碍被看穿清掉"的格：没有任何一层体素满足 看穿 < ray_beta × 打中。"""
+        if not self.cfg.ray_clear or self._ray_hit is None:
+            return None
+        c = self.cfg
+        (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
+        veto = np.zeros((H, W), bool)
+        # 只看本来就够障碍点数的格：整块体素逐个比，1200 帧的图每次要几十 ms。
+        cand = np.flatnonzero(self._acc_o.reshape(-1) > c.min_pts - 0.5)
+        if not len(cand):
+            return veto
+        hit = self._ray_hit.reshape(len(self._ray_hit), -1)[:, cand].astype(np.float32)
+        mis = self._ray_mis.reshape(len(self._ray_mis), -1)[:, cand].astype(np.float32)
+        if walked:
+            line = np.zeros((H, W), np.uint8)
+            k = 1.0 / (c.world_scale * c.res_m)
+            for q in walked:
+                p = np.column_stack([np.floor(q[:, 0] * k) - x0, np.floor(q[:, 1] * k) - y0]).astype(np.int32)
+                cv2.polylines(line, [p.reshape(-1, 1, 2)], False, 1, 1)
+            mis += line.reshape(-1)[cand].astype(np.float32) * np.float32(c.ray_walk_w)
+        veto.reshape(-1)[cand] = ~((hit > 0) & (mis < c.ray_beta * hit)).any(axis=0)
+        return veto
 
     def add_trail(self, node_id: int, pose_map_frame: np.ndarray, osc_dist_m: float | None = None) -> None:
         """关键帧之间的逐帧位姿（地图系，追踪米）挂到最近的前一个关键帧上，存成相对位姿，
@@ -290,6 +532,7 @@ class KeyframeGridMapper:
         self._trail.setdefault(k, []).append((rel[:2, 3].copy(), rel[:2, :2].copy(),
                                               None if osc_dist_m is None else float(osc_dist_m)))
         self._trail_arr.pop(k, None)
+        self._ver += 1
 
     def _trail_xy_d(self, k: int) -> tuple[np.ndarray, np.ndarray]:
         c = self._trail_arr.get(k)
@@ -307,21 +550,33 @@ class KeyframeGridMapper:
         双目看不到脚下 ~1.6 m 以内的地面，身体实际走过的地方只能靠这条链当通行证据。
         相邻两点的 SLAM 位移超过 OSC 位移 ×(1+gate_frac) + gate_m 就断开（位姿跳变不能画成走廊）；
         没有 OSC 路程时退回 max_hop_m（追踪米）硬门限。"""
+        key = (self._ver, gate_m, gate_frac, max_hop_m)
+        if self._walked_cache is not None and self._walked_cache[0] == key:
+            return [q.copy() for q in self._walked_cache[1]]
+        out = self._walked(gate_m, gate_frac, max_hop_m)
+        self._walked_cache = (key, out)
+        return [q.copy() for q in out]
+
+    def _walked(self, gate_m: float, gate_frac: float, max_hop_m: float) -> list[np.ndarray]:
         s = self.cfg.world_scale
-        xs: list[np.ndarray] = []
-        ds: list[np.ndarray] = []
-        for k in sorted(self._pose):
-            T = self._pose[k]
-            txy, td = self._trail_xy_d(k)
-            xs.append(T[:2, 3][None])
-            ds.append(np.array([self._osc.get(k, np.nan)], float))
-            if len(txy):
-                xs.append(T[:2, 3] + txy @ T[:2, :2].T)
-                ds.append(td)
-        if not xs:
+        keys = sorted(self._pose)
+        if not keys:
             return []
-        p = np.concatenate(xs) * s
-        d = np.concatenate(ds)
+        # 每个关键帧先放自己，再放挂在它上面的轨迹点；位姿批量套，1200 帧时逐帧 Python 循环要 15 ms。
+        Ts = np.array([self._pose[k] for k in keys])
+        tr = [self._trail_xy_d(k) for k in keys]
+        n = np.array([1 + len(t[0]) for t in tr])
+        owner = np.repeat(np.arange(len(keys)), n)
+        rel = np.zeros((len(owner), 2))
+        d = np.empty(len(owner))
+        head = np.cumsum(n) - n
+        d[head] = [self._osc.get(k, np.nan) for k in keys]
+        tail = np.ones(len(owner), bool)
+        tail[head] = False
+        if tail.any():
+            rel[tail] = np.concatenate([t[0] for t in tr])
+            d[tail] = np.concatenate([t[1] for t in tr])
+        p = (Ts[owner, :2, 3] + np.einsum("nij,nj->ni", Ts[owner, :2, :2], rel)) * s
         step = np.hypot(*(p[1:] - p[:-1]).T)
         dd = d[1:] - d[:-1]                        # 任一端没有 OSC 路程 → NaN → 退回硬门限
         limit = np.where(np.isnan(dd), max_hop_m * s, np.nan_to_num(dd) * (1 + gate_frac) + gate_m)
@@ -333,9 +588,13 @@ class KeyframeGridMapper:
         moved = 0.0
         for k, T in poses.items():
             if k in self._pose:
-                T = np.asarray(T, np.float64).reshape(4, 4)
+                T = np.array(T, np.float64).reshape(4, 4)
+                if np.array_equal(T, self._pose[k]):
+                    continue
                 moved = max(moved, float(np.linalg.norm(T[:3, 3] - self._pose[k][:3, 3])))
                 self._pose[k] = T
+                self._dirty.add(k)
+                self._ver += 1
         return moved
 
     def anchor(self, xy_track: tuple[float, float]) -> tuple[int, tuple[float, float]] | None:
@@ -366,10 +625,12 @@ class KeyframeGridMapper:
         增量：全局累加器只更新变了的关键帧——新关键帧投一次；回环只改平移，按整格挪下标；
         朝向或 cam_h 变了才重投。输出只裁剪累加器，不再每次拼接全部关键帧的格。"""
         c = self.cfg
-        for k in self._pts:
+        dirty, self._dirty = {k for k in self._dirty if k in self._pts}, set()
+        for k in dirty:
             self._rotated(k)
         self._update_cam_h()
-        self._sync_acc()
+        self._sync_ray(self._sync_acc(dirty))
+        veto = self._ray_veto(self.walked()) if self.cfg.ray_clear else None
         pts = []
         if self._acc_g is not None:
             seen = (self._acc_g > 0.5) | (self._acc_o > 0.5)
@@ -399,6 +660,11 @@ class KeyframeGridMapper:
             if ox1 > ox0 and oy1 > oy0:
                 n_g[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = self._acc_g[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
                 n_o[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = self._acc_o[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+                if veto is not None:
+                    v = veto[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+                    view = n_o[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx]
+                    self.ray_cleared_cells = int((v & (view > c.min_pts - 0.5)).sum())
+                    view[v] = 0.0
         # 权重 = 原始点数，min_pts 语义不变；累加器是整数加减，用 ±0.5 比较免得 1e-12 级残差翻转。
         occ = ((n_o > c.min_pts - 0.5) & (n_o >= c.occ_ground_ratio * n_g)).astype(np.uint8)
         occ &= (cv2.filter2D(occ, -1, np.ones((3, 3), np.float32)) >= 3).astype(np.uint8)

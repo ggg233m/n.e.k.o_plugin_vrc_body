@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -11,7 +14,7 @@ import numpy as np
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend import nav_online
 from neko_anyadance_body.backend.nav_online import (DeadReckoner, OnlineNavConfig, OnlineNavigator,
-                                                    hmd_to_base_rotation, near_obstacle)
+                                                    SessionRecorder, hmd_to_base_rotation, near_obstacle)
 
 S = 0.755
 CAM_H = 1.73
@@ -33,15 +36,33 @@ class DeadReckonerTest(unittest.TestCase):
         r = hmd_to_base_rotation(hmd_yaw(90.0))
         np.testing.assert_allclose(r[:2, 0], [0.0, 1.0], atol=1e-9)   # 前方转到 +y（左）
 
-    def test_forward_walk_integrates_to_now_plus_lag(self) -> None:
+    def test_forward_walk_output_leads_by_velocity_times_lag(self) -> None:
         dr = DeadReckoner(S, osc_lag_s=0.13)
         r = hmd_to_base_rotation(np.eye(3))
         dr.update(0.0, r, [osc(0.0, 0.0, 1.0)])
         T = dr.update(1.0, r, [osc(0.0, 0.0, 1.0)])
-        self.assertAlmostEqual(T[0, 3] * S, 1.0, places=6)
+        self.assertAlmostEqual(T[0, 3] * S, 1.13, places=6)   # 积分 1.0 + 1 m/s × 0.13 s
         self.assertAlmostEqual(T[1, 3], 0.0, places=9)
-        self.assertAlmostEqual(dr.dist_m, 1.0, places=6)
+        self.assertAlmostEqual(dr.dist_m, 1.0, places=6)      # 路程不含超前量
         self.assertEqual(dr.samples, 1)                     # 重复样本不重复计
+
+    def test_lag_compensation_survives_late_samples(self) -> None:
+        # 旧实现把积分终点推到 now+lag，迟到样本又从 now+lag 起生效，两者抵消：换 lag 输出不变。
+        r = hmd_to_base_rotation(np.eye(3))
+        out = []
+        for lag in (0.0, 0.2):
+            dr = DeadReckoner(S, osc_lag_s=lag)
+            dr.update(0.0, r, [osc(0.0, 0.0, 0.0)])
+            dr.update(1.0, r, [osc(0.95, 0.0, 2.0)])       # 每个样本都晚 50 ms 才到
+            out.append(dr.update(2.0, r, [osc(1.95, 0.0, 2.0)])[0, 3] * S)
+        self.assertAlmostEqual(out[1] - out[0], 2.0 * 0.2, places=6)
+
+    def test_stop_removes_lead(self) -> None:
+        dr = DeadReckoner(S, osc_lag_s=0.2)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 1.0)])
+        T = dr.update(1.0, r, [osc(1.0, 0.0, 0.0)])
+        self.assertAlmostEqual(T[0, 3] * S, 1.0, places=6)
 
     def test_strafe_right_goes_to_negative_y(self) -> None:
         dr = DeadReckoner(S, osc_lag_s=0.0)
@@ -124,7 +145,7 @@ class FakeSensors:
 
 
 class Harness:
-    def __init__(self, armed: bool = True, vz: float = 0.0) -> None:
+    def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None) -> None:
         self.armed = armed
         self.vz = vz
         self.moves: list[tuple[float, int]] = []
@@ -138,7 +159,7 @@ class Harness:
             send_turn=lambda d: self.turns.append(d),
             stop_motion=self._stop,
             drive_block_reason=lambda: None if self.armed else "autonomy_not_armed",
-            sensors_factory=lambda: self.sensors, cfg=cfg)
+            sensors_factory=lambda: self.sensors, cfg=cfg, record_root=record_root)
 
     def _stop(self) -> None:
         self.stops += 1
@@ -287,6 +308,72 @@ class ThreadsTest(unittest.TestCase):
         h.nav.stop()
         self.assertTrue(any("SteamVR not running" in e for e in st["errors"]))
         self.assertEqual(st["pose_state"], "unknown")
+
+
+class RecorderTest(unittest.TestCase):
+    def run_session(self, root: Path | None, record: bool) -> dict:
+        h = Harness(armed=False, vz=0.5, record_root=root)
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start(record=record)
+            try:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and h.nav.status()["keyframes"] < 3:
+                    time.sleep(0.05)
+            finally:
+                st = h.nav.stop()
+        return st
+
+    def test_default_off_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self.run_session(Path(d), record=False)
+            self.assertIsNone(st["recording"])
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_recording_has_everything_needed_to_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self.run_session(Path(d), record=True)
+            rec = st["recording"]
+            self.assertEqual(rec["stopped"], "closed")
+            out = Path(rec["dir"])
+            self.assertEqual(out.parent, Path(d))
+            meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+            self.assertIn("mapper", meta["config"])
+            ev = [json.loads(x) for x in (out / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+            kfs = [e for e in ev if e["kind"] == "kf"]
+            self.assertEqual(ev[0]["kind"], "sensors")
+            self.assertAlmostEqual(ev[0]["baseline_m"], FakeSensors.baseline_m)
+            # 录到的关键帧数与状态一致、id 连续，每个都有点云文件。
+            self.assertEqual([e["k"] for e in kfs], list(range(st["keyframes"])))
+            self.assertGreaterEqual(len(kfs), 3)
+            for e in kfs:
+                with np.load(out / "kf" / f"{e['k']:06d}.npz") as z:
+                    self.assertEqual(z["pts"].shape, ground_and_wall(None).shape)
+                    self.assertEqual(z["T_dr"].shape, (4, 4))
+            hmd = (out / "hmd.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertGreater(len(hmd), len(kfs))
+            self.assertEqual(np.array(json.loads(hmd[0])["R"]).shape, (3, 3))
+            # 假 OSC 历史每拍都一样：同一时间戳只记一次。
+            osc_lines = (out / "osc.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(osc_lines), 1)
+            with np.load(out / "final_poses.npz") as final:
+                self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
+
+    def test_size_limit_stops_recording_not_navigation(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            r = SessionRecorder(Path(d) / "s", max_bytes=2000, meta={"x": 1})
+            for i in range(3):
+                r.keyframe(i, np.zeros((500, 3), np.float32), np.eye(4), np.eye(4), 0.0, None)
+            self.assertEqual(r.status()["stopped"], "size_limit")
+            self.assertEqual(r.status()["keyframes"], 1)
+            r.line("hmd", {"t": 0.0})
+            r.close(None)
+            self.assertFalse((Path(d) / "s" / "hmd.jsonl").exists())
+            self.assertEqual(r.status()["stopped"], "size_limit")
+
+    def test_record_without_root_reports_error(self) -> None:
+        st = self.run_session(None, record=True)
+        self.assertIsNone(st["recording"])
+        self.assertTrue(any("record_root_not_configured" in e for e in st["errors"]))
 
 
 if __name__ == "__main__":

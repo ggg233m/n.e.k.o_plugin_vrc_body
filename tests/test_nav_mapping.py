@@ -73,6 +73,28 @@ class MapperTests(unittest.TestCase):
         self.assertEqual(int(ng.grid[r, c]), FREE)
         self.assertLess(occ_near.sum() * 0.01, 0.3 * 2)   # 障碍只有那堵墙那么点面积（追踪 m²）
 
+    def test_unmodelled_pitch_ground_tilt_is_fitted_out(self) -> None:
+        # 位姿里没有的 14° 俯仰（HMD 与相机外参误差）：远处地面在关键帧里一路抬高，常数偏移修不掉，
+        # 地面上冒出一片假障碍。斜面拟合后假障碍消失，墙不受影响。
+        def occ_cells(cap: float):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, ground_plane_max_deg=cap))
+            m.add_keyframe(0, observe(self.scene, pose(1.0, 0, pitch=math.radians(14))), pose(1.0, 0))
+            ng = m.rasterize()
+            s, occ = ng.meta.world_scale, ng.grid == OCC
+
+            def box(x0, x1, y0, y1):
+                r0, c0 = ng.to_cell((x0 * s, y1 * s))
+                r1, c1 = ng.to_cell((x1 * s, y0 * s))
+                return int(occ[r0:r1 + 1, c0:c1 + 1].sum())
+            return box(1.3, 3.3, -1.4, 1.4) + box(3.3, 4.0, 0.4, 1.4), box(3.3, 3.7, -1.4, 0.2)
+
+        ground_off, wall_off = occ_cells(0.0)
+        ground_on, wall_on = occ_cells(15.0)
+        self.assertGreater(ground_off, 20)          # 证明这条用例确实需要斜面
+        self.assertLessEqual(ground_on, 3)
+        self.assertEqual(wall_on, wall_off)
+        self.assertGreater(wall_on, 20)
+
     def test_trajectory_z_drift_ignored(self) -> None:
         # 轨迹 z 漂了 0.4 m 且点跟着一起漂（同一个关键帧内一致）：高度相对该关键帧，结果不变。
         T = pose(1.0, 0, z=0.4)
@@ -140,6 +162,101 @@ class MapperTests(unittest.TestCase):
         ng = self.mapper_with([pose(0, 0)]).rasterize()
         ng.build(radius_m=0.25)
         self.assertEqual(frontiers(ng, (50.0, 50.0)), [])
+
+
+def ghost_block(x0: float, x1: float, y0: float, y1: float, h0: float, h1: float) -> np.ndarray:
+    """地图系一块实心障碍点（离地 h0..h1），用来模拟某一帧的鬼影。"""
+    gx, gy, gz = np.meshgrid(np.arange(x0, x1, 0.03), np.arange(y0, y1, 0.03), np.arange(h0, h1, 0.05))
+    return np.column_stack([gx.ravel(), gy.ravel(), gz.ravel() - CAM_H])
+
+
+class RayClearTests(unittest.TestCase):
+    """射线清除：墙留着、只在一帧里出现又被后来视线看穿的鬼影清掉、走过的中心线清掉；回环不重追线。"""
+
+    def setUp(self) -> None:
+        self.scene = world_scene()
+        # 第 0 帧从 (−0.5, 0) 看到 x∈[2, 2.3] 的一块假障碍，之后几帧都没有它，而且视线从它中间穿过去看地面。
+        self.ghost = ghost_block(2.0, 2.3, 0.5, 1.0, 0.35, 0.6)
+        self.poses = [pose(-0.5, 0), pose(0, 0), pose(0.5, 0), pose(1.0, 0), pose(1.5, 0)]
+
+    def build(self, ray_clear: bool) -> KeyframeGridMapper:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=ray_clear))
+        for i, T in enumerate(self.poses):
+            scene = np.vstack([self.scene, self.ghost]) if i == 0 else self.scene
+            m.add_keyframe(i, observe(scene, T), T)
+        return m
+
+    def test_ghost_seen_through_is_cleared_wall_is_kept(self) -> None:
+        base = self.build(False).rasterize()
+        self.assertEqual(value_at(base, (2.15, 0.75)), OCC)       # 旧规则：一帧的鬼影压过了地面
+        m = self.build(True)
+        ng = m.rasterize()
+        self.assertEqual(value_at(ng, (2.15, 0.75)), FREE)
+        self.assertGreater(m.ray_cleared_cells, 0)
+        # 每帧都打中的墙不受影响（视线止于墙面前 ray_stop_m，不会自己看穿自己）。
+        for y in (-1.2, -0.8, -0.3, 0.1):
+            self.assertEqual(value_at(ng, (3.52, y)), OCC)
+            self.assertEqual(value_at(base, (3.52, y)), OCC)
+
+    def test_ray_clear_off_changes_nothing(self) -> None:
+        m = self.build(False)
+        ng = m.rasterize()
+        self.assertEqual(m.ray_cleared_cells, 0)
+        self.assertIsNone(m._ray_hit)
+        self.assertEqual(value_at(ng, (3.52, -0.8)), OCC)
+
+    def test_walked_centerline_clears_obstacle_nobody_saw_through(self) -> None:
+        # 障碍旁边只有一条侧面的地面（定地面高度用），没有视线穿过它，只能靠"身体从这里走过去了"。
+        gx, gy = np.meshgrid(np.arange(0.3, 3.0, 0.03), np.arange(0.8, 1.5, 0.03))
+        side = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, -CAM_H)])
+        blob = np.vstack([ghost_block(1.4, 1.7, -0.3, 0.3, 0.5, 1.0), side])
+
+        def occ_on_path(osc_backed: bool) -> int:
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+            s = m.cfg.world_scale
+            m.add_keyframe(0, observe(blob, pose(0, 0)), pose(0, 0), 0.0)
+            # OSC 路程对得上 → 连成走廊；没有 OSC 时 3 m 一跳超过硬门限 → 断开，没有走廊。
+            m.add_keyframe(1, np.zeros((0, 3)), pose(3.0, 0), 3.0 * s if osc_backed else None)
+            return int(value_at(m.rasterize(), (1.55, 0.0)) == OCC)
+
+        self.assertEqual(occ_on_path(False), 1)
+        self.assertEqual(occ_on_path(True), 0)
+
+    def test_loop_shift_reuses_rays_and_matches_fresh_build(self) -> None:
+        from neko_anyadance_body.backend import nav_mapping as NM
+
+        calls = []
+        real = NM._ray_voxels
+
+        def counting(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+
+        with mock.patch.object(NM, "_ray_voxels", counting):
+            m = self.build(True)
+            m.rasterize()
+            self.assertEqual(len(calls), 5)
+            m.rasterize()                                          # 什么都没变：不追线
+            self.assertEqual(len(calls), 5)
+            # 回环整体平移 0.5 m（整格）：只挪下标，不重追线。
+            shifted = {i: pose(-1.0 + 0.5 * i, 0) for i in range(5)}
+            m.update_poses(shifted)
+            inc = m.rasterize()
+            self.assertEqual(len(calls), 5)
+            m.add_keyframe(5, observe(self.scene, pose(2.0, 0)), pose(1.5, 0))
+            m.rasterize()                                          # 新关键帧只追它自己
+            self.assertEqual(len(calls), 6)
+        # 增量结果与直接按终态位姿建图一致（平移是整格，没有取整差）。
+        fresh = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i, T in enumerate(self.poses):
+            scene = np.vstack([self.scene, self.ghost]) if i == 0 else self.scene
+            fresh.add_keyframe(i, observe(scene, T), shifted[i])
+        ref = fresh.rasterize()
+        self.assertEqual(inc.grid.shape, ref.grid.shape)
+        self.assertTrue((inc.grid == ref.grid).all())
+        self.assertEqual(value_at(ref, (1.65, 0.75)), FREE)       # 鬼影跟着挪了 0.5 m，仍被清掉
+        self.assertGreaterEqual(int(m._ray_hit.min()), 0)
+        self.assertGreaterEqual(int(m._ray_mis.min()), 0)
 
 
 class SessionTests(unittest.TestCase):
