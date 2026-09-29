@@ -1,5 +1,33 @@
 # SLAM 代码地图（2026-09-23 全仓扫描）
 
+> ## ⚠️ 2026-09-29 更正横幅 —— 本文描述的架构**已不存在**，请勿据本文找文件
+>
+> 逐条实扫后确认：下文列为"活跃"的 **11 个模块全仓都不存在**：
+> `backend/live_mapping.py`、`.slam_probe/slam_core.py`、`.slam_probe/relocalization.py`、
+> `backend/nav_plan.py`、`backend/nav_map_builder`、`backend/nav_target`、`backend/route_executor`、
+> `backend/online_pose.py`、`backend/realtime_depth.py`、`backend/metric_scale_calibrator.py`、
+> `backend/obstacle_map_2d.py`、`backend/offline_route_replay.py`、`backend/relocalization_observer.py`；
+> `tools/pose_math_equivalence.py`（§四之二 的"六道闸门"）亦**全仓无此文件**。
+>
+> **特别是 §五「为什么 `.slam_probe` 不能删」**：它举的五处证据全部指向上述不存在的文件，
+> **该论证目前已无有效证据**。但这**不等于可以删** —— `.slam_probe/offline_probe/recorder/`
+> 仍是离线流水线（`map_from_capture.py`、`build_topo_map.py`、`place_group.py`、`loop_verify.py`、
+> `nav_map.py`、`world_model_build.py`、`pointcloud_build.py` 等）。**重新做 import 关系实扫之前，
+> 不得据此判断能否删除。**
+>
+> **现状替代**（据 `backend/` 实读）：
+> - 在线导航 = `backend/nav_online.py`（航位推算 + 回环）+ `nav_mapping.py`（SGBM 关键帧三态栅格）
+>   + `nav_loop.py`（ORB+PnP 回环）+ `nav_grid.py` + `nav_follow.py`
+> - 在线位姿由 `nav_online.py` 内部算（OSC 速度 ZOH × HMD 朝向），**不经过 `pose_math`**
+>   （`backend/pose_math.py:38-39` 自述）
+> - 在线深度 = `nav_mapping.make_sgbm/stereo_disparity`；**`backend/` 内没有任何深度模型**
+> - 记录器文件**拆成两处**：`scale_calib.py` / `pose_graph.py` / `run_motion.py` / `obs_ctl.py` /
+>   `record_stage1.py` / `route_v2.py` 在 **`research/recorder/`**；其余在
+>   `.slam_probe/offline_probe/recorder/`
+>
+> 完整勘误见 `Docs/文档勘误与过时清单（2026-09-29）.md`。
+> **本文正文保留为 2026-09-23 快照，不做改写**（改写有引入新错误的风险）。
+
 > 目的：这个项目里有**两套并行的 SLAM**，加上若干已证伪的探针，名字又高度重复。
 > 本文只做梳理与定性，不改动任何代码。所有结论基于实扫（mtime / docstring / import 关系），不是推断。
 

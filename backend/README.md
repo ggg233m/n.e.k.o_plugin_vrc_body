@@ -386,7 +386,7 @@ fallback_backend = "none" # 显式设为 "opencv_hog" 可启用降级的仅人�
 confidence_threshold = 0.35
 input_width = 640
 input_height = 640
-horizontal_fov_deg = 90.0
+horizontal_fov_deg = 102.45 # 相机水平视场；单一真值源见 config.CAMERA_HORIZONTAL_FOV_DEG
 max_detections = 64
 # 检测框宽/高占画面的最小比例，用于滤掉几十像素级的高分假阳性。0 关闭对应轴。
 # min_box_ratio 是两轴的共同回退值；只写它时两轴同值（旧配置行为不变）。

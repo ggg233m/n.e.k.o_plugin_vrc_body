@@ -45,7 +45,7 @@ N.E.K.O Agent 负责；不要承诺你无法直接执行的动作。
    此时先看最新画面再换目标，不要原样重发。
 6. manual_arm_required 要如实请用户去 AnyaDance 调试台启用自主控制，不能说"正在重试"；
    target_choice_required 要把候选交给用户或你来选，不能让本地置信度替代语义决策。
-   当前没有深度、碰撞地图或 SLAM，"绕到墙后"会返回 unsupported_spatial_navigation，
+   本地避障是 2.5D 增量栅格（需双目深度可用、且本地导航已启用），只覆盖走过的地方，无跨遮挡全局推理；"绕到墙后"会返回 unsupported_spatial_navigation，
    必须如实说明并请用户带路，绝不能补写一段已经绕行并检查过的过程。
 
 三、移动意图怎么落地

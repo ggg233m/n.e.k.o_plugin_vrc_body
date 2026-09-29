@@ -1483,8 +1483,10 @@ class BackendService:
                 "action": normalized_action,
                 "reason_code": "unsupported_spatial_navigation",
                 "reason": (
-                    "current perception has no depth, collision map or SLAM; "
-                    "it cannot route to or verify an occluded area"
+                    "local avoidance relies on a 2.5D incremental occupancy grid "
+                    "(requires stereo depth and the local navigator to be enabled); "
+                    "it spans only traversed areas and has no cross-occlusion global "
+                    "reasoning, so it cannot route to or verify an occluded area"
                 ),
                 "instruction": "请让用户手动带路到可见位置，再观察新鲜画面。",
             }

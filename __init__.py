@@ -557,8 +557,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                     "wander 必须在 constraints.turn_deg 携带主模型已经选择的相对方向；若"
                     "缺失，后端会返回 pending_route 并把最新画面交回主模型选路。"
                     "pending_semantic 不代表已经移动。必须先由用户在面板手动"
-                    "启用自主控制。当前没有深度、碰撞地图或 SLAM，不能规划到墙后等被"
-                    "遮挡位置；此类请求用 inspect_occluded_area 获取明确的不支持结果。"
+                    "启用自主控制。本地避障是 2.5D 增量栅格（需双目深度可用、且本地"
+                    "导航已启用），只覆盖走过的地方、无跨遮挡全局推理，不能规划到墙后等被遮挡位置；"
+                    "此类请求用 inspect_occluded_area 获取明确的不支持结果。"
                 ),
                 {
                     "type": "object",
@@ -2113,8 +2114,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
             "不需要 Agent 高频重复调用。安全要求：必须已由用户在插件面板手动启用自主控制；"
             "未启用时结果会返回 manual_arm_required，应如实提示用户点击启用，不能声称正在移动。"
             "approach/follow 未提供 target_id 时，只允许自动绑定当前唯一的语义确认目标；"
-            "多个候选会返回 target_choice_required，必须由主 LLM 或用户选择。当前没有"
-            "深度、碰撞地图或 SLAM；墙后等遮挡位置会返回 unsupported_spatial_navigation。"
+            "多个候选会返回 target_choice_required，必须由主 LLM 或用户选择。本地后端"
+            "本地避障是 2.5D 增量栅格（需双目深度可用、且本地导航已启用），只覆盖走过的"
+            "地方、无跨遮挡全局推理；墙后等遮挡位置会返回 unsupported_spatial_navigation。"
         ),
         input_schema={
             "type": "object",
@@ -2204,8 +2206,9 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "action": normalized_action,
                 "reason_code": "unsupported_spatial_navigation",
                 "reason": (
-                    "当前系统只有二维画面检测，没有深度、碰撞地图或 SLAM，"
-                    "无法规划到墙后等被遮挡区域，也无法验证那里是否存在暗格或道具"
+                    "本地避障是 2.5D 增量栅格（需双目深度可用、且本地导航已启用），"
+                    "只覆盖走过的地方、无跨遮挡全局推理，无法规划到墙后等被遮挡区域，"
+                    "也无法验证那里是否存在暗格或道具"
                 ),
                 "instruction": "请让用户手动带路到可见位置，再用新鲜画面进行观察。",
             })

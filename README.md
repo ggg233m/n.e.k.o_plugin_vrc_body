@@ -2,7 +2,12 @@
 
 - [N.E.K.O 宿主一键安装包说明](INSTALL.md)：导入 `.neko-plugin` 即可安装模型和运行依赖。
 
-- 2026-09-20：正在制作世界模型
+- 🔴 **[读文档前先读这个：Docs 索引与权威性](Docs/README.md)**
+  —— `Docs/` 下有 30 份文档，其中多数是**日期化实验记录**，彼此存在 **8 组冲突陈述**。
+  该索引给出权威矩阵与冲突登记表；**任何文档与代码不符时以代码为准**。
+
+- 2026-09-20：正在制作世界模型（**现状见 [开发进度](ROADMAP.md) 与
+  [世界模型方案落地评估](Docs/业界世界模型方案落地评估（2026-09-29）.md)**）
 
 - [开发进度](ROADMAP.md)
 - [独立后端](backend/README.md)
@@ -29,7 +34,7 @@
 - 把 N.E.K.O 对话里**角色说出口的那句**自动转发到 VRChat 聊天框（`[chatbox_relay]`，默认开启）。只转 `proactive_reply`，不转承载用户原话的 `proactive_instruction`。
 - 用 `body_status(include=["autonomy"])`、`vrc_autonomy_goal`、`body_stop(scope="navigation")` 管理当前实例内的自主目标；授权必须从调试面板或 `/autonomy/arm` 手动启用。
 - 向 N.E.K.O 后台 Agent 暴露正式的“观察当前 VRChat 世界”和“寻找或走向 VRChat 目标”入口；自然语言里的“找 NPC / 走过去 / 跟着它”会进入同一个安全导航接口，而不是被误判成仅有身体姿态能力。唯一语义目标可自动绑定稳定 ID，多个候选仍必须交回主 LLM 选择。
-- 用 `body_turn(degrees=360, wait_complete=true)` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。当前没有深度、碰撞地图或 SLAM，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
+- 用 `body_turn(degrees=360, wait_complete=true)` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。本地避障是 2.5D 增量栅格（需双目深度可用、且本地导航已启用），只覆盖走过的地方，不承诺跨遮挡推理，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
 - 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
 - 单一发送线程以配置的 120 Hz（默认）向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
