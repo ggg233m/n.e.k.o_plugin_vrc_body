@@ -1,166 +1,163 @@
-# SLAM 代码地图（2026-09-23 全仓扫描）
+# SLAM 代码地图（2026-09-30 重写）
 
-> ## ⚠️ 2026-09-29 更正横幅 —— 本文描述的架构**已不存在**，请勿据本文找文件
+> **本文已重写。** 原版（2026-09-23）描述的"两条 SLAM 路线"里，**在线单目 SLAM 那一条的实现在
+> 之后的重构中被整体删除**（`slam_core.py` / `live_mapping.py` / `relocalization.py` /
+> `online_pose.py` / `nav_plan.py` / `nav_target.py` / `route_executor.py` / `realtime_depth.py` /
+> `relocalization_observer.py` —— 源码已删，仅剩孤儿 `.pyc`，因此原版多处已失效）。
+> 原版全文见 git `688e420` 之前的历史。
 >
-> 逐条实扫后确认：下文列为"活跃"的 **11 个模块全仓都不存在**：
-> `backend/live_mapping.py`、`.slam_probe/slam_core.py`、`.slam_probe/relocalization.py`、
-> `backend/nav_plan.py`、`backend/nav_map_builder`、`backend/nav_target`、`backend/route_executor`、
-> `backend/online_pose.py`、`backend/realtime_depth.py`、`backend/metric_scale_calibrator.py`、
-> `backend/obstacle_map_2d.py`、`backend/offline_route_replay.py`、`backend/relocalization_observer.py`；
-> `tools/pose_math_equivalence.py`（§四之二 的"六道闸门"）亦**全仓无此文件**。
->
-> **特别是 §五「为什么 `.slam_probe` 不能删」**：它举的五处证据全部指向上述不存在的文件，
-> **该论证目前已无有效证据**。但这**不等于可以删** —— `.slam_probe/offline_probe/recorder/`
-> 仍是离线流水线（`map_from_capture.py`、`build_topo_map.py`、`place_group.py`、`loop_verify.py`、
-> `nav_map.py`、`world_model_build.py`、`pointcloud_build.py` 等）。**重新做 import 关系实扫之前，
-> 不得据此判断能否删除。**
->
-> **现状替代**（据 `backend/` 实读）：
-> - 在线导航 = `backend/nav_online.py`（航位推算 + 回环）+ `nav_mapping.py`（SGBM 关键帧三态栅格）
->   + `nav_loop.py`（ORB+PnP 回环）+ `nav_grid.py` + `nav_follow.py`
-> - 在线位姿由 `nav_online.py` 内部算（OSC 速度 ZOH × HMD 朝向），**不经过 `pose_math`**
->   （`backend/pose_math.py:38-39` 自述）
-> - 在线深度 = `nav_mapping.make_sgbm/stereo_disparity`；**`backend/` 内没有任何深度模型**
-> - 记录器文件**拆成两处**：`scale_calib.py` / `pose_graph.py` / `run_motion.py` / `obs_ctl.py` /
->   `record_stage1.py` / `route_v2.py` 在 **`research/recorder/`**；其余在
->   `.slam_probe/offline_probe/recorder/`
->
-> 完整勘误见 `Docs/文档勘误与过时清单（2026-09-29）.md`。
-> **本文正文保留为 2026-09-23 快照，不做改写**（改写有引入新错误的风险）。
-
-> 目的：这个项目里有**两套并行的 SLAM**，加上若干已证伪的探针，名字又高度重复。
-> 本文只做梳理与定性，不改动任何代码。所有结论基于实扫（mtime / docstring / import 关系），不是推断。
+> **权威口径与 15 组冲突登记见 [`Docs/README.md`](README.md)。** 本文只描述**现状**。
 
 ---
 
 ## 一、一句话结论
 
-1. **不是一堆乱代码，是两条路线 + 一片实验坟场**：
-   - **路线 A（离线 2.5D）**：`.slam_probe/offline_probe/recorder/*`，靠 OBS 录像 + OSC + HMD 建经验图。已验收（P1 `degraded`）。
-   - **路线 B（在线单目 SLAM）**：`.slam_probe/slam_core.py` + `relocalization.py`，被 `backend/live_mapping.py` **动态 import**。P2 在建。
-   - **坟场**：`ORB_SLAM3/`、`deps/`、`depth_scale/`、`sfm_ba/`、`triangulation/`、`loop_probe/`、`learned_probe/` —— 全部是负结果，已证伪。（`ORB_SLAM3/` 的双目模式 09-26 另有参照评估，仍不采用，见 §六。）
-   - **双目采集（09-26 新增，探针）**：`research/tools/openvr_mirror_probe.py`（合成器镜像纹理，GPU mip 缩放）、`research/tools/record_stereo_euroc.py`（录 EuRoC 格式序列 + OSC）、`research/tools/downscale_stereo_seq.py`（受控降分辨率）、`research/tools/analyze_orbslam3_stereo.py`（覆盖/丢追/尺度）、`research/tools/stereo_seq_ground_truth.py`（OSC+HMD 位置真值打分）。**不接实时链路。**
-   - **RTAB-Map 双目（09-26，离线评估）**：`research/tools/prepare_rtabmap_euroc.py`（转 RTAB-Map 的 EuRoC 布局，z-up T_BS）、`research/tools/rtabmap_poses_to_euroc.py`（位姿转回左目光学系）。当前最优候选，结论见 `Docs/RTAB-Map双目评估（2026-09-26）.md`。
-2. **`.slam_probe` 不能删**：`backend/` 有 4 个模块运行时去这个目录里 `import`（见 §五），删了在线建图直接崩。
-3. **5 组重名文件**是当前最危险的混淆源，见 §四。
+1. **现在不是"两套 SLAM"**，是**一条离线 2.5D 流水线 + 一条在线 navmesh**，
+   而且两者的产物**至今没有绑定**（"去某地点"因此无入口）。
+2. **`.slam_probe` 不能删 —— 但理由变了**：**不是** backend 运行期 `import` 它
+   （实扫证明那个依赖是 **0**），而是**未迁移的半条流水线 + 全部录制素材都在里面，且它被 gitignore**。
+3. **项目自有目录内的文件重名只剩 2 组**，其中 **1 组是真隐患**（见 §四）。
+4. **`world model` 一词在本仓库有三个含义**，新增代码**不要再用它**（见 §四）。
 
 ---
 
-## 二、两条路线的分工
+## 二、两条路线
 
-| | 路线 A：离线 2.5D 经验图 | 路线 B：在线单目 SLAM |
+| | **路线 A：离线 2.5D 经验图** | **路线 B：在线 navmesh** |
 |---|---|---|
-| 入口 | `recorder/map_from_capture.py`（P1 一键） | `backend/live_mapping.py` |
-| 核心 | 录像抽帧 + OSC 里程 + HMD yaw | `slam_core.py`（MonocularSlam）+ `relocalization.py` |
-| 输出 | `topo_map / place_groups / loop_verify / pose_graph / nav_map / world_model` | 视觉地图段 + `relocalization_map.json/.npz` |
-| 尺度 | OSC 路程当量反解 `cam_h`（`scale_calib.py`） | 视觉里程 + `metric_scale_calibrator` 待 OSC 配对 |
-| 状态 | ✅ 2.5D 主验收 pass，因缺 `action_timeline` 标 degraded | 🟡 `preview_ready`，`scale_validated=false` ⇒ 只能预览不能执行 |
-| 生产接线 | `backend/nav_plan.py`（逐字复制 `recorder/nav_map.py` 的规划器） | `backend/nav_map_builder / nav_target / route_executor` |
+| 代码 | `research/recorder/` + `.slam_probe/offline_probe/recorder/` | `backend/nav_online.py`、`nav_mapping.py`、`nav_loop.py`、`nav_grid.py`、`nav_follow.py` |
+| 输入 | OBS 录像 + OSC + HMD | **镜像双目 SGBM** + OSC 速度 + HMD 朝向 |
+| 位姿 | 航位推算（`backend/pose_math.py`）+ 位姿图 | 20 Hz 航位推算 + `nav_loop.LoopCloser`（ORB+PnP，**只修平移**，朝向来自 HMD） |
+| 产物 | `topo_map` / `nav_map.json` / `world_model.json` / 2.5D 障碍层 | 三态栅格（free/obstacle/unknown）+ navmesh |
+| 接线 | **离线跑，人工触发**（入口 `map_from_capture.py`） | **已接进后端**：`service.py` 构造 `OnlineNavigator`，11 处调用 |
+| HTTP | 无 | `GET /worldmodel/navmesh`、`POST /worldmodel/navmesh/{start,stop,goto,explore,cancel}` |
+| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话重定位失败** |
 
-**两条路线目前没有合并**：A 出 2.5D 导航图，B 出视觉坐标系下的定位；`nav_target` 现在因为两者 revision/尺度/坐标系没绑定而**安全拒绝**（`navigation_map_frame_mismatch`）——这是当前 P2 最大的一个洞。
+**两条路线各有坐标系与尺度、没有绑定** —— 这是当前最大的结构洞。
+详见 [`Docs/自动到达能力差距清单.md`](自动到达能力差距清单.md)（2026-09-30 已重写）。
 
 ---
 
 ## 三、活跃链（按流水线层次）
 
-| 层 | 文件 | 职责 |
+| 层 | 现行文件 | 职责 |
 |---|---|---|
-| 采集 | `recorder/record_stage1.py`、`obs_ctl.py`、`record_snap/axis/calib.py` | 受控录制（v2.1 手动 HMD 采集） |
-| 采集自检 | `research/tools/check_recording_channels.py`、`recorder/verify_run.py` | 录完先验通道，全 PASS 才进后处理 |
-| 时间基准 | `research/tools/estimate_video_offset.py` → `recorder/time_align_check.py`；`research/tools/offline_timebase_harness.py`；`backend/time_alignment.py` | 视频↔OSC↔HMD 统一单调钟 |
-| 深度/尺度 | `recorder/stage3_horizon.py`（地平线/地板归一）、`scale_calib.py`（cam_h 自动标定）、`openvino_depth_probe.py`；`backend/realtime_depth.py`、`backend/metric_scale_calibrator.py` | 单目深度 + 米制尺度 |
-| 拓扑/回环 | `recorder/build_topo_map.py` → `place_group.py` → `loop_verify.py` | 观测簇 → 地点组 → 回环几何验证（四级确认协议） |
-| 位姿图 | **`recorder/pose_graph.py`**（2D 米制）← 活跃 | 航位推算 + 闭环修正 |
-| 航位推算数学 | **`backend/pose_math.py`**（唯一实现，纯 `math`，无 numpy） | 本地矢量位移按朝向旋进世界；在线 `backend/online_pose.py` 与离线 `recorder/pose_graph.py` **共用同一份** |
-| 导航图/规划 | `recorder/nav_map.py`（A*/Dijkstra 原实现）→ `backend/nav_plan.py`（无 numpy 副本） | 2.5D 可导航图 |
-| 避障 | `recorder/local_avoid.py`（三态）+ `tools/local_avoid_replay.py`（冻结回放验证） | passable/unknown/stop |
-| 障碍层 | `recorder/obstacle_map_2d.py`（离线产物） vs `backend/obstacle_map_2d.py`（自建坐标系） | 见 §四 |
-| 世界模型/预览 | `recorder/world_model_build.py`、`map_preview.py`、`pointcloud_build/splat.py`、`check_pointcloud_orientation.py` | 收敛成单一世界模型 + HTML 预览 |
-| 重定位 | `.slam_probe/relocalization.py`（被 backend 加载）；实验区 `recorder/relocalize.py`、`relocalize_geom.py`；回放 `tools/relocalize_video.py`、`replay_navtarget_video.py` | 只读视觉重定位 |
-| 执行/回放 | `backend/route_executor.py`、`backend/offline_route_replay.py`（实现）+ `tools/offline_route_replay.py`（CLI） | 安全状态机，缺证据就暂停 |
-| 门禁 | `research/tools/regression_place_identity.py`（15 断言）、`research/tools/check_2d_map_acceptance.py` | 回归与验收 |
+| **采集（桌面/窗口）** | `backend/wgc_capture.py`（**遗留，决定移除**）、`backend/vision.py`（`WgcWindowFrameSource` / `desktop_mirror` / mss / dxcam 四种源） | 2D 帧 |
+| **采集（双目镜像）** | `backend/openvr_mirror.py`（`MirrorEye`、`read_stereo`、`projection_intrinsics`） | SteamVR 合成器镜像纹理，两眼同帧；GPU mip 降采样 |
+| **时间基准** | `backend/time_alignment.py`；`research/tools/estimate_video_offset.py`；`.slam_probe/.../recorder/time_align_check.py` | 视频↔OSC↔HMD 统一单调钟 |
+| **深度** | **在线**：`backend/nav_mapping.py` 的 `make_sgbm` / `stereo_disparity` / `stereo_points`（**backend 内没有任何深度模型**）；**离线**：`recorder/openvino_depth_probe.py` + Depth Anything V2 | 视差 → 点 → 栅格 |
+| **在线建图** | `backend/nav_mapping.py`（关键帧增量三态栅格）、`nav_grid.py`（`FREE`/`OCC`/`UNK`、`GridMeta`）、`nav_online.py`（`OnlineNavigator`：位姿 / 关键帧 / 控制 / 快照） | 首访世界边走边建 |
+| **回环** | `backend/nav_loop.py`（`LoopCloser`） | ORB 互最近邻 → 候选关键帧双目 3D 点 + 当前帧 2D → `solvePnPRansac` + LM；**HMD 相对 yaw 一致性是最强外点过滤** |
+| **航位推算数学** | `backend/pose_math.py` | **唯一实现**（纯 `math`，无 numpy）。⚠️ **在线 navmesh 不经过它**，见其 docstring |
+| **规划 / 跟随** | `backend/nav_follow.py`（跟随器）；`backend/navigator.py`（LLM 侧 10 Hz 闭环 + 卡墙判据） | 局部移动 |
+| **世界状态** | `backend/world_state.py`、根目录 `world_salience.py` | 实体/事件账本 + 唤醒分级 |
+| **世界身份** | `backend/world_model.py` | **W1：当前在哪个世界** + 启停骨架；按世界分区记忆路径 |
+| **感知** | `backend/local_perception.py`（检测器）、`reid_embedder.py`（OSNet）、`traversability.py` | 人 / 可通行性 |
+| **可视化** | `GET /worldmodel/navmesh` → `grid_view()`（栅格 PNG + 像素↔世界米换算）、前端 `ui/navmesh.js`；离线 `recorder/map_preview.py` + HTML | 地图预览 |
+| **回归门 / 工具** | `research/tools/regression_place_identity.py`、**`import_audit.py`**（AST 跨根依赖审计）、**`doc_health.py`**（文档体检） | 防复发 |
 
-`map_from_capture.py` 用 **subprocess** 串起这一串（不是 import）：`estimate_video_offset → scale_calib → build_topo_map → place_group → loop_verify → pose_graph → nav_map → obstacle_map_2d → check_pointcloud_orientation → map_preview → world_model_build`。
+`map_from_capture.py` 用 **subprocess** 串起离线那一串（不是 import）：
+`estimate_video_offset → scale_calib → build_topo_map → place_group → loop_verify → pose_graph → nav_map → obstacle_map_2d → check_pointcloud_orientation → map_preview → world_model_build`。
+⚠️ 迁移曾把它打断（两个步骤的目标脚本已迁走），已于 2026-09-29 修复并按脚本所在目录解析。
 
 ---
 
-## 四、⚠️ 5 组重名陷阱
+## 四、⚠️ 陷阱
 
-| 同名 | 谁活跃 | 另一个是什么 |
-|---|---|---|
-| `pose_graph.py` | `recorder/pose_graph.py`（2D 米制，P1 链上） | `.slam_probe/pose_graph.py`＝SE(3) 早期图优化（09-18，路线 B 早期） |
-| `obstacle_map_2d.py` | 两者都在用 | `recorder/`＝离线深度出证据图；`backend/`＝自建坐标系在线三态障碍层 |
-| `offline_route_replay.py` | `research/tools/` 是 CLI 入口 | `backend/` 是实现（纯函数 `_contract_checks` / `_safety_checks`） |
-| `probe.py` | 都不是活跃链 | `loop_probe/` 与 `learned_probe/` 各一份，均为负结果探针 |
-| `test_world_model.py` | `tests/`（13 条，全过） | `recorder/` 里还有一份旧的单测 |
+### 4.1 文件重名：现在只剩 2 组（原版列的 5 组已大多消失）
 
-**还有一个语义重名**：`backend/world_model.py` 是 **W1 世界身份**（"当前在哪个世界"+启停骨架），跟建图的世界模型（`recorder/world_model_build.py` 产物 `world_model.json`）**完全不是一回事**。
+实扫（项目自有目录：根、`backend/`、`research/`、`tests/`、`.slam_probe/offline_probe/recorder/`）：
 
-### 四之二、⚠️ 更危险的一类：**同一算法存两份拷贝**
+| 重名 | 状态 |
+|---|---|
+| `__init__.py` | 根 与 `backend/` —— **包初始化，不是隐患** |
+| **`test_world_model.py`** | `tests/`（现行单测）与 `.slam_probe/offline_probe/recorder/`（旧的） —— **唯一真隐患，改测试时别改错那份** |
 
-重名至少会当场报错；**同一公式存两份**不会报错，只会**悄悄漂移**。这一类已经真实
-发生过一次：
+原版的 `pose_graph.py` / `obstacle_map_2d.py` / `offline_route_replay.py` / `probe.py` 重名
+**都已随重构消失**（对应文件已删或只剩一份）。
 
-> `backend/online_pose.py`（在线）与 `recorder/pose_graph.py`（离线）各写了一份
-> "本地矢量位移按朝向旋进世界"。在线那份一直是对的；离线那份退化成
-> **标量路程沿 yaw 前进**（`x += ds*sin(yaw)`），等价于把横移当成前进 ——
-> 该 run 终点差 **1.5496 m**，且 596/895 步都带一点横移，不是"横移很少见"。
+### 4.2 同一算法存两份：**已收敛，但这段历史必须留着**
 
-2026-09-24 已收敛：公式只留一份在 `backend/pose_math.py`，两侧都调它。
-防复发靠**门禁**而不是自觉：
+> 在线 `online_pose.py` 与离线 `pose_graph.py` 曾各写了一份"本地矢量位移按朝向旋进世界"。
+> 在线那份一直对；**离线那份退化成标量路程沿 yaw 前进**（`x += ds*sin(yaw)`），
+> 等价于把横移当前进 —— 实测该 run 终点差 **1.419 m**（当次横移报文仅占 2.9%）。
 
-```
-python tools/pose_math_equivalence.py --selftest
-```
+2026-09-24 收敛：公式只留一份在 **`backend/pose_math.py`**，离线三处都调它
+（`research/recorder/run_motion.py`、`research/recorder/pose_graph.py`、
+`research/tools/stereo_seq_ground_truth.py`）。
 
-六道闸门：共享模块纯净 / yaw 符号常量被钉住 / 同符号下两侧数值一致 /
-家族文件里不再出现第二份三角函数 / 在线与离线输出与重构前**逐位一致** /
-以及"闸门本身不是空转"的自检（喂历史 bug 会红、注入第二份公式会红）。
+**规矩**：航位推算家族里**不允许出现任何 `cos/sin/tan` 调用** —— 需要旋转就调 `pose_math`。
 
-**规矩**：航位推算家族（`backend/online_pose.py`、`recorder/pose_graph.py`、
-`recorder/run_motion.py`、`tools/slam_metric_retest.py`、
-`depth_scale/osc_odometry.py`）里**不允许出现任何 `cos/sin/tan` 调用** ——
-需要旋转就调 `backend/pose_math.py`。
-
-**已知有意保留的其它旋转副本**（形状不同，不是航位推算，勿照抄）：
-`recorder/scale_calib.py::_R_wc`（同一旋转的 3×3 矩阵，相机→世界三维落点）、
+**已知有意保留的其它旋转副本**（形状不同，不是航位推算，**勿照抄**）：
+`research/recorder/scale_calib.py::_R_wc`（3×3 矩阵，相机→世界三维落点）、
 `pointcloud_build.py` / `pointcloud_splat.py` 里的 GL/JS 着色器旋转（渲染坐标变换）。
 
-**仍未决**：在线侧的 yaw 符号（`ONLINE_YAW_SIGN = +1.0`）在本仓库内
-**既无标定证据、也无测试钉住** —— `POST /worldmodel/navroute/feedback` 的调用方
-不在本仓库内，符号约定由外部决定。离线侧的 `-1` 有画面证据
-（`yaw_sign_check.json`）。**动在线符号前先补在线侧的证据。**
+### 4.3 🔴 `world model` 一词三义 —— **新增代码不要用这个词**
+
+| 含义 | 位置 |
+|---|---|
+| **W1 世界身份**（"当前在哪个世界"+启停骨架） | `backend/world_model.py` |
+| **建图产物** | `recorder/world_model_build.py` → `world_model.json`（schema `neko.world_model/v1`） |
+| **持久空间记忆**（新北极星里的那个） | `ROADMAP.md` 北极星；`Docs/业界世界模型方案落地评估（2026-09-29）.md` |
+
+⇒ **说"世界身份"或"地点记忆"，不要写"世界模型"**。这条**已经在文档里造成过实际混淆**
+（见 `Docs/README.md` §三 C7 / C15）。
 
 ---
 
-## 五、🔴 为什么 `.slam_probe` 不能删
+## 五、🔴 为什么 `.slam_probe` 不能删（理由已更正）
 
-`backend/` 运行时依赖它（实扫 import 关系）：
+**原版的理由是错的。** 它说"`backend/` 有 4～5 个模块运行时去 `.slam_probe` import"，
+举的证据（`backend/live_mapping.py:22-31`、`backend/nav_plan.py`、`backend/realtime_depth.py`、
+`backend/offline_route_replay.py`、`backend/relocalization_observer.py`）**全部不存在**。
 
-- `backend/live_mapping.py:22-31`：`sys.path.insert(0, ".slam_probe")` → `importlib.import_module("slam_core")` 取 `MonocularSlam/SlamConfig`；再 `import_module("relocalization")` 取 `export_relocalization_map`
-- `backend/nav_plan.py`：`recorder/nav_map.py` 的 `plan`/`_format_plan` **逐字复制**（为在无 numpy、无 recorder 依赖的环境下也能规划）
-- `backend/realtime_depth.py`、`backend/offline_route_replay.py`、`backend/relocalization_observer.py`：同样按路径加载 `.slam_probe` 里的模块
+2026-09-29 三重实扫证明**发行面对 `.slam_probe` 的运行时依赖是 0**：
 
-⇒ 清理时只能清理**坟场子目录**，不能动 `slam_core.py` / `relocalization.py` / `recorder/`。
+1. `backend/` 与插件根里对 `slam_probe` 的**字面引用：0 处**（只有 `pose_math.py` 的 docstring 提及）；
+2. `backend/` 唯一的动态导入是 `process.py`，插的是 **`PROJECT_DIR.parent`**（插件包自身命名空间）
+   与 `VENDOR_DIR`（`vendor/`），**与 `.slam_probe` 无关**；
+3. **AST 全量导入审计**（`research/tools/import_audit.py`）：解析不到的只有
+   `plugin`（宿主 SDK）、`mss` / `openvino`（可选依赖，代码用 `find_spec` 守卫）。
+
+**⇒ 但结论仍然是"不能删"，理由换成两条：**
+
+1. **未迁移的那半条离线流水线只在里面**（`build_topo_map.py`、`place_group.py`、
+   `loop_verify.py`、`nav_map.py`、`obstacle_map_2d.py`、`world_model_build.py`、
+   `pointcloud_build.py`、`map_preview.py`、`map_from_capture.py` 等 39 个 `.py`），
+   **而 `.slam_probe/` 在 `.gitignore:19`** ⇒ 删掉等于丢掉**没有备份的代码**；
+2. **全部录制素材与负结果证据在里面**：`runs/*`（29 个，含唯一完整的主样本 `20260920-233456`）、
+   `stereo_seq/run1–7`、`rtabmap*`、`orbslam3_run*`、`depth_scale/`、`learned_probe/`、
+   `loop_probe/`、`roomscale/`、`ov_env/`（OpenVINO 2026.4）、`deps/` + `ORB_SLAM3/` 构建树。
+
+**清理时只能清坟场子目录，不能动 `recorder/` 与素材。**
+
+> 附带：`.slam_probe/ov_env`（OpenVINO）是**开发期 PYTHONPATH 便利**
+> （`research/recorder/scale_calib.py` 用 `PYTHONPATH=.slam_probe/ov_env`），
+> 不是 `import .slam_probe`。但**部署面若依赖它就说明装错了** —— 用户机器上没有这个目录。
 
 ---
 
 ## 六、坟场清单（已证伪，别再投时间）
 
-| 目录/文件 | 结论 |
+| 目录 / 文件 | 结论 |
 |---|---|
-| `ORB_SLAM3/`、`deps/`（Pangolin/glew/libepoxy）、`orbslam3_run*`、`run_mono_tum.sh`、`analyze_orbslam3.py`、`orb_slam3_result.json` | **单目**：走—停全败，直接喂录像不可行。**双目**（2026-09-26）已重新评估：几何与尺度成立，但因 GPLv3 和 30 Hz 做不到而不采用，只做参照 → `Docs/ORB-SLAM3双目参照评估（2026-09-26）.md` |
-| `depth_scale/*`（`vio_new`、`vio_traj`、`osc_odometry`、`pose_graph_opt`、`loop_closure_check`、`metric_scale`、`umeyama_check`、`batch_scale`、`check_consistency`、`scale_drift_check`、`overlap_new`、`diag_motion`） | VO 闭合误差 12–14% ❌，不用它替代 OSC 里程 |
-| `sfm_ba/`、`triangulation/triangulate_check.py` | 增量几何已止损：单帧墙 0.0098 m → 融合 0.071 m，瓶颈在跨帧位姿 |
-| `loop_probe/`、`learned_probe/` | 学习描述子替 BoW、全局指纹：判别力不足 |
+| `ORB_SLAM3/`、`deps/`（Pangolin/glew/libepoxy）、`orbslam3_run*`、`run_mono_tum.sh`、`analyze_orbslam3.py` | **单目**：走—停全败，直接喂录像不可行。**双目**（2026-09-26）已重新评估：几何与尺度成立，但**因 GPLv3 + 30 Hz 做不到而不采用**，只做参照 → `Docs/ORB-SLAM3双目参照评估（2026-09-26）.md` |
+| `depth_scale/*`（`vio_new`、`osc_odometry`、`pose_graph_opt`、`loop_closure_check`、`metric_scale`、`umeyama_check`、`batch_scale`、`overlap_new`…） | VO 闭合误差 12–14% ❌，不用它替代 OSC 里程 |
+| `sfm_ba/`、`triangulation/triangulate_check.py` | 增量几何已止损：单帧墙 0.0098 m → 融合 0.071 m，瓶颈在**跨帧位姿** |
+| `loop_probe/`、`learned_probe/` | 学习描述子替 BoW、全局指纹：**判别力不足** |
 | `jump_detect.py`、`show_jumps.py`、`compare_runs.py`、`measure_reloc.py`、`plot_traj.py`、`show_traj.py` | 09-18 路线 B 的配套分析脚本 |
 | `research/tools/seqslam_probe.py`、`orb_place_probe.py`、`world_fingerprint_probe.py`、`landmark_probe.py`、`location_distinguishability_probe.py` | 离线探针，**不接实时链路**（docstring 自己写明） |
-| `runs/` 下 29 个早期 run（除 `20260920-233456` 外） | 只有 2–4 个文件的标定/自测残留；`20260920-233456` 有 67 个产物，是唯一完整素材 |
+| `runs/` 下 29 个早期 run（除 `20260920-233456` 外） | 只有 2–4 个文件的标定/自测残留 |
 
 ---
 
-## 七、建议（未执行，等确认）
+## 七、建议（按价值排序）
 
-1. **先立规矩再动文件**：给坟场目录加 `Docs/` 级别的归档标记或统一挪到 `.slam_probe/_archive/`，**不要直接删**（有运行时 import 风险）。
-2. **消歧改名**（低风险、收益高）：`recorder/pose_graph.py` → `pose_graph_2d.py`；`backend/obstacle_map_2d.py` → `obstacle_layer_2d.py`。注意改后要同步改 `map_from_capture.py` 里的 subprocess 调用与所有产物文件名。
-3. **两条路线的合并点**才是该花时间的地方：`nav_map` 需要绑定 `visual_map_revision` + `meters_per_unit` + 同一坐标系，否则 `nav_target` 会一直拒绝（`navigation_map_frame_mismatch`）。
+1. **P0：跨会话重定位** —— 给 `nav_loop.LoopCloser` 补**全局地点检索入口**
+   （`_candidates()` 现在只按会话内路径距离取候选）。**保留** ORB+PnP 与 HMD 一致性门。
+2. **绑定两条路线** —— `nav_map` 需要绑定 `visual_map_revision` + 同一尺度 + 同一坐标系，
+   否则"去某地点"永远没有入口。
+3. **把未迁移的那半条流水线纳入版本控制** —— 它现在**没有任何备份**（gitignore）。
+   这是结构性风险，不是整洁问题。
+4. **消歧改名**（低风险、收益高）：`.slam_probe/.../test_world_model.py` 与 `tests/test_world_model.py` 之一改名。
+   **新增代码不要用 "world model" 这个词**（§4.3）。
