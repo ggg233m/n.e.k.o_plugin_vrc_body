@@ -27,7 +27,11 @@ from .nav_grid import FREE, OCC, UNK, GridMeta, NavGrid
 @dataclass
 class MapperConfig:
     res_m: float = 0.10             # 追踪米；0.05 在 run6 上碎成很多小岛
-    range_m: float = 3.0            # 离观测关键帧的水平距离上限（追踪米）
+    # 离观测关键帧的水平距离上限（追踪米）。相机平视、垂直视场 90°，地面要到 cam_h≈1.73 m 外才进画面，
+    # 3 m 时每帧只有 1.3 m 深的一条带，要走遍才建得全。5 m（2026-09-30，run5/6/7 全因果回放）：
+    # 已观测面积 ×1.5–1.8、可走面积 ×1.5–2.0，路径上障碍仍为 0，空地里的假障碍孤岛反被远处视线看穿清掉；
+    # 基线 0.126 下 5 m 处视差约 5 px，地面高度误差约 0.1 m/像素，仍在 ground_tol 内。
+    range_m: float = 5.0
     ground_tol_m: float = 0.30
     obst_top_m: float = 2.0
     min_pts: int = 3
@@ -58,10 +62,12 @@ class MapperConfig:
     # ≥ ray_beta × 被打中的关键帧数，就不再算障碍。没有它，障碍只增不减：定位误差、回环挪位每次
     # 都在旁边再画一份墙，旧的那份没有任何机制清掉（21 min 实测 150 块障碍里 94 块是空地中间的孤岛）。
     # 身体走过的中心线每格额外算 ray_walk_w 次看穿。run6：路径上假障碍 8→0，多帧障碍一格不丢。
+    # β 2→1（2026-09-30）：21 min 录制（去掉静止重复帧后）路径上障碍格 195→23、可走 223→261 m²；
+    # 代价是 run5 障碍格少 13%（665→581，路径上本来就是 0），run6 可走 +5 m²。
     ray_clear: bool = True
-    ray_beta: float = 2.0
+    ray_beta: float = 1.0
     ray_z_m: float = 0.10           # 障碍高度带 (ground_tol, obst_top) 的分层
-    ray_step_m: float = 0.05        # 视线水平采样步长
+    ray_step_m: float = 0.10        # 视线水平采样步长 = 一格；0.05 时 5 m 视距每帧多花 ~25 ms，结果几乎不变
     ray_stop_m: float = 0.20        # 离端点这么近就不算看穿（端点本身的深度噪声）
     ray_walk_w: float = 3.0
 
@@ -259,6 +265,17 @@ class KeyframeGridMapper:
         self._ver += 1
         if osc_dist_m is not None:
             self._osc[k] = float(osc_dist_m)
+
+    def drop_points(self, node_id: int) -> None:
+        """去掉关键帧的点云贡献，保留位姿、OSC 路程和挂在它上面的轨迹：目标锚点照样能 resolve，
+        走过的折线不变。用于原地不动时新帧替换上一帧（同一视角重复叠加只会放大深度噪声）。"""
+        k = int(node_id)
+        if self._pts.pop(k, None) is None:
+            return
+        self._cnt.pop(k, None)
+        self._drop_cache(k)
+        self._dirty.discard(k)
+        self._ver += 1
 
     def _drop_cache(self, k: int) -> None:
         self._rot.pop(k, None)

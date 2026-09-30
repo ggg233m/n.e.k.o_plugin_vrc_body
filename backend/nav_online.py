@@ -3,7 +3,7 @@
 
 三个频率各管各的（别混成一个"1 Hz"）：
 * 位姿 20 Hz：OSC 速度（ZOH，前值保持）× HMD 朝向，与离线 ``dr_odom_db.py`` 同一口径；
-* 双目 ~3 Hz：SGBM 约 21 ms/帧，既做近距急停，也按**距离/转角**触发关键帧；
+* 双目 ~10 Hz：SGBM 约 21 ms/帧，既做近距急停，也按**距离/转角/时长**触发关键帧（``KeyframePolicy``：快转推迟、原地补帧替换）；
 * 地图更新：有新关键帧才栅格化 + 重规划（~130 ms），最快 2 Hz；
 * 控制 10 Hz：跟随器吃最新位姿，每拍重发带 400 ms 自动过期的轴（线程死了人就停）。
 
@@ -43,14 +43,25 @@ def hmd_to_base_rotation(r_hmd: np.ndarray) -> np.ndarray:
 class OnlineNavConfig:
     osc_lag_s: float = 0.18          # OSC 速度比画面晚到约 0.18 s（run5/run6 局部窗口回放扫描最优 0.175–0.2）
     pose_hz: float = 20.0
-    # 每帧双目只看得到脚前 ~1.6 m 到 range_m 那一条带（约 0.7 m 深）：3 Hz 时跑步一帧走 1.3 m，
+    # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
     stereo_period_s: float = 0.1
     control_hz: float = 10.0
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
     kf_dist_m: float = 0.4           # 世界米；< 条带深度，快走也首尾相接
     kf_turn_deg: float = 25.0
-    kf_max_age_s: float = 3.0        # 原地不动时也偶尔补一帧（例如原地转完一圈）
+    kf_max_age_s: float = 3.0        # 原地不动时也隔这么久补一帧（刷新动态物体、给射线清除新视线）
+    # 原地不动（离上一关键帧 < still_m 且转角 < still_deg）补的帧**替换**上一帧的点云，不叠加：
+    # 同一视角叠 N 份只会把深度噪声放大 N 倍。21 min 录制 3014 帧里约 43% 是这种帧。
+    kf_still_m: float = 0.1
+    kf_still_deg: float = 10.0
+    # 快速转头时推迟关键帧：HMD 朝向与画面有时差，转得快点云就被甩歪。兜底：推迟超过 defer_max_s
+    # 或期间走了 defer_max_m 就照取，原地连转不会整段没帧、边走边转不会断带。
+    # 2026-09-30 回放（替换+推迟+β=1 合计）：21 min 录制路径上障碍格 251→13、可走 221→265 m²；
+    # run5/run6 路径障碍仍为 0，可走面积持平（30°/s 阈值会让 run6 丢 5 m²，故取 45）。
+    kf_defer_dps: float = 45.0
+    kf_defer_max_s: float = 1.0
+    kf_defer_max_m: float = 0.8
     trail_period_s: float = 0.2
     pose_stale_s: float = 0.5
     stereo_stale_s: float = 0.8
@@ -65,6 +76,42 @@ class OnlineNavConfig:
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
     record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
+
+
+class KeyframePolicy:
+    """双目帧要不要成为关键帧。``decide`` 返回 None（不取）、``"new"``（追加）或
+    ``"refresh"``（原地补帧：点云替换上一关键帧的，位姿/回环节点照留）。在线与离线回放共用。"""
+
+    def __init__(self, cfg: OnlineNavConfig) -> None:
+        self.cfg = cfg
+        self.scale = cfg.mapper.world_scale
+        self.xy: np.ndarray | None = None
+        self.yaw = 0.0
+        self.at = -math.inf
+        self.defer_since: float | None = None
+        self.deferred = 0
+
+    def decide(self, t: float, xy: np.ndarray, yaw: float, yaw_rate_dps: float) -> str | None:
+        c = self.cfg
+        if self.xy is None:
+            return self._take(t, xy, yaw, "new")
+        d = float(np.hypot(*(np.asarray(xy[:2], float) - self.xy))) * self.scale
+        dyaw = abs(math.degrees(_wrap(yaw - self.yaw)))
+        moved = d >= c.kf_dist_m or dyaw >= c.kf_turn_deg
+        if not moved and t - self.at < c.kf_max_age_s:
+            return None
+        if abs(yaw_rate_dps) > c.kf_defer_dps:
+            if self.defer_since is None:
+                self.defer_since = t
+            if t - self.defer_since < c.kf_defer_max_s and d < c.kf_defer_max_m:
+                self.deferred += 1
+                return None
+        kind = "refresh" if (not moved and d < c.kf_still_m and dyaw < c.kf_still_deg) else "new"
+        return self._take(t, xy, yaw, kind)
+
+    def _take(self, t: float, xy: np.ndarray, yaw: float, kind: str) -> str:
+        self.xy, self.yaw, self.at, self.defer_since = np.asarray(xy[:2], float).copy(), yaw, t, None
+        return kind
 
 
 class SessionRecorder:
@@ -393,6 +440,8 @@ class OnlineNavigator:
         self._near_pts = 0
         self._pending: list[tuple[str, Any]] = []
         self._keyframes = 0
+        self._kf_refreshed = 0
+        self._kf_policy: KeyframePolicy | None = None
         self._map_updates = 0
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
@@ -493,9 +542,8 @@ class OnlineNavigator:
         matcher = None
         orb = None
         kf_id = -1
-        kf_xy: np.ndarray | None = None
-        kf_yaw = 0.0
-        kf_at = -math.inf
+        policy = self._kf_policy = KeyframePolicy(c)
+        yaw_hist: list[tuple[float, float]] = []    # 近 ~0.25 s 的 (时刻, 展开 yaw)，算转速
         next_stereo = next_trail = self._clock()
         period = 1.0 / c.pose_hz
         prev_yaw: float | None = None
@@ -524,6 +572,10 @@ class OnlineNavigator:
                                     "t_s": round(tick - (self._started_at or tick), 2),
                                     "delta_deg": round(dyaw, 1), "keyframe": kf_id,
                                     "odometry_m": round(self.dr.dist_m, 2)}])[-10:]
+                    yaw_hist.append((tick, yaw_now if not yaw_hist else
+                                     yaw_hist[-1][1] + _wrap(yaw_now - yaw_hist[-1][1])))
+                    while len(yaw_hist) > 2 and tick - yaw_hist[1][0] >= 0.25:
+                        yaw_hist.pop(0)
                     prev_yaw, prev_tick = yaw_now, tick
                     with self._state_lock:
                         self._pose, self._pose_at = T, tick
@@ -539,17 +591,19 @@ class OnlineNavigator:
                             if matcher is None:
                                 matcher = make_sgbm()
                             disp = stereo_disparity(pair[0], pair[1], matcher)
+                            # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
                             pts = stereo_points(pair[0], pair[1], fx=sensors.fx, cx=sensors.cx, cy=sensors.cy,
-                                                baseline_m=sensors.baseline_m, disp=disp)
+                                                baseline_m=sensors.baseline_m, disp=disp,
+                                                max_range_m=c.mapper.range_m)
                             near, n = near_obstacle(
                                 pts, r_ob, cam_h=self._cam_h, scale=s, ahead_m=c.stop_ahead_m,
                                 half_width_m=c.radius_m, ground_tol_m=c.mapper.ground_tol_m,
                                 top_m=c.mapper.obst_top_m, min_pts=c.stop_min_pts)
                             yaw = math.atan2(T[1, 0], T[0, 0])
-                            new_kf = (kf_xy is None
-                                      or float(np.hypot(*(T[:2, 3] - kf_xy))) * s >= c.kf_dist_m
-                                      or abs(math.degrees(_wrap(yaw - kf_yaw))) >= c.kf_turn_deg
-                                      or tick - kf_at >= c.kf_max_age_s)
+                            (t_a, y_a), (t_b, y_b) = yaw_hist[0], yaw_hist[-1]
+                            rate = math.degrees(y_b - y_a) / (t_b - t_a) if t_b > t_a else 0.0
+                            kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
+                            new_kf = kf_kind is not None
                             feat = None
                             if new_kf and self.loops is not None:
                                 # 同一张视差图给 ORB 点深度；只在关键帧上做，约 6 ms。
@@ -564,9 +618,9 @@ class OnlineNavigator:
                                 self._stereo_ms = (time.perf_counter() - t0) * 1000.0
                                 if new_kf:
                                     kf_id += 1
-                                    self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick)))
+                                    self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
+                                                                 kf_kind == "refresh")))
                             if new_kf:
-                                kf_xy, kf_yaw, kf_at = T[:2, 3].copy(), yaw, tick
                                 self._map_event.set()
                 self._stop.wait(max(0.0, period - (self._clock() - tick)))
         except Exception as exc:  # noqa: BLE001 - 线程死了控制线程会因位姿过期而停车
@@ -597,7 +651,7 @@ class OnlineNavigator:
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
                 for kind, item in pending:
                     if kind == "kf":
-                        k, pts, T, dist, feat, t_kf = item
+                        k, pts, T, dist, feat, t_kf, refresh = item
                         dirty = True
                         found = []
                         if self.loops is None:
@@ -606,9 +660,14 @@ class OnlineNavigator:
                             found = self.loops.add_keyframe(k, T, dist, feat)
                             # 关键帧按修正后的位姿入图；回环后所有关键帧整体换位姿。
                             self.mapper.add_keyframe(k, pts, self.loops.pose(k), osc_dist_m=dist)
+                        if refresh:
+                            # 原地补帧：上一帧的点云让给这帧；它的位姿、轨迹、回环节点都留着。
+                            self.mapper.drop_points(k - 1)
+                            self._kf_refreshed += 1
                         if rec is not None:
                             rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat)
-                            rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found})
+                            rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
+                                                "refresh": refresh})
                         if self.loops is not None:
                             if found:
                                 moved = self.mapper.update_poses(self.loops.poses())
@@ -763,6 +822,9 @@ class OnlineNavigator:
             "osc_samples": self.dr.samples,
             "goal_xy_m": None if goal is None else [round(goal[0], 3), round(goal[1], 3)],
             "keyframes": self._keyframes,
+            # 原地补帧（点云替换上一帧）与快转推迟的次数；地图里有点云的关键帧 = keyframes − refreshed。
+            "keyframes_refreshed": self._kf_refreshed,
+            "keyframes_deferred": 0 if self._kf_policy is None else self._kf_policy.deferred,
             "map_updates": self._map_updates,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),

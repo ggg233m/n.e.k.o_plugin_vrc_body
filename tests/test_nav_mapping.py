@@ -170,6 +170,33 @@ def ghost_block(x0: float, x1: float, y0: float, y1: float, h0: float, h1: float
     return np.column_stack([gx.ravel(), gy.ravel(), gz.ravel() - CAM_H])
 
 
+class DropPointsTests(unittest.TestCase):
+    """原地补帧：去掉旧帧的点云 = 从没加过它；位姿、轨迹、锚点照旧。"""
+
+    def test_drop_matches_build_without_it_and_keeps_pose(self) -> None:
+        scene = world_scene()
+        poses = [pose(0, 0), pose(0.02, 0.01), pose(1.0, 0)]
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i, T in enumerate(poses):
+            m.add_keyframe(i, observe(scene, T), T, osc_dist_m=float(i))
+        m.add_trail(1, pose(0.5, 0), osc_dist_m=1.5)
+        m.rasterize()
+        anc = m.anchor((0.03, 0.0))
+        walked = m.walked()
+        m.drop_points(1)
+        m.drop_points(1)                                    # 重复调用无副作用
+        ref = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i in (0, 2):
+            ref.add_keyframe(i, observe(scene, poses[i]), poses[i])
+        a, b = m.rasterize(), ref.rasterize()
+        self.assertEqual(len(m), 2)
+        np.testing.assert_array_equal(a.grid, b.grid)
+        self.assertEqual(anc[0], 1)
+        self.assertIsNotNone(m.resolve(anc))
+        self.assertEqual(len(m.walked()), len(walked))
+        np.testing.assert_allclose(np.vstack(m.walked()), np.vstack(walked))
+
+
 class RayClearTests(unittest.TestCase):
     """射线清除：墙留着、只在一帧里出现又被后来视线看穿的鬼影清掉、走过的中心线清掉；回环不重追线。"""
 

@@ -13,7 +13,7 @@ import numpy as np
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend import nav_online
-from neko_anyadance_body.backend.nav_online import (DeadReckoner, OnlineNavConfig, OnlineNavigator,
+from neko_anyadance_body.backend.nav_online import (DeadReckoner, KeyframePolicy, OnlineNavConfig, OnlineNavigator,
                                                     SessionRecorder, hmd_to_base_rotation, near_obstacle)
 
 S = 0.755
@@ -102,6 +102,36 @@ def ground_and_wall(wall_x_track: float | None) -> np.ndarray:
         wy, wz = np.meshgrid(np.arange(-0.5, 0.5, 0.03), np.arange(-CAM_H + 0.5, -CAM_H + 1.2, 0.05))
         pts.append(np.column_stack([np.full(wy.size, wall_x_track), wy.ravel(), wz.ravel()]))
     return np.vstack(pts).astype(np.float32)
+
+
+class KeyframePolicyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.p = KeyframePolicy(OnlineNavConfig())
+        self.assertEqual(self.p.decide(0.0, np.zeros(2), 0.0, 0.0), "new")
+
+    def test_still_age_frame_is_refresh(self) -> None:
+        self.assertIsNone(self.p.decide(1.0, np.zeros(2), 0.0, 0.0))
+        self.assertEqual(self.p.decide(3.0, np.array([0.05, 0.0]), math.radians(5), 0.0), "refresh")
+        # 慢慢挪了 0.2 m（没到 0.4 m 触发距离）：到龄补的帧是新视角，追加不替换。
+        self.assertEqual(self.p.decide(6.0, np.array([0.05 + 0.2 / S, 0.0]), math.radians(5), 0.0), "new")
+
+    def test_distance_triggers_new(self) -> None:
+        self.assertEqual(self.p.decide(0.5, np.array([0.45 / S, 0.0]), 0.0, 0.0), "new")
+
+    def test_fast_turn_defers_then_falls_back(self) -> None:
+        yaw = math.radians(40)
+        self.assertIsNone(self.p.decide(0.5, np.zeros(2), yaw, 90.0))
+        self.assertIsNone(self.p.decide(1.0, np.zeros(2), yaw, 90.0))
+        self.assertEqual(self.p.deferred, 2)
+        # 转了 1 s 还没停：兜底照取。
+        self.assertEqual(self.p.decide(1.6, np.zeros(2), yaw, 90.0), "new")
+        # 转慢下来立刻取，推迟计时从头算。
+        self.assertIsNone(self.p.decide(1.7, np.zeros(2), yaw * 2, 90.0))
+        self.assertEqual(self.p.decide(1.8, np.zeros(2), yaw * 2, 10.0), "new")
+
+    def test_fast_turn_while_walking_falls_back_on_distance(self) -> None:
+        self.assertIsNone(self.p.decide(0.2, np.array([0.5 / S, 0.0]), 0.0, 60.0))
+        self.assertEqual(self.p.decide(0.4, np.array([0.85 / S, 0.0]), 0.0, 60.0), "new")
 
 
 class NearObstacleTest(unittest.TestCase):
@@ -344,6 +374,7 @@ class RecorderTest(unittest.TestCase):
             self.assertAlmostEqual(ev[0]["baseline_m"], FakeSensors.baseline_m)
             # 录到的关键帧数与状态一致、id 连续，每个都有点云文件。
             self.assertEqual([e["k"] for e in kfs], list(range(st["keyframes"])))
+            self.assertTrue(all(isinstance(e["refresh"], bool) for e in kfs))
             self.assertGreaterEqual(len(kfs), 3)
             for e in kfs:
                 with np.load(out / "kf" / f"{e['k']:06d}.npz") as z:
