@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -52,6 +53,18 @@ class LoopConfig:
     max_offset_m: float = 6.0
     max_view_deg: float = 60.0
     max_candidates: int = 4
+    # ---- 外观候选（词袋）：让候选发现**不再只依赖当前估计位置** ----
+    # 病灶（`Docs/停顿后地图错位-根因诊断（2026-10-01）.md` §10）：位置候选的排序键就是被漂移
+    # 污染的位置本身 ⇒ 漂移让轨迹自我折叠，真配对 (181,385) 排到第 60 名，59 个不相干帧在
+    # "几何上更近"。外观候选与位置无关，是唯一能跳出这个自指的入口。
+    # 0 = 关闭（**默认关**）。> 0 时每帧额外试这么多外观候选，与位置候选取并集。
+    bow_candidates: int = 0
+    # 先取这么多外观候选，**过完 min_path_m 再截断**到 bow_candidates（顺序不能反，见
+    # `_bow_candidates` 的注释）。
+    bow_shortlist: int = 32
+    # 离线训好的词汇树（tools/train_bow_vocab.py）。空字符串 = 不启用。
+    # ⚠️ 词汇树是世界相关的：跨路线迁移实测只掉 0.5~4.6 pt，但**跨世界未测**，换世界要重训。
+    bow_vocab: str = "models/bow_vocab.npz"
     ratio: float = 0.8
     min_inliers: int = 50              # run6：30→50 回环 26→19 条，对参照中位 0.51→0.45 m
     reproj_px: float = 3.0
@@ -219,6 +232,45 @@ class LoopCloser:
         # （重生点、传送门）而 HMD 不知道时，这里会出现一串同号的大偏差。
         self.yaw_checks: deque[tuple[int, int, float, bool]] = deque(maxlen=64)
         self.orb = cv2.ORB_create(nfeatures=self.cfg.orb_features)
+        # 外观候选（词袋）。默认关；开了但词汇树不存在也只是没有外观候选，回环照常跑。
+        self._bow: Any = None
+        self._bow_ready = False
+        self._bow_reason = "disabled" if self.cfg.bow_candidates <= 0 else "not_loaded"
+        self._bow_docs = 0
+        if self.cfg.bow_candidates > 0:
+            self._init_bow()
+
+    def _init_bow(self) -> None:
+        """载入词汇树、建空索引。**任何失败都不抛** —— 外观只是候选来源之一。"""
+        raw = str(self.cfg.bow_vocab or "").strip()
+        if not raw:
+            self._bow_reason = "no_vocab_path"
+            return
+        p = Path(raw)
+        if not p.is_absolute():
+            root = Path(__file__).resolve().parent.parent
+            cand = root / raw
+            p = cand if cand.exists() else Path(raw)
+        if not p.exists():
+            self._bow_reason = "vocab_missing"
+            return
+        try:
+            from .nav_bow import BowIndex, BowVocabulary
+        except ImportError:
+            # 离线回放常把 nav_loop 当单文件加载（没有父包），退回绝对导入。
+            try:
+                from nav_bow import BowIndex, BowVocabulary  # type: ignore[no-redef]
+            except ImportError:                             # pragma: no cover
+                self._bow_reason = "import_error"
+                return
+        try:
+            self._bow = BowIndex(BowVocabulary.load(str(p)))
+        except Exception:                                   # pragma: no cover
+            self._bow = None
+            self._bow_reason = "load_error"
+            return
+        self._bow_ready = True
+        self._bow_reason = "ok"
 
     def __len__(self) -> int:
         return len(self._order)
@@ -283,6 +335,15 @@ class LoopCloser:
                 continue
             self.loops.append(loop)
             accepted.append({"a": a, "b": k, **loop.info})
+        # 索引**必须在 query 之后**才收当前帧：先 add 再 query 会检索到自己，
+        # 产生 a==b 的自回环（z≈0、内点≈1000，所有门都过），实测回环数 623→949、覆盖帧 19→36 全是假的。
+        if self._bow_ready and node.feat is not None and len(node.feat.des):
+            try:
+                self._bow.add(k, node.feat.des)
+                self._bow_docs = len(self._bow)
+            except Exception:                               # pragma: no cover
+                self._bow_ready = False
+                self._bow_reason = "add_error"
         if accepted:
             self._last_loop_kf = k
             self._last_loop_idx = len(self._order) - 1     # 本帧已在上面 append，索引即末位
@@ -309,7 +370,50 @@ class LoopCloser:
             if math.degrees(math.acos(float(np.clip(fa @ fb, -1.0, 1.0)))) > c.max_view_deg:
                 continue
             out.append((gap, a))
-        return [a for _g, a in sorted(out)[:c.max_candidates]]
+        res = [a for _g, a in sorted(out)[:c.max_candidates]]
+        if self._bow_ready:
+            res += self._bow_candidates(b, nb)
+        seen: set[int] = set()
+        uniq = []
+        for a in res:
+            if a not in seen:
+                seen.add(a)
+                uniq.append(a)
+        return uniq
+
+    def _bow_candidates(self, b: int, nb: "_Node") -> list[int]:
+        """外观候选。**先过门、再截断** —— 顺序反了会全军覆没。
+
+        ⚠️ 顺序为什么不能反：长时间停顿时 `dist_m` 不动，一堆积压的重复帧在外观上都"最像"，
+        会把 top-N 名额占满；若先截断再过 `min_path_m`，这些名额全被废掉 —— 9-29 录制
+        （41% 是停顿）实测存活 **0.0~0.2 / 12**，97~100% 的帧一个真候选都不剩。
+        所以先取 `bow_shortlist` 个、用 `min_path_m` 筛掉"同一次经过"，再截断到 `bow_candidates`。
+
+        ⚠️ `min_path_m` 必须在这里**自己过**：`_verify` 不查这个门（它只写在位置分支里），
+        绕过它就会混进大量相邻帧平凡对（实测 63%，路程中位 1.4 m vs 正常 15.9 m）。
+        """
+        c = self.cfg
+        if nb.feat is None or not len(nb.feat.des):
+            return []
+        try:
+            ranked = self._bow.query(nb.feat.des, top_n=int(max(1, c.bow_shortlist)))
+        except Exception:                                   # pragma: no cover
+            self._bow_ready = False
+            self._bow_reason = "query_error"
+            return []
+        out: list[int] = []
+        for a, _score in ranked:
+            if a == b:
+                continue
+            na = self._nodes.get(a)
+            if na is None or na.feat is None or len(na.feat.des3d) < c.min_inliers:
+                continue
+            if nb.dist_m - na.dist_m < c.min_path_m:        # 同一次经过不算重访
+                continue
+            out.append(a)
+            if len(out) >= int(c.bow_candidates):
+                break
+        return out
 
     def _verify(self, a: int, b: int) -> tuple[_Loop | None, str]:
         c, s = self.cfg, self.cfg.world_scale
@@ -400,6 +504,12 @@ class LoopCloser:
                 "kf_since_last_loop": kf_since,
                 "path_since_last_loop_m": round(path_since, 1),
                 "loops_downweighted": sum(1 for L in self.loops if L.weight < 0.5),
+                # 外观候选的状态必须外显：默认关，但一旦开了却没词汇树，最容易变成
+                # "以为在跑其实没跑"。bow_reason 直接说原因（ok / vocab_missing / ...）。
+                "bow_ready": bool(self._bow_ready),
+                "bow_reason": self._bow_reason,
+                "bow_docs": int(self._bow_docs),
+                "bow_candidates": int(self.cfg.bow_candidates),
                 "correction_m": round(float(np.hypot(*self.offset())) * s, 3),
                 "rejects": dict(self.rejects),
                 "yaw_checks": [{"b": b, "a": a, "yaw_err_deg": e, "accepted": ok}

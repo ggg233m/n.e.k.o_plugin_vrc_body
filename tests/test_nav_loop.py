@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -201,6 +203,149 @@ class LoopCloserTest(unittest.TestCase):
         lc.add_keyframe(3, pose(0, 0), 0.0, None)
         with self.assertRaises(ValueError):
             lc.add_keyframe(3, pose(0, 0), 0.0, None)
+
+
+class BowCandidateTest(unittest.TestCase):
+    """外观（词袋）候选的接线：默认关、缺词汇树不致命、候选必须过 min_path_m。
+
+    对应 `Docs/停顿后地图错位-根因诊断（2026-10-01）.md` §10 的两条硬要求：
+      ① `_verify` 不查 `min_path_m`，所以外观候选必须**自己过**；
+      ② 必须**先过门再截断**，否则长时间停顿时名额被重复帧占满。
+    """
+
+    @staticmethod
+    def _vocab(tmpdir: str) -> str:
+        from neko_anyadance_body.backend import nav_bow
+
+        rng = np.random.default_rng(0)
+        pool = rng.integers(0, 256, (4000, 32), dtype=np.uint8)
+        # 词数不能太少：16 词的粗直方图会让**随机**描述子也拿到满分 1.0 排到最前
+        # （实测 top8 里混进 4 个只有 20 个描述子的填充帧），测试就失去判别力。
+        v = nav_bow.BowVocabulary(branching=8, depth=3, seed=0).train(pool, iters=3)
+        p = os.path.join(tmpdir, "bow_vocab_test.npz")
+        v.save(p)
+        return p
+
+    @staticmethod
+    def _filler(seed: int) -> KeyframeFeatures:
+        """不合格的填充特征：des3d < min_inliers ⇒ 永远当不了候选。"""
+        rng = np.random.default_rng(seed)
+        n = 20
+        P = np.column_stack([rng.uniform(2.0, 5.0, n), rng.uniform(-2.0, 2.0, n),
+                             rng.uniform(-1.0, 0.5, n)])
+        uv = rng.uniform(0, 700, (n, 2)).astype(np.float32)
+        des = rng.integers(0, 256, (n, 32), dtype=np.uint8)
+        return KeyframeFeatures(uv, des, P.astype(np.float32), des, K, (720, 405), HALF_B)
+
+    def test_off_by_default(self) -> None:
+        self.assertEqual(LoopConfig().bow_candidates, 0)
+        st = LoopCloser(LoopConfig()).status()
+        self.assertFalse(st["bow_ready"])
+        self.assertEqual(st["bow_reason"], "disabled")
+
+    def test_missing_vocab_is_not_fatal(self) -> None:
+        cfg = LoopConfig(bow_candidates=4, bow_vocab="no/such/vocab.npz")
+        lc = LoopCloser(cfg)
+        st = lc.status()
+        self.assertFalse(st["bow_ready"])
+        self.assertEqual(st["bow_reason"], "vocab_missing")
+        # 回环照常跑：外观只是候选来源之一，没有它不能崩。
+        for i in range(3):
+            lc.add_keyframe(i, pose(float(i) * 0.5, 0.0), float(i) * 0.4, None)
+        self.assertEqual(len(lc), 3)
+
+    def test_appearance_candidate_found_and_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = self._vocab(td)
+            # 0 号与 8 号是同一处（描述子一致、相对位姿已知），中间夹 7 帧填充。
+            fa, fb = scene_pair(yaw_R(5.0), np.array([0.25, 0.10, 0.0]), n=600, seed=1)
+            cfg = LoopConfig(bow_candidates=4, bow_shortlist=32, bow_vocab=path)
+            lc = LoopCloser(cfg)
+            self.assertTrue(lc.status()["bow_ready"])
+            feats = [fa] + [self._filler(100 + i) for i in range(7)] + [fb]
+            yaws = [0.0] * 8 + [5.0]
+            for i in range(9):
+                lc.add_keyframe(i, pose(float(i) * 0.25, 0.0, yaws[i]), float(i) * 1.0, feats[i])
+
+            # ① 外观分支确实把 0 号找了出来（填充帧因 des3d 太少被挡）
+            cand = lc._bow_candidates(8, lc._nodes[8])
+            self.assertIn(0, cand)
+            self.assertNotIn(8, cand)                      # 永不自荐
+            # ② 索引是 query 之后才收当前帧的 ⇒ 关键帧数 == 索引文档数，且无自回环
+            self.assertEqual(lc.status()["bow_docs"], 9)
+            self.assertEqual([(L.a, L.b) for L in lc.loops if L.a == L.b], [])
+            # ③ 每条收下的回环都满足 min_path_m —— `_verify` 不查这个门，全靠候选分支自己过
+            for L in lc.loops:
+                self.assertGreaterEqual(lc._nodes[L.b].dist_m - lc._nodes[L.a].dist_m,
+                                        cfg.min_path_m)
+
+    def test_gate_before_truncate(self) -> None:
+        """先过门再截断：短名单全被 min_path 挡掉时，也不能退化成"一个候选都没有"。"""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._vocab(td)
+            fa, fb = scene_pair(yaw_R(5.0), np.array([0.25, 0.10, 0.0]), n=600, seed=2)
+            # 真实重访不会像素级相同：把 0 号 600 个描述子里的 250 个换掉 ⇒ 外观分低于
+            # "和 61 号一模一样"的停顿帧，排名落在它们后面，这样"先截断"才会真把它挤掉。
+            rng = np.random.default_rng(7)
+            des0 = fa.des.copy()
+            pick = rng.choice(len(des0), 250, replace=False)
+            des0[pick] = rng.integers(0, 256, (len(pick), 32), dtype=np.uint8)
+            fa = KeyframeFeatures(fa.uv, des0, fa.xyz, des0, fa.K, fa.size, fa.eye_y)
+            cfg = LoopConfig(bow_candidates=4, bow_shortlist=32, bow_vocab=path)
+            lc = LoopCloser(cfg)
+            # 走到 10 m：0 号是出发点，1..30 号在走（路程增长）
+            lc.add_keyframe(0, pose(0.0, 0.0), 0.0, fa)
+            for i in range(1, 31):
+                lc.add_keyframe(i, pose(float(i) * 0.1, 0.0), float(i) * 0.33, self._filler(200 + i))
+            # 然后**原地停 20 帧**：路程全停在 10.0，且画面和 51 号一模一样（外观最像）
+            for i in range(31, 51):
+                lc.add_keyframe(i, pose(3.0, 0.0), 10.0, fb)
+            # 51 号：仍停在 10.0，但这里是 0 号那处的重访
+            lc.add_keyframe(51, pose(0.25, 0.10, 5.0), 10.0, fb)
+
+            # 先证明"病灶"存在：外观排名前 4 全是停顿帧，先截断的话一个真候选都不剩
+            raw = lc._bow.query(lc._nodes[51].feat.des, top_n=32)
+            top4 = [a for a, _s in raw[:4]]
+            self.assertTrue(top4)
+            self.assertTrue(all(lc._nodes[a].dist_m >= 9.9 for a in top4))
+            # 再证明修法有效：先过 min_path 再截断，真候选 0 号活下来了
+            cand = lc._bow_candidates(51, lc._nodes[51])
+            self.assertIn(0, cand)
+            self.assertTrue(all(lc._nodes[a].dist_m <= 10.0 - cfg.min_path_m for a in cand))
+
+    def test_shortlist_depth_is_a_hard_bound(self) -> None:
+        """"先过门再截断"只在短名单深度内有效 —— 停顿长过 shortlist 时照样找不到。
+
+        这不是 bug，是有界性：真候选必须**先出现在 top-N 里**才有机会过门。
+        实测（同等构造、shortlist=32）：停 20 帧时 0 号排第 23；停 30 帧时排第 33 ⇒ 掉出短名单。
+        把这条写成断言，是为了防止有人以为"先过门"能救任意长的停顿。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = self._vocab(td)
+            fa, fb = scene_pair(yaw_R(5.0), np.array([0.25, 0.10, 0.0]), n=600, seed=2)
+            rng = np.random.default_rng(7)
+            des0 = fa.des.copy()
+            pick = rng.choice(len(des0), 250, replace=False)
+            des0[pick] = rng.integers(0, 256, (len(pick), 32), dtype=np.uint8)
+            fa = KeyframeFeatures(fa.uv, des0, fa.xyz, des0, fa.K, fa.size, fa.eye_y)
+            cfg = LoopConfig(bow_candidates=4, bow_shortlist=32, bow_vocab=path)
+            lc = LoopCloser(cfg)
+            lc.add_keyframe(0, pose(0.0, 0.0), 0.0, fa)
+            for i in range(1, 31):
+                lc.add_keyframe(i, pose(float(i) * 0.1, 0.0), float(i) * 0.33,
+                                self._filler(200 + i))
+            for i in range(31, 61):                       # 停 30 帧 > 短名单里给它留的位置
+                lc.add_keyframe(i, pose(3.0, 0.0), 10.0, fb)
+            lc.add_keyframe(61, pose(0.25, 0.10, 5.0), 10.0, fb)
+
+            raw = lc._bow.query(lc._nodes[61].feat.des, top_n=64)
+            rank0 = [r for r, (a, _s) in enumerate(raw) if a == 0]
+            self.assertTrue(rank0)
+            self.assertGreaterEqual(rank0[0], cfg.bow_shortlist)   # 已在短名单外
+            self.assertEqual(lc._bow_candidates(61, lc._nodes[61]), [])
+            # 把短名单抬到能覆盖它 ⇒ 立刻找得回来（证明瓶颈确实是深度，不是门）
+            cfg.bow_shortlist = 64
+            self.assertIn(0, lc._bow_candidates(61, lc._nodes[61]))
 
 
 if __name__ == "__main__":

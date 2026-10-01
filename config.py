@@ -268,6 +268,10 @@ NAVMESH_LOOP_KEYS: dict[str, tuple[type, float, float]] = {
     "reproj_px": (float, 0.5, 20.0),
     "max_candidates": (int, 1, 64),
     "yaw_tol_deg": (float, 0.0, 180.0),
+    # 外观（词袋）候选。0 = 关闭（默认）。开着但词汇树缺失时回环照常跑，
+    # 只是没有外观候选 —— 见 nav_loop.LoopCloser.status()["bow_reason"]。
+    "bow_candidates": (int, 0, 64),
+    "bow_shortlist": (int, 1, 256),
 }
 
 NavmeshOverrides = tuple[tuple[str, "float | int | bool"], ...]
