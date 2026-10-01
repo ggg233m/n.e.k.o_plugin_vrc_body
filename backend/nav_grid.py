@@ -83,9 +83,12 @@ class NavGrid:
             raise FileNotFoundError(str(pgm))
         if g.shape != (int(info["rows"]), int(info["cols"])) or info.get("row0") != "max_y":
             raise ValueError(f"{pgm} 与 {side.name} 的尺寸或行序不一致")
+        # 不回落默认值：world_scale 随 avatar 变，猜一个会把整张图按错的比例换成世界米。
+        if "world_scale" not in info:
+            raise ValueError(f"{side.name} 缺 world_scale")
         return cls(g, GridMeta(float(info["resolution_m"]),
                                (float(info["origin_xy_m"][0]), float(info["origin_xy_m"][1])),
-                               float(info.get("world_scale", 0.755))))
+                               float(info["world_scale"])))
 
     # ---- 坐标 ----
     def to_cell(self, xy_world: Sequence[float]) -> tuple[int, int]:

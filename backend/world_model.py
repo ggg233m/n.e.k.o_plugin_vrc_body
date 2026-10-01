@@ -47,8 +47,8 @@ _SAFE_KEY = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_KEY_LEN = 128
 
 
-def _sanitize(value: str) -> str:
-    """把任意 world_key 规整成安全的单段文件名。"""
+def sanitize_world_key(value: str) -> str:
+    """把任意 world_key 规整成安全的单段文件名（navmesh 记忆分区目录也用它）。"""
     safe = _SAFE_KEY.sub("_", value).strip("_.-")
     if not safe:
         safe = "unknown"
@@ -139,6 +139,12 @@ class WorldModel:
             "world_conflict_risk": source == "manual_name",
         }
 
+    def identity(self) -> dict[str, Any]:
+        """当前世界身份快照：``{"world_key", "world_name", "world_source"}``；未知时 key 为 None。"""
+        with self._lock:
+            return {"world_key": self._world_key, "world_name": self._world_name,
+                    "world_source": self._world_source}
+
     # ---- 记忆分区 ----------------------------------------------------------
 
     def memory_partition(self) -> str | None:
@@ -155,7 +161,7 @@ class WorldModel:
             key = self._world_key
             if key is None:
                 return None
-            return str(self._state_dir / f"world_memory_{_sanitize(key)}.json")
+            return str(self._state_dir / f"world_memory_{sanitize_world_key(key)}.json")
 
     # ---- 启停（后台线程，支持耗时启动） ------------------------------------
 
@@ -255,7 +261,7 @@ class WorldModel:
         key = self._world_key
         if key is None:
             return None
-        return str(self._state_dir / f"world_memory_{_sanitize(key)}.json")
+        return str(self._state_dir / f"world_memory_{sanitize_world_key(key)}.json")
 
 
 __all__ = ["WorldModel"]

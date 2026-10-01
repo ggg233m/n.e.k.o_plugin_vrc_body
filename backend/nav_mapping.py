@@ -38,7 +38,7 @@ class MapperConfig:
     pad_m: float = 1.0
     cam_h_band: tuple[float, float] = (1.2, 2.6)   # 地面候选：相机下方这个范围
     cam_h_default: float = 1.73     # 候选太少时的回退值（run6 实测 1.728）
-    world_scale: float = 0.755
+    world_scale: float = 0.755      # 由 OnlineNavConfig.world_scale 覆盖，别在这里改
     # 入图时按关键帧局部系体素化（带计数），栅格化只处理体素中心：run6 每帧约 1 万点 → 2.5 千体素。
     # xy 取栅格的一半，量化误差 ≤ 2.5 cm；z 2 cm，远小于 ground_tol。
     vox_xy_m: float = 0.05
@@ -256,6 +256,10 @@ class KeyframeGridMapper:
                      osc_dist_m: float | None = None) -> None:
         """``osc_dist_m``：该关键帧时刻的 OSC 累计路程（世界米）；给了才能门控走过的走廊。"""
         k = int(node_id)
+        if k in self._pts:
+            # 与 LoopCloser.add_keyframe 同口径的廉价防御：重复 id 会静默覆盖点云与位姿。
+            # drop_points(k) 之后再 add_keyframe(k) 不算重复（点云已摘掉），refresh 走的正是这条路。
+            raise ValueError("关键帧 id 必须递增")
         p = np.asarray(points_base, np.float32).reshape(-1, 3)
         p = p[np.hypot(p[:, 0], p[:, 1]) <= self.cfg.range_m]
         self._pts[k], self._cnt[k] = _voxelize(p, self.cfg.vox_xy_m, self.cfg.vox_z_m)

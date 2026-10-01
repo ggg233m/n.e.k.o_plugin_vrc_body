@@ -27,3 +27,4 @@ models/depth_anything_v2_small/
 /_wm_out.txt
 # 在线 navmesh 会话录制（大文件）
 navmesh_recordings/
+navmesh_memory/

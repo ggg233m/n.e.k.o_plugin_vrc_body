@@ -135,6 +135,11 @@ class NavGridTests(unittest.TestCase):
                 "row0": "max_y"}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 NavGrid.load(pgm)
+            pgm.with_suffix(".json").write_text(json.dumps({     # 尺寸对、只缺 world_scale：不许回落默认值
+                "resolution_m": RES, "origin_xy_m": [0, 0], "rows": 80, "cols": 120,
+                "row0": "max_y"}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "world_scale"):
+                NavGrid.load(pgm)
 
 
 if __name__ == "__main__":

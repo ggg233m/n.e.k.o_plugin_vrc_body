@@ -137,11 +137,14 @@ function render(s, auto) {
   $("mapMs").textContent = s.map_update_ms == null ? "—" : `${num(s.map_update_ms, 0)} ms`;
   $("camH").textContent = s.camera_height_m == null ? "—" : `${num(s.camera_height_m)} m`;
   const lc = s.loop_closure;
-  $("loops").textContent = lc ? `${lc.loops} / ${lc.loops_downweighted} / ${num(lc.correction_m)} m` : "关闭";
+  // 回环健康度：距上次回环多少关键帧 / 多少 OSC 路程。长期单涨 = 回环静默（尾部 0 回环）的现场证据。
+  $("loops").textContent = lc
+    ? `${lc.loops} / ${lc.loops_downweighted} / ${num(lc.correction_m)} m · 距上次回环 ${lc.kf_since_last_loop ?? "—"} 帧 / ${lc.path_since_last_loop_m ?? "—"} m`
+    : "关闭";
   const yc = (lc && lc.yaw_checks) || [];
   const jumps = s.hmd_yaw_jumps || [];
   const lastYaw = yc.slice(-4).map(c => `${c.accepted ? "" : "✗"}${num(c.yaw_err_deg, 0)}°`).join(" ");
-  flag($("yawDiag"), `${lastYaw || "—"} / ${jumps.length ? jumps.slice(-2).map(j => num(j.delta_deg, 0) + "°").join(" ") : "无"}`,
+  flag($("yawDiag"), `${lastYaw || "—"} / ${jumps.length ? jumps.slice(-2).map(j => (j.neutral ? "外部中立帧 " : "") + num(j.delta_deg, 0) + "°").join(" ") : "无"}`,
        jumps.length ? "bad" : "ok");
   const near = s.near_obstacle || {};
   flag($("near"), near.stop ? `停（${near.points} 点）` : `无（${near.points ?? 0} 点）`, near.stop ? "bad" : "ok");
@@ -175,6 +178,7 @@ async function poll() {
   } finally { pollBusy = false; }
 }
 
+if ($("memoryLink") && token) $("memoryLink").href = `/navmesh/memory#token=${encodeURIComponent(token)}`;
 if (!token) $("msg").textContent = "URL 里没有 token：用 /navmesh#token=… 打开。";
 poll();
 setInterval(poll, 500);

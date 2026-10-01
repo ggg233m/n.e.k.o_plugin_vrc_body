@@ -56,6 +56,18 @@ class MapperTests(unittest.TestCase):
             m.add_keyframe(i, observe(self.scene, T), T)
         return m
 
+    def test_duplicate_keyframe_id_rejected(self) -> None:
+        # 与 LoopCloser.add_keyframe 同口径的廉价防御：重复 id 会静默覆盖点云与位姿。
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        m.add_keyframe(0, observe(self.scene, pose(0, 0)), pose(0, 0))
+        with self.assertRaises(ValueError):
+            m.add_keyframe(0, observe(self.scene, pose(1.0, 0)), pose(1.0, 0))
+        # 摘掉点云之后重新入同一个 id 不算重复：原地补帧走的就是这条路。
+        m.drop_points(0)
+        self.assertEqual(len(m), 0)
+        m.add_keyframe(0, observe(self.scene, pose(1.0, 0)), pose(1.0, 0))
+        self.assertEqual(len(m), 1)
+
     def test_ground_free_wall_obstacle_behind_unknown(self) -> None:
         ng = self.mapper_with([pose(0, 0), pose(1.0, 0)]).rasterize()
         self.assertEqual(value_at(ng, (2.0, 0.0)), FREE)

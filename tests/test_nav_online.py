@@ -5,7 +5,9 @@ import math
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
+from dataclasses import fields
 from pathlib import Path
 from unittest import mock
 
@@ -13,8 +15,12 @@ import numpy as np
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend import nav_online
+from neko_anyadance_body import config
+from neko_anyadance_body.backend.nav_loop import LoopConfig
+from neko_anyadance_body.backend.nav_mapping import MapperConfig
 from neko_anyadance_body.backend.nav_online import (DeadReckoner, KeyframePolicy, OnlineNavConfig, OnlineNavigator,
-                                                    SessionRecorder, hmd_to_base_rotation, near_obstacle)
+                                                    SessionRecorder, check_baseline, hmd_to_base_rotation,
+                                                    near_obstacle)
 
 S = 0.755
 CAM_H = 1.73
@@ -307,6 +313,47 @@ class ThreadsTest(unittest.TestCase):
         self.assertTrue(h.sensors.closed)
         self.assertFalse(h.nav.running)
 
+    def test_session_is_persisted_to_world_memory(self) -> None:
+        from neko_anyadance_body.backend.nav_memory import MemoryConfig, NavMemoryStore, world_dir_name
+        with tempfile.TemporaryDirectory() as tmp:
+            store = NavMemoryStore(Path(tmp), MemoryConfig(min_session_keyframes=1))
+            h = Harness(armed=False, vz=0.5)
+            h.nav.memory = store
+            h.nav._world_identity = lambda: {"world_key": "wrld_test", "world_name": "t", "world_source": "manual"}
+            with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+                h.nav.start()
+                try:
+                    self.assertEqual(h.nav.status()["memory"]["status"], "recording")
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline and h.nav.status()["keyframes"] < 3:
+                        time.sleep(0.05)
+                finally:
+                    h.nav.stop()
+            wid = world_dir_name("wrld_test")
+            sessions = store.list_sessions(wid)
+            self.assertEqual(len(sessions), 1)
+            info = store.session(wid, sessions[0]["session_id"])
+            self.assertEqual(info["status"], "complete")
+            self.assertGreaterEqual(info["keyframes"], 3)
+            self.assertEqual(info["baseline_m"], 0.126)
+            self.assertEqual(info["world_scale"], S)
+            poses = store.load_poses(wid, sessions[0]["session_id"])
+            self.assertEqual(len(poses["ids"]), info["keyframes"])
+            self.assertIsNone(store.active_status())
+
+    def test_unknown_world_runs_without_memory(self) -> None:
+        from neko_anyadance_body.backend.nav_memory import NavMemoryStore
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Harness(armed=False)
+            h.nav.memory = NavMemoryStore(Path(tmp))
+            h.nav._world_identity = lambda: {"world_key": None}
+            h.nav.start()
+            try:
+                self.assertEqual(h.nav.status()["memory"], {"active": False, "reason": "world_unknown"})
+            finally:
+                h.nav.stop()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_external_hmd_yaw_snap_reported(self) -> None:
         h = Harness(armed=False)
         yaw = {"deg": 0.0}
@@ -338,6 +385,80 @@ class ThreadsTest(unittest.TestCase):
         h.nav.stop()
         self.assertTrue(any("SteamVR not running" in e for e in st["errors"]))
         self.assertEqual(st["pose_state"], "unknown")
+
+    def test_baseline_mismatch_reported_but_keeps_running(self) -> None:
+        h = Harness(armed=False)
+        h.sensors.baseline_m = 0.063          # 发行版驱动
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start()
+            try:
+                time.sleep(0.2)
+                st = h.nav.status()
+            finally:
+                h.nav.stop()
+        self.assertIs(st["baseline_check"]["ok"], False)
+        self.assertTrue(any(e.startswith("baseline_mismatch") for e in st["errors"]))
+        self.assertEqual(st["pose_state"], "localized")
+
+    def test_baseline_ok_has_no_error(self) -> None:
+        h = Harness(armed=False)
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start()
+            try:
+                time.sleep(0.2)
+                st = h.nav.status()
+            finally:
+                h.nav.stop()
+        self.assertIs(st["baseline_check"]["ok"], True)
+        self.assertFalse(any(e.startswith("baseline_mismatch") for e in st["errors"]))
+
+
+class ConfigSurfaceTest(unittest.TestCase):
+    def test_world_scale_single_source(self) -> None:
+        c = OnlineNavConfig(world_scale=0.9)
+        self.assertEqual((c.mapper.world_scale, c.loop.world_scale), (0.9, 0.9))
+        c = OnlineNavConfig(world_scale=0.8, mapper=MapperConfig(world_scale=0.5))
+        self.assertEqual(c.mapper.world_scale, 0.8)
+        self.assertEqual(KeyframePolicy(c).scale, 0.8)
+
+    def test_check_baseline(self) -> None:
+        c = OnlineNavConfig()
+        self.assertTrue(check_baseline(0.1262, c)["ok"])
+        self.assertFalse(check_baseline(0.063, c)["ok"])
+        self.assertFalse(check_baseline(float("nan"), c)["ok"])
+        self.assertIsNone(check_baseline(0.063, OnlineNavConfig(expected_baseline_m=0.0))["ok"])
+
+    def test_config_keys_match_backend_fields(self) -> None:
+        for spec, cls in ((config.NAVMESH_ONLINE_KEYS, OnlineNavConfig), (config.NAVMESH_MAPPER_KEYS, MapperConfig),
+                          (config.NAVMESH_LOOP_KEYS, LoopConfig)):
+            names = {f.name: f for f in fields(cls)}
+            for key, (kind, _lo, _hi) in spec.items():
+                self.assertIn(key, names, f"{cls.__name__}.{key}")
+                self.assertIsInstance(getattr(cls(), key), kind, f"{cls.__name__}.{key}")
+            self.assertNotIn("world_scale", spec)
+
+    def test_defaults_equal_backend_defaults(self) -> None:
+        c = OnlineNavConfig.from_plugin(config.PluginConfig.from_mapping({}).navmesh)
+        self.assertEqual(c, OnlineNavConfig())
+
+    def test_plugin_toml_round_trip(self) -> None:
+        with (Path(__file__).resolve().parents[1] / "plugin.toml").open("rb") as fh:
+            nav = config.PluginConfig.from_mapping(tomllib.load(fh)).navmesh
+        c = OnlineNavConfig.from_plugin(nav)
+        self.assertEqual((c.world_scale, c.expected_baseline_m, c.mapper.range_m), (0.755, 0.126, 5.0))
+
+    def test_overrides_and_validation(self) -> None:
+        nav = config.PluginConfig.from_mapping({"navmesh": {
+            "world_scale": 0.8, "kf_dist_m": 0.5, "stop_min_pts": 20, "loop_closure": False,
+            "mapper": {"range_m": 4.0, "ray_clear": False}, "loop": {"min_inliers": 40}}}).navmesh
+        c = OnlineNavConfig.from_plugin(nav)
+        self.assertEqual((c.world_scale, c.kf_dist_m, c.stop_min_pts, c.loop_closure), (0.8, 0.5, 20, False))
+        self.assertEqual((c.mapper.range_m, c.mapper.ray_clear, c.mapper.world_scale), (4.0, False, 0.8))
+        self.assertEqual((c.loop.min_inliers, c.loop.world_scale), (40, 0.8))
+        for bad in ({"world_scale": 0}, {"kf_dst_m": 0.5}, {"mapper": {"world_scale": 0.9}},
+                    {"mapper": {"range_m": "far"}}, {"loop": {"min_inliers": 1.5}}, {"mapper": 3}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                config.PluginConfig.from_mapping({"navmesh": bad})
 
 
 class RecorderTest(unittest.TestCase):

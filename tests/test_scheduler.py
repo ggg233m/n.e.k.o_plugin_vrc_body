@@ -470,6 +470,36 @@ class SchedulerTests(unittest.TestCase):
         devices = self.transport.latest_payload()["devices"]
         self.assertEqual(list(devices), ["hmd"])
 
+    def test_disabled_head_is_resent_after_turn_so_foreign_frames_self_heal(self) -> None:
+        """驱动保留最后一帧：别的发送端插一帧中立姿态，朝向会一直偏到下次转向。
+
+        2026-10-01 会话里 HMD 从 165° 突然变成单位旋转停了 27 s，就是这样。
+        转过之后身体输出关着也要低频重发 HMD，偏差最多持续一个心跳周期。
+        """
+        self.assertEqual(self.transport.count(), 0)       # 没转过就不占驱动
+        self.assertTrue(self.scheduler.submit("turn", {"delta_deg": 90.0})["accepted"])
+        wait_until(lambda: self.scheduler.snapshot()["heading"]["turn_commands"] >= 1)
+        wait_until(lambda: not self.scheduler.snapshot()["heading"]["turning"])
+        time.sleep(0.4)                                   # 等 250 ms 的收尾帧发完
+        settled = self.transport.count()
+        wait_until(lambda: self.transport.count() > settled, timeout=2.0)
+        x, y, z, w = self.transport.latest_payload()["devices"]["hmd"]["pose"]["rotation_xyzw"]
+        self.assertAlmostEqual(math.degrees(2 * math.atan2(y, w)), 90.0, places=1)
+        # 是心跳不是全速：1 s 内只该多出几帧。
+        before = self.transport.count()
+        time.sleep(1.0)
+        self.assertLessEqual(self.transport.count() - before, 3)
+
+    def test_shutdown_keeps_heading_in_neutral_frames(self) -> None:
+        """停机回中立的是身体，不是朝向：不叠 yaw 会把镜头甩回会话起点。"""
+        self.enable()
+        self.assertTrue(self.scheduler.submit("turn", {"yaw_deg": 120.0})["accepted"])
+        wait_until(lambda: self.scheduler.snapshot()["heading"]["turn_commands"] >= 1)
+        wait_until(lambda: not self.scheduler.snapshot()["heading"]["turning"])
+        self.scheduler.shutdown()
+        x, y, z, w = self.transport.latest_payload()["devices"]["hmd"]["pose"]["rotation_xyzw"]
+        self.assertAlmostEqual(math.degrees(2 * math.atan2(y, w)), 120.0, places=1)
+
     def test_turn_rotates_whole_play_space_not_just_the_head(self) -> None:
         """只转头会让身体拧着；整个 play space 绕原点转才是原地转身。"""
         self.enable()

@@ -109,6 +109,9 @@ _UI_ASSETS = {
     "/ui/navmesh.css": ("navmesh.css", "text/css; charset=utf-8"),
     # 在线增量 navmesh：镜像双目 + 航位推算 + 回环；goto 需点击后确认，驾驶另需自主武装。
     "/navmesh": ("navmesh.html", "text/html; charset=utf-8"),
+    # navmesh 记忆管理：按世界列会话、看缩略图、钉住/标签/删除/配额清理。
+    "/navmesh/memory": ("navmesh_memory.html", "text/html; charset=utf-8"),
+    "/ui/navmesh_memory.js": ("navmesh_memory.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -232,6 +235,25 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             grid = parse_qs(urlsplit(self.path).query).get("grid", ["0"])[0]
             self._json(200, self.server.service.navmesh_status(
                 include_grid=str(grid).lower() in {"1", "true", "yes"}))
+            return
+        if path.startswith("/worldmodel/navmesh/memory"):
+            q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            svc = self.server.service
+            if path == "/worldmodel/navmesh/memory":
+                self._json(200, svc.navmesh_memory_summary())
+            elif path == "/worldmodel/navmesh/memory/sessions":
+                self._json(200, svc.navmesh_memory_sessions(q.get("world")))
+            elif path == "/worldmodel/navmesh/memory/session":
+                self._json(200, svc.navmesh_memory_session(q.get("world"), q.get("session")))
+            elif path == "/worldmodel/navmesh/memory/thumb":
+                try:
+                    body = svc.navmesh_memory_thumbnail(q.get("world"), q.get("session"), q.get("k"))
+                except (KeyError, ValueError, TypeError) as exc:
+                    self._json(404, {"error": str(exc)})
+                    return
+                self._bytes(200, body, "image/jpeg")
+            else:
+                self._json(404, {"error": "unknown endpoint"})
             return
         if path == "/config":
             self._json(200, self.server.config_store.snapshot())
@@ -415,6 +437,14 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.navmesh_explore()
             elif self.path == "/worldmodel/navmesh/cancel":
                 result = self.server.service.navmesh_cancel()
+            elif self.path == "/worldmodel/navmesh/memory/update":
+                result = self.server.service.navmesh_memory_update(
+                    value.get("world"), value.get("session"), value.get("label"), value.get("pinned"))
+            elif self.path == "/worldmodel/navmesh/memory/delete":
+                result = self.server.service.navmesh_memory_delete(
+                    value.get("world"), value.get("session"), value.get("scope"))
+            elif self.path == "/worldmodel/navmesh/memory/prune":
+                result = self.server.service.navmesh_memory_prune()
             elif self.path == "/vmc/recalibrate":
                 result = self.server.service.vmc_recalibrate(
                     value.get("reason"),

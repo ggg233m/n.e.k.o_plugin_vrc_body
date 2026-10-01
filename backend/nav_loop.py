@@ -43,7 +43,13 @@ class LoopConfig:
     search_base_m: float = 1.0        # 世界米
     search_frac: float = 0.06         # 漂移半径随路程增长（实测 2.8%，留两倍余量）
     search_max_m: float = 6.0
-    max_offset_m: float = 3.0         # 追踪米：两帧相机最多隔这么远还能看到同一片东西
+    # 追踪米：两帧相机最多隔这么远还能看到同一片东西。
+    # 3.0（= 2.27 世界米）对 102.45° FOV 偏保守：见 Docs/停顿后地图错位-根因诊断（2026-10-01）.md §九，
+    # 录制 20261001_044153 上尾部 0 回环的唯一病灶就是它 —— 唯一能启动尾部链条的那条回环
+    # (a=181,b=385) 真实相隔 5.45 追踪米，被 3.0 判 too_far；放到 6.0 后尾部 16 条回环全部出现，
+    # 且经交叉留出验证为**真实漂移的修正**（留出组残差 4.91→0.27 m、深度点云倒角 3.86→0.08 m）。
+    # ⚠️ 5.45 vs 6.0 余量只有 10%，且漂移半径封顶 search_max_m=6.0 会在更长的录制上复发（§九.6）。
+    max_offset_m: float = 6.0
     max_view_deg: float = 60.0
     max_candidates: int = 4
     ratio: float = 0.8
@@ -56,7 +62,7 @@ class LoopConfig:
     loop_sigma_m: float = 0.10
     loop_sigma_frac: float = 0.03     # 回环 σ 随两帧距离增长（远点深度更不准）
     robust_k: float = 3.0
-    world_scale: float = 0.755
+    world_scale: float = 0.755        # 由 OnlineNavConfig.world_scale 覆盖，别在这里改
 
 
 @dataclass
@@ -203,6 +209,12 @@ class LoopCloser:
         self._x: dict[int, np.ndarray] = {}
         self.loops: list[_Loop] = []
         self.rejects: dict[str, int] = {}
+        # 回环健康度：距上次**接受**回环过去了多少关键帧 / 多少 OSC 路程。
+        # 「尾部长期 0 回环」此前没有任何外显，只能事后翻录制才发现（见
+        # Docs/停顿后地图错位-根因诊断（2026-10-01）.md §七.3），这里让它自己报警。
+        self._last_loop_kf: int | None = None
+        self._last_loop_idx: int | None = None
+        self._last_loop_dist_m: float | None = None
         # PnP 过了、再比 HMD 朝向的每个候选：(b, a, 带符号 yaw 差°, 是否接受)。VRChat 自己转/传送了人
         # （重生点、传送门）而 HMD 不知道时，这里会出现一串同号的大偏差。
         self.yaw_checks: deque[tuple[int, int, float, bool]] = deque(maxlen=64)
@@ -272,6 +284,9 @@ class LoopCloser:
             self.loops.append(loop)
             accepted.append({"a": a, "b": k, **loop.info})
         if accepted:
+            self._last_loop_kf = k
+            self._last_loop_idx = len(self._order) - 1     # 本帧已在上面 append，索引即末位
+            self._last_loop_dist_m = node.dist_m
             self.optimize()
         return accepted
 
@@ -371,7 +386,19 @@ class LoopCloser:
 
     def status(self) -> dict[str, Any]:
         s = self.cfg.world_scale
+        # 健康度：还没出过回环时，"距上次回环"= 从起点到现在（一样是单调增长、能报警）。
+        if not self._order:
+            kf_since, path_since = 0, 0.0
+        elif self._last_loop_idx is None:
+            kf_since = len(self._order)
+            path_since = self._nodes[self._order[-1]].dist_m - self._nodes[self._order[0]].dist_m
+        else:
+            kf_since = len(self._order) - 1 - self._last_loop_idx
+            path_since = self._nodes[self._order[-1]].dist_m - (self._last_loop_dist_m or 0.0)
         return {"keyframes": len(self._order), "loops": len(self.loops),
+                "last_loop_keyframe": self._last_loop_kf,
+                "kf_since_last_loop": kf_since,
+                "path_since_last_loop_m": round(path_since, 1),
                 "loops_downweighted": sum(1 for L in self.loops if L.weight < 0.5),
                 "correction_m": round(float(np.hypot(*self.offset())) * s, 3),
                 "rejects": dict(self.rejects),

@@ -229,6 +229,117 @@ class WorldModelConfig:
     persist: bool = True
 
 
+# [navmesh] 各子表允许覆盖的键：名字 -> (类型, 下限, 上限)。键名必须与 backend 的
+# OnlineNavConfig / MapperConfig / LoopConfig 字段一致（tests/test_nav_online.py 钉住），
+# 默认值只在 backend 一处；这里不写的键就用 backend 默认。未知键直接报错，防止拼错后静默不生效。
+NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
+    "osc_lag_s": (float, 0.0, 1.0),
+    "stereo_period_s": (float, 0.02, 2.0),
+    "map_min_interval_s": (float, 0.05, 10.0),
+    "kf_dist_m": (float, 0.05, 5.0),
+    "kf_turn_deg": (float, 1.0, 180.0),
+    "kf_max_age_s": (float, 0.1, 60.0),
+    "kf_still_m": (float, 0.0, 2.0),
+    "kf_still_deg": (float, 0.0, 90.0),
+    "kf_defer_dps": (float, 1.0, 10000.0),
+    "stop_ahead_m": (float, 0.1, 5.0),
+    "stop_min_pts": (int, 1, 100000),
+    "radius_m": (float, 0.05, 2.0),
+    "move_hold_ms": (int, 100, 5000),
+    "record_max_mb": (float, 1.0, 100000.0),
+}
+NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
+    "res_m": (float, 0.02, 1.0),
+    "range_m": (float, 0.5, 20.0),
+    "ground_tol_m": (float, 0.02, 2.0),
+    "obst_top_m": (float, 0.2, 5.0),
+    "min_pts": (int, 1, 1000),
+    "occ_ground_ratio": (float, 0.0, 10.0),
+    "ray_clear": (bool, 0, 1),
+    "ray_beta": (float, 0.1, 20.0),
+    "ray_step_m": (float, 0.02, 1.0),
+}
+NAVMESH_LOOP_KEYS: dict[str, tuple[type, float, float]] = {
+    "orb_features": (int, 100, 10000),
+    "max_depth_m": (float, 1.0, 50.0),
+    "min_path_m": (float, 0.0, 100.0),
+    "ratio": (float, 0.1, 1.0),
+    "min_inliers": (int, 6, 10000),
+    "reproj_px": (float, 0.5, 20.0),
+    "max_candidates": (int, 1, 64),
+    "yaw_tol_deg": (float, 0.0, 180.0),
+}
+
+NavmeshOverrides = tuple[tuple[str, "float | int | bool"], ...]
+
+
+def _navmesh_overrides(data: Mapping[str, Any], spec: Mapping[str, tuple[type, float, float]], *,
+                       prefix: str, nested: frozenset[str] = frozenset()) -> NavmeshOverrides:
+    unknown = sorted(set(data) - set(spec) - nested)
+    if unknown:
+        raise ValueError(f"{prefix} has unknown keys: {', '.join(unknown)}")
+    out: list[tuple[str, float | int | bool]] = []
+    for key, (kind, lo, hi) in spec.items():
+        raw = data.get(key)
+        if raw is None:
+            continue
+        name = f"{prefix}.{key}"
+        if kind is bool:
+            out.append((key, _boolean(raw, False, name=name)))
+        elif kind is int:
+            out.append((key, _bounded_int(raw, 0, minimum=int(lo), maximum=int(hi), name=name)))
+        else:
+            out.append((key, _finite_float(raw, 0.0, minimum=lo, maximum=hi, name=name)))
+    return tuple(out)
+
+
+def _navmesh_memory(data: Mapping[str, Any]) -> "NavmeshMemoryConfig":
+    spec: dict[str, tuple[type, float, float]] = {
+        "enabled": (bool, 0, 1), "max_total_mb": (float, 10.0, 1_000_000.0),
+        "max_world_mb": (float, 5.0, 1_000_000.0), "max_sessions_per_world": (int, 1, 10000),
+        "max_session_mb": (float, 1.0, 100_000.0), "min_session_keyframes": (int, 0, 100000),
+        "pose_flush_s": (float, 1.0, 3600.0), "thumb_width": (int, 64, 1280), "thumb_quality": (int, 20, 95),
+    }
+    return NavmeshMemoryConfig(**dict(_navmesh_overrides(data, spec, prefix="navmesh.memory")))
+
+
+@dataclass(frozen=True)
+class NavmeshMemoryConfig:
+    """[navmesh.memory]：按世界分区的关键帧记忆（位姿 + 地图侧 ORB 特征 + 缩略图），在
+    ``<state_dir>/navmesh_memory/``。字段与 backend ``nav_memory.MemoryConfig`` 同名同义。
+    world_key 未设置（POST /worldmodel/world）时不写。钉住的会话永不被配额清理删除。"""
+
+    enabled: bool = True
+    max_total_mb: float = 4096.0
+    max_world_mb: float = 1024.0
+    max_sessions_per_world: int = 30
+    max_session_mb: float = 512.0
+    min_session_keyframes: int = 20
+    pose_flush_s: float = 10.0
+    thumb_width: int = 320
+    thumb_quality: int = 70
+
+
+@dataclass(frozen=True)
+class NavmeshConfig:
+    """在线建图导航（/worldmodel/navmesh）的配置面。
+
+    ``world_scale`` 是唯一真值源：世界米 = 追踪米 × s，随 avatar 变（现用 avatar 实测 0.755）。
+    ``expected_baseline_m`` 是启动自检的期望双目基线：0.126 只有自编 AnyaDance 驱动才有，
+    SteamVR 注册回发行版会静默回到 0.063（深度噪声翻倍、跨会话记忆混用）。0 表示不检查。
+    ``online`` / ``mapper`` / ``loop`` 只存用户显式写了的覆盖项，其余沿用 backend 默认。
+    """
+
+    world_scale: float = 0.755
+    expected_baseline_m: float = 0.126
+    baseline_tol_m: float = 0.01
+    loop_closure: bool = True
+    online: NavmeshOverrides = ()
+    mapper: NavmeshOverrides = ()
+    loop: NavmeshOverrides = ()
+    memory: NavmeshMemoryConfig = NavmeshMemoryConfig()
+
+
 @dataclass(frozen=True)
 class VisionConfig:
     """模型无关的感知 worker 配置；具体 detector 由后端注入。"""
@@ -341,6 +452,7 @@ class PluginConfig:
     autonomy: AutonomyConfig = AutonomyConfig()
     world_memory: WorldMemoryConfig = WorldMemoryConfig()
     world_model: WorldModelConfig = WorldModelConfig()
+    navmesh: NavmeshConfig = NavmeshConfig()
     vision: VisionConfig = VisionConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
@@ -526,6 +638,21 @@ class PluginConfig:
         world_model_config = WorldModelConfig(
             enabled=_boolean(world_model.get("enabled"), False, name="world_model.enabled"),
             persist=_boolean(world_model.get("persist"), True, name="world_model.persist"),
+        )
+        navmesh = _section(root, "navmesh")
+        navmesh_top = {"world_scale", "expected_baseline_m", "baseline_tol_m", "loop_closure", "mapper", "loop", "memory"}
+        for sub in ("mapper", "loop", "memory"):
+            if sub in navmesh and not isinstance(navmesh[sub], Mapping):
+                raise ValueError(f"navmesh.{sub} must be a table")
+        navmesh_config = NavmeshConfig(
+            world_scale=_finite_float(navmesh.get("world_scale"), 0.755, minimum=0.05, maximum=20.0, name="navmesh.world_scale"),
+            expected_baseline_m=_finite_float(navmesh.get("expected_baseline_m"), 0.126, minimum=0.0, maximum=0.5, name="navmesh.expected_baseline_m"),
+            baseline_tol_m=_finite_float(navmesh.get("baseline_tol_m"), 0.01, minimum=0.0, maximum=0.2, name="navmesh.baseline_tol_m"),
+            loop_closure=_boolean(navmesh.get("loop_closure"), True, name="navmesh.loop_closure"),
+            online=_navmesh_overrides(navmesh, NAVMESH_ONLINE_KEYS, prefix="navmesh", nested=frozenset(navmesh_top)),
+            mapper=_navmesh_overrides(_section(navmesh, "mapper"), NAVMESH_MAPPER_KEYS, prefix="navmesh.mapper"),
+            loop=_navmesh_overrides(_section(navmesh, "loop"), NAVMESH_LOOP_KEYS, prefix="navmesh.loop"),
+            memory=_navmesh_memory(_section(navmesh, "memory")),
         )
         vision_source = str(vision.get("source", "none")).strip().lower() or "none"
         if vision_source not in {"none", "mss", "dxcam", "desktop_mirror", "wgc", "external"}:
@@ -903,6 +1030,7 @@ class PluginConfig:
             autonomy=autonomy_config,
             world_memory=world_memory_config,
             world_model=world_model_config,
+            navmesh=navmesh_config,
             vision=vision_config,
             profile=body_profile,
             safety=safety_config,

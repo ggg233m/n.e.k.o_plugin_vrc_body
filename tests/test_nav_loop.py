@@ -170,6 +170,32 @@ class LoopCloserTest(unittest.TestCase):
         T = pose(1.0, 2.0)
         np.testing.assert_allclose(lc.correct(T), T)
 
+    def test_status_reports_loop_freshness(self) -> None:
+        # 健康度：全程 0 回环时 = 从起点累计，单调增长 —— 这就是"尾部长期 0 回环"的报警器
+        # （此前只能事后翻录制才发现，见 Docs/停顿后地图错位-根因诊断（2026-10-01）.md §七.3）。
+        lc = LoopCloser(LoopConfig())
+        pts = square_loop()
+        walk(lc, pts, 0.05, lambda a, b: (None, "few_matches"))
+        st = lc.status()
+        self.assertIsNone(st["last_loop_keyframe"])
+        self.assertEqual(st["kf_since_last_loop"], len(pts))
+        self.assertAlmostEqual(st["path_since_last_loop_m"], 16.0, delta=0.2)
+
+        # 回环发生那一刻：两个计数归零。
+        lc2 = LoopCloser(LoopConfig())
+        last = len(pts) - 1
+
+        def rel(a, b):
+            if (a, b) == (0, last):
+                return {"R_ab": np.eye(3), "t_ab": np.zeros(3), **OK_REL}, "ok"
+            return None, "few_matches"
+
+        walk(lc2, pts, 0.05, rel)
+        st2 = lc2.status()
+        self.assertEqual(st2["last_loop_keyframe"], last)
+        self.assertEqual(st2["kf_since_last_loop"], 0)
+        self.assertAlmostEqual(st2["path_since_last_loop_m"], 0.0, places=1)
+
     def test_ids_must_increase(self) -> None:
         lc = LoopCloser(LoopConfig())
         lc.add_keyframe(3, pose(0, 0), 0.0, None)

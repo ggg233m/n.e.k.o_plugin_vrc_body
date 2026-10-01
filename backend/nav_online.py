@@ -20,7 +20,7 @@ import json
 import math
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -29,6 +29,7 @@ import numpy as np
 
 from .nav_grid import FREE, OCC
 from .nav_loop import LoopCloser, LoopConfig, extract_features
+from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, make_sgbm, stereo_disparity, stereo_points
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
@@ -41,6 +42,13 @@ def hmd_to_base_rotation(r_hmd: np.ndarray) -> np.ndarray:
 
 @dataclass
 class OnlineNavConfig:
+    # 世界米 = 追踪米 × world_scale（随 avatar 变）。唯一真值源：__post_init__ 把它推给 mapper / loop，
+    # 两边各写一份时以这里为准（改 mapper.world_scale 不会生效，别在那边改）。
+    world_scale: float = 0.755
+    # 启动自检：实测双目基线与期望差超过 tol 就报 baseline_mismatch（不停机：深度按实测基线算，几何仍对，
+    # 只是噪声变了；但跨会话记忆不能混用）。0.126 = 自编驱动；发行版驱动是 0.063。0 表示不检查。
+    expected_baseline_m: float = 0.126
+    baseline_tol_m: float = 0.01
     osc_lag_s: float = 0.18          # OSC 速度比画面晚到约 0.18 s（run5/run6 局部窗口回放扫描最优 0.175–0.2）
     pose_hz: float = 20.0
     # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
@@ -77,6 +85,31 @@ class OnlineNavConfig:
     loop: LoopConfig = field(default_factory=LoopConfig)
     record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
 
+    def __post_init__(self) -> None:
+        if self.mapper.world_scale != self.world_scale:
+            self.mapper = replace(self.mapper, world_scale=self.world_scale)
+        if self.loop.world_scale != self.world_scale:
+            self.loop = replace(self.loop, world_scale=self.world_scale)
+
+    @classmethod
+    def from_plugin(cls, nav: Any) -> "OnlineNavConfig":
+        """由 ``config.NavmeshConfig`` 构造：顶层字段 + online/mapper/loop 三组覆盖项（键已在 config 校验）。"""
+        mapper = replace(MapperConfig(), **dict(nav.mapper))
+        loop = replace(LoopConfig(), **dict(nav.loop))
+        return cls(world_scale=nav.world_scale, expected_baseline_m=nav.expected_baseline_m,
+                   baseline_tol_m=nav.baseline_tol_m, loop_closure=nav.loop_closure,
+                   mapper=mapper, loop=loop, **dict(nav.online))
+
+
+def check_baseline(measured_m: float, cfg: OnlineNavConfig) -> dict[str, Any]:
+    """实测基线对期望。``ok`` 为 None 表示不检查。"""
+    exp = float(cfg.expected_baseline_m)
+    if exp <= 0.0:
+        return {"ok": None, "measured_m": round(float(measured_m), 4), "expected_m": None}
+    ok = math.isfinite(measured_m) and abs(float(measured_m) - exp) <= cfg.baseline_tol_m
+    return {"ok": bool(ok), "measured_m": round(float(measured_m), 4), "expected_m": exp,
+            "tol_m": cfg.baseline_tol_m}
+
 
 class KeyframePolicy:
     """双目帧要不要成为关键帧。``decide`` 返回 None（不取）、``"new"``（追加）或
@@ -84,7 +117,7 @@ class KeyframePolicy:
 
     def __init__(self, cfg: OnlineNavConfig) -> None:
         self.cfg = cfg
-        self.scale = cfg.mapper.world_scale
+        self.scale = cfg.world_scale
         self.xy: np.ndarray | None = None
         self.yaw = 0.0
         self.at = -math.inf
@@ -341,13 +374,20 @@ class OpenVRSensors:
         m = pose.mDeviceToAbsoluteTracking
         return np.array([[m[i][j] for j in range(3)] for i in range(3)], float)
 
-    def read_stereo(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def read_stereo_rgb(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """两眼同帧 RGB（记忆缩略图要彩色）；``read_stereo`` 是它的灰度版。"""
         from .openvr_mirror import read_stereo
 
         left, right = read_stereo(self._eyes[0], self._eyes[1])
         if left is None or right is None:
             return None
-        return cv2.cvtColor(left, cv2.COLOR_RGB2GRAY), cv2.cvtColor(right, cv2.COLOR_RGB2GRAY)
+        return left, right
+
+    def read_stereo(self) -> tuple[np.ndarray, np.ndarray] | None:
+        pair = self.read_stereo_rgb()
+        if pair is None:
+            return None
+        return cv2.cvtColor(pair[0], cv2.COLOR_RGB2GRAY), cv2.cvtColor(pair[1], cv2.COLOR_RGB2GRAY)
 
     def close(self) -> None:
         from .wgc_capture import _release
@@ -405,8 +445,14 @@ class OnlineNavigator:
                  stop_motion: Callable[[], Any], drive_block_reason: Callable[[], str | None],
                  sensors_factory: Callable[[], Any] = OpenVRSensors,
                  cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
-                 record_root: Path | None = None) -> None:
+                 record_root: Path | None = None, memory: NavMemoryStore | None = None,
+                 world_identity: Callable[[], dict[str, Any]] | None = None) -> None:
         self.cfg = cfg or OnlineNavConfig()
+        # 持久记忆（按世界分区）。world_identity() → {"world_key", ...}；key 为空时本次会话不写记忆。
+        self.memory = memory
+        self._world_identity = world_identity
+        self._mem: SessionWriter | None = None
+        self._mem_reason: str | None = "not_started"
         self._record_root = None if record_root is None else Path(record_root)
         self.recorder: SessionRecorder | None = None
         self._motion_history = motion_history
@@ -427,7 +473,7 @@ class OnlineNavigator:
         c = self.cfg
         self.mapper = KeyframeGridMapper(c.mapper)
         self.session = NavSession(self.mapper, radius_m=c.radius_m, request_update=self._request_map_update)
-        self.dr = DeadReckoner(c.mapper.world_scale, c.osc_lag_s)
+        self.dr = DeadReckoner(c.world_scale, c.osc_lag_s)
         self.loops = LoopCloser(c.loop) if c.loop_closure else None
         self._offset = np.zeros(2)          # 回环修正量（追踪米），加在原始航位推算上
         self._last_loop: dict[str, Any] | None = None
@@ -446,6 +492,7 @@ class OnlineNavigator:
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
         self._sensor_info: dict[str, Any] | None = None
+        self._baseline_check: dict[str, Any] | None = None
         self._errors: list[str] = []
         # 一个位姿周期里 HMD yaw 变化超过调度器转速上限能解释的量 = 有人在我们之外转了 play space
         # （SteamVR/VRChat 重置朝向、传送）。航位推算会从那一刻起朝错方向积分，必须留痕。
@@ -454,6 +501,9 @@ class OnlineNavigator:
         self._drive_block: str | None = "not_started"
         self._last_step: dict[str, Any] = {}
         self._started_at: float | None = None
+        # 记忆位姿表：k → (T_dr, osc 路程, 相对启动秒)。T_map 在整表写时现取（回环会改）。
+        self._mem_rows: dict[int, tuple[np.ndarray, float, float]] = {}
+        self._mem_flushed_at = -math.inf
 
     # ---- 生命周期 ----
     @property
@@ -478,6 +528,9 @@ class OnlineNavigator:
                         {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at})
                 except (OSError, TypeError) as exc:
                     self._fail("recorder", exc)
+        self._mem_rows = {}
+        self._mem_flushed_at = -math.inf
+        self._begin_memory()
         self._threads = [threading.Thread(target=fn, name=f"navmesh-{name}", daemon=True)
                          for name, fn in (("perception", self._perception_loop),
                                           ("mapping", self._mapping_loop),
@@ -497,7 +550,48 @@ class OnlineNavigator:
             self.session.cancel()
         if self.recorder is not None:
             self.recorder.close(None if self.loops is None else self.loops.poses())
+        self._end_memory()
         return self.status()
+
+    # ---- 持久记忆 ----
+    def _begin_memory(self) -> None:
+        self._mem = None
+        if self.memory is None:
+            self._mem_reason = "memory_not_configured"
+            return
+        try:
+            identity = {} if self._world_identity is None else dict(self._world_identity() or {})
+            self._mem, self._mem_reason = self.memory.begin(identity, {
+                "world_scale": self.cfg.world_scale, "expected_baseline_m": self.cfg.expected_baseline_m,
+                "loop_closure": self.cfg.loop_closure})
+        except Exception as exc:  # noqa: BLE001 - 记忆开不了照样导航
+            self._mem, self._mem_reason = None, "memory_error"
+            self._fail("memory", exc)
+
+    def _mem_table(self) -> dict[str, np.ndarray] | None:
+        rows = dict(self._mem_rows)
+        if not rows:
+            return None
+        ids = sorted(rows)
+        loops = self.loops
+        T_map = [loops.pose(k) if loops is not None and k in loops else rows[k][0] for k in ids]
+        return {"ids": np.array(ids), "T_map": np.array(T_map), "T_dr": np.array([rows[k][0] for k in ids]),
+                "dist_m": np.array([rows[k][1] for k in ids]), "t_s": np.array([rows[k][2] for k in ids])}
+
+    def _end_memory(self) -> None:
+        mem, self._mem = self._mem, None
+        if mem is None or self.memory is None:
+            return
+        extra: dict[str, Any] = {"odometry_m": round(self.dr.dist_m, 2)}
+        if self._loop_status is not None:
+            extra["loops"] = self._loop_status.get("loops")
+        mem.annotate(**extra)
+        try:
+            # 线程都已 join，loops 不会再变。
+            self.memory.end(self._mem_table(), "complete_with_errors" if self._errors else "complete")
+            self._mem_reason = "ended"
+        except Exception as exc:  # noqa: BLE001
+            self._fail("memory_end", exc)
 
     def _fail(self, where: str, exc: BaseException) -> None:
         with self._state_lock:
@@ -517,7 +611,7 @@ class OnlineNavigator:
             T, at, off = self._pose, self._pose_at, self._offset
         if T is None or at is None or self._clock() - at > self.cfg.pose_stale_s:
             return {"state": "unknown", "reason": "pose_stale"}
-        s = self.cfg.mapper.world_scale
+        s = self.cfg.world_scale
         x, y = T[0, 3] + off[0], T[1, 3] + off[1]
         return {"state": "localized", "xy": (float(x * s), float(y * s)),
                 "theta": math.atan2(T[1, 0], T[0, 0]), "sigma_m": self.cfg.dr_sigma_m}
@@ -525,15 +619,26 @@ class OnlineNavigator:
     # ---- 感知线程 ----
     def _perception_loop(self) -> None:
         c = self.cfg
-        s = c.mapper.world_scale
+        s = c.world_scale
         try:
             sensors = self._sensors_factory()
             info = sensors.open()
         except Exception as exc:  # noqa: BLE001 - SteamVR 没开 / openvr 没装：如实报，不崩 backend
             self._fail("sensors_open", exc)
             return
+        bl = check_baseline(float(sensors.baseline_m), c)
         with self._state_lock:
             self._sensor_info = info
+            self._baseline_check = bl
+        mem = self._mem
+        if mem is not None:
+            # 基线不对的会话也记，但带实测基线：跨会话重定位只拿同基线的记忆比。
+            mem.annotate(sensors=info, baseline_m=round(float(sensors.baseline_m), 4), baseline_check=bl)
+        read_rgb = getattr(sensors, "read_stereo_rgb", None) if mem is not None else None
+        if bl["ok"] is False:
+            self._fail("baseline_mismatch", RuntimeError(
+                f"measured {bl['measured_m']} m, expected {bl['expected_m']}±{bl['tol_m']} m "
+                "(SteamVR 注册的 AnyaDance 驱动不是自编版？)"))
         rec = self.recorder
         if rec is not None:
             rec.line("events", {"kind": "sensors", "t": self._clock(), "info": info, "fx": sensors.fx,
@@ -571,7 +676,9 @@ class OnlineNavigator:
                                 self._yaw_jumps = (self._yaw_jumps + [{
                                     "t_s": round(tick - (self._started_at or tick), 2),
                                     "delta_deg": round(dyaw, 1), "keyframe": kf_id,
-                                    "odometry_m": round(self.dr.dist_m, 2)}])[-10:]
+                                    "odometry_m": round(self.dr.dist_m, 2),
+                                    # 精确单位旋转 = 驱动收到了别的发送端的中立帧，不是 VRChat 转的。
+                                    "neutral": bool(np.allclose(r_ob, np.eye(3), atol=1e-6))}])[-10:]
                     yaw_hist.append((tick, yaw_now if not yaw_hist else
                                      yaw_hist[-1][1] + _wrap(yaw_now - yaw_hist[-1][1])))
                     while len(yaw_hist) > 2 and tick - yaw_hist[1][0] >= 0.25:
@@ -586,7 +693,14 @@ class OnlineNavigator:
                     if tick >= next_stereo:
                         next_stereo = tick + c.stereo_period_s
                         t0 = time.perf_counter()
-                        pair = sensors.read_stereo()
+                        left_rgb = None
+                        if read_rgb is not None:
+                            rgb = read_rgb()
+                            pair = None if rgb is None else (cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY),
+                                                             cv2.cvtColor(rgb[1], cv2.COLOR_RGB2GRAY))
+                            left_rgb = None if rgb is None else rgb[0]
+                        else:
+                            pair = sensors.read_stereo()
                         if pair is not None:
                             if matcher is None:
                                 matcher = make_sgbm()
@@ -605,7 +719,7 @@ class OnlineNavigator:
                             kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
                             new_kf = kf_kind is not None
                             feat = None
-                            if new_kf and self.loops is not None:
+                            if new_kf and (self.loops is not None or mem is not None):
                                 # 同一张视差图给 ORB 点深度；只在关键帧上做，约 6 ms。
                                 if orb is None:
                                     orb = cv2.ORB_create(nfeatures=c.loop.orb_features)
@@ -618,8 +732,12 @@ class OnlineNavigator:
                                 self._stereo_ms = (time.perf_counter() - t0) * 1000.0
                                 if new_kf:
                                     kf_id += 1
+                                    thumb = None
+                                    if mem is not None:
+                                        src = left_rgb if left_rgb is not None else pair[0]
+                                        thumb = make_thumbnail(src, mem.cfg.thumb_width)
                                     self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
-                                                                 kf_kind == "refresh")))
+                                                                 kf_kind == "refresh", thumb)))
                             if new_kf:
                                 self._map_event.set()
                 self._stop.wait(max(0.0, period - (self._clock() - tick)))
@@ -651,7 +769,7 @@ class OnlineNavigator:
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
                 for kind, item in pending:
                     if kind == "kf":
-                        k, pts, T, dist, feat, t_kf, refresh = item
+                        k, pts, T, dist, feat, t_kf, refresh, thumb = item
                         dirty = True
                         found = []
                         if self.loops is None:
@@ -664,6 +782,10 @@ class OnlineNavigator:
                             # 原地补帧：上一帧的点云让给这帧；它的位姿、轨迹、回环节点都留着。
                             self.mapper.drop_points(k - 1)
                             self._kf_refreshed += 1
+                        mem = self._mem
+                        if mem is not None:
+                            self._mem_rows[k] = (T.copy(), float(dist), t_kf - (self._started_at or t_kf))
+                            mem.keyframe(k, feat, thumb, refresh)
                         if rec is not None:
                             rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat)
                             rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
@@ -672,7 +794,7 @@ class OnlineNavigator:
                             if found:
                                 moved = self.mapper.update_poses(self.loops.poses())
                                 self._last_loop = {"keyframe": k, "loops": found,
-                                                   "map_shift_m": round(moved * c.mapper.world_scale, 3)}
+                                                   "map_shift_m": round(moved * c.world_scale, 3)}
                             loop_status = self.loops.status()
                             with self._state_lock:
                                 self._offset = self.loops.offset()
@@ -690,6 +812,13 @@ class OnlineNavigator:
                         dirty = True
                 if rec is not None:
                     rec.flush()
+                mem = self._mem
+                if mem is not None and self._clock() - self._mem_flushed_at >= mem.cfg.pose_flush_s:
+                    # 位姿整表写：回环会改之前所有帧的位姿，逐帧写的会过期。
+                    table = self._mem_table()
+                    if table is not None:
+                        mem.poses(table)
+                        self._mem_flushed_at = self._clock()
                 if dirty and len(self.mapper):
                     wait = c.map_min_interval_s - (self._clock() - last_update)
                     if wait > 0.0:
@@ -797,6 +926,7 @@ class OnlineNavigator:
         with self._state_lock:
             near, near_pts, stereo_at = self._near, self._near_pts, self._stereo_at
             errors, info, stereo_ms = list(self._errors), self._sensor_info, self._stereo_ms
+            baseline_check = self._baseline_check
             loop_status, last_loop = self._loop_status, self._last_loop
             yaw_jumps = list(self._yaw_jumps)
         with self._nav_lock:
@@ -835,9 +965,12 @@ class OnlineNavigator:
             "last_step": dict(self._last_step),
             "last_plan": last,
             "sensors": info,
+            "baseline_check": baseline_check,
+            "world_scale": self.cfg.world_scale,
             "errors": errors,
             "uptime_s": None if self._started_at is None else round(now - self._started_at, 1),
             "recording": None if self.recorder is None else self.recorder.status(),
+            "memory": self._mem.status() if self._mem is not None else {"active": False, "reason": self._mem_reason},
         }
 
     def grid_png(self) -> str | None:

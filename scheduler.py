@@ -43,6 +43,10 @@ from .expression_motion import (
 )
 
 
+# 身体输出关闭、朝向非零时 HMD 部分帧的重发周期（秒）。别的发送端覆盖后最多偏这么久。
+HEAD_HEARTBEAT_S = 0.5
+
+
 class DatagramTransport(Protocol):
     def send(self, payload: bytes, address: tuple[str, int]) -> None: ...
     def close(self) -> None: ...
@@ -527,9 +531,11 @@ class BodyScheduler:
                                 self._state = "disabled"
                                 self._active = None
                                 self._clear_current_action(now, "completed")
-                    elif self._yaw_is_settling():
+                    elif self._yaw_is_settling() or self._head_heartbeat_due(now):
                         # 身体输出关着也要能转向：只推 HMD，别的设备保持驱动里的
-                        # 上一帧，所以不会把角色拽成 T Pose。
+                        # 上一帧，所以不会把角色拽成 T Pose。转完后仍低频重发：驱动
+                        # 保留最后收到的一帧，别的发送端（AnyaDance UI、探针脚本）
+                        # 插一帧中立姿态就会让朝向固定偏掉，直到下次转向才恢复。
                         self._send_head_frame(now)
                     self._publish_snapshot_if_due(now)
                 except Exception as exc:  # scheduler must fail safe instead of dying
@@ -842,6 +848,11 @@ class BodyScheduler:
         # 转到位之后再多发一小段。身体输出关着时我们只在转向期间发包，丢掉收尾帧
         # 就会停在差几度的地方；驱动保留最后一帧，多推 250ms 足够让它落地。
         self._yaw_hold_frames = max(self._yaw_hold_frames, max(2, int(self.config.rate_hz) // 4))
+
+    def _head_heartbeat_due(self, now: float) -> bool:
+        if self._yaw_commands == 0:
+            return False    # 从没转过就不占驱动：朝向本来就是中立的
+        return self._last_send_at is None or now - self._last_send_at >= HEAD_HEARTBEAT_S
 
     def _yaw_is_settling(self) -> bool:
         return abs(self._yaw_target_rad - self._yaw_rad) > 1e-6 or self._yaw_hold_frames > 0
@@ -1516,6 +1527,8 @@ class BodyScheduler:
             self._input_overlay.clear()
             self._frame = neutral_frame()
             self._output_frame = self._frame.clone()
+            # 中立的是身体姿势，不是朝向：不叠 yaw 会把镜头甩回会话起点。
+            self._apply_play_space_yaw()
             for _ in range(6):
                 try:
                     self._send_current_frame(self._clock())

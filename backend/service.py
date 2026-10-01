@@ -45,7 +45,8 @@ from .vision import (
 from .world_state import WorldStateStore
 from .world_model import WorldModel
 from .time_alignment import TimeAlignmentBuffer
-from .nav_online import OnlineNavigator
+from .nav_memory import NavMemoryStore, config_from_plugin as nav_memory_config
+from .nav_online import OnlineNavConfig, OnlineNavigator
 
 
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
@@ -433,6 +434,15 @@ class BackendService:
         # 光流按 WGC 帧时刻取对齐后的 OSC 速度；只保留有界样本。
         self.time_alignment = TimeAlignmentBuffer()
         self._last_osc_alignment_timestamp: float | None = None
+        # navmesh 持久记忆：按世界分区；上次没正常结束的会话在这里标成 interrupted。
+        self.navmesh_memory = NavMemoryStore(
+            Path(os.getenv("VRC_NAVMESH_MEMORY_DIR") or (self.state_dir / "navmesh_memory")),
+            nav_memory_config(self.config.navmesh.memory),
+        )
+        try:
+            self.navmesh_memory.recover()
+        except OSError:
+            pass
         # 在线增量 navmesh：显式 start 才开 OpenVR 会话，默认不占 SteamVR。
         self.navmesh = OnlineNavigator(
             motion_history=self._navmesh_motion_history,
@@ -442,6 +452,9 @@ class BackendService:
             drive_block_reason=self._navmesh_drive_block,
             # 录制默认不开；开了落到 state_dir（或 VRC_NAVMESH_RECORD_DIR），不写安装目录。
             record_root=Path(os.getenv("VRC_NAVMESH_RECORD_DIR") or (self.state_dir / "navmesh_recordings")),
+            cfg=OnlineNavConfig.from_plugin(self.config.navmesh),
+            memory=self.navmesh_memory,
+            world_identity=self.world_model.identity,
         )
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
@@ -547,6 +560,49 @@ class BackendService:
 
     def navmesh_cancel(self) -> dict[str, Any]:
         return self.navmesh.cancel()
+
+    # ---- navmesh 记忆管理（列/看/改标签/钉住/删/清理）----
+    def navmesh_memory_summary(self) -> dict[str, Any]:
+        return {**self.navmesh_memory.summary(), "world_list": self.navmesh_memory.list_worlds(),
+                "current_world": self.world_model.identity()}
+
+    def navmesh_memory_sessions(self, world_id: Any) -> dict[str, Any]:
+        return self._memory_call(lambda: {"world_id": world_id,
+                                          "sessions": self.navmesh_memory.list_sessions(world_id)})
+
+    def navmesh_memory_session(self, world_id: Any, session_id: Any) -> dict[str, Any]:
+        return self._memory_call(lambda: self.navmesh_memory.session(world_id, session_id))
+
+    def navmesh_memory_thumbnail(self, world_id: Any, session_id: Any, k: Any) -> bytes:
+        return self.navmesh_memory.thumbnail(world_id, session_id, int(k))
+
+    def navmesh_memory_update(self, world_id: Any, session_id: Any, label: Any = None,
+                              pinned: Any = None) -> dict[str, Any]:
+        return self._memory_call(lambda: self.navmesh_memory.update_session(
+            world_id, session_id, label=label, pinned=pinned))
+
+    def navmesh_memory_delete(self, world_id: Any, session_id: Any = None, scope: Any = None) -> dict[str, Any]:
+        # 整个世界删除必须显式 scope="world"：漏传 session 不能变成删整个世界。
+        if scope == "world":
+            return self._memory_call(lambda: self.navmesh_memory.delete_world(world_id))
+        if session_id is None:
+            return {"ok": False, "reason": "session_required"}
+        return self._memory_call(lambda: self.navmesh_memory.delete_session(world_id, session_id))
+
+    def navmesh_memory_prune(self) -> dict[str, Any]:
+        return self._memory_call(self.navmesh_memory.prune)
+
+    @staticmethod
+    def _memory_call(fn: Any) -> dict[str, Any]:
+        # 管理错误是可预期的（id 不对、会话正在写）：给明确 reason，不让 HTTP 层当 400 异常。
+        try:
+            return {"ok": True, **fn()}
+        except KeyError as exc:
+            return {"ok": False, "reason": str(exc.args[0]) if exc.args else "not_found"}
+        except (ValueError, PermissionError) as exc:
+            return {"ok": False, "reason": str(exc)}
+        except OSError as exc:
+            return {"ok": False, "reason": f"io_error: {exc}"[:200]}
 
     def _new_vision_worker(self, source: FrameSource) -> VisionWorker:
         # 已配置的检测器对象可能存在，但可选模型不可用（例如未部署 OpenVINO

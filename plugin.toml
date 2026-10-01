@@ -189,6 +189,34 @@ persist_players = false
 enabled = false
 persist = true
 
+# 在线建图导航（/worldmodel/navmesh）。world_scale 是唯一真值源：世界米 = 追踪米 × s，
+# 随 avatar 变（现用 avatar 实测 0.755），换 avatar 须重标。expected_baseline_m 是启动自检：
+# 0.126 只有自编 AnyaDance 驱动才有，发行版驱动是 0.063，不符时 status.errors 报 baseline_mismatch；
+# 0 表示不检查。其余参数默认沿用代码里的实测值，要覆盖就在本节或 [navmesh.mapper] /
+# [navmesh.loop] 写同名键（可写的键见 config.py 的 NAVMESH_*_KEYS，写错键名会拒绝启动）。
+[navmesh]
+world_scale = 0.755
+expected_baseline_m = 0.126
+baseline_tol_m = 0.01
+loop_closure = true
+
+[navmesh.mapper]
+range_m = 5.0
+
+[navmesh.loop]
+
+# 按世界分区的关键帧记忆（位姿整表 + 地图侧 ORB 特征 + 彩色缩略图，不存点云），
+# 在 <state_dir>/navmesh_memory/。世界身份未设置时不写。管理页：/navmesh/memory。
+# 超配额从最旧的未钉会话删起；钉住的会话永不自动删除。
+[navmesh.memory]
+enabled = true
+max_total_mb = 4096
+max_world_mb = 1024
+max_sessions_per_world = 30
+max_session_mb = 512
+min_session_keyframes = 20
+pose_flush_s = 10
+
 # 订阅 AnyaDance 驱动的遥测多播，用于确认驱动是否真的收到了命令。
 # 需要驱动支持该通道（steamvr.vrsettings 的 driver_anyadance.command_log_enabled）；
 # 旧版驱动下监听器会正常启动但收不到数据，相关字段回落为 unknown/unsupported。

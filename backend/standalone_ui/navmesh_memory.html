@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>navmesh 记忆管理</title>
+  <link rel="stylesheet" href="/ui/navmesh.css">
+  <style>
+    main { grid-template-columns:minmax(260px,1fr) minmax(420px,2fr); }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    tr.sel { background:#1f2a37; } tr.pick { cursor:pointer; } tr.pick:hover { background:#1b222c; }
+    button { background:#21262d; color:#e6edf3; border:1px solid var(--line); border-radius:6px; padding:5px 9px; cursor:pointer; }
+    button:hover:not(:disabled) { border-color:#58a6ff; } button:disabled { opacity:.45; cursor:not-allowed; }
+    button.danger { border-color:var(--bad); color:#ffb4ae; }
+    input[type=text] { background:#0d1117; color:#e6edf3; border:1px solid var(--line); border-radius:6px; padding:4px 6px; width:12em; }
+    .thumbs { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:8px; margin-top:10px; }
+    .thumbs figure { margin:0; } .thumbs img { width:100%; border-radius:4px; display:block; background:#05070a; }
+    .thumbs figcaption { font-size:11px; color:var(--muted); }
+    .ok { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+    .detail pre { white-space:pre-wrap; font-size:12px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>navmesh 记忆管理</h1>
+    <span id="summary" class="muted">—</span>
+    <span><a href="#" id="navLink" style="color:#58a6ff">← 返回在线 navmesh</a></span>
+  </header>
+  <main>
+    <section class="card">
+      <div class="title">世界（当前：<b id="curWorld">—</b>）</div>
+      <div class="controls">
+        <button id="refresh">刷新</button>
+        <button id="prune">按配额清理</button>
+      </div>
+      <table><thead><tr><th>世界</th><th>会话</th><th>MB</th><th></th></tr></thead><tbody id="worlds"></tbody></table>
+      <p id="msg" class="muted"></p>
+    </section>
+    <section class="card">
+      <div class="title" id="sessTitle">会话（先选一个世界）</div>
+      <table><thead><tr><th>会话</th><th>状态</th><th>关键帧/特征</th><th>MB</th><th>基线</th><th>标签</th><th></th></tr></thead>
+        <tbody id="sessions"></tbody></table>
+      <div class="detail" id="detail"></div>
+    </section>
+  </main>
+  <script src="/ui/navmesh_memory.js" defer></script>
+</body>
+</html>
