@@ -1,0 +1,16 @@
+/* 覆盖俯视页样式（CSP style-src 'self' 禁内联，全部走文件；基础布局复用 navmesh.css）。 */
+.map canvas { image-rendering: pixelated; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: -1px; border: 1px solid var(--line); }
+.sw-good { background: #4bb43c; }
+.sw-sparse { background: #ffd700; }
+.sw-far { background: #ff8c00; }
+.sw-hole { background: #ff00ff; }
+.sw-dark { background: #3c3c3c; }
+.sw-occ { background: #000; }
+.sw-walk { background: #78beff; }
+.sw-pose { background: #f00; }
+.sw-goal { background: #0c0; }
+#spark { display: block; width: 100%; height: auto; background: #080b10; border: 1px solid var(--line); border-radius: 6px; margin-top: 8px; }
+.title.sub { margin-top: 14px; }
+a.link { color: #58a6ff; }

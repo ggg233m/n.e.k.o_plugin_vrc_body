@@ -70,6 +70,9 @@ class MapperConfig:
     ray_step_m: float = 0.10        # 视线水平采样步长 = 一格；0.05 时 5 m 视距每帧多花 ~25 ms，结果几乎不变
     ray_stop_m: float = 0.20        # 离端点这么近就不算看穿（端点本身的深度噪声）
     ray_walk_w: float = 3.0
+    # 覆盖伴生网格（纯显示，不进三态判定）：观测点离该关键帧相机水平距离 ≤ cov_near_m 算"近看"。
+    # 近看计数=0 的已观测格 = 只远看过的信息洞（走过去补扫）；近看点数再分稀疏/高质量（显示层阈值）。
+    cov_near_m: float = 3.0
 
 
 def _voxelize(p: np.ndarray, xy_m: float, z_m: float) -> tuple[np.ndarray, np.ndarray]:
@@ -223,9 +226,12 @@ class KeyframeGridMapper:
         self._trail_arr: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.cam_h = self.cfg.cam_h_default
         # 缓存：_rot[k] = (R·p 的 xy, R·p 的 z = 相对关键帧的高度, 点数, 算它用的 R)；
-        # 只改平移时高度不变，分类也不变。_base[k] = (ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h)。
+        # 只改平移时高度不变，分类也不变。
+        # _base[k] = (ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far)；
+        # 近/远看按点到关键帧相机的水平距离分桶（相机在 base 系原点，与平移无关），整格平移照常复用。
         self._rot: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._base: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = {}
+        self._base: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                    float, np.ndarray, np.ndarray]] = {}
         self._hist: dict[int, np.ndarray] = {}
         lo, hi = self.cfg.cam_h_band
         self._hist_sum = np.zeros(int(round((hi - lo) / 0.01)), np.int64)
@@ -233,6 +239,8 @@ class KeyframeGridMapper:
         # 变了就先减旧的再加新的：新关键帧只算自己，回环只挪整格，不重投点。
         self._acc_g: np.ndarray | None = None
         self._acc_o: np.ndarray | None = None
+        self._acc_near: np.ndarray | None = None    # 近看（≤ cov_near_m）点数，与 _acc_g 同布局同记账
+        self._acc_far: np.ndarray | None = None     # 远看点数；near+far>0 = 已观测格（覆盖原始数据）
         self._acc_lo = (0, 0)
         self._acc_cam_h: float | None = None
         self._applied: dict[int, tuple[tuple, int, int]] = {}
@@ -314,9 +322,12 @@ class KeyframeGridMapper:
         if abs(est - self.cam_h) > self.cfg.cam_h_hyst_m:
             self.cam_h = est
 
-    def _kf_base(self, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        """关键帧 k 在"算它那一刻的平移 t0"下的格计数 (ix, iy, n_ground, n_obst, t0, cam_h)。
-        朝向或 cam_h 变了才重算；只有平移变了就按整格平移复用（见 ``_shift``）。"""
+    def _kf_base(self, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                        float, np.ndarray, np.ndarray]:
+        """关键帧 k 在"算它那一刻的平移 t0"下的格计数
+        (ix, iy, n_ground, n_obst, t0, cam_h, n_near, n_far)。
+        朝向或 cam_h 变了才重算；只有平移变了就按整格平移复用（见 ``_shift``）。
+        n_near/n_far：近/远看（观测距离 ≤ cov_near_m）的点数，与 n_ground/n_obst 同格同权重。"""
         c = self.cfg
         cached = self._base.get(k)
         if cached is not None and cached[5] == self.cam_h:
@@ -331,7 +342,7 @@ class KeyframeGridMapper:
         sel = g | o
         if not sel.any():
             z = np.zeros(0, np.int64)
-            out = (z, z, z, z, t, self.cam_h)
+            out = (z, z, z, z, t, self.cam_h, z, z)
             self._base[k] = out
             return out
         xy = rxy[sel].astype(np.float64) + t
@@ -345,8 +356,13 @@ class KeyframeGridMapper:
         w = cnt[sel]
         ng = np.bincount(flat, w * g[sel], minlength=size)
         no = np.bincount(flat, w * o[sel], minlength=size)
+        # 覆盖伴生：点到相机（base 系原点）的水平距离分近/远两桶，复用同一 flat 与权重。
+        r = np.hypot(rxy[sel, 0], rxy[sel, 1])
+        near = r <= c.cov_near_m
+        nn = np.bincount(flat, w * near, minlength=size)
+        nf = np.bincount(flat, w * ~near, minlength=size)
         nz = np.flatnonzero((ng > 0) | (no > 0))
-        out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h)
+        out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h, nn[nz], nf[nz])
         self._base[k] = out
         return out
 
@@ -360,7 +376,7 @@ class KeyframeGridMapper:
         """全局累加器只处理 (base, 整格平移) 变了的关键帧：旧贡献负权、新贡献正权，一次 bincount。
         ``keys``：要重查的关键帧；cam_h 变了会清空重建，此时改查全部。返回实际查过的集合（射线同用）。"""
         if self._acc_cam_h != self.cam_h:
-            self._acc_g = self._acc_o = self._ray_hit = self._ray_mis = None
+            self._acc_g = self._acc_o = self._acc_near = self._acc_far = self._ray_hit = self._ray_mis = None
             self._applied.clear()
             self._ray_applied.clear()
             self._acc_cam_h = self.cam_h
@@ -387,11 +403,15 @@ class KeyframeGridMapper:
         iy = np.concatenate([b[1] + sy for b, _sx, sy, _g in work])
         wg = np.concatenate([b[2] * sg for b, _sx, _sy, sg in work])
         wo = np.concatenate([b[3] * sg for b, _sx, _sy, sg in work])
+        wn = np.concatenate([b[6] * sg for b, _sx, _sy, sg in work])
+        wf = np.concatenate([b[7] * sg for b, _sx, _sy, sg in work])
         self._grow_acc(int(ix.min()), int(iy.min()), int(ix.max()), int(iy.max()))
         (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
         flat = (iy - y0) * W + (ix - x0)
         self._acc_g += np.bincount(flat, wg, minlength=H * W).reshape(H, W)
         self._acc_o += np.bincount(flat, wo, minlength=H * W).reshape(H, W)
+        self._acc_near += np.bincount(flat, wn, minlength=H * W).reshape(H, W)
+        self._acc_far += np.bincount(flat, wf, minlength=H * W).reshape(H, W)
         return keys
 
     def _ray_z(self) -> int:
@@ -404,6 +424,7 @@ class KeyframeGridMapper:
             x0, y0 = xmin - m, ymin - m
             shape = (ymax + 1 + m - y0, xmax + 1 + m - x0)
             self._acc_g, self._acc_o, self._acc_lo = np.zeros(shape), np.zeros(shape), (x0, y0)
+            self._acc_near, self._acc_far = np.zeros(shape), np.zeros(shape)
             if self.cfg.ray_clear:
                 self._ray_hit = np.zeros((self._ray_z(), *shape), np.int32)
                 self._ray_mis = np.zeros((self._ray_z(), *shape), np.int32)
@@ -415,7 +436,7 @@ class KeyframeGridMapper:
         ny0 = ymin - m if ymin < y0 else y0
         nx1 = xmax + 1 + m if xmax >= x0 + W else x0 + W
         ny1 = ymax + 1 + m if ymax >= y0 + H else y0 + H
-        for name in ("_acc_g", "_acc_o", "_ray_hit", "_ray_mis"):
+        for name in ("_acc_g", "_acc_o", "_acc_near", "_acc_far", "_ray_hit", "_ray_mis"):
             old = getattr(self, name)
             if old is None:
                 continue
@@ -693,6 +714,18 @@ class KeyframeGridMapper:
         g[(n_g > 0.5) & (occ == 0)] = FREE
         g[occ == 1] = OCC
         return NavGrid(g[::-1].copy(), GridMeta(c.res_m, (float(lo[0]), float(lo[1])), c.world_scale))
+
+    def coverage_counts(self) -> dict[str, Any] | None:
+        """覆盖伴生网格的只读快照（**仅建图线程可调**，HTTP 侧消费下游快照）。
+
+        total = near + far > 0 即"已观测格"；near = 近看（≤ cov_near_m）点数。
+        布局与 _acc_g 相同：原点 ``lo``（格下标）、分辨率 ``res_m``（追踪米）。
+        数组是引用不拷贝——调用方不得持有多轮更新之间的引用做写比较。"""
+        if self._acc_g is None or self._acc_near is None:
+            return None
+        return {"near": self._acc_near, "far": self._acc_far,
+                "lo": self._acc_lo, "res_m": float(self.cfg.res_m),
+                "cov_near_m": float(self.cfg.cov_near_m)}
 
 
 @dataclass

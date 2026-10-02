@@ -540,6 +540,11 @@ class BackendService:
             status["grid_meta"] = view
         return status
 
+    def navmesh_coverage(self) -> dict[str, Any]:
+        """覆盖俯视快照：伴生覆盖网格（观测计数/近看质量）+ 洞分类 + 诚实进度指标。只读。"""
+        view = self.navmesh.coverage_view()
+        return view if view is not None else {"available": False, "reason": "no_map_yet"}
+
     def navmesh_start(self, record: bool = False) -> dict[str, Any]:
         if not self._started:
             return {**self.navmesh.status(), "ok": False, "reason": "backend_not_started"}

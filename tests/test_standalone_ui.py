@@ -208,6 +208,28 @@ class StandaloneHttpUiTests(unittest.TestCase):
         self.assertEqual(calls[0], ("request", "semantic-request:test:1"))
         self.assertEqual(calls[1], ("commit", "semantic-request:test:2", 42, []))
 
+    def test_navmesh_coverage_endpoint_requires_token_and_assets_served(self) -> None:
+        class Service:
+            def navmesh_coverage(self):
+                return {"available": False, "reason": "no_map_yet"}
+
+        self.server.service = Service()
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(self.base + "/worldmodel/navmesh/coverage", timeout=2.0)
+        self.assertEqual(raised.exception.code, 401)
+
+        request = Request(self.base + "/worldmodel/navmesh/coverage",
+                          headers={"X-Neko-Backend-Token": "test-token"})
+        payload = json.loads(urlopen(request, timeout=2.0).read())
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["reason"], "no_map_yet")
+
+        # 覆盖页三件套已注册（CSP style-src 'self' 禁内联，样式必须走文件）。
+        for path, ctype in (("/coverage", "text/html"), ("/ui/coverage.js", "text/javascript"),
+                            ("/ui/coverage.css", "text/css")):
+            with urlopen(self.base + path, timeout=2.0) as resp:
+                self.assertTrue(resp.headers["Content-Type"].startswith(ctype), path)
+
 
 if __name__ == "__main__":
     unittest.main()

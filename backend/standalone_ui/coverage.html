@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>扫描覆盖</title>
+  <link rel="stylesheet" href="/ui/navmesh.css">
+  <link rel="stylesheet" href="/ui/coverage.css">
+</head>
+<body>
+  <header>
+    <h1>扫描覆盖（观测质量 + 洞）</h1>
+    <span>伴生覆盖网格，只读：驾驶与选点去在线 navmesh 页</span>
+    <span><a href="/navmesh" id="navLink" class="link">← 在线 navmesh</a></span>
+  </header>
+  <main>
+    <section class="map card">
+      <div class="title">覆盖俯视图（导航系世界米，上 = +y，右 = +x）</div>
+      <canvas id="grid" width="900" height="600"></canvas>
+      <div class="legend">
+        <span><i class="sw sw-good"></i>高质量观测（近看且密）</span>
+        <span><i class="sw sw-sparse"></i>近看但稀（离线融合可修）</span>
+        <span><i class="sw sw-far"></i>只远看过（走过去补扫）</span>
+        <span><i class="sw sw-hole"></i>信息洞·未观测（走过去补扫）</span>
+        <span><i class="sw sw-dark"></i>未到达（不算洞）</span>
+        <span><i class="sw sw-occ"></i>障碍</span>
+        <span><i class="sw sw-walk"></i>走过中心线</span>
+        <span><i class="sw sw-pose"></i>当前位姿</span>
+        <span><i class="sw sw-goal"></i>目标</span>
+      </div>
+      <p id="clickInfo" class="muted">还没有覆盖快照：先启动导航，走几步生成关键帧。</p>
+    </section>
+    <section class="status card">
+      <div class="title">扫描进度（诚实口径：只报走过范围内的覆盖）</div>
+      <div class="grid">
+        <span>visited 范围覆盖率</span><b id="covRatio">—</b>
+        <span>近看质量覆盖率</span><b id="nearRatio">—</b>
+        <span>visited 面积 / 观测面积</span><b id="areas">—</b>
+        <span>信息洞（未观测格）</span><b id="holes">—</b>
+        <span>只远看格</span><b id="farOnly">—</b>
+        <span>frontier 边界格 / 目标</span><b id="frontier">—</b>
+        <span>关键帧 / 建图次数</span><b id="kf">—</b>
+        <span>覆盖计算耗时</span><b id="covMs">—</b>
+        <span>口径</span><b id="caliber">—</b>
+      </div>
+      <div class="title sub">覆盖率趋势（后端最近 600 次建图）</div>
+      <canvas id="spark" width="420" height="120"></canvas>
+      <p class="muted">绿线 = visited 范围覆盖率（0–1）；黄线 = frontier 边界格数（右轴无刻度，看趋势）。两者都趋平且 frontier 归零 ≈ 当前可达区域扫完。</p>
+      <p id="msg" class="muted"></p>
+    </section>
+  </main>
+  <script src="/ui/coverage.js" defer></script>
+</body>
+</html>

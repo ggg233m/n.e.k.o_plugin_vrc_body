@@ -112,6 +112,10 @@ _UI_ASSETS = {
     # navmesh 记忆管理：按世界列会话、看缩略图、钉住/标签/删除/配额清理。
     "/navmesh/memory": ("navmesh_memory.html", "text/html; charset=utf-8"),
     "/ui/navmesh_memory.js": ("navmesh_memory.js", "text/javascript; charset=utf-8"),
+    # 覆盖俯视页：伴生覆盖网格（观测计数/近看质量）+ 洞分类 + 诚实进度指标；只读，驾驶仍去 /navmesh。
+    "/coverage": ("coverage.html", "text/html; charset=utf-8"),
+    "/ui/coverage.js": ("coverage.js", "text/javascript; charset=utf-8"),
+    "/ui/coverage.css": ("coverage.css", "text/css; charset=utf-8"),
 }
 
 
@@ -235,6 +239,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             grid = parse_qs(urlsplit(self.path).query).get("grid", ["0"])[0]
             self._json(200, self.server.service.navmesh_status(
                 include_grid=str(grid).lower() in {"1", "true", "yes"}))
+            return
+        if path == "/worldmodel/navmesh/coverage":
+            self._json(200, self.server.service.navmesh_coverage())
             return
         if path.startswith("/worldmodel/navmesh/memory"):
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}

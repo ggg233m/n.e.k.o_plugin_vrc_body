@@ -405,5 +405,95 @@ class StereoPointsTests(unittest.TestCase):
         self.assertLess(float(np.median(pts[pts[:, 1] < 0, 1])), 0)
 
 
+class CoverageCountsTests(unittest.TestCase):
+    """覆盖伴生网格（_acc_near/_acc_far）：分桶正确、与 seen 严格一致、可逆、随回环平移、cam_h 重建一致。"""
+
+    def setUp(self) -> None:
+        self.scene = world_scene()
+
+    def mapper_with(self, poses, **kw):
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+        for i, T in enumerate(poses):
+            m.add_keyframe(i, observe(self.scene, T), T)
+        return m
+
+    @staticmethod
+    def _seen_cells(arr) -> set:
+        rows, cols = np.nonzero(arr)
+        return {(int(r), int(c)) for r, c in zip(rows, cols)}
+
+    def _cov(self, m):
+        m.rasterize()                         # 触发增量同步（幂等：无 dirty 时为 no-op）
+        cc = m.coverage_counts()
+        return cc, self._seen_cells((cc["near"] + cc["far"]) > 0.5)
+
+    def test_coverage_counts_accumulate(self) -> None:
+        m = self.mapper_with([pose(0, 0), pose(1.0, 0)], cov_near_m=1.5)
+        cc, cells = self._cov(m)
+        self.assertTrue(cells)
+        # 不变量：near+far 的格集合与 rasterize 用的 seen（acc_g|acc_o）严格一致（同一批选中点）。
+        self.assertEqual(cells, self._seen_cells((m._acc_g > 0.5) | (m._acc_o > 0.5)))
+        self.assertTrue(np.array_equal(cc["near"] + cc["far"], m._acc_g + m._acc_o))
+        # 两个桶都有内容：observe() 只留 3 m 内的点，cov_near_m=1.5 时近/远各应存在。
+        self.assertGreater(float(cc["near"].sum()), 0.0)
+        self.assertGreater(float(cc["far"].sum()), 0.0)
+
+    def test_coverage_counts_reversible(self) -> None:
+        m = self.mapper_with([pose(0, 0), pose(1.0, 0)], cov_near_m=1.5)
+        base_cc, base_cells = self._cov(m)
+        m0 = self.mapper_with([pose(0, 0)], cov_near_m=1.5)
+        cc0, cells0 = self._cov(m0)
+        m.drop_points(1)                      # 原地补帧路径：撤掉 kf1 的点
+        _, cells = self._cov(m)
+        # 两个 mapper 的累加器形状/原点可以不同，比格集合与总量。
+        self.assertEqual(cells, cells0)
+        cc, _ = self._cov(m)
+        self.assertAlmostEqual(float(cc["near"].sum()), float(cc0["near"].sum()), places=3)
+        self.assertAlmostEqual(float(cc["far"].sum()), float(cc0["far"].sum()), places=3)
+        m.add_keyframe(1, observe(self.scene, pose(1.0, 0)), pose(1.0, 0))
+        cc2, cells2 = self._cov(m)
+        self.assertEqual(cells2, base_cells)  # 加减同一批数，精确还原
+        self.assertAlmostEqual(float(cc2["near"].sum()), float(base_cc["near"].sum()), places=3)
+        self.assertAlmostEqual(float(cc2["far"].sum()), float(base_cc["far"].sum()), places=3)
+
+    def test_coverage_counts_loop_shift(self) -> None:
+        m = self.mapper_with([pose(0, 0), pose(1.0, 0)], cov_near_m=1.5)
+        m.rasterize()
+        cc0, cells0 = self._cov(m)
+        total0 = float(cc0["near"].sum() + cc0["far"].sum())
+        m.update_poses({0: pose(0.5, 0), 1: pose(1.5, 0)})    # 回环整体挪 0.5 m = 5 格
+        m.rasterize()
+        cc1, cells1 = self._cov(m)
+        self.assertAlmostEqual(total0, float(cc1["near"].sum() + cc1["far"].sum()), places=3)
+        self.assertEqual(cells1, {(r, c + 5) for r, c in cells0})   # 跟着平移，无残影
+
+    def test_coverage_cam_h_rebuild(self) -> None:
+        # 地面高度变了 → 直方图中位越滞回 → cam_h 换 → 累加器连 near/far 一起清空重建，不变量仍成立。
+        # 两个 hi 关键帧让新高度簇占多数（中位估计才会跨过滞回带）。
+        hi = self.scene.copy()
+        hi[:, 2] -= 0.15                      # 相机离地比 CAM_H 高 15 cm
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, cov_near_m=1.5))
+        m.add_keyframe(0, observe(self.scene, pose(0, 0)), pose(0, 0))
+        self._cov(m)
+        h_before = m.cam_h
+        m.add_keyframe(1, observe(hi, pose(2.0, 0)), pose(2.0, 0))
+        m.add_keyframe(2, observe(hi, pose(3.0, 0)), pose(3.0, 0))
+        self._cov(m)
+        self.assertNotEqual(m.cam_h, h_before)
+        cc, cells = self._cov(m)
+        self.assertEqual(cells, self._seen_cells((m._acc_g > 0.5) | (m._acc_o > 0.5)))
+        self.assertTrue(np.array_equal(cc["near"] + cc["far"], m._acc_g + m._acc_o))
+
+    def test_cov_near_boundary(self) -> None:
+        # 体素中心恰在阈值两侧：2.975 → 近，3.025 → 远（体素中心 = (floor(p/0.05)+0.5)·0.05）。
+        pts = np.array([[2.97, 0.0, -CAM_H], [3.03, 0.0, -CAM_H]], np.float32)
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, cov_near_m=3.0))
+        m.add_keyframe(0, pts, pose(0, 0))
+        m.rasterize()
+        cc, _ = self._cov(m)
+        self.assertAlmostEqual(float(cc["near"].sum()), 1.0, places=6)
+        self.assertAlmostEqual(float(cc["far"].sum()), 1.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

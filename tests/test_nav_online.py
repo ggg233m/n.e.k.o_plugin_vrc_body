@@ -528,5 +528,52 @@ class RecorderTest(unittest.TestCase):
         self.assertTrue(any("record_root_not_configured" in e for e in st["errors"]))
 
 
+class CoverageViewTest(unittest.TestCase):
+    """覆盖可视化快照：available 语义、指标口径、meta 同构、status()/grid_view() 契约不动。"""
+
+    def run_nav(self, h, until, timeout=5.0):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start()
+            try:
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline and not until(h.nav):
+                    time.sleep(0.05)
+                return until(h.nav)
+            finally:
+                h.nav.stop()
+
+    def test_coverage_view_none_before_map(self) -> None:
+        h = Harness()
+        self.assertIsNone(h.nav.coverage_view())
+        self.assertIsNone(h.nav.grid_view())          # 既有行为不受影响
+
+    def test_coverage_metrics(self) -> None:
+        h = Harness(armed=False, vz=0.5)
+        self.assertTrue(self.run_nav(h, lambda n: n.status()["map_updates"] >= 2))
+        view = h.nav.coverage_view()
+        self.assertTrue(view["available"])
+        m = view["metrics"]
+        self.assertGreater(m["hull_cells"], 0)        # 走过 → hull 非空
+        self.assertGreater(m["observed_cells"], 0)    # 走过的走廊有观测
+        self.assertTrue(0.0 <= m["coverage_ratio"] <= 1.0)
+        self.assertGreaterEqual(m["hull_m2"], m["observed_m2"])
+        self.assertEqual(m["hole_cells"], m["hull_cells"] - m["observed_cells"])
+        g = view["grid"]                              # 与 grid_view 同构的 meta（前端坐标换算复用）
+        for k in ("rows", "cols", "origin_xy_track_m", "resolution_track_m", "world_scale", "frame"):
+            self.assertIn(k, g)
+        self.assertEqual(g["resolution_track_m"], 0.30)
+        self.assertTrue(g["png_base64"])
+        self.assertTrue(view["trend"])
+        self.assertAlmostEqual(view["trend"][-1]["coverage_ratio"], m["coverage_ratio"], places=3)
+
+    def test_coverage_status_and_grid_untouched(self) -> None:
+        h = Harness(armed=False, vz=0.5)
+        self.assertTrue(self.run_nav(h, lambda n: n.status()["map_updates"] >= 1))
+        keys = set(h.nav.status())
+        self.assertFalse([k for k in keys if "coverage" in k or k.startswith("cov")])
+        view = h.nav.grid_view()                      # PNG 输出契约不变：rows/cols 与主栅格一致
+        self.assertEqual((view["rows"], view["cols"]), h.nav.session.ng.grid.shape)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -27,7 +28,7 @@ from typing import Any, Callable, Sequence
 import cv2
 import numpy as np
 
-from .nav_grid import FREE, OCC
+from .nav_grid import FREE, OCC, UNK
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, make_sgbm, stereo_disparity, stereo_points
@@ -84,6 +85,12 @@ class OnlineNavConfig:
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
     record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
+    # 覆盖可视化（纯显示，不进三态/规划）：粗格边长（追踪米）、走过走廊的 hull 半径（世界米）、
+    # "近看且密"的近看点数阈值（粗格）、趋势历史条数（≈5 min @2 Hz）。
+    cov_coarse_m: float = 0.30
+    cov_hull_m: float = 3.0
+    cov_sparse_pts: float = 8.0
+    cov_hist_len: int = 600
 
     def __post_init__(self) -> None:
         if self.mapper.world_scale != self.world_scale:
@@ -504,6 +511,10 @@ class OnlineNavigator:
         # 记忆位姿表：k → (T_dr, osc 路程, 相对启动秒)。T_map 在整表写时现取（回环会改）。
         self._mem_rows: dict[int, tuple[np.ndarray, float, float]] = {}
         self._mem_flushed_at = -math.inf
+        # 覆盖可视化快照（mapping 线程整 dict 原子替换，HTTP 线程只读引用）+ 惰性 PNG 编码缓存。
+        self._cov: dict[str, Any] | None = None
+        self._cov_hist: deque = deque(maxlen=c.cov_hist_len)
+        self._cov_png: tuple[int, str | None] | None = None
 
     # ---- 生命周期 ----
     @property
@@ -836,6 +847,7 @@ class OnlineNavigator:
                         self._map_updates += 1
                         last_update = self._clock()
                         dirty = False
+                        self._update_coverage(res)
             except Exception as exc:  # noqa: BLE001
                 self._fail("mapping", exc)
 
@@ -976,6 +988,145 @@ class OnlineNavigator:
     def grid_png(self) -> str | None:
         view = self.grid_view()
         return None if view is None else view["png_base64"]
+
+    # ---- 覆盖可视化（纯显示）----
+    def _update_coverage(self, res: dict[str, Any]) -> None:
+        """建图线程内（apply 之后、_nav_lock 之外）算覆盖伴生快照：粗格分类 + 走过 hull + 诚实指标。
+
+        分类规则（粗格，0.30 m 追踪格）：occ=黑（障碍叠加）；hull 内 total==0 = 信息洞·未观测（亮紫红）；
+        total>0 且 near==0 = 信息洞·只远看（橙）；0<near<cov_sparse_pts = 融合洞提示（黄）；
+        near≥cov_sparse_pts = 高质量（绿）；hull 外未观测 = 深灰（不算洞，不把没走过的世界报成欠账）。
+        纯显示：这里出任何异常只记进快照，不许拖垮建图线程。"""
+        t0 = time.perf_counter()
+        try:
+            cc = self.mapper.coverage_counts()
+            ng = res["ng"]
+            if cc is None:
+                return
+            c = self.cfg
+            g = ng.grid                       # 行 0 = +y 最大（显示布局）
+            h, w = g.shape
+            m = ng.meta
+            res_m, s = m.resolution_m, m.world_scale
+            f = max(1, int(round(c.cov_coarse_m / res_m)))
+            Hc, Wc = -(-h // f), -(-w // f)
+            # 累加器布局 → 主格布局窗口裁剪（与 rasterize 同一套对齐；主格行 0 = min y）。
+            near = np.zeros((h, w))
+            far = np.zeros((h, w))
+            (x0, y0), (Ha, Wa) = cc["lo"], cc["near"].shape
+            lx, ly = int(round(m.origin_xy_m[0] / res_m)), int(round(m.origin_xy_m[1] / res_m))
+            ox0, oy0 = max(lx, x0), max(ly, y0)
+            ox1, oy1 = min(lx + w, x0 + Wa), min(ly + h, y0 + Ha)
+            if ox1 > ox0 and oy1 > oy0:
+                near[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = cc["near"][oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+                far[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = cc["far"][oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+
+            def pool(a: np.ndarray) -> np.ndarray:
+                # 细格 → 粗格求和池化（观测是加性量）；补零到 f 的倍数。
+                pad_h, pad_w = Hc * f - h, Wc * f - w
+                if pad_h or pad_w:
+                    a = np.pad(a, ((0, pad_h), (0, pad_w)))
+                return a.reshape(Hc, f, Wc, f).sum(axis=(1, 3))
+
+            # 转到显示布局（行 0 = +y 最大），与 g 一致。
+            near_c, far_c = pool(near)[::-1], pool(far)[::-1]
+            occ_c = pool((g[::-1] == OCC).astype(np.float64))[::-1] > 0.5
+            # hull = 走过折线（OSC 门控，walked() 按 _ver 缓存）按 cov_hull_m 半径膨胀的粗格掩码。
+            cw = c.cov_coarse_m * s           # 粗格世界米
+            hull = np.zeros((Hc, Wc), np.uint8)
+            thick = max(1, int(round(2 * c.cov_hull_m / cw)))
+            for poly in self.mapper.walked():
+                p = np.asarray(poly, float)
+                cols = np.floor((p[:, 0] / s - m.origin_xy_m[0]) / c.cov_coarse_m).astype(np.int32)
+                rows = (Hc - 1
+                        - np.floor((p[:, 1] / s - m.origin_xy_m[1]) / c.cov_coarse_m).astype(np.int32))
+                pts = np.column_stack([cols, rows]).astype(np.int32)
+                if len(pts) >= 2:
+                    cv2.polylines(hull, [pts.reshape(-1, 1, 2)], False, 1, thick)
+            hullb = hull > 0
+            total_c = near_c + far_c
+            cls = np.zeros((Hc, Wc), np.uint8)
+            cls[total_c > 0] = 1                                  # 只远看
+            cls[(near_c > 0) & (near_c < c.cov_sparse_pts)] = 2   # 近看但稀
+            cls[near_c >= c.cov_sparse_pts] = 3                   # 高质量
+            cls[(total_c == 0) & hullb] = 4                       # 信息洞·未观测
+            hull_cells = int(hullb.sum())
+            observed_cells = int((hullb & (total_c > 0)).sum())
+            coverage_ratio = observed_cells / hull_cells if hull_cells else 0.0
+            near_ratio = float((hullb & (near_c > 0)).sum()) / hull_cells if hull_cells else 0.0
+            # frontier 边界（细格、模式无关）：观测 free 紧挨 unknown。
+            touch = cv2.dilate((g == UNK).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+            frontier_cells = int(((g == FREE) & touch).sum())
+            self._cov_hist.append({
+                "t_s": round(self._clock() - (self._started_at if self._started_at is not None else self._clock()), 1),
+                "coverage_ratio": round(coverage_ratio, 3), "near_ratio": round(near_ratio, 3),
+                "frontier_cells": frontier_cells})
+            img = np.full((Hc, Wc, 3), 60, np.uint8)              # hull 外未观测 = 深灰
+            for v, col in ((1, (0, 140, 255)), (2, (0, 215, 255)), (3, (60, 180, 75)), (4, (255, 0, 255))):
+                img[cls == v] = col
+            img[occ_c] = (0, 0, 0)
+            # 走过中心线（浅蓝）+ 当前位姿（红）+ 目标（绿），与 grid_view 同色约定。
+            for poly in self.mapper.walked():
+                p = np.asarray(poly, float)
+                cols = np.floor((p[:, 0] / s - m.origin_xy_m[0]) / c.cov_coarse_m).astype(np.int32)
+                rows = (Hc - 1
+                        - np.floor((p[:, 1] / s - m.origin_xy_m[1]) / c.cov_coarse_m).astype(np.int32))
+                pts = np.column_stack([cols, rows]).astype(np.int32)
+                if len(pts) >= 2:
+                    cv2.polylines(img, [pts.reshape(-1, 1, 2)], False, (255, 190, 120), 1)
+            est = self._est()
+            if est.get("state") == "localized":
+                cc_r, cc_c = self._world_to_cov_cell(est["xy"], m, c.cov_coarse_m, Hc)
+                cv2.circle(img, (cc_c, cc_r), 2, (0, 0, 255), -1)
+            goal = self.session.goal_xy()
+            if goal is not None:
+                gg_r, gg_c = self._world_to_cov_cell(goal, m, c.cov_coarse_m, Hc)
+                cv2.circle(img, (gg_c, gg_r), 2, (0, 200, 0), -1)
+            self._cov = {
+                "available": True, "seq": self._map_updates,
+                "metrics": {
+                    "hull_cells": hull_cells, "observed_cells": observed_cells,
+                    "coverage_ratio": round(coverage_ratio, 3), "near_ratio": round(near_ratio, 3),
+                    "hull_m2": round(hull_cells * cw * cw, 1), "observed_m2": round(observed_cells * cw * cw, 1),
+                    "hole_cells": int((hullb & (total_c == 0)).sum()),
+                    "far_only_cells": int((hullb & (total_c > 0) & (near_c == 0)).sum()),
+                    "frontier_cells": frontier_cells,
+                    "frontier_goals": res["info"].get("frontiers"),
+                    "keyframes": self._keyframes, "map_updates": self._map_updates,
+                    "near_m": float(cc["cov_near_m"]), "coarse_m": float(c.cov_coarse_m),
+                    "cov_ms": round((time.perf_counter() - t0) * 1000.0, 2)},
+                "grid": {"rows": int(Hc), "cols": int(Wc),
+                         "origin_xy_track_m": [float(m.origin_xy_m[0]), float(m.origin_xy_m[1])],
+                         "resolution_track_m": float(c.cov_coarse_m), "world_scale": float(s),
+                         "frame": "nav_map_xy_world_m"},
+                "trend": list(self._cov_hist),
+                "img": img}
+        except Exception as exc:  # noqa: BLE001 - 显示功能不出现在建图线程的错误里
+            self._cov = {"available": False, "seq": self._map_updates,
+                         "error": f"{type(exc).__name__}: {exc}"}
+
+    @staticmethod
+    def _world_to_cov_cell(xy_world: Sequence[float], meta: Any, coarse_m: float,
+                           rows: int) -> tuple[int, int]:
+        x = xy_world[0] / meta.world_scale - meta.origin_xy_m[0]
+        y = xy_world[1] / meta.world_scale - meta.origin_xy_m[1]
+        return rows - 1 - int(math.floor(y / coarse_m)), int(math.floor(x / coarse_m))
+
+    def coverage_view(self) -> dict[str, Any] | None:
+        """覆盖快照（HTTP 线程只读 mapping 线程产出的整 dict 引用）；PNG 按快照代数惰性编码缓存。"""
+        cov = self._cov
+        if cov is None:
+            return None
+        out = {k: v for k, v in cov.items() if k != "img"}
+        img = cov.get("img")
+        if isinstance(img, np.ndarray):
+            seq = cov["seq"]
+            if self._cov_png is None or self._cov_png[0] != seq:
+                ok, buf = cv2.imencode(".png", img)
+                png = base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
+                self._cov_png = (seq, png)
+            out["grid"]["png_base64"] = self._cov_png[1]
+        return out
 
     def grid_view(self) -> dict[str, Any] | None:
         """当前栅格的 base64 PNG（一格一像素，第 0 行 = 北/+y 最大）+ 像素↔导航系世界米的换算。
