@@ -316,6 +316,7 @@ class VrchatOscBridge:
         except OSError as exc:
             self._record_error(f"could not create OSC send socket: {exc}")
             return
+        receiver = None
         try:
             receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             receiver.bind((self.config.listen_host, self.config.listen_port))
@@ -324,6 +325,16 @@ class VrchatOscBridge:
             with self._lock:
                 self._receiver_listening = True
         except OSError as exc:
+            # bind 失败时 receiver 已经持有一个 OS socket。它是局部变量，出作用域后
+            # 会被 GC，但异常 traceback 一旦把它挂住，FD 就一直不释放——重试 start()
+            # 会逐个累积到 EMFILE。而此时 self._receive_socket 仍是 None，stop()
+            # （全文件唯一的回收点）根本拿不到它，所以必须在这里就关掉。
+            # socket.close() 幂等，与 stop() 不会重复关。
+            if receiver is not None:
+                try:
+                    receiver.close()
+                except OSError:
+                    pass
             self._receive_socket = None
             self._record_error(
                 f"could not listen on {self.config.listen_host}:{self.config.listen_port}: {exc}"
@@ -1024,7 +1035,10 @@ class VrchatOscBridge:
         result["value_age_ms"] = None if value_age_ms is None else round(value_age_ms, 1)
         # VelocityX/Z 只在移动时回传，所以任何旧速度（包括旧的 0）都只是历史样本。
         # 不能用其他 OSC 参数的活跃度替它续命，也不能把静止沉默伪造成实时零速度。
-        if value_age_ms is None or (limit_ms and value_age_ms > limit_ms):
+        # limit_ms = max(0, int(max_age_ms))（:927）明确允许 0，语义是"任何历史样本
+        # 都不算数"，与 docstring 的承诺一致；写成 `(limit_ms and ...)` 会把 0 当成
+        # "不检查"，反而收到任意旧的速度值且 available=True。
+        if value_age_ms is None or limit_ms <= 0 or value_age_ms > limit_ms:
             result["reason"] = "velocity_feedback_quiet"
             return result
 

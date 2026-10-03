@@ -4,9 +4,12 @@ import math
 import socket
 import struct
 import time
+import types
 import unittest
+from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
+from neko_anyadance_body import osc as osc_module
 from neko_anyadance_body.config import VrchatOscConfig
 from neko_anyadance_body.osc import (
     OscProtocolError,
@@ -227,6 +230,19 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.bridge._handle_message(f"/avatar/parameters/{name}", (value,))
         self.bridge._last_receive_at_monotonic = self.now[0]
 
+    def test_zero_max_age_makes_every_sample_stale(self) -> None:
+        # max_age_ms=0 的语义是「任何历史样本都不算数」（limit_ms = max(0, ...) 明确
+        # 允许 0）。旧实现写成 `(limit_ms and ...)`，0 是假值 ⇒ 短路成「永不判过期」，
+        # 反而把刚到的样本当成可信速度返回。
+        self._feed("VelocityX", 1.0)
+        self._feed("VelocityZ", 1.0)
+        motion = self.bridge.motion_feedback(max_age_ms=0)
+        self.assertFalse(motion["available"])
+        self.assertEqual(motion["reason"], "velocity_feedback_quiet")
+        self.assertIsNone(motion["horizontal_speed_mps"])
+        # 同一个样本在默认窗口下必须是可用的，否则就说明改过头了。
+        self.assertTrue(self.bridge.motion_feedback()["available"])
+
     def test_missing_builtins_report_unavailable_not_zero_speed(self) -> None:
         # 最重要的一条：avatar 没配这些参数时不能读成「速度为零」，否则导航器
         # 会把「读不到」当成「卡住了」，一armed 就立刻停车。
@@ -419,6 +435,57 @@ class OscMotionFeedbackTests(unittest.TestCase):
         motion = self.bridge.snapshot()["motion"]
         self.assertTrue(motion["available"], motion["reason"])
         self.assertAlmostEqual(motion["horizontal_speed_mps"], 1.5, places=3)
+
+
+class OscStartFailureTests(unittest.TestCase):
+    """bind 失败时不能把 socket 留在手里。
+
+    用假 socket 而不是真的去占端口：Windows 的 SO_REUSEADDR 语义允许重复绑定，
+    真端口方案在这里不稳定。
+    """
+
+    class _FakeSocket:
+        def __init__(self, family: int, kind: int) -> None:
+            self.closed = False
+            self.bound = False
+
+        def setblocking(self, _flag: bool) -> None:
+            pass
+
+        def settimeout(self, _value: float) -> None:
+            pass
+
+        def sendto(self, packet: bytes, _addr: object) -> int:
+            return len(packet)
+
+        def bind(self, _addr: object) -> None:
+            self.bound = True
+            raise OSError("address already in use")
+
+        def close(self) -> None:
+            self.closed = True
+
+    def test_bind_failure_closes_the_receiver_socket(self) -> None:
+        created: list[OscStartFailureTests._FakeSocket] = []
+
+        def factory(family: int, kind: int) -> OscStartFailureTests._FakeSocket:
+            sock = OscStartFailureTests._FakeSocket(family, kind)
+            created.append(sock)
+            return sock
+
+        bridge = VrchatOscBridge(VrchatOscConfig(), clock=lambda: 0.0, wall_clock=lambda: 0.0)
+        fake = types.SimpleNamespace(AF_INET=2, SOCK_DGRAM=2, socket=factory)
+        try:
+            with mock.patch.object(osc_module, "socket", fake):
+                bridge.start()
+        finally:
+            bridge.stop()
+        # 0 = 发送 socket（归 bridge 所有，由 stop() 关），1 = 接收 socket
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[1].bound, "接收 socket 确实走到了 bind")
+        self.assertTrue(created[1].closed, "bind 失败的接收 socket 泄漏了 FD")
+        self.assertIsNone(bridge._receive_socket)
+        self.assertFalse(bridge.snapshot()["receiver_listening"])
 
 
 class OscBridgeIntegrationTests(unittest.TestCase):
