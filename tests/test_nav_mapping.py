@@ -219,6 +219,26 @@ class DropPointsTests(unittest.TestCase):
         self.assertEqual(len(m.walked()), len(walked))
         np.testing.assert_allclose(np.vstack(m.walked()), np.vstack(walked))
 
+    def test_drop_points_clamps_the_cam_h_throttle_counter(self) -> None:
+        """``_cam_h_at`` 必须跟着 len(_pts) 一起缩，否则 cam_h 会被冻结。
+
+        它记录的是「上次改 cam_h 时的关键帧数」，而 len(_pts) 可能下降（离线回放
+        tools/q_tier_ab.py:87-92 是「先摘 k-1、可能再摘 k、最后加 k」）。一旦
+        _cam_h_at 越过 len(_pts)，_update_cam_h 的 d 变负 ⇒ 恒 < 阈值 ⇒ 走 return，
+        cam_h **不再更新**（注意：是冻结，不是"更频繁重算"），且要多等
+        (_cam_h_at - len) 帧才恢复。夹回之后等待帧数就是设计值。
+        """
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        scene = world_scene()
+        for i, T in enumerate([pose(0, 0), pose(0.5, 0), pose(1.0, 0)]):
+            m.add_keyframe(i, observe(scene, T), T)
+        m._cam_h_at = len(m)                       # 假装刚在满规模时改过 cam_h
+        self.assertEqual(m._cam_h_at, 3)
+        m.drop_points(0)
+        m.drop_points(1)
+        self.assertEqual(m._cam_h_at, 1)           # 跟着缩到 1，而不是停在 3
+        self.assertLessEqual(m._cam_h_at, len(m))
+
 
 class RayClearTests(unittest.TestCase):
     """射线清除：墙留着、只在一帧里出现又被后来视线看穿的鬼影清掉、走过的中心线清掉；回环不重追线。"""

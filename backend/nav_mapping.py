@@ -418,6 +418,16 @@ class KeyframeGridMapper:
         if self._pts.pop(k, None) is None:
             return
         self._cnt.pop(k, None)
+        # 把 cam_h 限流计数器夹回当前规模。背景（核查 issue #3-5 时实测澄清）：
+        #   * 在线路径（nav_online.py:920-927）总是先 add_keyframe(k) 再 drop_points(k-1)，
+        #     len(_pts) 单调不减，_cam_h_at <= len(_pts) 恒成立 ⇒ **线上不可达**，这里是 no-op；
+        #   * 离线回放（tools/q_tier_ab.py:87-92）是「先摘 k-1、可能再摘 k、最后加 k」，
+        #     len 反而会下降，此时 _cam_h_at 会越过 len(_pts)；
+        #   * 越过之后的后果与外界报告**相反**：d = len - _cam_h_at 为负 ⇒ 恒 < 阈值 ⇒
+        #     走 :478 的 return，cam_h **冻结不再更新**，而不是"更频繁地重算"。冻结会一直
+        #     持续到 len 重新爬回 _cam_h_at + len//8，比设计值多等 (_cam_h_at - len) 帧。
+        # 夹回之后等待帧数恢复成设计值。不改变 cam_h 的最终取值，只改变到达它的时机。
+        self._cam_h_at = min(self._cam_h_at, len(self._pts))
         self._drop_cache(k)
         self._dirty.discard(k)
         self._ver += 1
@@ -467,7 +477,10 @@ class KeyframeGridMapper:
         # 架不住在阈值附近反复触发，所以按"距上次变更至少过了当前规模的 1/8"来限：
         # 早期（几帧）几乎立刻就能跟上一个正确值，晚期每次重算之间隔得越来越开。
         # 这样重建次数是 O(log N)、总代价 O(N)，而不是原来那种线性翻转让单次卡到 1.6 s。
-        if len(self._pts) - self._cam_h_at < max(1, len(self._pts) // 8):
+        # max(0, ...)：drop_points 已把 _cam_h_at 夹回当前规模，这里再加一层防御。
+        # 注意方向：d 为负时是**不更新**（冻结 cam_h），不是"放行重算"——别照着
+        # "负值 ⇒ 限流失效"的直觉改这里。
+        if len(self._pts) - max(0, self._cam_h_at) < max(1, len(self._pts) // 8):
             return
         self.cam_h = est
         self._cam_h_at = len(self._pts)
