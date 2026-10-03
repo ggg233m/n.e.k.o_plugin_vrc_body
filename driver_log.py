@@ -55,6 +55,16 @@ def _whole(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _whole_or_none(value: Any) -> int | None:
+    """整数字段：给不出就返回 ``None``，**不**把「缺失」伪装成「真的是 0」。
+
+    ``monotonic_ms`` 必须用这一条：驱动在录制起始帧自报的就是 0，而
+    :meth:`ActionTimeline._emit` 本地构造的 action 根本没有这个键。两者若都被
+    ``_whole`` 压成 0，``record()`` 就分不清该用驱动时钟还是本地时钟。
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _device_names(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -215,7 +225,7 @@ def _parse_action_fields(root: dict[str, Any]) -> dict[str, Any]:
     send_result = root.get("actual_send_result")
     ack = root.get("driver_ack")
     return {
-        "monotonic_ms": _whole(root.get("monotonic_ms")),
+        "monotonic_ms": _whole_or_none(root.get("monotonic_ms")),
         "goal_id": _text(root.get("goal_id"), _ACTION_ID_CHARS),
         "episode_id": _text(root.get("episode_id"), _ACTION_ID_CHARS),
         "input_command": {
@@ -288,6 +298,10 @@ class DriverLogListener:
         # 与 _last_error 分开：ingest_packet 在成功解码后会清空 _last_error，
         # 若把落盘失败写在那里面，会被这次清空吞掉，故障就静默了。
         self._last_action_error: str | None = None
+        # 第三个通道，同一个理由：HMD sink 的失败写在 _apply_event_locked 里，
+        # 同样会被 ingest_packet 的清空抹掉。注意 service.py 目前并没有传 on_hmd，
+        # 线上该 sink 恒为 None，所以这是先把报故障的通路补上，不是修已触发的故障。
+        self._last_hmd_error: str | None = None
 
     @property
     def thread_alive(self) -> bool:
@@ -462,7 +476,12 @@ class DriverLogListener:
                             "driver_timestamp_ms": event["timestamp_ms"],
                         }, now)
                     except Exception as exc:  # noqa: BLE001 - 读取器故障不能拖垮遥测
-                        self._last_error = f"HMD telemetry sink failed: {exc}"[:500]
+                        # 不能写 _last_error：ingest_packet 在成功解码后会无条件把它
+                        # 清空，这里的失败会被同一帧内的下一次清空吞掉。
+                        self._last_hmd_error = f"HMD telemetry sink failed: {exc}"[:500]
+                    else:
+                        # 下一次成功投递就清掉：一次偶发的读取器抖动不该永久挂在面板上。
+                        self._last_hmd_error = None
         elif kind == "haptic_vibration":
             haptic = event["haptic"]
             self._last_haptic = {
@@ -539,6 +558,7 @@ class DriverLogListener:
                 "senders": active_senders,
                 "last_error": self._last_error,
                 "last_action_error": self._last_action_error,
+                "last_hmd_error": self._last_hmd_error,
             }
 
 
@@ -681,9 +701,13 @@ class ActionLogRecorder:
         if self._handle is None and not self.start():
             return False
         now = self._clock() if monotonic_time is None else float(monotonic_time)
-        # 驱动自报的 monotonic_ms 优先作为事件时刻；缺失则用本地时钟。
-        reported = action.get("monotonic_ms") or 0
-        event_time = reported / 1000.0 if reported else now
+        # 驱动自报的 monotonic_ms 优先作为事件时刻；**只有键缺失**才回退本地时钟。
+        # 原先写成 `action.get("monotonic_ms") or 0`，把「驱动自报 0（录制起始帧）」
+        # 和「键不存在（ActionTimeline._emit 本地构造）」压成同一种情况，前者被错误地
+        # 顶成本地时钟，由此算出的 frame_index 全错。写盘字段是 monotonic_time，
+        # 磁盘 JSONL 格式不变。
+        reported = _whole_or_none(action.get("monotonic_ms"))
+        event_time = reported / 1000.0 if reported is not None else now
         try:
             frame_index = self.timebase.frame_index_at(event_time)
         except RuntimeError as exc:
@@ -925,6 +949,18 @@ def load_action_timeline(path: str | Path) -> tuple[VideoTimebase | None, list[d
     return timebase, rows
 
 
+def _action_subdict(row: dict[str, Any], key: str) -> dict[str, Any]:
+    """子表缺失或不是对象时退化成空表。
+
+    ``load_action_timeline`` 只校验 ``record == "action"``，不校验字段：旧版录制器
+    写的行、手工编辑过的行、第三方写的行都可能缺 ``input_command`` / ``turn_intent``
+    / ``osc_velocity``，或者类型不对。汇总服务于离线分析，不能因为一行有问题就让
+    整段 episode 报 KeyError。本函数里其它行一律用 ``.get``，只有这几处曾是硬下标。
+    """
+    value = row.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def episode_action_summary(path: str | Path,
                            episodes: Sequence[Sequence[int]],
                            labels: Iterable[object] | None = None,
@@ -971,7 +1007,7 @@ def episode_action_summary(path: str | Path,
             prev_t = t
         ei = _episode_of(int(r.get("frame_index", -1)))
         if ei is not None:
-            v = r.get("osc_velocity", {})
+            v = _action_subdict(r, "osc_velocity")
             per_ep[ei] += math.hypot(_finite(v.get("vx")),
                                      _finite(v.get("vz"))) * dt
 
@@ -979,10 +1015,10 @@ def episode_action_summary(path: str | Path,
     for idx, (a, b) in enumerate(episodes):
         a, b = int(a), int(b)
         inside = [r for r in rows if a <= int(r.get("frame_index", -1)) < b]
-        fwd = sum(1 for r in inside if float(r["input_command"].get("forward", 0.0)) > 0)
-        back = sum(1 for r in inside if float(r["input_command"].get("forward", 0.0)) < 0)
-        left = sum(1 for r in inside if float(r["turn_intent"].get("yaw_delta", 0.0)) > 0)
-        right = sum(1 for r in inside if float(r["turn_intent"].get("yaw_delta", 0.0)) < 0)
+        fwd = sum(1 for r in inside if _finite(_action_subdict(r, "input_command").get("forward")) > 0.0)
+        back = sum(1 for r in inside if _finite(_action_subdict(r, "input_command").get("forward")) < 0.0)
+        left = sum(1 for r in inside if _finite(_action_subdict(r, "turn_intent").get("yaw_delta")) > 0.0)
+        right = sum(1 for r in inside if _finite(_action_subdict(r, "turn_intent").get("yaw_delta")) < 0.0)
         sent = sum(1 for r in inside if r.get("actual_send_result") == "sent")
         acked = sum(1 for r in inside if r.get("driver_ack") == "accepted")
         out.append({

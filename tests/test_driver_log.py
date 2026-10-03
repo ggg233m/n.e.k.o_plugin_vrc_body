@@ -115,8 +115,22 @@ class DriverLogParseTests(unittest.TestCase):
         self.assertEqual(len(event["command"]["payload"]), 2048)
 
 
+_HMD_PAYLOAD = json.dumps({
+    "version": 1,
+    "devices": {"hmd": {"pose": {
+        "position": [0.1, 1.5, -0.2],
+        "rotation_xyzw": [0.0, 0.3826834, 0.0, 0.9238795],
+    }}}
+})
+
+
 class DriverLogListenerTests(unittest.TestCase):
     """Deterministic: the public ingest path is exercised without a socket."""
+
+    def hmd_command(self) -> bytes:
+        """带 HMD 姿态的 command_processed：只有它才会走到 on_hmd 回调。"""
+        return datagram(COMMAND_EVENT,
+                        command={**COMMAND_EVENT["command"], "payload": _HMD_PAYLOAD})
 
     def listener(self, **overrides) -> DriverLogListener:
         config = DriverLogConfig(**overrides)
@@ -152,6 +166,36 @@ class DriverLogListenerTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertAlmostEqual(seen[0][0]["yaw_deg"], 45.0, places=3)
         self.assertEqual(seen[0][1], 12.5)
+
+    def test_hmd_sink_failure_survives_the_ingest_error_clear(self) -> None:
+        """HMD sink 的失败不能被 ingest_packet 的 ``_last_error = None`` 吞掉。
+
+        代码里 :288-290 正是为这件事才把 _last_action_error 从 _last_error 里分出来，
+        action sink 用了，HMD sink 漏了。
+        """
+
+        def boom(_sample, _received_at):
+            raise RuntimeError("hmd reader exploded")
+
+        listener = DriverLogListener(DriverLogConfig(enabled=False), on_hmd=boom)
+        self.assertTrue(listener.ingest_packet(self.hmd_command(), now=12.5))
+        snapshot = listener.snapshot()
+        self.assertIn("HMD telemetry sink failed", snapshot["last_hmd_error"] or "")
+        self.assertIsNone(snapshot["last_action_error"])
+        # 失败不得影响遥测本身：计数器照常前进。
+        self.assertEqual(snapshot["accepted_commands"], 1)
+
+    def test_hmd_sink_error_is_cleared_on_the_next_success(self) -> None:
+        """一次偶发的读取器抖动不该永久挂在面板上：下次成功投递即清除。"""
+        seen = []
+        listener = DriverLogListener(
+            DriverLogConfig(enabled=False),
+            on_hmd=lambda sample, at: seen.append((sample, at)),
+        )
+        listener._last_hmd_error = "stale failure"
+        self.assertTrue(listener.ingest_packet(self.hmd_command(), now=12.5))
+        self.assertIsNone(listener.snapshot()["last_hmd_error"])
+        self.assertEqual(len(seen), 1)
 
     def test_hmd_sink_preserves_full_pose(self) -> None:
         payload = json.dumps({

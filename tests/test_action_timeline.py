@@ -222,6 +222,25 @@ class ActionLogRecorderTests(unittest.TestCase):
         self.assertEqual(rows_b[0]["frame_index"], 16)
         self.assertGreater(rows_a[0]["frame_index"], rows_b[0]["frame_index"])
 
+    def test_zero_monotonic_ms_is_an_anchor_not_a_missing_field(self) -> None:
+        """驱动自报的 0 是录制起点，不能被本地时钟顶掉；只有键缺失才回退本地时钟。
+
+        旧实现写成 ``action.get("monotonic_ms") or 0``，两种情况都落到本地时钟，
+        起始帧（monotonic_ms 恰好为 0）的 frame_index 会按「当前时刻」算，全错。
+        """
+        rec = self._recorder()
+        self.assertTrue(rec.record(action={"monotonic_ms": 0}, sequence=1))
+        self.assertTrue(rec.record(action={}, sequence=2))       # 本地构造：键缺失
+        rec.stop()
+        _, rows = load_action_timeline(self.path)
+        self.assertEqual(len(rows), 2)
+        # 锚点 1.0s（见 setUp）：自报 0 ⇒ 事件时刻 0.0 ⇒ 第 -20 帧
+        self.assertAlmostEqual(rows[0]["monotonic_time"], 0.0)
+        self.assertEqual(rows[0]["frame_index"], -20)
+        # 键缺失 ⇒ 回退本地时钟 1.0 ⇒ 第 0 帧
+        self.assertAlmostEqual(rows[1]["monotonic_time"], 1.0)
+        self.assertEqual(rows[1]["frame_index"], 0)
+
     def test_record_without_begin_fails_without_raising(self) -> None:
         naive = VideoTimebase(20.0, clock=self.clock)
         rec = ActionLogRecorder(Path(self._tmp.name) / "x.jsonl", naive,
@@ -469,6 +488,22 @@ class EpisodeActionSummaryTests(unittest.TestCase):
         self.assertNotAlmostEqual(r["osc_forward_distance"], 0.15, places=4)
         self.assertEqual(r["osc_distance_dt_real"], 2)
         self.assertEqual(r["osc_distance_dt_fallbacks"], 1)
+
+    def test_rows_with_broken_subtables_do_not_crash_the_summary(self) -> None:
+        """load_action_timeline 只校验 record=="action"，不校验字段。
+
+        旧版录制器 / 手工编辑过的行可能缺 input_command、turn_intent、osc_velocity，
+        或者类型不对。汇总服务于离线分析，不能因为一行有问题就让整段 episode 报错。
+        """
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"record": "action", "frame_index": 0, "monotonic_time": 0.0}) + "\n")
+            fh.write(json.dumps({"record": "action", "frame_index": 1, "monotonic_time": 0.05,
+                                 "input_command": None, "turn_intent": "not-a-dict",
+                                 "osc_velocity": 7}) + "\n")
+        row = episode_action_summary(self.path, [[0, 10]])[0]
+        self.assertEqual(row["n_records"], 12)
+        self.assertEqual(row["forward_frames"], 10)
+        self.assertEqual(row["turn_right_frames"], 10)
 
     def test_missing_file_yields_empty_history(self) -> None:
         rows = episode_action_summary(Path(self._tmp.name) / "nope.jsonl",
