@@ -130,6 +130,13 @@ function render(s, auto) {
   $("poseState").textContent = s.pose_state || "—";
   $("goal").textContent = s.goal_xy_m ? `${num(s.goal_xy_m[0])}, ${num(s.goal_xy_m[1])}` : "—";
   $("odo").textContent = `${num(s.odometry_distance_m, 1)} m / ${s.osc_samples ?? 0}`;
+  // 静默封顶：VelocityX/Z 无心跳，丢包丢掉"停下"那个 0 包时，最后一个速度不能被永远积分。
+  // 丢弃量不为 0 = 现场真的撞上了这个洞（不是误差条，是没算进去的那段）。
+  const ho = s.odometry_holdout || {};
+  const hoText = ho.last_sample_age_s == null ? "—" : `${num(ho.last_sample_age_s, 1)} s`;
+  $("odoHold").textContent = `${hoText} / ${num(ho.dropped_m, 1)} m · 最长合法空档 ${num(ho.max_legit_gap_s, 2)} s`;
+  flag($("odoHold"), (ho.dropped_m || 0) > 0.5
+    || (ho.max_legit_gap_s || 0) > (ho.zoh_max_s || 2.5) ? "bad" : "ok");
   const sen = s.sensors;
   $("sensors").textContent = sen && sen.size ? `${sen.size[0]}×${sen.size[1]} fx ${num(sen.fx, 1)} 基线 ${num(sen.baseline_m, 3)}` : "未打开";
   $("stereo").textContent = `${s.stereo_ms == null ? "—" : num(s.stereo_ms, 0) + " ms"} / ${s.stereo_age_s == null ? "—" : num(s.stereo_age_s, 1) + " s"}`;

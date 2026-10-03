@@ -6,7 +6,9 @@
 > `relocalization_observer.py` —— 源码已删，仅剩孤儿 `.pyc`，因此原版多处已失效）。
 > 原版全文见 git `688e420` 之前的历史。
 >
-> **权威口径与 15 组冲突登记见 [`Docs/README.md`](README.md)。** 本文只描述**现状**。
+> **权威口径与 20 组冲突登记见 [`Docs/README.md`](README.md)。** 本文只描述**现状**。
+> ⚠️ 2026-10-04 复核：§三「活跃链」表**漏了** 2026-10 起上线的 `nav_xsession.py`（跨会话 P0 主体，默认开）、
+> `nav_bow.py`、`nav_memory.py`，已补入 `Docs/README.md` §二 权威矩阵。
 
 ---
 
@@ -31,7 +33,7 @@
 | 产物 | `topo_map` / `nav_map.json` / `world_model.json` / 2.5D 障碍层 | 三态栅格（free/obstacle/unknown）+ navmesh |
 | 接线 | **离线跑，人工触发**（入口 `map_from_capture.py`） | **已接进后端**：`service.py` 构造 `OnlineNavigator`，11 处调用 |
 | HTTP | 无 | `GET /worldmodel/navmesh`、`POST /worldmodel/navmesh/{start,stop,goto,explore,cancel}` |
-| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话重定位失败** |
+| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话检索 ✅ / 采纳下游消费 ❌**（2026-10-04 更正，见 `Docs/README.md` §三 **C18**） |
 
 **两条路线各有坐标系与尺度、没有绑定** —— 这是当前最大的结构洞。
 详见 [`Docs/自动到达能力差距清单.md`](自动到达能力差距清单.md)（2026-09-30 已重写）。

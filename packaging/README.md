@@ -11,6 +11,9 @@ uv pip install --python <Python3.11路径> --target vendor --require-hashes --on
 
 开始前创建 `build/`。更换 Python 小版本、依赖或平台时，使用新的暂存目录重建 vendor；不要混合不同 ABI 的 `.pyd` 文件。
 构建使用宿主官方打包器、包检查器和安装器，测试安装目的地仅为本项目的 `build/安装验证 空格-*`。
+`build_neko.py` 在**每次构建开始时**清理上一轮的 `安装验证 空格-*` / `profile-conflict-*` 残留
+（每份都是一整份插件树加完整 `vendor/`，上白 MB，不清会无限累积）；
+想留着上一轮现场用 `--keep-install` 跳过。
 交付使用文件名带 `-profile-safe` 的包：移除打包器自动生成、无业务参数的默认 profile，并重新计算 payload 哈希，避免旧宿主同名 profile 归属不明时导入失败。插件代码、模型、vendor、元数据均保持不变，现有 profile 不被接管或覆盖。
 可运行 `packaging/verify_profile_conflict.py --host <N.E.K.O源码根目录>`，复现旧包冲突并验证修订包安装后原有 profile 字节不变。
 读取 `build/package-verification.json` 的 `installed_plugin`，再用无第三方库的 Python 3.11 验证安装结果：
@@ -18,6 +21,11 @@ uv pip install --python <Python3.11路径> --target vendor --require-hashes --on
 ```powershell
 <干净Python路径> -I -S -B packaging/verify_runtime.py <installed_plugin路径>
 ```
+
+> ⚠️ 该目录是**临时验证产物**：下一次运行 `build_neko.py` 会被自动清理
+> （`package-verification.json` 里的 `install_dir_transient: true` 就是这个意思）。
+> **`verify_runtime.py` 必须在本次构建之后、下次构建之前运行**，
+> 否则 `installed_plugin` 指向的路径已经不存在。
 
 `-I -S` 禁用用户目录和系统 site-packages，只允许后端入口加载包内 vendor。
 该验证不启动屏幕捕获，不输出设备控制指令；完成后停止测试后端。

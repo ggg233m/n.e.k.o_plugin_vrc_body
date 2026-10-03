@@ -1859,6 +1859,5 @@ class PluginPackageNameTests(unittest.TestCase):
             "plugin.plugins.neko_anyadance_body",
         )
 
-
 if __name__ == "__main__":
     unittest.main()

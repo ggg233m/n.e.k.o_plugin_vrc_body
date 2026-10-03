@@ -100,6 +100,72 @@ class DeadReckonerTest(unittest.TestCase):
         self.assertEqual(float(T[0, 3]), 0.0)
         self.assertEqual(dr.samples, 0)
 
+    # ---- 静默封顶：人站着不动，路程不能一直涨（2026-10 现场）----
+    def test_silence_stops_extrapolating_instead_of_drifting_forever(self) -> None:
+        # 复现现场：最后一个速度包丢了 0 之后 OSC 彻底静默，旧实现会 0.4 m/s 永远积分下去。
+        dr = DeadReckoner(S, osc_lag_s=0.0, zoh_max_s=2.5, zoh_fade_s=1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 0.4)])
+        dr.update(3600.0, r, [])                       # 站了一小时，一个新包都没有
+        self.assertLessEqual(dr.dist_m, 0.4 * 3.5 + 1e-9)   # 满速 2.5 s + 淡出 1 s 到顶
+        self.assertLess(dr.dist_m, 1.5)
+        self.assertAlmostEqual(float(dr.xy[0] * S), dr.dist_m, places=9)   # 位姿不再偷偷跑
+        # 丢掉的那段照实记账，不假装本来就该是 0
+        self.assertAlmostEqual(dr.holdout_m + dr.dist_m, 0.4 * 3600.0, places=3)
+        self.assertAlmostEqual(dr.holdout_s, 3600.0 - 3.0, places=6)
+
+    def test_short_silence_keeps_zoh_protocol_semantics(self) -> None:
+        # 真实的匀速长走每 ~0.09 s 一个包；短空档必须照旧满速外推（协议语义：静默 = 速度没变）。
+        dr = DeadReckoner(S, osc_lag_s=0.0, zoh_max_s=2.5, zoh_fade_s=1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 1.0)])
+        dr.update(0.9, r, [])
+        self.assertAlmostEqual(dr.dist_m, 0.9, places=9)
+        self.assertAlmostEqual(dr.holdout_m, 0.0, places=9)
+
+    def test_jump_gap_up_to_observed_max_is_not_truncated(self) -> None:
+        # 20260929 录制里最长的"真位移"空档是 2.03 s @ 4 m/s（滞空），默认上限必须放过它。
+        dr = DeadReckoner(S, osc_lag_s=0.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 4.0)])
+        dr.update(2.03, r, [])
+        self.assertAlmostEqual(dr.dist_m, 4.0 * 2.03, places=6)
+        self.assertAlmostEqual(dr.holdout_m, 0.0, places=9)
+
+    def test_new_sample_after_silence_resumes_full_speed(self) -> None:
+        dr = DeadReckoner(S, osc_lag_s=0.0, zoh_max_s=2.5, zoh_fade_s=1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 0.4)])
+        dr.update(600.0, r, [])                       # 静默很久：已经停下积分
+        before = dr.dist_m
+        dr.update(600.1, r, [osc(600.1, 0.0, 0.4)])   # 又走起来了，新速度从 600.1 起生效
+        self.assertAlmostEqual(dr.dist_m, before, places=9)
+        dr.update(600.2, r, [])                       # 之后照旧满速积分
+        self.assertAlmostEqual(dr.dist_m - before, 0.4 * 0.1, places=6)
+        self.assertAlmostEqual(dr.holdout_m, 0.4 * (600.2 - 3.0 - 0.1), places=6)
+
+    def test_zero_speed_silence_is_never_counted_as_holdout(self) -> None:
+        # 停住之后的静默是真的 0×Δt，不该被算成"被丢掉的位移"（否则现场噪音淹没真信号）。
+        dr = DeadReckoner(S, osc_lag_s=0.0, zoh_max_s=2.5, zoh_fade_s=1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 0.0)])
+        dr.update(3600.0, r, [])
+        self.assertEqual(dr.holdout_s, 0.0)
+        self.assertEqual(dr.holdout_m, 0.0)
+        self.assertEqual(dr.dist_m, 0.0)
+
+    def test_legit_gap_is_measured_so_the_cap_can_be_checked_in_the_field(self) -> None:
+        # "恒速不发包"这个前提要能被现场读数证伪：两端都非零的静默段最长多长，直接报出来。
+        dr = DeadReckoner(S, osc_lag_s=0.0, zoh_max_s=2.5, zoh_fade_s=1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        dr.update(0.0, r, [osc(0.0, 0.0, 1.0)])
+        dr.update(0.016, r, [osc(0.016, 0.0, 1.0)])
+        self.assertAlmostEqual(dr.max_legit_gap_s, 0.016, places=6)
+        dr.update(2.0, r, [osc(2.0, 0.0, 0.0)])       # 停住：两端不都非零，不计入
+        self.assertAlmostEqual(dr.max_legit_gap_s, 0.016, places=6)
+        dr.update(5.0, r, [osc(5.0, 0.0, 1.0)])       # 3 s 的"两端非零"空档被记下
+        self.assertAlmostEqual(dr.max_legit_gap_s, 3.0, places=6)
+
 
 def ground_and_wall(wall_x_track: float | None) -> np.ndarray:
     gx, gy = np.meshgrid(np.arange(0.3, 3.0, 0.05), np.arange(-1.5, 1.5, 0.05))
@@ -181,21 +247,35 @@ class FakeSensors:
 
 
 class Harness:
-    def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None) -> None:
+    def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None,
+                 frozen_osc: bool = False) -> None:
         self.armed = armed
         self.vz = vz
+        self.frozen_osc = frozen_osc
         self.moves: list[tuple[float, int]] = []
         self.turns: list[float] = []
         self.stops = 0
         self.sensors = FakeSensors()
+        self._osc_ts: float | None = None
         cfg = OnlineNavConfig(map_min_interval_s=0.1, stereo_period_s=0.05, kf_max_age_s=0.3)
         self.nav = OnlineNavigator(
-            motion_history=lambda: [osc(0.0, 0.0, self.vz)],
+            motion_history=self._motion,
             send_move=lambda f, ms: self.moves.append((f, ms)),
             send_turn=lambda d: self.turns.append(d),
             stop_motion=self._stop,
             drive_block_reason=lambda: None if self.armed else "autonomy_not_armed",
             sensors_factory=lambda: self.sensors, cfg=cfg, record_root=record_root)
+
+    def _motion(self) -> list[dict]:
+        # 时间戳必须和 navigator 同一个 monotonic 时钟且**新鲜**：真实回传是变化驱动的，
+        # 拿一个固定的 0.0 当时间戳等于宣称"最后一条速度报文是开机以来的"，航位推算
+        # 会按静默封顶把它丢掉（见 DeadReckoner._hold_dt），测的就不是同一件事了。
+        if self.frozen_osc:                      # 录制去重那条用：每拍都是同一个样本
+            self._osc_ts = time.monotonic() if self._osc_ts is None else self._osc_ts
+        else:
+            now = time.monotonic()
+            self._osc_ts = now if self._osc_ts is None else max(self._osc_ts + 1e-6, now)
+        return [osc(self._osc_ts, 0.0, self.vz)]
 
     def _stop(self) -> None:
         self.stops += 1
@@ -298,6 +378,11 @@ class ThreadsTest(unittest.TestCase):
         self.assertEqual(st["loop_closure"]["keyframes"], st["keyframes"])
         self.assertEqual(st["pose_state"], "localized")
         self.assertGreater(st["odometry_distance_m"], 0.0)
+        # 静默封顶的现场读数：有新报文在流 → 静默时长接近 0、丢弃量必须是 0。
+        ho = st["odometry_holdout"]
+        self.assertEqual((ho["zoh_max_s"], ho["zoh_fade_s"]), (2.5, 1.0))
+        self.assertLess(ho["last_sample_age_s"], 0.5)
+        self.assertEqual((ho["dropped_s"], ho["dropped_m"]), (0.0, 0.0))
         self.assertEqual(st["drive_block"], "autonomy_not_armed")
         self.assertEqual(h.moves, [])
         self.assertEqual(st["errors"], [])
@@ -462,8 +547,8 @@ class ConfigSurfaceTest(unittest.TestCase):
 
 
 class RecorderTest(unittest.TestCase):
-    def run_session(self, root: Path | None, record: bool) -> dict:
-        h = Harness(armed=False, vz=0.5, record_root=root)
+    def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False) -> dict:
+        h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
             h.nav.start(record=record)
             try:
@@ -482,7 +567,7 @@ class RecorderTest(unittest.TestCase):
 
     def test_recording_has_everything_needed_to_replay(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            st = self.run_session(Path(d), record=True)
+            st = self.run_session(Path(d), record=True, frozen_osc=True)
             rec = st["recording"]
             self.assertEqual(rec["stopped"], "closed")
             out = Path(rec["dir"])
@@ -573,6 +658,32 @@ class CoverageViewTest(unittest.TestCase):
         self.assertFalse([k for k in keys if "coverage" in k or k.startswith("cov")])
         view = h.nav.grid_view()                      # PNG 输出契约不变：rows/cols 与主栅格一致
         self.assertEqual((view["rows"], view["cols"]), h.nav.session.ng.grid.shape)
+
+
+class XSessionAlignTest(unittest.TestCase):
+    """P0.3b：会话末自动采纳线程体（同步调用验证接线，不 spawn 真线程）。"""
+
+    def test_align_thread_body_writes_result(self) -> None:
+        import types
+        from tests.test_nav_xsession import build_align_fixture
+        from neko_anyadance_body.backend.nav_xsession import XSessionConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wdir = Path(tmp) / "wrld_x-abc"
+            build_align_fixture(wdir)
+            nav = OnlineNavigator.__new__(OnlineNavigator)
+            nav._state_lock = threading.Lock()
+            nav._errors = []
+            nav._mem = types.SimpleNamespace(session_id="NEW")
+            nav._xs = types.SimpleNamespace(world_dir=wdir)
+            nav._align_out = None
+            nav.cfg = OnlineNavConfig(xsession=XSessionConfig(align_min_constraints=8))
+            nav._align_xsession()                     # 直接调线程体
+            out = nav._align_out
+            self.assertIsNotNone(out)
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["old_sid"], "OLD")
+            self.assertTrue(Path(out["merged"]).is_file())
 
 
 if __name__ == "__main__":

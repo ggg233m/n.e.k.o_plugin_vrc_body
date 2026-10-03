@@ -3,7 +3,7 @@
 - [N.E.K.O 宿主一键安装包说明](INSTALL.md)：导入 `.neko-plugin` 即可安装模型和运行依赖。
 
 - 🔴 **[读文档前先读这个：Docs 索引与权威性](Docs/README.md)**
-  —— `Docs/` 下有 30 份文档，其中多数是**日期化实验记录**，彼此存在 **8 组冲突陈述**。
+  —— `Docs/` 下有 **43 份文档**，其中多数是**日期化实验记录**，彼此存在 **20 组冲突陈述**。
   该索引给出权威矩阵与冲突登记表；**任何文档与代码不符时以代码为准**。
 
 - 2026-09-20：正在制作世界模型（**现状见 [开发进度](ROADMAP.md) 与
@@ -24,7 +24,7 @@
 - 把手移动到相对 HMD、胸口或髋部的局部 XYZ 目标。
 - 开掌、握拳、抓握和指向。
 - 向腰部、胸部或头部高度伸手，并在轨迹末段发送 grip。
-- 挥手、点头、鞠躬、急停、复位和显式启停输出。
+- 挥手、点头、鞠躬、急停和动作取消输出。**复位与「启用/停用身体输出」是面板专属**——见下方「安全与运行约束」第 1 条。
 - 用 `body_express` 提交“问候、同意、解释、思考、庆祝”等语义意图，由分层状态机选择自然表达动作。
 - `motions/` 目录中的白名单 AnyaDance `.nya` 预制动作由 `body_express` 的状态机自动选片，不再单独暴露枚举/播放入口。
 - 用 `body_status` 读取 LLM 可理解的当前/上一动作、切换关系、完成状态、剩余时间和实际语义姿态；`include` 可只取 `body`/`autonomy`/`vision` 中的某几段。
@@ -37,13 +37,16 @@
 - 用 `body_turn(degrees=360, wait_complete=true)` 执行并校验一次 360° 原地转向；它只证明转向完成，不会把沿途未送入 VLM 的画面伪装成“已经检查”。普通 Agent 的拒绝结果会提升为 failed run，避免 `accepted=false` 被宿主误说成动作完成。本地避障是 2.5D 增量栅格（需双目深度可用、且本地导航已启用），只覆盖走过的地方，不承诺跨遮挡推理，“绕到墙后”会明确返回 `unsupported_spatial_navigation`。
 - 监听 VRChat 的 Avatar 切换和参数回传，把白名单动作状态加入 `body_status`。
 - 在 `idle` 状态监听 N.E.K.O VMC 2.0 OSC，完成 Humanoid FK 后中转头、双手、髋和双脚六点姿态。
-- 单一发送线程以配置的 120 Hz（默认）向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
+- 单一发送线程以配置的发送频率向 `127.0.0.1:39570` 发送完整 UDP 帧，控制器叠加与六点姿态共用同一帧。
+  代码默认 60 Hz（`config.py:443`），**随插件部署的 `plugin.toml` 设为 120 Hz**。
 
 “拿东西”只表示手移动到语义目标并发送握持输入。VRChat OSC 不提供通用物体位置或 Pickup 附着确认，因此插件始终把 `object_held` 报告为 `unknown`。
 
 ## 安全与运行约束
 
-1. 插件默认不自动启动；启动后仍处于 `disabled`，必须显式调用 `body_enable`。
+1. 插件默认不自动启动；启动后仍处于 `disabled`。**`body_enable` / `body_disable` / `body_reset` 是面板专属入口**
+   （`panel_command`，`metadata.agent_auto=false`，宿主保证 Agent 看不到也分派不了）——
+   **agent 调不到，需要用户在调试面板点「启用」**。其余身体操作走 `debug_command` 通道，agent 可用。
 2. `body_stop(scope="freeze")` 会撤掉当前自主目标、冻结当前合法姿态、释放所有控制器输入，并锁定后续动作与转向（`turn` 与 `NORMAL`/`INPUT` 两组命令一起被闩锁挡在 `submit()` 外，因此导航器的朝向修正也进不来）。撤目标是尽力而为的副作用，后端不可用时不影响急停本身报成功。解除按「谁锁的谁能解」分流：LLM 自己下的急停可以由它自己调用 `body_stop(scope="unfreeze")` 恢复 T Pose（否则它有权进入一个自己无权离开的状态）；面板「立即急停」按钮下的急停和故障闩锁只能由用户点击面板的「复位 T Pose」解除。
 3. 调试面板的「允许模型急停」开关决定 LLM 能不能自己下 `scope="freeze"`，默认允许（急停是降权，多数时候让它能停下更安全）。关闭后模型只剩 `scope="all"` 这类普通停车，freeze 会被明确拒绝而不是悄悄降级——降级会让它把返回值当成「已经急停」。开关只管进入 freeze，不影响它解除自己已经下过的那次急停，也不影响面板自己的急停按钮。面板急停走的是只有面板能分派的 `body_freeze`（`panel_command`，`metadata.agent_auto=false`），不是带来源参数的共用入口：共用入口拿不到调用方身份，参数里的来源字符串模型自己也能填。
 4. UDP 协议本身没有响应或发送者身份。启用并收到 AnyaDance 驱动遥测时，`body_status.driver_log` 和 `body_status` 的 `body.driver_delivery` 可以确认驱动实际处理了命令；遥测不可用时只能确认本地发送成功。
@@ -118,7 +121,7 @@ API key 只从环境变量读取。完整说明见 [独立后端](backend/README
 
 插件新增 `world_observe` 工具和 revision 增量世界桥；后端目录内的 `backend/world_state.py` / `backend/vision.py` 提供状态层、DXcam/MSS 桌面镜像采集、可插拔 OpenVINO/VLM worker。它们不进入 AnyaDance 的 120 Hz 调度线程，也不替代宿主 VMC 待机中转。模型包和 OpenAI-compatible VLM 由部署环境提供，缺少依赖时明确降级为 unavailable；启用采集但没有模型时只运行 capture-only 诊断，不发布猜测实体。视觉后端可以发布带 `confidence`、`source`、`age_ms`、`ttl_ms` 和 `unknown` 不确定性的目标与事件；LLM 读取不到新观测时不得把空结果当成“场景为空”。
 
-当前发布配置启用桌面采集，并从插件内的 `models/person_detect_v1.3_s/` 加载人物检测 ONNX 和标签文件。目录包含原始模型说明、参考阈值和 SHA-256 清单，详见 [模型说明](models/person_detect_v1.3_s/README.md)。模型路径相对于插件配置目录解析；复制插件时应保留整个 `models/` 目录。DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 仍使用可选适配器；缺少依赖时明确报告不可用。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
+当前发布配置从插件内的 `models/person_detect_v1.3_s/` 加载人物检测 ONNX 和标签文件。目录包含原始模型说明、参考阈值和 SHA-256 清单，详见 [模型说明](models/person_detect_v1.3_s/README.md)。模型路径相对于插件配置目录解析；复制插件时应保留整个 `models/` 目录。DXcam/MSS、OpenVINO 和 OpenAI-compatible VLM 仍使用可选适配器；缺少依赖时明确报告不可用。后端的可移植边界、启动方式和适配说明见 `backend/README.md`。
 
 桌面镜像采集会自动探测 DXGI 的 GPU/显示输出，并在失败时逐个尝试 MSS 物理显示器；
 `/perception` 会保留每个候选输出的错误，便于区分权限、显卡和 BitBlt 问题。可在
@@ -135,14 +138,14 @@ python -m pip install --user "dxcam[winrt]"
 安装后保持 `dxcam_backend = "auto"`；DXGI 被拒绝时会自动切换到 WinRT。该依赖仍是
 可选的，未安装时插件会继续使用 DXGI/MSS，并在 `/perception` 报告缺失原因。
 
-`[vision]` 默认 `capture = "wgc"`，按窗口捕获 `window_title` 指定的窗口
-（随插件部署的配置为 `"VRChat"`）。Windows.Graphics.Capture 从 DWM 取该窗口自己的
+`[vision]` 的 `capture` **代码默认是 `"desktop_mirror"`**（`config.py:353`/`:664`）；**随插件部署的 `plugin.toml` 设为 `"wgc"`**，
+按窗口捕获 `window_title` 指定的窗口（部署值为 `"VRChat"`）。Windows.Graphics.Capture 从 DWM 取该窗口自己的
 合成内容，压在上面的窗口不参与，因此别的窗口盖住 VRChat 时画面依然是游戏本身，
 也不需要窗口矩形——捕获项跟着窗口走，拖动和改分辨率都不必重新解析坐标。唯一仍然
 抓不到的情形是窗口最小化：DWM 不再为它合成，此时暂停观测。需要 Win10 1903+。
 
-改成 `capture = "desktop_mirror"`（或 `"dxcam"`/`"mss"`）会退到桌面镜像：采集区域取
-窗口的屏幕矩形而不是整块显示器。这条路径抓的是**合成后的桌面**，VRChat 被别的窗口
+部署配置用的是 `wgc`；**改成 `capture = "desktop_mirror"`（或 `"dxcam"`/`"mss"`）才退到桌面镜像**：
+采集区域取窗口的屏幕矩形而不是整块显示器。这条路径抓的是**合成后的桌面**，VRChat 被别的窗口
 压住时采集照样"成功"，拿到的却是上层窗口的像素——那正是遮挡检测必须存在的原因
 （实测同一时刻两者相关系数仅 0.065）。窗口矩形也不是一次性的：窗口被拖动、改分辨率
 或全屏切换后，启动时解析的坐标就会一直抓错位置，而 DXcam/MSS 的区域在构造时固定、
@@ -290,10 +293,11 @@ awareness_parameters = [
 ]
 ```
 
-参数工具示例：
+参数工具示例（前两条 `body_turn` / `body_stop` / `body_chatbox` 是独立工具；
+`body_vrchat_input` 走 `debug_command` 通道）：
 
 ```text
-body_vrchat_input(action="grab", side="right", hold_ms=100)
+debug_command(command="body_vrchat_input", arguments={action="grab", side="right", hold_ms=100})
 body_turn(degrees=-45)
 body_stop(scope="axes")
 body_chatbox(text="你好", immediate=true)
@@ -327,25 +331,30 @@ body_chatbox(text="你好", immediate=true)
 
 ```powershell
 cd H:\AI\neko-music\N.E.K.O
-python -m plugin.neko_plugin_cli.cli check H:\AI\neko-music\vrc\neko_anyadance_body
-python -m plugin.neko_plugin_cli.cli build H:\AI\neko-music\vrc\neko_anyadance_body
+python -m plugin.neko_plugin_cli.cli check H:\AI\neko-music\vrc\pc-vr\n.e.k.o_plugin_vrc_body
+python -m plugin.neko_plugin_cli.cli build H:\AI\neko-music\vrc\pc-vr\n.e.k.o_plugin_vrc_body
 ```
+
+> ⚠️ 路径是**源码目录**，不是安装后的插件目录 `neko_anyadance_body`（那是 `plugin.toml` 的 `id`）。
 
 若系统 Python 缺少 N.E.K.O 宿主依赖，请使用该仓库配置的 `uv run python` 执行同样命令。
 
 ## 建议调用
 
+`body_status`、`body_stop`、`body_turn`、`body_chatbox`、`body_express` 等是**独立 LLM 工具**。
+手臂/手部/抓取类没有独立 schema，走**共用入口** `debug_command(command="…", arguments={…})`：
+
 ```text
-body_enable()
-body_arm_pose(mode="polar", side="right", elevation_deg=130, azimuth_deg=-25, reach=0.9, wrist_roll_deg=45)
-body_arm_pose(mode="anchor", side="right", relative_to="chest", x_m=0.30, y_m=0.10, z_m=-0.45, palm="down")
-body_hand(side="right", pose="grip", strength=1.0)
-body_vrchat_input(action="use", side="right")
 body_status()
 body_stop()
-body_reset()
-body_disable()
+debug_command(command="body_arm_pose", arguments={mode="polar", side="right", elevation_deg=130, azimuth_deg=-25, reach=0.9, wrist_roll_deg=45})
+debug_command(command="body_arm_pose", arguments={mode="anchor", side="right", relative_to="chest", x_m=0.30, y_m=0.10, z_m=-0.45, palm="down"})
+debug_command(command="body_hand", arguments={side="right", pose="grip", strength=1.0})
+debug_command(command="body_vrchat_input", arguments={action="use", side="right"})
 ```
+
+⚠️ **`body_enable` / `body_disable` / `body_reset` agent 调不到** —— 它们是 `panel_command`
+（`agent_auto=false`），需用户在调试面板点击。参见 [Docs/README.md](Docs/README.md) §三 **C8 / C17**。
 
 角度是插件定义的语义手臂角度，不是真实肩关节测量值。肩膀位置由 HMD 和身体配置估算，肩肘最终由 VRChat IK 求解。
 

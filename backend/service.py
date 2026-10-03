@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from collections import deque
 import math
 import os
 import threading
@@ -409,6 +410,15 @@ class BackendService:
         self._last_error: str | None = None
         self._expression_side_count = 0
         self._motion_intent_counts: dict[str, int] = {}
+        # turn 来源账本：play-space yaw 的每一次转身都必须能归因。只看
+        # turn_commands 总数无法回答"这 282 条是谁发的"——导航器、HTTP
+        # set_turn、调试工具共用一个调度器通道，不记账就只剩猜测。
+        self._turn_trace_lock = threading.Lock()
+        self._turn_source_counts: dict[str, int] = {}
+        self._turn_trace: deque[dict[str, Any]] = deque(maxlen=64)
+        # HTTP 处理线程在分发请求前写入的客户端地址（ip:port）。turn 账本
+        # 取它归因到具体客户端连接；非 HTTP 路径（导航器）读到 None 属预期。
+        self._http_client_addr: str | None = None
         self.autonomy = AutonomyRuntime(
             world_provider=lambda: self.vision.snapshot(),
             release_inputs=self._release_all_inputs,
@@ -2306,6 +2316,7 @@ class BackendService:
             "cognition": self.cognition.snapshot(),
             "autonomy": self.autonomy.snapshot(),
             "navigation": self.navigator.snapshot(),
+            "turn_trace": self.turn_trace_snapshot(),
             "control_latency": self.control_metrics_snapshot(),
             "backend": {
                 "started": self._started,
@@ -2600,6 +2611,29 @@ class BackendService:
             timeline.record_command(forward=y, strafe=x, sent=accepted)
         return accepted
 
+    def _record_turn_submission(
+        self, source: str, delta_deg: float, accepted: bool
+    ) -> None:
+        """记账一条 turn 提交：来源、请求增量、是否被调度器接受。"""
+        with self._turn_trace_lock:
+            self._turn_source_counts[source] = self._turn_source_counts.get(source, 0) + 1
+            self._turn_trace.append(
+                {
+                    "t": round(time.monotonic(), 3),
+                    "source": source,
+                    "client": self._http_client_addr,
+                    "delta_deg": round(float(delta_deg), 2),
+                    "accepted": accepted,
+                }
+            )
+
+    def turn_trace_snapshot(self) -> dict[str, Any]:
+        with self._turn_trace_lock:
+            return {
+                "counts": dict(self._turn_source_counts),
+                "recent": list(self._turn_trace),
+            }
+
     def _navigator_send_turn(self, delta_deg: float) -> bool:
         """转向直接进调度器，不经 set_turn。
 
@@ -2615,6 +2649,9 @@ class BackendService:
         # 既能连续重定向，也不会在 0/360° 边界误转一整圈。
         result = scheduler.submit("turn", {"correction_deg": float(delta_deg)})
         accepted = bool(result.get("accepted"))
+        recorder = getattr(self, "_record_turn_submission", None)
+        if recorder is not None:
+            recorder("navigator", delta_deg, accepted)
         timeline = self.action_timeline
         if timeline is not None:
             # turn_intent 记录的是**输入意图**（要求转多少度），不是实际转过的角度。
@@ -2783,7 +2820,12 @@ class BackendService:
         record(False)
         return False, horizontal_result[1] or "VRChat OSC locomotion send failed"
 
-    def set_turn(self, horizontal: Any, duration_ms: Any) -> tuple[bool, str | None]:
+    def set_turn(
+        self,
+        horizontal: Any,
+        duration_ms: Any,
+        source: str = "set_turn",
+    ) -> tuple[bool, str | None]:
         """转向走 AnyaDance，直接转虚拟 HMD，不经 VRChat 的输入层。
 
         VR 模式下 ``/input/LookHorizontal`` 是死路：VRChat 只在桌面模式把它当连续
@@ -2803,6 +2845,9 @@ class BackendService:
             return False, "AnyaDance scheduler is not initialized"
         delta_deg = normalized_horizontal * TURN_SPEED_DPS * (normalized_duration / 1000.0)
         result = self.scheduler.submit("turn", {"delta_deg": delta_deg})
+        recorder = getattr(self, "_record_turn_submission", None)
+        if recorder is not None:
+            recorder(source, delta_deg, bool(result.get("accepted")))
         if self.action_timeline is not None:
             self.action_timeline.record_turn(yaw_delta=delta_deg, sent=bool(result.get("accepted")))
         return bool(result.get("accepted")), result.get("reason")
@@ -2863,7 +2908,7 @@ class BackendService:
             return False, "AnyaDance scheduler is not initialized"
         if normalized_side == "left":
             return self.set_locomotion(normalized_y, normalized_x, normalized_duration)
-        return self.set_turn(normalized_x, normalized_duration)
+        return self.set_turn(normalized_x, normalized_duration, source="axes:right_fallback")
 
     def set_controller_button(
         self,
@@ -2961,6 +3006,7 @@ class BackendService:
                 result = self.set_turn(
                     command.get("horizontal"),
                     command.get("duration_ms", 500),
+                    source="batch:turn",
                 )
                 axis_touched = True
             elif kind == "stop_movement":

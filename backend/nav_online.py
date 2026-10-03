@@ -31,6 +31,7 @@ import numpy as np
 from .nav_grid import FREE, OCC, UNK
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
+from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, make_sgbm, stereo_disparity, stereo_points
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
@@ -51,6 +52,12 @@ class OnlineNavConfig:
     expected_baseline_m: float = 0.126
     baseline_tol_m: float = 0.01
     osc_lag_s: float = 0.18          # OSC 速度比画面晚到约 0.18 s（run5/run6 局部窗口回放扫描最优 0.175–0.2）
+    # 非零速度的 ZOH 外推上限：VelocityX/Z 无心跳，静默只在短时间内等于"速度没变"
+    # （实测需要外推非零速度的空档全部 ≤ 2.03 s）。静默超过 osc_zoh_max_s 后在 osc_zoh_fade_s
+    # 内线性淡出到 0，避免丢掉"停下"那个 0 包时把最后一个速度永远积分下去（静止漂移 + 路程虚涨）。
+    # 任一项为 0 = 不封顶（回到旧行为，只在明知道自己在赌时才这么配）。
+    osc_zoh_max_s: float = 2.5
+    osc_zoh_fade_s: float = 1.0
     pose_hz: float = 20.0
     # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
@@ -82,6 +89,8 @@ class OnlineNavConfig:
     yaw_jump_dps: float = 400.0      # 调度器转向上限 360°/s，留点余量
     yaw_jump_min_deg: float = 10.0
     mapper: MapperConfig = field(default_factory=MapperConfig)
+    # 跨会话地点检索（P0）：世界索引装载/查询/约束写回。确认对只写约束不碰位姿图（隔离层）。
+    xsession: XSessionConfig = field(default_factory=XSessionConfig)
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
     record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
@@ -281,17 +290,49 @@ class DeadReckoner:
     所以输出 = 积分位置 + 当前速度 × lag（只加在输出上，不写回积分）。旧实现把积分终点
     推到 now+lag，但迟到样本同样从 now+lag 起生效，两者相互抵消，等于没补。
     代价：起步/停下时输出沿运动方向跳 v×lag（跑步约 0.5 m）。
+
+    ## 非零速度的 ZOH 外推必须封顶（2026-10 静止漂移修复）
+
+    VelocityX/Z 是**变化驱动、没有心跳**的通道：静止不发包，匀速也不发包，所以
+    "静默"在信息上等于"速度没变"——**但只在短时间内成立**。实测（Docs/SLAM米制复测报告
+    2026-09-24 §3.1，以及 navmesh_recordings/20260929_045615 回放）需要拿非零速度跨空档
+    外推的空档全部 ≤ 2.03 s；超过 1 s 的空档里前速度几乎全是 0（真的停住了）。
+
+    旧实现对静默**无上限**外推。丢掉"停下"那个 0 包（UDP 丢包、Avatar 切换、追踪丢失、
+    断网）时，最后一个非零速度会被永远积分下去：0.4 m/s 静默 1 小时 = 虚增 1.4 km 路程，
+    位姿沿最后运动方向一路"飘"，关键帧与回环被这条假路程带着连发。这就是现场看到的
+    "人没动、OSC 路程一直在涨"。
+
+    所以给外推封顶：``zoh_max_s`` 内按满速外推（协议语义），之后在 ``zoh_fade_s`` 内线性
+    淡出到 0，再往后完全停止积分。**被丢掉的那段路程照实计数**（``holdout_m`` /
+    ``holdout_s``）并进 status()，既不静默改数，也不假装"本来就该是 0"。真正的匀速长走
+    每 ~0.09 s 就有新报文（20260929 录制实测 ~11.7 Hz），碰不到这个上限。
     """
 
-    def __init__(self, world_scale: float, osc_lag_s: float = 0.18) -> None:
+    def __init__(self, world_scale: float, osc_lag_s: float = 0.18, *,
+                 zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0) -> None:
         self.s = float(world_scale)
         self.lag = float(osc_lag_s)
+        self.zoh_max = max(0.0, float(zoh_max_s))
+        self.zoh_fade = max(0.0, float(zoh_fade_s))
         self.xy = np.zeros(2)
         self.dist_m = 0.0            # OSC 路程，世界米
+        self.holdout_s = 0.0         # 因静默超上限而**没有**积分的时长（秒）
+        self.holdout_m = 0.0         # 同上，按最后速度折算的**没算进去**的路程（世界米）
         self._v = (0.0, 0.0)         # (vx 右, vz 前)，世界米/秒
+        self._v_at: float | None = None   # 最后一个速度样本的 OSC 时刻
+        # 本会话里"被新报文证明当时确实在动"的静默段最长多长（两端速度都非零的空档）。
+        # 它是 zoh_max_s 该取多少的**现场读数**：实测恒速走的中位间隔 16 ms、最长 0.16 s，
+        # 若这个数逼近 osc_zoh_max_s，说明该 Avatar 的回传比录制时更慢，该调大上限。
+        self.max_legit_gap_s = 0.0
         self._t: float | None = None
         self._last_ts = -math.inf
         self.samples = 0
+
+    @property
+    def last_sample_at(self) -> float | None:
+        """最后一个被接受的 OSC 速度样本时刻（None = 一个都没有）。"""
+        return self._v_at
 
     def update(self, t_now: float, r_ob: np.ndarray, osc: Sequence[dict[str, Any]]) -> np.ndarray:
         fwd = np.array([r_ob[0, 0], r_ob[1, 0]], float)
@@ -308,8 +349,13 @@ class DeadReckoner:
             vx, vz = item.get("velocity_x"), item.get("velocity_z")
             if vx is None or vz is None or not (math.isfinite(vx) and math.isfinite(vz)):
                 continue
+            # 这段静默是被"新报文速度仍非零"证明当时确实在动的 → 一次合法的 ZOH 外推，
+            # 记下来做封顶阈值的现场对照（不能说它一定全对：中途滞空也会这样）。
+            if self._v_at is not None and math.hypot(vx, vz) > 0.05:
+                self.max_legit_gap_s = max(self.max_legit_gap_s, ts - self._v_at)
             self._advance(min(max(ts, self._t), target), fwd, right)
             self._v = (float(vx), float(vz))
+            self._v_at = ts
             self._last_ts = ts
             self.samples += 1
         self._advance(target, fwd, right)
@@ -319,13 +365,39 @@ class DeadReckoner:
         T[:2, 3] = self.xy + (vz * fwd + vx * right) * self.lag / self.s
         return T
 
+    def _hold_dt(self, a: float, b: float) -> float:
+        """[a,b] 里"有报文支撑"的等效时长：静默 ≤ ``zoh_max_s`` 全给，之后线性淡出到 0。
+
+        权重 w(τ)（τ = 距最后一个样本的时长）：≤M 取 1，M→M+F 之间 1→0 线性，之后取 0。
+        返回 ∫w dτ 的闭式解，不是采样近似。
+        """
+        m, f = self.zoh_max, self.zoh_fade
+        if self._v_at is None or m <= 0.0 or f <= 0.0:
+            return b - a
+
+        def _area(u: float) -> float:
+            if u <= m:
+                return u
+            if u >= m + f:
+                return m + 0.5 * f
+            return m + ((m + f) * (u - m) - 0.5 * (u * u - m * m)) / f
+
+        return min(max(_area(b - self._v_at) - _area(a - self._v_at), 0.0), b - a)
+
     def _advance(self, t: float, fwd: np.ndarray, right: np.ndarray) -> None:
         dt = t - float(self._t)
         if dt <= 0.0:
             return
         vx, vz = self._v
-        self.xy = self.xy + (vz * fwd + vx * right) * dt / self.s
-        self.dist_m += math.hypot(vx, vz) * dt
+        speed = math.hypot(vx, vz)
+        kept = dt if (speed <= 0.0 or self._v_at is None) else self._hold_dt(float(self._t), t)
+        self.xy = self.xy + (vz * fwd + vx * right) * kept / self.s
+        self.dist_m += speed * kept
+        dropped = dt - kept
+        if dropped > 0.0:
+            # 静默太久，后面这段"位移"没有任何证据支撑：只记账，不积分。
+            self.holdout_s += dropped
+            self.holdout_m += speed * dropped
         self._t = t
 
 
@@ -480,7 +552,8 @@ class OnlineNavigator:
         c = self.cfg
         self.mapper = KeyframeGridMapper(c.mapper)
         self.session = NavSession(self.mapper, radius_m=c.radius_m, request_update=self._request_map_update)
-        self.dr = DeadReckoner(c.world_scale, c.osc_lag_s)
+        self.dr = DeadReckoner(c.world_scale, c.osc_lag_s,
+                               zoh_max_s=c.osc_zoh_max_s, zoh_fade_s=c.osc_zoh_fade_s)
         self.loops = LoopCloser(c.loop) if c.loop_closure else None
         self._offset = np.zeros(2)          # 回环修正量（追踪米），加在原始航位推算上
         self._last_loop: dict[str, Any] | None = None
@@ -515,6 +588,12 @@ class OnlineNavigator:
         self._cov: dict[str, Any] | None = None
         self._cov_hist: deque = deque(maxlen=c.cov_hist_len)
         self._cov_png: tuple[int, str | None] | None = None
+        # 跨会话地点检索（P0）：tracker 在 start() 里创建，mapping 线程喂数据。
+        self._xs: XSessionTracker | None = None
+        self._xs_reason = "not_started"
+        # 会话末自动采纳（P0.3b）：write_back 成功后后台线程跑 align_into_auto。
+        self._align_out: dict | None = None
+        self._align_thread: threading.Thread | None = None
 
     # ---- 生命周期 ----
     @property
@@ -542,6 +621,7 @@ class OnlineNavigator:
         self._mem_rows = {}
         self._mem_flushed_at = -math.inf
         self._begin_memory()
+        self._begin_xsession()
         self._threads = [threading.Thread(target=fn, name=f"navmesh-{name}", daemon=True)
                          for name, fn in (("perception", self._perception_loop),
                                           ("mapping", self._mapping_loop),
@@ -562,7 +642,60 @@ class OnlineNavigator:
         if self.recorder is not None:
             self.recorder.close(None if self.loops is None else self.loops.poses())
         self._end_memory()
+        self._end_xsession()
         return self.status()
+
+    # ---- 跨会话地点检索（P0）----
+    def _begin_xsession(self) -> None:
+        """世界索引装载在 tracker 的后台线程里做，start() 不阻塞。依赖记忆会话（world_key + 目录）。"""
+        self._xs = None
+        mem = self._mem
+        if mem is None:
+            self._xs_reason = self._mem_reason or "memory_not_configured"
+            return
+        if not self.cfg.xsession.enabled:
+            self._xs_reason = "disabled"
+            return
+        try:
+            wdir = mem.dir.parent.parent          # <root>/<world>/sessions/<sid> → <root>/<world>
+            self._xs = XSessionTracker(self.cfg.xsession, wdir, mem.session_id, session_dir=mem.dir)
+            self._xs_reason = ""
+        except Exception as exc:                  # noqa: BLE001 - 检索坏了导航照常
+            self._xs, self._xs_reason = None, f"init_error:{type(exc).__name__}"
+            self._fail("xsession", exc)
+
+    def _end_xsession(self) -> None:
+        """会话末把本会话并入世界索引。在 _end_memory 之后调用（特征已落盘、线程已 join）。"""
+        xs = self._xs
+        if xs is None:
+            return
+        try:
+            wb = xs.write_back(self._mem_table())
+        except Exception as exc:                  # noqa: BLE001
+            self._fail("xsession_end", exc)
+            wb = {}
+        # P0.3b：写回成功后后台自动采纳（对齐进历史世界系；对齐失败不拖垮 stop）。
+        if wb.get("written"):
+            self._align_out = None
+            try:
+                self._align_thread = threading.Thread(
+                    target=self._align_xsession, name="navmesh-xsession-align", daemon=True)
+                self._align_thread.start()
+            except Exception as exc:              # noqa: BLE001
+                self._fail("xsession_align", exc)
+
+    def _align_xsession(self) -> None:
+        """后台采纳线程体：挑约束最多的旧会话对齐，结果进 status()["xsession_align"]。"""
+        try:
+            mem = self._mem
+            if mem is None:
+                self._align_out = {"ok": False, "reason": "memory_gone"}
+                return
+            out = align_into_auto(self._xs.world_dir, mem.session_id, self.cfg.xsession)
+        except Exception as exc:                  # noqa: BLE001 - 采纳只是锦上添花
+            self._fail("xsession_align", exc)
+            out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+        self._align_out = out
 
     # ---- 持久记忆 ----
     def _begin_memory(self) -> None:
@@ -797,6 +930,13 @@ class OnlineNavigator:
                         if mem is not None:
                             self._mem_rows[k] = (T.copy(), float(dist), t_kf - (self._started_at or t_kf))
                             mem.keyframe(k, feat, thumb, refresh)
+                        if self._xs is not None:
+                            try:
+                                # 跨会话查询+验证；T 的旋转来自 HMD（yaw 门的外部真值）。
+                                self._xs.on_keyframe(k, feat, float(dist), T[:3, :3], refresh)
+                            except Exception as exc:  # noqa: BLE001 - 检索出错禁用自身，不杀建图线程
+                                self._fail("xsession", exc)
+                                self._xs = None
                         if rec is not None:
                             rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat)
                             rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
@@ -962,6 +1102,18 @@ class OnlineNavigator:
             "hmd_yaw_jumps": yaw_jumps,
             "odometry_distance_m": round(self.dr.dist_m, 2),
             "osc_samples": self.dr.samples,
+            # 静默封顶的现场证据：丢包丢掉"停下"那个 0 包时，位姿不再被最后一个速度带着跑。
+            # dropped_m 是**没算进** odometry_distance_m 的那部分，不是误差条。
+            "odometry_holdout": {
+                "zoh_max_s": self.cfg.osc_zoh_max_s,
+                "zoh_fade_s": self.cfg.osc_zoh_fade_s,
+                "last_sample_age_s": (None if self.dr.last_sample_at is None
+                                      else round(max(0.0, now - self.dr.last_sample_at), 2)),
+                # 本会话最长"两端都非零"的静默段：与 zoh_max_s 对照看，逼近它就说明该调大。
+                "max_legit_gap_s": round(self.dr.max_legit_gap_s, 2),
+                "dropped_s": round(self.dr.holdout_s, 1),
+                "dropped_m": round(self.dr.holdout_m, 2),
+            },
             "goal_xy_m": None if goal is None else [round(goal[0], 3), round(goal[1], 3)],
             "keyframes": self._keyframes,
             # 原地补帧（点云替换上一帧）与快转推迟的次数；地图里有点云的关键帧 = keyframes − refreshed。
@@ -983,6 +1135,12 @@ class OnlineNavigator:
             "uptime_s": None if self._started_at is None else round(now - self._started_at, 1),
             "recording": None if self.recorder is None else self.recorder.status(),
             "memory": self._mem.status() if self._mem is not None else {"active": False, "reason": self._mem_reason},
+            "xsession": self._xs.status() if self._xs is not None else {"active": False, "reason": self._xs_reason},
+            # P0.3b 会话末自动采纳：None=还没跑到，running=后台线程在算，其余为结果/跳过原因
+            "xsession_align": ({"state": "running"} if self._align_out is None and self._align_thread is not None
+                               and self._align_thread.is_alive() else
+                               (self._align_out if self._align_out is not None
+                                else {"state": "pending"})),
         }
 
     def grid_png(self) -> str | None:

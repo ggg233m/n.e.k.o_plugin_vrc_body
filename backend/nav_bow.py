@@ -177,7 +177,11 @@ class BowIndex:
         return self._n
 
     def add(self, kf_id: int, des: np.ndarray) -> None:
-        w = self.v.transform(des)
+        self.add_words(kf_id, self.v.transform(des))
+
+    def add_words(self, kf_id: int, words: np.ndarray) -> None:
+        """直接收一帧的 word id 序列（跨会话索引从持久化直方图重建时用，免去重算 transform）。"""
+        w = np.asarray(words, np.int64)
         cnt = np.bincount(w, minlength=self.V).astype(np.float32)
         if self._n == self._C.shape[0]:
             if self._n >= self._cap:
@@ -191,10 +195,26 @@ class BowIndex:
     def query(self, des: np.ndarray, top_n: int = 4, min_score: float = 0.0
               ) -> list[tuple[int, float]]:
         """返回 [(kf_id, score)]，score ∈ [0,1]，越大越像同一处。"""
+        return self.query_words(self.v.transform(des), top_n=top_n, min_score=min_score)
+
+    def query_words(self, words: np.ndarray, top_n: int = 4, min_score: float = 0.0,
+                    norm: str = "min") -> list[tuple[int, float]]:
+        """同 query，但直接收 word id（跨会话索引已持久化直方图，免二次 transform）。
+
+        norm="min"（默认，会话内回环的历史口径）：score = 交集 / min(双方 L1)。
+        ⚠️ 该口径在**查询与文档词数悬殊**时有短文档偏置：查询帧词多时几乎必然覆盖
+        短文档的全部词，交集≈文档总质量 ⇒ 短文档次次趋近满分霸榜
+        （实测 wrld_home：025013 排名第一的帧 89% 是 des3d<50 的帧，把验证预算全部
+        挤掉——`.tmp/_diag_025013_*.py`，2026-10-02）。
+        norm="l1"（DBoW2 经典对称口径）：score = 0.5 + 交集/(双方 L1 之和)，∈[0.5,1]，
+        两直方图完全不交时 0.5，完全相同时 1.0——对词数悬殊对称。
+        **只该在查询/文档词数分布不一致的索引上用 l1**（跨会话：REF 侧 des3d 分布与
+        查询侧不同）；会话内回环两侧同分布，保持 "min" 不动（参数停调 binding）。
+        """
         if self._n == 0:
             return []
         n = self._n
-        q = np.bincount(self.v.transform(des), minlength=self.V).astype(np.float32)
+        q = np.bincount(np.asarray(words, np.int64), minlength=self.V).astype(np.float32)
         nz = np.nonzero(q)[0]
         if not len(nz):
             return []
@@ -205,9 +225,13 @@ class BowIndex:
         qs = float(qv.sum())
         if qs <= 0:
             return []
-        dn = D.sum(1)
         num = np.minimum(D[:, nz], qv[None, :]).sum(1)
-        s = num / np.minimum(dn, qs)
+        if norm == "l1":
+            dn = D.sum(1)
+            s = 0.5 + num / np.maximum(dn + qs, 1e-9)
+        else:
+            dn = D.sum(1)
+            s = num / np.minimum(dn, qs)
         order = np.argsort(-s)
         out = [(self._ids[int(j)], float(s[j])) for j in order[:max(top_n, 0)] if s[j] >= min_score]
         return out[:top_n]

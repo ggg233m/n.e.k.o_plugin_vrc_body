@@ -323,6 +323,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._json(401, {"error": "unauthorized"})
             return
         started_at = time.perf_counter()
+        # 请求期间记录客户端地址，供 turn 账本归因到具体连接。
+        # 放 finally 里清掉：ThreadingHTTPServer 每请求一线程，串扰窗口极小，
+        # 但导航器路径读到陈旧地址会污染账本，宁可清。
+        self.server.service._http_client_addr = "%s:%s" % self.client_address[:2]
         try:
             value = self._read_json()
             if self.path == "/config":
@@ -354,6 +358,7 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.set_turn(
                     value.get("horizontal"),
                     value.get("duration_ms", 500),
+                    source="http:/osc/turn",
                 )
                 result = {"accepted": result[0], "reason": result[1]}
             elif self.path == "/osc/stop_movement":
@@ -496,6 +501,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._json(200, result)
         except Exception as exc:
             self._json(400, {"error": f"{type(exc).__name__}: {exc}"[:500]})
+        finally:
+            self.server.service._http_client_addr = None
 
 
 class BackendHttpServer(ThreadingHTTPServer):

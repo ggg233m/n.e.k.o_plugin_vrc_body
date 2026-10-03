@@ -234,6 +234,8 @@ class WorldModelConfig:
 # 默认值只在 backend 一处；这里不写的键就用 backend 默认。未知键直接报错，防止拼错后静默不生效。
 NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "osc_lag_s": (float, 0.0, 1.0),
+    "osc_zoh_max_s": (float, 0.0, 30.0),
+    "osc_zoh_fade_s": (float, 0.0, 30.0),
     "stereo_period_s": (float, 0.02, 2.0),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
