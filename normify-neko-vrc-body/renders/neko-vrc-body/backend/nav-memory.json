@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-memory",
+  "updated_at": "2026-10-03T16:01:49.639Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：codec 编解码导航网格，session-writer 写入会话，store 管理记忆库；箭头是网格编码流向存储。",
+    "en": "Left to right: codec encodes and decodes the navmesh, session-writer writes sessions and store manages the memory bank; arrows run from encoding into storage."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-memory.codec",
+    "neko-vrc-body.backend.nav-memory.session-writer",
+    "neko-vrc-body.backend.nav-memory.store"
+  ]
+}

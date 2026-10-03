@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.local-perception.detector.decode",
+  "updated_at": "2026-10-03T16:15:16.537Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先把形态各异的输出归一成统一行，再解码成检测框，最后抑制重叠框并丢掉过小框。",
+    "en": "Left to right: normalise heterogeneous output into uniform rows, decode them into detection boxes, then suppress overlaps and drop boxes that are too small."
+  },
+  "order": [
+    "neko-vrc-body.backend.local-perception.detector.decode.row-normalise",
+    "neko-vrc-body.backend.local-perception.detector.decode.row-decode",
+    "neko-vrc-body.backend.local-perception.detector.decode.nms"
+  ]
+}

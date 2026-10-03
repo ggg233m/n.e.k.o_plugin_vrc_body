@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.llm-contract.tool-defs",
+  "updated_at": "2026-10-03T14:58:32.204Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左列是身体对自己的动作，右列是它在世界中的感知与决策。",
+    "en": "Left column is what the body can do to itself; right column is what it can perceive and decide in the world."
+  },
+  "order": [
+    "neko-vrc-body.llm-contract.tool-defs.preconditions",
+    "neko-vrc-body.llm-contract.tool-defs.body-posture",
+    "neko-vrc-body.llm-contract.tool-defs.body-limbs",
+    "neko-vrc-body.llm-contract.tool-defs.body-io",
+    "neko-vrc-body.llm-contract.tool-defs.body-turn-chatbox",
+    "neko-vrc-body.llm-contract.tool-defs.world",
+    "neko-vrc-body.llm-contract.tool-defs.vision",
+    "neko-vrc-body.llm-contract.tool-defs.semantic",
+    "neko-vrc-body.llm-contract.tool-defs.autonomy"
+  ],
+  "groups": [
+    {
+      "id": "g-body",
+      "title": {
+        "zh": "身体工具",
+        "en": "Body Tools"
+      },
+      "children": [
+        "neko-vrc-body.llm-contract.tool-defs.preconditions",
+        "neko-vrc-body.llm-contract.tool-defs.body-posture",
+        "neko-vrc-body.llm-contract.tool-defs.body-limbs",
+        "neko-vrc-body.llm-contract.tool-defs.body-io",
+        "neko-vrc-body.llm-contract.tool-defs.body-turn-chatbox"
+      ]
+    },
+    {
+      "id": "g-world",
+      "title": {
+        "zh": "世界与自主工具",
+        "en": "World and Autonomy Tools"
+      },
+      "children": [
+        "neko-vrc-body.llm-contract.tool-defs.world",
+        "neko-vrc-body.llm-contract.tool-defs.vision",
+        "neko-vrc-body.llm-contract.tool-defs.semantic",
+        "neko-vrc-body.llm-contract.tool-defs.autonomy"
+      ]
+    }
+  ]
+}

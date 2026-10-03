@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.explorer",
+  "updated_at": "2026-10-03T15:59:06.858Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：entity-helpers 读取实体字段，directive 给出探索指令，state-machine 推进探索状态；箭头表示自观察流向探索动作。",
+    "en": "Left to right: entity-helpers reads entity fields, directive states the explore instruction and state-machine advances the exploration state; arrows run from observation to explore action."
+  },
+  "order": [
+    "neko-vrc-body.backend.explorer.entity-helpers",
+    "neko-vrc-body.backend.explorer.directive",
+    "neko-vrc-body.backend.explorer.state-machine"
+  ]
+}

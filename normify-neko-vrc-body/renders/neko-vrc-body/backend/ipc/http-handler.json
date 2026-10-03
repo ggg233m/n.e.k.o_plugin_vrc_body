@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.ipc.http-handler",
+  "updated_at": "2026-10-03T15:58:33.903Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：auth 先鉴权，responses 提供响应写出助手，get-routes 处理只读查询，post-routes 处理命令写入；箭头是一次请求的通过顺序。",
+    "en": "Left to right: auth authorizes first, responses supplies the writer helpers, get-routes serves read-only queries and post-routes serves commands; the arrows are the order one request passes through."
+  },
+  "order": [
+    "neko-vrc-body.backend.ipc.http-handler.auth",
+    "neko-vrc-body.backend.ipc.http-handler.responses",
+    "neko-vrc-body.backend.ipc.http-handler.get-routes",
+    "neko-vrc-body.backend.ipc.http-handler.post-routes"
+  ]
+}

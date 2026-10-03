@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-online.navigator.loops",
+  "updated_at": "2026-10-03T16:15:09.422Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：感知线程产出二十赫兹位姿与双目帧 → 建图线程更新地图 → 控制线程按十赫兹推进一拍。",
+    "en": "Left to right: the perception thread produces 20 Hz pose and stereo frames, the mapping thread updates the map, and the control thread advances one tick at 10 Hz."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-online.navigator.loops.perception-loop",
+    "neko-vrc-body.backend.nav-online.navigator.loops.mapping-loop",
+    "neko-vrc-body.backend.nav-online.navigator.loops.control-loop"
+  ]
+}

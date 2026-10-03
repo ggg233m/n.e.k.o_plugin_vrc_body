@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-grid",
+  "updated_at": "2026-10-03T16:01:40.570Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：types 定义三态栅格类型，grid 实现加载、建图与规划；箭头是类型定义流向栅格实现。",
+    "en": "Left to right: types defines the three-state grid types and grid implements loading, building and planning; the arrow runs from the type definitions into the grid implementation."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-grid.types",
+    "neko-vrc-body.backend.nav-grid.grid"
+  ]
+}

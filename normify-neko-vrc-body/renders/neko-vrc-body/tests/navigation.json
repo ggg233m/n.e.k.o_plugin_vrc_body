@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.navigation",
+  "updated_at": "2026-10-03T16:04:51.885Z",
+  "mode": "grid",
+  "max_columns": 4,
+  "reading": {
+    "zh": "从左到右，与在线流水线一致：栅格、跟随、建图、回环闭合、在线导航器，最后是持久化与跨会话复用。",
+    "en": "Read left to right, mirroring the online pipeline: grid, following, mapping, loop closure, the online navigator, then persistence and cross-session reuse."
+  },
+  "order": [
+    "neko-vrc-body.tests.navigation.nav-grid",
+    "neko-vrc-body.tests.navigation.nav-follow",
+    "neko-vrc-body.tests.navigation.nav-mapping",
+    "neko-vrc-body.tests.navigation.nav-loop",
+    "neko-vrc-body.tests.navigation.nav-online",
+    "neko-vrc-body.tests.navigation.nav-memory",
+    "neko-vrc-body.tests.navigation.nav-xsession",
+    "neko-vrc-body.tests.navigation.posegraph4-residual"
+  ]
+}

@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend",
+  "updated_at": "2026-10-03T16:04:01.395Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左上开始：先是服务与其回环 IPC，然后是世界模型与决策层，再是感知，然后是导航，控制台与调试工具在最后。箭头指向被调用方。",
+    "en": "Start top-left: the service and its loopback IPC, then the world model and decision layer, then perception, then navigation, with the console and debug tools last. Arrows point at the callee."
+  },
+  "order": [
+    "neko-vrc-body.backend.service",
+    "neko-vrc-body.backend.ipc",
+    "neko-vrc-body.backend.client",
+    "neko-vrc-body.backend.adapters",
+    "neko-vrc-body.backend.package",
+    "neko-vrc-body.backend.world-state",
+    "neko-vrc-body.backend.world-model",
+    "neko-vrc-body.backend.cognition",
+    "neko-vrc-body.backend.autonomy",
+    "neko-vrc-body.backend.explorer",
+    "neko-vrc-body.backend.direction-memory",
+    "neko-vrc-body.backend.perception",
+    "neko-vrc-body.backend.local-perception",
+    "neko-vrc-body.backend.avatar-identity",
+    "neko-vrc-body.backend.reid-embedder",
+    "neko-vrc-body.backend.traversability",
+    "neko-vrc-body.backend.obs-capture",
+    "neko-vrc-body.backend.openvr-mirror",
+    "neko-vrc-body.backend.wgc-capture",
+    "neko-vrc-body.backend.time-alignment",
+    "neko-vrc-body.backend.stage-profile",
+    "neko-vrc-body.backend.navigator",
+    "neko-vrc-body.backend.nav-online",
+    "neko-vrc-body.backend.nav-mapping",
+    "neko-vrc-body.backend.nav-loop",
+    "neko-vrc-body.backend.nav-bow",
+    "neko-vrc-body.backend.nav-grid",
+    "neko-vrc-body.backend.nav-follow",
+    "neko-vrc-body.backend.nav-memory",
+    "neko-vrc-body.backend.nav-xsession",
+    "neko-vrc-body.backend.pose-math",
+    "neko-vrc-body.backend.webui",
+    "neko-vrc-body.backend.debug-cli"
+  ],
+  "groups": [
+    {
+      "id": "g-runtime",
+      "title": {
+        "zh": "运行时与进程边界",
+        "en": "Runtime and Process Boundary"
+      },
+      "children": [
+        "neko-vrc-body.backend.service",
+        "neko-vrc-body.backend.ipc",
+        "neko-vrc-body.backend.client",
+        "neko-vrc-body.backend.adapters",
+        "neko-vrc-body.backend.package"
+      ]
+    },
+    {
+      "id": "g-world",
+      "title": {
+        "zh": "世界与决策",
+        "en": "World and Decisions"
+      },
+      "children": [
+        "neko-vrc-body.backend.world-state",
+        "neko-vrc-body.backend.world-model",
+        "neko-vrc-body.backend.cognition",
+        "neko-vrc-body.backend.autonomy",
+        "neko-vrc-body.backend.explorer",
+        "neko-vrc-body.backend.direction-memory"
+      ]
+    },
+    {
+      "id": "g-sense",
+      "title": {
+        "zh": "感知",
+        "en": "Perception"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception",
+        "neko-vrc-body.backend.local-perception",
+        "neko-vrc-body.backend.avatar-identity",
+        "neko-vrc-body.backend.reid-embedder",
+        "neko-vrc-body.backend.traversability",
+        "neko-vrc-body.backend.obs-capture",
+        "neko-vrc-body.backend.openvr-mirror",
+        "neko-vrc-body.backend.wgc-capture",
+        "neko-vrc-body.backend.time-alignment",
+        "neko-vrc-body.backend.stage-profile"
+      ]
+    },
+    {
+      "id": "g-nav",
+      "title": {
+        "zh": "导航",
+        "en": "Navigation"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator",
+        "neko-vrc-body.backend.nav-online",
+        "neko-vrc-body.backend.nav-mapping",
+        "neko-vrc-body.backend.nav-loop",
+        "neko-vrc-body.backend.nav-bow",
+        "neko-vrc-body.backend.nav-grid",
+        "neko-vrc-body.backend.nav-follow",
+        "neko-vrc-body.backend.nav-memory",
+        "neko-vrc-body.backend.nav-xsession",
+        "neko-vrc-body.backend.pose-math"
+      ]
+    },
+    {
+      "id": "g-console",
+      "title": {
+        "zh": "控制台与调试",
+        "en": "Console and Debug"
+      },
+      "children": [
+        "neko-vrc-body.backend.webui",
+        "neko-vrc-body.backend.debug-cli"
+      ]
+    }
+  ]
+}

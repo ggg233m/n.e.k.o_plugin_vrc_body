@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "ok": true,
+  "project": "normify-neko-vrc-body",
+  "compiled_at": "2026-10-03T16:20:34.575Z",
+  "stats": {
+    "tree_count": 1,
+    "module_count": 567,
+    "leaf_count": 449,
+    "api_count": 1010,
+    "dep_count": 26,
+    "cross_tree_dep_count": 0,
+    "max_depth": 6,
+    "layout_count": 118,
+    "planned_count": 0,
+    "deprecated_count": 0,
+    "policy_rule_count": 2,
+    "change_count": 1,
+    "open_change_count": 0
+  },
+  "warnings": {
+    "dep/unanchored": 1,
+    "structure/leaf-too-coarse": 15,
+    "structure/leaf-too-coarse-many": 1,
+    "evidence/root-no-source": 1
+  },
+  "artifacts": {
+    "tree.json": {
+      "sha256": "88e90d0fb35728cc75e4ff3efe2cb32f6de7e32ec9a101e71624195b0d21ced0",
+      "bytes": 1238852
+    },
+    "outline.md": {
+      "sha256": "fb65988375f7d347770d2a95e982f282ae087d61b8fddc22bce8bb39216c7494",
+      "bytes": 119526
+    },
+    "api-index.json": {
+      "sha256": "b207a7f7dae878bb8da044fefc0ca0515c71b7b27fe64ab8fcf6429d688ab588",
+      "bytes": 100025
+    },
+    "receipt.json": {
+      "sha256": "7d9af152696593c20819e29724f29af8ccc7d6d3ad210eb0a550ab98c00812aa",
+      "bytes": 1040
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-bow",
+  "updated_at": "2026-10-03T16:05:38.046Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先训练词汇树，再用它把描述子转成带权词直方图用于检索。",
+    "en": "Train the vocabulary tree first, then use it to turn descriptors into weighted word histograms for retrieval."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-bow.vocabulary",
+    "neko-vrc-body.backend.nav-bow.retrieval"
+  ]
+}

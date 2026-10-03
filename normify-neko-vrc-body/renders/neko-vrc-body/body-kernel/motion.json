@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel.motion",
+  "updated_at": "2026-10-03T15:01:39.204Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "插值是底层；手势、旋转、臂部姿态与伸手目标都建立在它之上。",
+    "en": "Interpolation is the base layer; gestures, rotations, arm poses and reaches all build on top of it."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.motion.gesture",
+    "neko-vrc-body.body-kernel.motion.rotations",
+    "neko-vrc-body.body-kernel.motion.arm-pose",
+    "neko-vrc-body.body-kernel.motion.reach",
+    "neko-vrc-body.body-kernel.motion.interpolation"
+  ]
+}

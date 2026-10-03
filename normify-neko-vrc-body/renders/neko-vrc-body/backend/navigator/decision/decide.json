@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.decision.decide",
+  "updated_at": "2026-10-03T16:15:02.240Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先判目标是否存在并挑选目标，再决定近距离如何接近，最后决定后退、停止还是放弃。",
+    "en": "Left to right: decide whether a goal is present and pick it, then decide how to approach at close range, and finally decide to back off, stop or give up."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.decision.decide.goal-decision",
+    "neko-vrc-body.backend.navigator.decision.decide.approach-decision",
+    "neko-vrc-body.backend.navigator.decision.decide.retreat-decision"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.wander",
+  "updated_at": "2026-10-03T16:00:59.182Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：turn-direction 选转向，trace 留轨迹，direction-memory 借方向记忆避开死路；箭头表示自选向到记录的顺序。",
+    "en": "Left to right: turn-direction picks the turn, trace keeps the trail and direction-memory uses past directions to avoid dead ends; arrows run from choosing a heading to recording it."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.wander.turn-direction",
+    "neko-vrc-body.backend.navigator.wander.trace",
+    "neko-vrc-body.backend.navigator.wander.direction-memory"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.overlay",
+  "updated_at": "2026-10-03T15:59:36.674Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：geometry 算图元位置，drawing 真正绘制叠加层；箭头表示几何结果流向绘制。",
+    "en": "Left to right: geometry computes overlay positions and drawing paints the overlay; the arrow carries the geometry into the painting."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.overlay.geometry",
+    "neko-vrc-body.backend.perception.overlay.drawing"
+  ]
+}

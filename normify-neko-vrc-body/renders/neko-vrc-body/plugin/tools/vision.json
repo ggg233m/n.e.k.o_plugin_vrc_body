@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.tools.vision",
+  "updated_at": "2026-10-03T15:00:30.171Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "启动感知、取一帧，然后把你自己对该帧的判读写回世界状态存储。",
+    "en": "Start perception, pull a frame, then write your own reading of that frame back into the world store."
+  },
+  "order": [
+    "neko-vrc-body.plugin.tools.vision.start-stop",
+    "neko-vrc-body.plugin.tools.vision.frame",
+    "neko-vrc-body.plugin.tools.vision.semantic-commit"
+  ]
+}

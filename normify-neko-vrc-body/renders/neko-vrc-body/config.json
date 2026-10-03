@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.config",
+  "updated_at": "2026-10-03T14:58:59.904Z",
+  "mode": "grid",
+  "max_columns": 4,
+  "reading": {
+    "zh": "自下而上读：先是取值助手，然后是各配置段，最后是把它们组装起来的 PluginConfig。",
+    "en": "Read bottom-up: coercion helpers, then each settings section, then the aggregate PluginConfig that assembles them all."
+  },
+  "order": [
+    "neko-vrc-body.config.helpers",
+    "neko-vrc-body.config.runtime-sections",
+    "neko-vrc-body.config.io-sections",
+    "neko-vrc-body.config.world-sections",
+    "neko-vrc-body.config.navmesh-sections",
+    "neko-vrc-body.config.vision-section",
+    "neko-vrc-body.config.plugin-config"
+  ]
+}

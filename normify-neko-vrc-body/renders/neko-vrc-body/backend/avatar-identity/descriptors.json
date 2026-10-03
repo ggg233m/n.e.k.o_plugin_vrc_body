@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.avatar-identity.descriptors",
+  "updated_at": "2026-10-03T16:00:15.958Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：appearance 取外观描述子，context 取背景上下文指纹；箭头是两类特征并列产出。",
+    "en": "Left to right: appearance yields the appearance descriptor and context yields the background context fingerprint; the two arrows are parallel feature outputs."
+  },
+  "order": [
+    "neko-vrc-body.backend.avatar-identity.descriptors.appearance",
+    "neko-vrc-body.backend.avatar-identity.descriptors.context"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.frame-sources",
+  "updated_at": "2026-10-03T15:59:43.386Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右并列五个画面源后端：mss、dxcam、wgc、desktop-mirror、window-tracked；箭头表示帧自各后端汇入统一帧流。",
+    "en": "Left to right, five frame-source backends in parallel: mss, dxcam, wgc, desktop-mirror and window-tracked; arrows show frames from each backend joining one stream."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.frame-sources.mss",
+    "neko-vrc-body.backend.perception.frame-sources.dxcam",
+    "neko-vrc-body.backend.perception.frame-sources.wgc",
+    "neko-vrc-body.backend.perception.frame-sources.desktop-mirror",
+    "neko-vrc-body.backend.perception.frame-sources.window-tracked"
+  ]
+}

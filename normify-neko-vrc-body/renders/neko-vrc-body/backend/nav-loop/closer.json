@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-loop.closer",
+  "updated_at": "2026-10-03T16:01:37.588Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：state 维护回环状态，candidates 提候选，optimize 做位姿图优化；箭头表示候选经优化变为回环结果。",
+    "en": "Left to right: state maintains the closure state, candidates proposes candidates and optimize runs the pose-graph optimisation; arrows turn candidates into a closure result through optimisation."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-loop.closer.state",
+    "neko-vrc-body.backend.nav-loop.closer.candidates",
+    "neko-vrc-body.backend.nav-loop.closer.optimize"
+  ]
+}

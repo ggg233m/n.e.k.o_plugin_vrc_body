@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.stall-guard",
+  "updated_at": "2026-10-03T16:15:13.200Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先采样一次运动观测，再据此判定是否卡死，最后把无进展的目标标记为不可达。",
+    "en": "Left to right: sample one motion observation, use it to decide whether progress has stalled, and finally mark the target unreachable."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.stall-guard.motion-sample",
+    "neko-vrc-body.backend.navigator.stall-guard.stall-detect",
+    "neko-vrc-body.backend.navigator.stall-guard.unreachable"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel.model",
+  "updated_at": "2026-10-03T15:00:41.673Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "设备与控制器组成一帧；叠加层是叠加其上的非权威层；四元数净化放在最后，在任何内容上线之前。",
+    "en": "Devices and controllers make up one frame; the overlay is a non-authoritative layer on top; quaternions are sanitised last, before anything goes on the wire."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.model.device",
+    "neko-vrc-body.body-kernel.model.overlay",
+    "neko-vrc-body.body-kernel.model.frame",
+    "neko-vrc-body.body-kernel.model.quat"
+  ]
+}

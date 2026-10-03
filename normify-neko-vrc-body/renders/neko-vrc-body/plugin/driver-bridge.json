@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.driver-bridge",
+  "updated_at": "2026-10-03T15:00:05.593Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先把快照写进本机驱动，再告诉宿主驱动是否真的接收了。",
+    "en": "Write the snapshot into the local driver, then tell the host whether the driver actually took it."
+  },
+  "order": [
+    "neko-vrc-body.plugin.driver-bridge.udp-apply",
+    "neko-vrc-body.plugin.driver-bridge.delivery-awareness"
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.agent",
+  "updated_at": "2026-10-03T14:59:56.774Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左列是宿主让模型「看到」的内容，中间是从轮询到文本的通路，右列是与主 LLM 的一问一答往返。",
+    "en": "Left is what the host needs to see the model; middle is the poll-to-text path; right is the ask-and-answer round trip with the main LLM."
+  },
+  "order": [
+    "neko-vrc-body.plugin.agent.tool-registration",
+    "neko-vrc-body.plugin.agent.instruction-injection",
+    "neko-vrc-body.plugin.agent.tool-reassert",
+    "neko-vrc-body.plugin.agent.world-context-bridge",
+    "neko-vrc-body.plugin.agent.world-context-loop",
+    "neko-vrc-body.plugin.agent.journal-changes",
+    "neko-vrc-body.plugin.agent.decision-context",
+    "neko-vrc-body.plugin.agent.world-context-text",
+    "neko-vrc-body.plugin.agent.semantic-request",
+    "neko-vrc-body.plugin.agent.semantic-push",
+    "neko-vrc-body.plugin.agent.frame-image-part",
+    "neko-vrc-body.plugin.agent.navigation-outcome",
+    "neko-vrc-body.plugin.agent.tool-execution"
+  ],
+  "groups": [
+    {
+      "id": "g-context",
+      "title": {
+        "zh": "世界上下文通路",
+        "en": "World Context Path"
+      },
+      "children": [
+        "neko-vrc-body.plugin.agent.world-context-bridge",
+        "neko-vrc-body.plugin.agent.world-context-loop",
+        "neko-vrc-body.plugin.agent.journal-changes",
+        "neko-vrc-body.plugin.agent.decision-context",
+        "neko-vrc-body.plugin.agent.world-context-text"
+      ]
+    },
+    {
+      "id": "g-tools",
+      "title": {
+        "zh": "工具契约",
+        "en": "Tool Contract"
+      },
+      "children": [
+        "neko-vrc-body.plugin.agent.tool-registration",
+        "neko-vrc-body.plugin.agent.instruction-injection",
+        "neko-vrc-body.plugin.agent.tool-reassert",
+        "neko-vrc-body.plugin.agent.tool-execution"
+      ]
+    },
+    {
+      "id": "g-semantic",
+      "title": {
+        "zh": "语义往返",
+        "en": "Semantic Round Trip"
+      },
+      "children": [
+        "neko-vrc-body.plugin.agent.semantic-request",
+        "neko-vrc-body.plugin.agent.semantic-push",
+        "neko-vrc-body.plugin.agent.frame-image-part",
+        "neko-vrc-body.plugin.agent.navigation-outcome"
+      ]
+    }
+  ]
+}

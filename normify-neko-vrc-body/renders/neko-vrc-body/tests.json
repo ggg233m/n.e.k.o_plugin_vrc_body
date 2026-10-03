@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests",
+  "updated_at": "2026-10-03T14:59:22.345Z",
+  "mode": "grid",
+  "max_columns": 4,
+  "reading": {
+    "zh": "按被测子系统分组，与生产结构树一一对应，使失败能直接指向归属模块。",
+    "en": "Grouped by the subsystem each file exercises, mirroring the production tree so a failure points straight at its owner."
+  },
+  "order": [
+    "neko-vrc-body.tests.infra",
+    "neko-vrc-body.tests.body",
+    "neko-vrc-body.tests.device",
+    "neko-vrc-body.tests.perception",
+    "neko-vrc-body.tests.world",
+    "neko-vrc-body.tests.navigation",
+    "neko-vrc-body.tests.backend"
+  ]
+}

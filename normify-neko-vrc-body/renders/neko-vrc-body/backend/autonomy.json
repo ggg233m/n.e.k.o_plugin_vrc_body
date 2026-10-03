@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.autonomy",
+  "updated_at": "2026-10-03T15:59:01.335Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：value-helpers 归一化目标取值，goal 表示目标本身，runtime 承接授权、提交与世界刷新；箭头是自取值归一化到执行的方向。",
+    "en": "Left to right: value-helpers normalises goal values, goal is the goal itself and runtime carries authorization, submission and world refresh; arrows run from normalisation to execution."
+  },
+  "order": [
+    "neko-vrc-body.backend.autonomy.value-helpers",
+    "neko-vrc-body.backend.autonomy.goal",
+    "neko-vrc-body.backend.autonomy.runtime"
+  ]
+}

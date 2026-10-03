@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.semantic",
+  "updated_at": "2026-10-03T16:04:04.895Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "向主 LLM 提问，然后提交一个必须仍然指向该问题的回答。",
+    "en": "Ask the main LLM a question, then commit an answer that must still refer to that same question."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.semantic.request",
+    "neko-vrc-body.backend.service.semantic.commit"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.behavior",
+  "updated_at": "2026-10-03T16:01:02.921Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：phase 判定行为阶段，direct 给出直行动作；箭头是阶段流向动作。",
+    "en": "Left to right: phase decides the behaviour stage and direct produces the straight-ahead action; the arrow runs from stage to action."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.behavior.phase",
+    "neko-vrc-body.backend.navigator.behavior.direct"
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body",
+  "updated_at": "2026-10-03T14:55:36.155Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左上开始、从左到右读：先看模型契约与插件外壳，再看 60Hz 身体内核及其设备接入，然后是独立后端，最后是工程支撑。箭头指向被调用方。",
+    "en": "Start top-left and read left to right: the model contract and plugin shell first, then the 60Hz body kernel and its device IO, then the out-of-process backend, and finally engineering support. Arrows point at the callee."
+  },
+  "order": [
+    "neko-vrc-body.llm-contract",
+    "neko-vrc-body.plugin",
+    "neko-vrc-body.world-salience",
+    "neko-vrc-body.config",
+    "neko-vrc-body.clips",
+    "neko-vrc-body.body-kernel",
+    "neko-vrc-body.device-io",
+    "neko-vrc-body.backend",
+    "neko-vrc-body.tools",
+    "neko-vrc-body.packaging",
+    "neko-vrc-body.tests"
+  ],
+  "groups": [
+    {
+      "id": "g-decision",
+      "title": {
+        "zh": "决策与契约",
+        "en": "Decision and Contract"
+      },
+      "children": [
+        "neko-vrc-body.plugin",
+        "neko-vrc-body.llm-contract",
+        "neko-vrc-body.world-salience"
+      ]
+    },
+    {
+      "id": "g-body",
+      "title": {
+        "zh": "身体运行时",
+        "en": "Body Runtime"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel",
+        "neko-vrc-body.device-io",
+        "neko-vrc-body.clips",
+        "neko-vrc-body.config"
+      ]
+    },
+    {
+      "id": "g-backend",
+      "title": {
+        "zh": "自主运行时",
+        "en": "Autonomous Runtime"
+      },
+      "children": [
+        "neko-vrc-body.backend"
+      ]
+    },
+    {
+      "id": "g-support",
+      "title": {
+        "zh": "工程支撑",
+        "en": "Engineering Support"
+      },
+      "children": [
+        "neko-vrc-body.tools",
+        "neko-vrc-body.packaging",
+        "neko-vrc-body.tests"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-online",
+  "updated_at": "2026-10-03T16:01:10.032Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：config 读配置，sensors 收传感器，dead-reckoner 做航位推算，keyframe-policy 决定关键帧，session-recorder 记录会话，navigator 驱动在线导航线程；箭头是数据自传感器流向在线导航。",
+    "en": "Left to right: config reads settings, sensors collect data, dead-reckoner propagates pose, keyframe-policy decides keyframes, session-recorder logs the session and navigator drives the online navigation thread; arrows run from sensors into online navigation."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-online.config",
+    "neko-vrc-body.backend.nav-online.sensors",
+    "neko-vrc-body.backend.nav-online.dead-reckoner",
+    "neko-vrc-body.backend.nav-online.keyframe-policy",
+    "neko-vrc-body.backend.nav-online.session-recorder",
+    "neko-vrc-body.backend.nav-online.navigator"
+  ]
+}

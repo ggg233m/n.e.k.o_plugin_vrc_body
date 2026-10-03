@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.device-io.chatbox-relay",
+  "updated_at": "2026-10-03T15:02:05.394Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先是文本类型与容错读取器，然后是轮询器生命周期，最后是决定什么真正进入聊天框的那一次轮询。",
+    "en": "The line type and its tolerant readers, then the poller lifecycle, then the single pass that decides what actually reaches the chatbox."
+  },
+  "order": [
+    "neko-vrc-body.device-io.chatbox-relay.line",
+    "neko-vrc-body.device-io.chatbox-relay.lifecycle",
+    "neko-vrc-body.device-io.chatbox-relay.poll"
+  ]
+}

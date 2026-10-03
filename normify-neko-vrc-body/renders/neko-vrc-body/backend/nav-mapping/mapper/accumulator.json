@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-mapping.mapper.accumulator",
+  "updated_at": "2026-10-03T16:15:32.922Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先让分带票数累加器与当前位姿同步并按需扩容，再编码与同步射线体素。",
+    "en": "Left to right: synchronise the banded-vote accumulator with the current poses and grow it as needed, then encode and synchronise ray voxels."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-mapping.mapper.accumulator.acc-sync",
+    "neko-vrc-body.backend.nav-mapping.mapper.accumulator.ray-encode"
+  ]
+}

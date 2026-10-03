@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.observation",
+  "updated_at": "2026-10-03T16:04:06.645Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "检测器输出先到，外部提供的世界快照与规划反馈随后。",
+    "en": "Detector output arrives first; externally supplied world snapshots and the planning feedback follow."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.observation.vision",
+    "neko-vrc-body.backend.service.observation.world"
+  ]
+}

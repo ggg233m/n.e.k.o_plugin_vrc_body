@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.openvr-mirror",
+  "updated_at": "2026-10-03T16:00:34.060Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：constants 定常量，mirror-eye 镜像单眼画面，stereo 组成立体对；箭头是单眼流向立体。",
+    "en": "Left to right: constants fix the values, mirror-eye mirrors the mono view and stereo assembles the stereo pair; the arrow runs from mono to stereo."
+  },
+  "order": [
+    "neko-vrc-body.backend.openvr-mirror.constants",
+    "neko-vrc-body.backend.openvr-mirror.mirror-eye",
+    "neko-vrc-body.backend.openvr-mirror.stereo"
+  ]
+}

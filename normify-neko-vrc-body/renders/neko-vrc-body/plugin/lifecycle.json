@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.lifecycle",
+  "updated_at": "2026-10-03T14:59:51.863Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "自上而下就是真正的启动顺序；关闭时按相反顺序进行，并释放聊天框中继。",
+    "en": "Top to bottom is the real start-up order; shutdown reverses it and releases the chatbox relay."
+  },
+  "order": [
+    "neko-vrc-body.plugin.lifecycle.version-metadata",
+    "neko-vrc-body.plugin.lifecycle.tool-arg-validation",
+    "neko-vrc-body.plugin.lifecycle.config-load",
+    "neko-vrc-body.plugin.lifecycle.chatbox-relay-control",
+    "neko-vrc-body.plugin.lifecycle.startup",
+    "neko-vrc-body.plugin.lifecycle.shutdown"
+  ]
+}

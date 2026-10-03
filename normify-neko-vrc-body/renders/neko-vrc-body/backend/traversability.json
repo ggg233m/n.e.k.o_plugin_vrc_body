@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.traversability",
+  "updated_at": "2026-10-03T16:00:26.602Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：config 给阈值，flow 组装流式流程，optical-flow 算光流，ground-extent 估地面范围；箭头表示配置流向可通行性结果。",
+    "en": "Left to right: config supplies thresholds, flow assembles the streaming flow, optical-flow estimates the optical flow and ground-extent estimates the ground area; arrows run from configuration to the traversability result."
+  },
+  "order": [
+    "neko-vrc-body.backend.traversability.config",
+    "neko-vrc-body.backend.traversability.flow",
+    "neko-vrc-body.backend.traversability.optical-flow",
+    "neko-vrc-body.backend.traversability.ground-extent"
+  ]
+}

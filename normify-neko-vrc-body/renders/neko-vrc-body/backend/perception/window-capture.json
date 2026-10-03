@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.window-capture",
+  "updated_at": "2026-10-03T15:59:40.080Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：find 找到目标窗口，visibility 判断窗口是否可见可抓；箭头表示定位之后再判可见。",
+    "en": "Left to right: find locates the target window and visibility decides whether it can be captured; the arrow runs from locating to the visibility check."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.window-capture.find",
+    "neko-vrc-body.backend.perception.window-capture.visibility"
+  ]
+}

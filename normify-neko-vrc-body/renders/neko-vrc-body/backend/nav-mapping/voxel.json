@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-mapping.voxel",
+  "updated_at": "2026-10-03T16:01:18.413Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：ground 估地面高度，ray 沿射线做占据更新；箭头表示射线结果汇入地面与体素状态。",
+    "en": "Left to right: ground estimates floor height and ray does occupancy updates along rays; arrows feed ray results into ground and voxel state."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-mapping.voxel.ground",
+    "neko-vrc-body.backend.nav-mapping.voxel.ray"
+  ]
+}

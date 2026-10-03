@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.world",
+  "updated_at": "2026-10-03T16:04:37.833Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "世界是什么、它意味着什么、什么可以被据此行动 —— 与运行时使用的顺序一致。",
+    "en": "What the world is, then what it means, then what may be acted on — the same order the runtime uses."
+  },
+  "order": [
+    "neko-vrc-body.tests.world.world-state",
+    "neko-vrc-body.tests.world.world-model",
+    "neko-vrc-body.tests.world.world-salience",
+    "neko-vrc-body.tests.world.cognition",
+    "neko-vrc-body.tests.world.direction-memory",
+    "neko-vrc-body.tests.world.input-autonomy"
+  ]
+}

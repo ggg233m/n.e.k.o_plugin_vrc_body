@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.webui",
+  "updated_at": "2026-10-03T16:00:39.614Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：config-store 存控制台配置，pages 提供页面；箭头表示配置被页面读取。",
+    "en": "Left to right: config-store persists console settings and pages serves the pages; the arrow shows pages reading the stored settings."
+  },
+  "order": [
+    "neko-vrc-body.backend.webui.config-store",
+    "neko-vrc-body.backend.webui.pages"
+  ]
+}

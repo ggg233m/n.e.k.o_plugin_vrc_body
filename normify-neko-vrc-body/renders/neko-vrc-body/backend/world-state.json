@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.world-state",
+  "updated_at": "2026-10-03T15:59:12.164Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：ids 生成实体标识，uncertainty 记录不确定度，entity 描述实体，event 记录事件，store 汇总存取；箭头表示状态自描述流向存储。",
+    "en": "Left to right: ids mints entity ids, uncertainty records confidence, entity describes entities, event records events and store ties storage together; arrows carry the described state into storage."
+  },
+  "order": [
+    "neko-vrc-body.backend.world-state.ids",
+    "neko-vrc-body.backend.world-state.uncertainty",
+    "neko-vrc-body.backend.world-state.entity",
+    "neko-vrc-body.backend.world-state.event",
+    "neko-vrc-body.backend.world-state.store"
+  ]
+}

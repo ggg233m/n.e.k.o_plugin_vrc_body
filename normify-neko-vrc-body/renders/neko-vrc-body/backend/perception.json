@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception",
+  "updated_at": "2026-10-03T15:59:22.547Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左到右五组：契约与编码定数据形状，画面源抓帧，检测出候选，语义理解并叠加，运行时串起 worker 与状态；箭头表示帧自抓取流向语义结果。",
+    "en": "Left to right in five groups: contracts and encoding fix the data shape, frame sources grab frames, detection yields candidates, semantics interpret and overlay them, and the runtime ties the workers to state; arrows show frames flowing from capture to semantic results."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.contracts",
+    "neko-vrc-body.backend.perception.frame-encoding",
+    "neko-vrc-body.backend.perception.window-capture",
+    "neko-vrc-body.backend.perception.frame-sources",
+    "neko-vrc-body.backend.perception.detector-adapter",
+    "neko-vrc-body.backend.perception.candidate-cache",
+    "neko-vrc-body.backend.perception.overlay",
+    "neko-vrc-body.backend.perception.semantic",
+    "neko-vrc-body.backend.perception.semantic-worker",
+    "neko-vrc-body.backend.perception.vision-worker",
+    "neko-vrc-body.backend.perception.runtime"
+  ],
+  "groups": [
+    {
+      "id": "g-contract",
+      "title": {
+        "zh": "契约与编码",
+        "en": "Contracts and Encoding"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception.contracts",
+        "neko-vrc-body.backend.perception.frame-encoding"
+      ]
+    },
+    {
+      "id": "g-source",
+      "title": {
+        "zh": "画面源",
+        "en": "Frame Sources"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception.window-capture",
+        "neko-vrc-body.backend.perception.frame-sources"
+      ]
+    },
+    {
+      "id": "g-detect",
+      "title": {
+        "zh": "检测",
+        "en": "Detection"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception.detector-adapter",
+        "neko-vrc-body.backend.perception.candidate-cache"
+      ]
+    },
+    {
+      "id": "g-semantic",
+      "title": {
+        "zh": "语义",
+        "en": "Semantic"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception.overlay",
+        "neko-vrc-body.backend.perception.semantic",
+        "neko-vrc-body.backend.perception.semantic-worker"
+      ]
+    },
+    {
+      "id": "g-runtime",
+      "title": {
+        "zh": "运行时",
+        "en": "Runtime"
+      },
+      "children": [
+        "neko-vrc-body.backend.perception.vision-worker",
+        "neko-vrc-body.backend.perception.runtime"
+      ]
+    }
+  ]
+}

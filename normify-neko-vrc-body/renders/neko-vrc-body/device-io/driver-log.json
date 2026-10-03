@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.device-io.driver-log",
+  "updated_at": "2026-10-03T16:03:30.865Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "防御性解析、在组播组上监听、锚定唯一时间基准、由时间轴决定什么值得记录，最后才写 JSONL。",
+    "en": "Parse defensively, listen on the multicast group, anchor one timebase, let the timeline decide what matters, and only then write JSONL."
+  },
+  "order": [
+    "neko-vrc-body.device-io.driver-log.parse",
+    "neko-vrc-body.device-io.driver-log.listener",
+    "neko-vrc-body.device-io.driver-log.timebase",
+    "neko-vrc-body.device-io.driver-log.timeline",
+    "neko-vrc-body.device-io.driver-log.recorder"
+  ]
+}

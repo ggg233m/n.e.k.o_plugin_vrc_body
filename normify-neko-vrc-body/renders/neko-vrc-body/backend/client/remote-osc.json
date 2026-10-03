@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.client.remote-osc",
+  "updated_at": "2026-10-03T15:58:39.357Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：awareness 负责状态与参数，motion 负责运动与输入；箭头表示自读取状态到下发动作的方向。",
+    "en": "Left to right: awareness covers state and parameters and motion covers movement and input; the arrow runs from reading state to sending actions."
+  },
+  "order": [
+    "neko-vrc-body.backend.client.remote-osc.awareness",
+    "neko-vrc-body.backend.client.remote-osc.motion"
+  ]
+}

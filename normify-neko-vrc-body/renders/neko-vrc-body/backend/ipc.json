@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.ipc",
+  "updated_at": "2026-10-03T15:58:30.961Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：constants 定常量与路径，http-handler 解析并路由请求，server 承载回环监听，bootstrap 拉起进程；箭头是请求自常量流向进程引导。",
+    "en": "Left to right: constants fix paths and constants, http-handler parses and routes requests, server hosts the loopback listener and bootstrap starts the process; arrows show the request flowing from constants to process bootstrap."
+  },
+  "order": [
+    "neko-vrc-body.backend.ipc.constants",
+    "neko-vrc-body.backend.ipc.http-handler",
+    "neko-vrc-body.backend.ipc.server",
+    "neko-vrc-body.backend.ipc.bootstrap"
+  ]
+}

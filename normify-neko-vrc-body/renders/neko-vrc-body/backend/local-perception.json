@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.local-perception",
+  "updated_at": "2026-10-03T15:59:57.136Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：runtime-setup 准备运行环境，labels 定义类别，detector 跑检测，tracking 做跟踪关联；箭头是检测结果流向跟踪的顺序。",
+    "en": "Left to right: runtime-setup prepares the environment, labels define the classes, detector runs detection and tracking links targets; arrows show detection results flowing into tracking."
+  },
+  "order": [
+    "neko-vrc-body.backend.local-perception.runtime-setup",
+    "neko-vrc-body.backend.local-perception.labels",
+    "neko-vrc-body.backend.local-perception.detector",
+    "neko-vrc-body.backend.local-perception.tracking"
+  ]
+}

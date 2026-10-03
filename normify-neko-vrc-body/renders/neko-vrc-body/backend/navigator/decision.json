@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.decision",
+  "updated_at": "2026-10-03T16:01:06.288Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：decide 是统一决策入口，target 面向目标决策，free-roam 是自由漫游兜底；箭头表示决策按场景分流。",
+    "en": "Left to right: decide is the single decision entry point, target decides with a goal in mind and free-roam is the roam-anywhere fallback; arrows show decisions branching by situation."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.decision.decide",
+    "neko-vrc-body.backend.navigator.decision.target",
+    "neko-vrc-body.backend.navigator.decision.free-roam"
+  ]
+}

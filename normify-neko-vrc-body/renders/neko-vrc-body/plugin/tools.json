@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.tools",
+  "updated_at": "2026-10-03T15:00:16.154Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "先感知、再动作、后决策：模型先看世界，再驱动身体，最后才允许请求自主操作。",
+    "en": "Sense, then act, then decide: the model observes the world, moves the body, and only then may ask for autonomous action."
+  },
+  "order": [
+    "neko-vrc-body.plugin.tools.world",
+    "neko-vrc-body.plugin.tools.vision",
+    "neko-vrc-body.plugin.tools.vmc",
+    "neko-vrc-body.plugin.tools.body",
+    "neko-vrc-body.plugin.tools.autonomy",
+    "neko-vrc-body.plugin.tools.chatbox-relay"
+  ],
+  "groups": [
+    {
+      "id": "g-sense",
+      "title": {
+        "zh": "感知",
+        "en": "Sense"
+      },
+      "children": [
+        "neko-vrc-body.plugin.tools.world",
+        "neko-vrc-body.plugin.tools.vision",
+        "neko-vrc-body.plugin.tools.vmc"
+      ]
+    },
+    {
+      "id": "g-act",
+      "title": {
+        "zh": "动作",
+        "en": "Act"
+      },
+      "children": [
+        "neko-vrc-body.plugin.tools.body"
+      ]
+    },
+    {
+      "id": "g-decide",
+      "title": {
+        "zh": "决策与说话",
+        "en": "Decide and Speak"
+      },
+      "children": [
+        "neko-vrc-body.plugin.tools.autonomy",
+        "neko-vrc-body.plugin.tools.chatbox-relay"
+      ]
+    }
+  ]
+}

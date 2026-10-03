@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-loop",
+  "updated_at": "2026-10-03T16:01:33.238Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：config 读配置，features 提特征，relative-pose 求相对位姿，closer 做回环闭合；箭头是观测流向回环结论。",
+    "en": "Left to right: config reads settings, features extracts descriptors, relative-pose solves the relative pose and closer performs loop closure; arrows run from observations to the loop-closure verdict."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-loop.config",
+    "neko-vrc-body.backend.nav-loop.features",
+    "neko-vrc-body.backend.nav-loop.relative-pose",
+    "neko-vrc-body.backend.nav-loop.closer"
+  ]
+}

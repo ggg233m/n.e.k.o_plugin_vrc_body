@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-online.navigator.lifecycle",
+  "updated_at": "2026-10-03T16:15:22.951Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先构造与启停在线导航器，再接上跨会话与记忆会话的开关，最后收口失败与停止状态。",
+    "en": "Left to right: construct and start/stop the online navigator, wire the cross-session and memory session hooks, then close on the failure and halt states."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-online.navigator.lifecycle.open-close",
+    "neko-vrc-body.backend.nav-online.navigator.lifecycle.session-hooks",
+    "neko-vrc-body.backend.nav-online.navigator.lifecycle.failure-state"
+  ]
+}

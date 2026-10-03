@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.wander.direction-memory",
+  "updated_at": "2026-10-03T16:15:19.829Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先把闲逛执行的实测结果写进方向记忆，再由对外接口给出建议、更新偏好并判定是否拒绝。",
+    "en": "Left to right: write the measured outcome of each wander leg into the direction memory, then let the outward API advise, update preferences and decide refusals."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.wander.direction-memory.record-outcome",
+    "neko-vrc-body.backend.navigator.wander.direction-memory.advice-api"
+  ]
+}

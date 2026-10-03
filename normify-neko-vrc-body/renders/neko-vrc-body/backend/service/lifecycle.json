@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.lifecycle",
+  "updated_at": "2026-10-03T16:04:03.727Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "启动，然后是 VMC 静止姿态校准流程，最后是释放全部按住输入的关闭流程。",
+    "en": "Start-up, then the VMC rest-pose calibration pass, then shutdown that releases every held input."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.lifecycle.startup",
+    "neko-vrc-body.backend.service.lifecycle.vmc-calibration",
+    "neko-vrc-body.backend.service.lifecycle.shutdown"
+  ]
+}

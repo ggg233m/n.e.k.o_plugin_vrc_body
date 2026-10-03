@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator",
+  "updated_at": "2026-10-03T16:00:56.147Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左到右五组：循环核心（config、lifecycle、goal-check）驱动，决策（decision、turn-gate）给出方向，闲逛（wander、goal-completion）兜底，守卫（behavior、stall-guard、target-observation）纠偏，最后 apply 下发、snapshot 回读；箭头是控制环的推进方向。",
+    "en": "Left to right in five groups: the loop core (config, lifecycle, goal-check) drives, decisions (decision, turn-gate) pick a heading, wander (wander, goal-completion) is the fallback, guards (behavior, stall-guard, target-observation) correct it, and finally apply dispatches while snapshot reads back; arrows show the control loop advancing."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.config",
+    "neko-vrc-body.backend.navigator.lifecycle",
+    "neko-vrc-body.backend.navigator.goal-check",
+    "neko-vrc-body.backend.navigator.decision",
+    "neko-vrc-body.backend.navigator.turn-gate",
+    "neko-vrc-body.backend.navigator.wander",
+    "neko-vrc-body.backend.navigator.goal-completion",
+    "neko-vrc-body.backend.navigator.behavior",
+    "neko-vrc-body.backend.navigator.stall-guard",
+    "neko-vrc-body.backend.navigator.target-observation",
+    "neko-vrc-body.backend.navigator.apply",
+    "neko-vrc-body.backend.navigator.snapshot"
+  ],
+  "groups": [
+    {
+      "id": "g-core",
+      "title": {
+        "zh": "循环核心",
+        "en": "Loop Core"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator.config",
+        "neko-vrc-body.backend.navigator.lifecycle",
+        "neko-vrc-body.backend.navigator.goal-check"
+      ]
+    },
+    {
+      "id": "g-decide",
+      "title": {
+        "zh": "决策",
+        "en": "Decision"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator.decision",
+        "neko-vrc-body.backend.navigator.turn-gate"
+      ]
+    },
+    {
+      "id": "g-wander",
+      "title": {
+        "zh": "闲逛",
+        "en": "Wander"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator.wander",
+        "neko-vrc-body.backend.navigator.goal-completion"
+      ]
+    },
+    {
+      "id": "g-guard",
+      "title": {
+        "zh": "守卫与行为",
+        "en": "Guards and Behaviour"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator.behavior",
+        "neko-vrc-body.backend.navigator.stall-guard",
+        "neko-vrc-body.backend.navigator.target-observation"
+      ]
+    },
+    {
+      "id": "g-out",
+      "title": {
+        "zh": "下发与回读",
+        "en": "Dispatch and Read-out"
+      },
+      "children": [
+        "neko-vrc-body.backend.navigator.apply",
+        "neko-vrc-body.backend.navigator.snapshot"
+      ]
+    }
+  ]
+}

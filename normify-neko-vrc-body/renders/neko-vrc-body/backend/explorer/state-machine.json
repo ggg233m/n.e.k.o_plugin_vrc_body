@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.explorer.state-machine",
+  "updated_at": "2026-10-03T16:15:29.540Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先固定目标签名与实体匹配规则，再按置信度与方位挑选候选，最后决定扫描、短前进还是再扫描。",
+    "en": "Left to right: fix the goal signature and entity-matching rules, pick a candidate by confidence and bearing, and finally decide scan, short advance or rescan."
+  },
+  "order": [
+    "neko-vrc-body.backend.explorer.state-machine.goal-state",
+    "neko-vrc-body.backend.explorer.state-machine.candidate-selection",
+    "neko-vrc-body.backend.explorer.state-machine.decide"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-online.navigator.status",
+  "updated_at": "2026-10-03T16:15:26.396Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：状态与栅格图像回读 → 覆盖率累积与世界坐标到覆盖格的换算 → 栅格视图的对外渲染数据。",
+    "en": "Left to right: status and grid-image readout, then coverage accumulation with the world-to-coverage-cell conversion, and finally the outward render data of the grid view."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-online.navigator.status.status-readout",
+    "neko-vrc-body.backend.nav-online.navigator.status.coverage-view",
+    "neko-vrc-body.backend.nav-online.navigator.status.grid-view"
+  ]
+}

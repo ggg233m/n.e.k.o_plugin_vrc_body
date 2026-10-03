@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.device-io",
+  "updated_at": "2026-10-03T14:55:50.784Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左侧是两条通往化身的出站通道（OSC 与 VMC 骨骼中继），右侧是两条入站流（驱动遥测与宿主对话中继）。",
+    "en": "Two avatar channels out (OSC and the VMC skeleton relay) and two inbound streams (driver telemetry and the host conversation relay)."
+  },
+  "order": [
+    "neko-vrc-body.device-io.osc",
+    "neko-vrc-body.device-io.vmc",
+    "neko-vrc-body.device-io.driver-log",
+    "neko-vrc-body.device-io.chatbox-relay"
+  ],
+  "groups": [
+    {
+      "id": "g-avatar",
+      "title": {
+        "zh": "化身通道",
+        "en": "Avatar Channels"
+      },
+      "children": [
+        "neko-vrc-body.device-io.osc",
+        "neko-vrc-body.device-io.vmc"
+      ]
+    },
+    {
+      "id": "g-telemetry",
+      "title": {
+        "zh": "遥测与语音",
+        "en": "Telemetry and Speech"
+      },
+      "children": [
+        "neko-vrc-body.device-io.driver-log",
+        "neko-vrc-body.device-io.chatbox-relay"
+      ]
+    }
+  ]
+}

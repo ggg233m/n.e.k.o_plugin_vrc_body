@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tools",
+  "updated_at": "2026-10-03T14:59:11.778Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "每个工具都拿真实录制回放生产代码里的 mapper 或对齐器，绝不跑简化替身。",
+    "en": "Every tool replays a real recording against the production mapper or aligner, never against a simplified stand-in."
+  },
+  "order": [
+    "neko-vrc-body.tools.precision-probe",
+    "neko-vrc-body.tools.q-tier-ab",
+    "neko-vrc-body.tools.q-tier-why",
+    "neko-vrc-body.tools.q-tier-bench",
+    "neko-vrc-body.tools.train-bow-vocab",
+    "neko-vrc-body.tools.xsession-align"
+  ]
+}

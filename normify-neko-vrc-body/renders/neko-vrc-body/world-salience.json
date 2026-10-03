@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.world-salience",
+  "updated_at": "2026-10-03T14:59:03.566Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：把原始检测量化成档位、把档位折成摘要、判定这次增量是否叫醒 agent，最后渲染成可读文本。",
+    "en": "Left to right: quantise raw detections into bands, fold bands into a digest, decide whether the delta wakes the agent, and finally render it as readable text."
+  },
+  "order": [
+    "neko-vrc-body.world-salience.bands",
+    "neko-vrc-body.world-salience.digest",
+    "neko-vrc-body.world-salience.classify",
+    "neko-vrc-body.world-salience.describe"
+  ]
+}

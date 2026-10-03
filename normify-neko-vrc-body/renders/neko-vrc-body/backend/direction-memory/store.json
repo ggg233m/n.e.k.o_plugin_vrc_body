@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.direction-memory.store",
+  "updated_at": "2026-10-03T16:15:36.264Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先取扇区条目并换算相对方位，再做预测与拒绝判定，最后输出方向建议并清理过期记忆。",
+    "en": "Left to right: fetch sector entries and convert to relative bearings, then predict and decide refusals, and finally emit direction advice while pruning expired memory."
+  },
+  "order": [
+    "neko-vrc-body.backend.direction-memory.store.sector-access",
+    "neko-vrc-body.backend.direction-memory.store.predict-refuse",
+    "neko-vrc-body.backend.direction-memory.store.advice-maintain"
+  ]
+}

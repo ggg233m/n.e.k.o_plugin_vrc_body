@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.autonomy.runtime",
+  "updated_at": "2026-10-03T15:59:04.352Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：authorization 判定授权，goal 提交目标，world 刷新世界状态；箭头是运行时一次调度的推进顺序。",
+    "en": "Left to right: authorization decides permission, goal submits the objective and world refreshes world state; the arrows are the order of one runtime dispatch."
+  },
+  "order": [
+    "neko-vrc-body.backend.autonomy.runtime.authorization",
+    "neko-vrc-body.backend.autonomy.runtime.goal",
+    "neko-vrc-body.backend.autonomy.runtime.world"
+  ]
+}

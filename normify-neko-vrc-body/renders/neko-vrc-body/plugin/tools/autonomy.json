@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.tools.autonomy",
+  "updated_at": "2026-10-03T15:00:37.847Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "授权必须显式执行且排在最前；下面的一切都依赖它，而且它会自行到期。",
+    "en": "Arming is explicit and comes first; nothing below it works without it, and it expires on its own."
+  },
+  "order": [
+    "neko-vrc-body.plugin.tools.autonomy.arm-disarm",
+    "neko-vrc-body.plugin.tools.autonomy.goal",
+    "neko-vrc-body.plugin.tools.autonomy.wander-step"
+  ]
+}

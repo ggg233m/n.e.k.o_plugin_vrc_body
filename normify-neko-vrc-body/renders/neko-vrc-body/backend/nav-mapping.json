@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-mapping",
+  "updated_at": "2026-10-03T16:01:15.335Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：config 读配置，stereo 取双目观测，voxel 维护体素，mapper 累积栅格化建图，frontier 选探索边界，nav-session 管建图会话；箭头是观测自双目流向地图与边界。",
+    "en": "Left to right: config reads settings, stereo takes the stereo observations, voxel maintains the volume, mapper accumulates and rasterises the map, frontier picks exploration edges and nav-session owns the mapping session; arrows run from the stereo view into the map and frontier."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-mapping.config",
+    "neko-vrc-body.backend.nav-mapping.stereo",
+    "neko-vrc-body.backend.nav-mapping.voxel",
+    "neko-vrc-body.backend.nav-mapping.mapper",
+    "neko-vrc-body.backend.nav-mapping.frontier",
+    "neko-vrc-body.backend.nav-mapping.nav-session"
+  ]
+}

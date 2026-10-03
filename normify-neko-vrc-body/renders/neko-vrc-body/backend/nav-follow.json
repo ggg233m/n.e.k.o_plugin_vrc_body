@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-follow",
+  "updated_at": "2026-10-03T16:01:46.860Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：se2 做 SE(2) 位姿运算，fuser 融合定位，follower 沿路径纯跟踪；箭头是定位融合流向路径跟随。",
+    "en": "Left to right: se2 does SE(2) pose maths, fuser fuses the localisation and follower pure-pursues the path; arrows run from localisation fusion into path following."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-follow.se2",
+    "neko-vrc-body.backend.nav-follow.fuser",
+    "neko-vrc-body.backend.nav-follow.follower"
+  ]
+}

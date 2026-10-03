@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.body",
+  "updated_at": "2026-10-03T16:04:36.066Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "一框一个测试文件，按身体内核的阅读顺序排列：先几何，再协议，最后是把它们串起来的调度器。",
+    "en": "One box per test file, ordered the way the body kernel reads: geometry, then protocol, then the scheduler that ties them together."
+  },
+  "order": [
+    "neko-vrc-body.tests.body.behavior",
+    "neko-vrc-body.tests.body.expression-motion",
+    "neko-vrc-body.tests.body.motion",
+    "neko-vrc-body.tests.body.motion-catalog",
+    "neko-vrc-body.tests.body.nya",
+    "neko-vrc-body.tests.body.protocol",
+    "neko-vrc-body.tests.body.scheduler",
+    "neko-vrc-body.tests.body.vmd-bake",
+    "neko-vrc-body.tests.body.navigator"
+  ]
+}

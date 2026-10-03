@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-xsession",
+  "updated_at": "2026-10-03T16:04:33.668Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：构建世界索引、估计两个会话之间的规范、对齐它们，并让追踪器逐关键帧持续查询。",
+    "en": "Read left to right: build the world index, estimate the gauge between two sessions, align them, and let the tracker keep querying per keyframe."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-xsession.config",
+    "neko-vrc-body.backend.nav-xsession.index",
+    "neko-vrc-body.backend.nav-xsession.gauge",
+    "neko-vrc-body.backend.nav-xsession.align",
+    "neko-vrc-body.backend.nav-xsession.tracker"
+  ]
+}

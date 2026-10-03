@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.avatar-identity",
+  "updated_at": "2026-10-03T16:00:13.431Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左到右两组：descriptors 描述外观与背景特征，registry 维护身份注册表并做合并与分配；箭头表示描述子流向注册表判定。",
+    "en": "Left to right in two groups: descriptors describe appearance and background features, registry keeps the identity table and performs merging and assignment; arrows carry descriptors into the registry decision."
+  },
+  "order": [
+    "neko-vrc-body.backend.avatar-identity.descriptors",
+    "neko-vrc-body.backend.avatar-identity.registry"
+  ],
+  "groups": [
+    {
+      "id": "g-desc",
+      "title": {
+        "zh": "描述子",
+        "en": "Descriptors"
+      },
+      "children": [
+        "neko-vrc-body.backend.avatar-identity.descriptors"
+      ]
+    },
+    {
+      "id": "g-reg",
+      "title": {
+        "zh": "注册表",
+        "en": "Registry"
+      },
+      "children": [
+        "neko-vrc-body.backend.avatar-identity.registry"
+      ]
+    }
+  ]
+}

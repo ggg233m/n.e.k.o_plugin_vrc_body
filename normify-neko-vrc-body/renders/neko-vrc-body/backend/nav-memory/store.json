@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-memory.store",
+  "updated_at": "2026-10-03T16:01:52.680Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：sessions 列出会话，listing 做清单读取，paths 解析落盘路径，deletion 删除会话；箭头是会话管理的自列举到删除顺序。",
+    "en": "Left to right: sessions enumerates sessions, listing reads the catalogue, paths resolves on-disk locations and deletion removes a session; arrows run from listing sessions to deleting them."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-memory.store.sessions",
+    "neko-vrc-body.backend.nav-memory.store.listing",
+    "neko-vrc-body.backend.nav-memory.store.paths",
+    "neko-vrc-body.backend.nav-memory.store.deletion"
+  ]
+}

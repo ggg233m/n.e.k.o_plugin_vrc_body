@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.backend",
+  "updated_at": "2026-10-03T16:04:52.490Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "先是各代理与页面的单元测试；冒烟测试放在最后，因为它是唯一能发现其它测试没覆盖到的接线错误的那个。",
+    "en": "Unit tests for each proxy and page first; the smoke test last because it is the one that would notice a wiring mistake nobody else covers."
+  },
+  "order": [
+    "neko-vrc-body.tests.backend.backend-client",
+    "neko-vrc-body.tests.backend.service-action-wiring",
+    "neko-vrc-body.tests.backend.debug-cli",
+    "neko-vrc-body.tests.backend.standalone-ui",
+    "neko-vrc-body.tests.backend.ui",
+    "neko-vrc-body.tests.backend.smoke"
+  ]
+}

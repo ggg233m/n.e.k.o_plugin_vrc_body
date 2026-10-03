@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.clips",
+  "updated_at": "2026-10-03T14:58:54.659Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：片段被解析与编目、离线从 VMD 烘焙，最后作为低优先级表情叠加层混到实时姿态上。",
+    "en": "Left to right: clips are parsed and catalogued, baked offline from VMD, and finally blended onto the live pose as low-priority expression overlays."
+  },
+  "order": [
+    "neko-vrc-body.clips.nya",
+    "neko-vrc-body.clips.catalog",
+    "neko-vrc-body.clips.vmd-bake",
+    "neko-vrc-body.clips.expression-motion"
+  ]
+}

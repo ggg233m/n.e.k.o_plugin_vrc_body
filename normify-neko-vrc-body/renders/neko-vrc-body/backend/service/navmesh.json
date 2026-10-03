@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.navmesh",
+  "updated_at": "2026-10-03T16:04:02.573Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "控制驱动在线导航器；记忆管理它从以往会话中持久化下来的一切。",
+    "en": "Control drives the live navigator; memory manages everything it persisted from past sessions."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.navmesh.control",
+    "neko-vrc-body.backend.service.navmesh.memory"
+  ]
+}

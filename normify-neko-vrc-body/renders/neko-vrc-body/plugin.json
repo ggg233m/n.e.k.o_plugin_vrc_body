@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin",
+  "updated_at": "2026-10-03T14:55:40.353Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左组是宿主调用进来的入口，右组是外壳把上下文推回模型、聊天框与驱动的地方。",
+    "en": "Left group is how the host calls in; right group is how the shell pushes context back out to the model, the chatbox and the driver."
+  },
+  "order": [
+    "neko-vrc-body.plugin.lifecycle",
+    "neko-vrc-body.plugin.tools",
+    "neko-vrc-body.plugin.agent",
+    "neko-vrc-body.plugin.conversation",
+    "neko-vrc-body.plugin.driver-bridge",
+    "neko-vrc-body.plugin.debug"
+  ],
+  "groups": [
+    {
+      "id": "g-entry",
+      "title": {
+        "zh": "入口",
+        "en": "Entry Points"
+      },
+      "children": [
+        "neko-vrc-body.plugin.lifecycle",
+        "neko-vrc-body.plugin.tools",
+        "neko-vrc-body.plugin.debug"
+      ]
+    },
+    {
+      "id": "g-bridge",
+      "title": {
+        "zh": "桥接",
+        "en": "Bridges"
+      },
+      "children": [
+        "neko-vrc-body.plugin.agent",
+        "neko-vrc-body.plugin.conversation",
+        "neko-vrc-body.plugin.driver-bridge"
+      ]
+    }
+  ]
+}

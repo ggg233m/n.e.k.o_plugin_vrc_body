@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel.scheduler",
+  "updated_at": "2026-10-03T16:03:30.297Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左到右：命令进来、动作被产出、化身通道被驱动，结果再发布回宿主。最后一组是保证这一切安全的东西。",
+    "en": "Read left to right: a command enters, a motion is produced, the avatar channels are driven, and the result is published back to the host. The last group is what keeps any of this safe."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.scheduler.transport",
+    "neko-vrc-body.body-kernel.scheduler.types",
+    "neko-vrc-body.body-kernel.scheduler.lifecycle",
+    "neko-vrc-body.body-kernel.scheduler.submit",
+    "neko-vrc-body.body-kernel.scheduler.run-loop",
+    "neko-vrc-body.body-kernel.scheduler.idle-relay",
+    "neko-vrc-body.body-kernel.scheduler.expression-overlay",
+    "neko-vrc-body.body-kernel.scheduler.motion-reach-grab",
+    "neko-vrc-body.body-kernel.scheduler.motion-gesture",
+    "neko-vrc-body.body-kernel.scheduler.motion-sequence",
+    "neko-vrc-body.body-kernel.scheduler.motion-clip",
+    "neko-vrc-body.body-kernel.scheduler.input-axes",
+    "neko-vrc-body.body-kernel.scheduler.yaw",
+    "neko-vrc-body.body-kernel.scheduler.head-heartbeat",
+    "neko-vrc-body.body-kernel.scheduler.transition-safety",
+    "neko-vrc-body.body-kernel.scheduler.action-descriptor",
+    "neko-vrc-body.body-kernel.scheduler.semantic-labels",
+    "neko-vrc-body.body-kernel.scheduler.awareness",
+    "neko-vrc-body.body-kernel.scheduler.publish",
+    "neko-vrc-body.body-kernel.scheduler.fault-shutdown"
+  ],
+  "groups": [
+    {
+      "id": "g-pipeline",
+      "title": {
+        "zh": "命令流水线",
+        "en": "Command Pipeline"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.scheduler.transport",
+        "neko-vrc-body.body-kernel.scheduler.types",
+        "neko-vrc-body.body-kernel.scheduler.lifecycle",
+        "neko-vrc-body.body-kernel.scheduler.submit",
+        "neko-vrc-body.body-kernel.scheduler.run-loop"
+      ]
+    },
+    {
+      "id": "g-motion",
+      "title": {
+        "zh": "动作产出",
+        "en": "Motion Producers"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.scheduler.idle-relay",
+        "neko-vrc-body.body-kernel.scheduler.expression-overlay",
+        "neko-vrc-body.body-kernel.scheduler.motion-reach-grab",
+        "neko-vrc-body.body-kernel.scheduler.motion-gesture",
+        "neko-vrc-body.body-kernel.scheduler.motion-sequence",
+        "neko-vrc-body.body-kernel.scheduler.motion-clip"
+      ]
+    },
+    {
+      "id": "g-avatar",
+      "title": {
+        "zh": "化身通道",
+        "en": "Avatar Channels"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.scheduler.input-axes",
+        "neko-vrc-body.body-kernel.scheduler.yaw",
+        "neko-vrc-body.body-kernel.scheduler.head-heartbeat"
+      ]
+    },
+    {
+      "id": "g-out",
+      "title": {
+        "zh": "回读与安全",
+        "en": "Read-out and Safety"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.scheduler.transition-safety",
+        "neko-vrc-body.body-kernel.scheduler.action-descriptor",
+        "neko-vrc-body.body-kernel.scheduler.semantic-labels",
+        "neko-vrc-body.body-kernel.scheduler.awareness",
+        "neko-vrc-body.body-kernel.scheduler.publish",
+        "neko-vrc-body.body-kernel.scheduler.fault-shutdown"
+      ]
+    }
+  ]
+}

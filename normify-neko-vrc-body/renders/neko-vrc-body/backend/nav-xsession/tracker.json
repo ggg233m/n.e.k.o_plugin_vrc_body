@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-xsession.tracker",
+  "updated_at": "2026-10-03T16:04:35.418Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "后台装载索引，逐关键帧查询与验证，会话结束时把约束写回。",
+    "en": "Load the index in the background, query and verify per keyframe, then write the constraints back at session end."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-xsession.tracker.init",
+    "neko-vrc-body.backend.nav-xsession.tracker.keyframe",
+    "neko-vrc-body.backend.nav-xsession.tracker.write-back"
+  ]
+}

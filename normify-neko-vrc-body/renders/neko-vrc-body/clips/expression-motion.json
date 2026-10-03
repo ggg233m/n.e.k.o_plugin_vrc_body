@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.clips.expression-motion",
+  "updated_at": "2026-10-03T15:02:17.900Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "描述符、相位帧，最后是让基础姿态保有权威性的增量施加。",
+    "en": "Descriptor, phase frames, and finally a delta application that leaves the base pose authoritative."
+  },
+  "order": [
+    "neko-vrc-body.clips.expression-motion.overlay",
+    "neko-vrc-body.clips.expression-motion.phases",
+    "neko-vrc-body.clips.expression-motion.apply"
+  ]
+}

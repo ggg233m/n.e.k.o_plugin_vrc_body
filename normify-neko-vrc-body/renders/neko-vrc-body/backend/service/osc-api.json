@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.osc-api",
+  "updated_at": "2026-10-03T16:04:32.506Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "先是离散动作，再是连续移动，最后是批量与取消路径 —— 它们负责在出错后收拾干净。",
+    "en": "Discrete actions first, continuous movement next, and the batch and cancel paths last because they are what cleans up after a mistake."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.osc-api.parameter",
+    "neko-vrc-body.backend.service.osc-api.locomotion",
+    "neko-vrc-body.backend.service.osc-api.turn-stop",
+    "neko-vrc-body.backend.service.osc-api.controller",
+    "neko-vrc-body.backend.service.osc-api.batch"
+  ]
+}

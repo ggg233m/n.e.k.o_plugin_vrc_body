@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.runtime",
+  "updated_at": "2026-10-03T15:59:53.742Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：init 建运行时，ingest 收帧，frame-cache 存帧，semantic-request 发起语义请求，semantic-commit 提交结果，status 汇报状态，stop-mask 标记停机；箭头是一帧从入库到结果回写的全流程。",
+    "en": "Left to right: init builds the runtime, ingest receives frames, frame-cache holds them, semantic-request asks the model, semantic-commit writes the answer back, status reports and stop-mask marks shutdown; arrows trace one frame from ingest to the committed result."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.runtime.init",
+    "neko-vrc-body.backend.perception.runtime.ingest",
+    "neko-vrc-body.backend.perception.runtime.frame-cache",
+    "neko-vrc-body.backend.perception.runtime.semantic-request",
+    "neko-vrc-body.backend.perception.runtime.semantic-commit",
+    "neko-vrc-body.backend.perception.runtime.status",
+    "neko-vrc-body.backend.perception.runtime.stop-mask"
+  ]
+}

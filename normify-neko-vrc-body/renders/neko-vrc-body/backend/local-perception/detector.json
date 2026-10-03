@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.local-perception.detector",
+  "updated_at": "2026-10-03T16:00:00.391Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：init 初始化模型，preprocess 预处理，onnx 与 opencv-hog 是两种推理后端，decode 解码输出，observe 发布观测，status 汇报状态；箭头是图像自预处理流向观测。",
+    "en": "Left to right: init loads the model, preprocess prepares the image, onnx and opencv-hog are two inference backends, decode turns output into boxes, observe publishes the observation and status reports; arrows run from preprocessing to the published observation."
+  },
+  "order": [
+    "neko-vrc-body.backend.local-perception.detector.init",
+    "neko-vrc-body.backend.local-perception.detector.preprocess",
+    "neko-vrc-body.backend.local-perception.detector.onnx",
+    "neko-vrc-body.backend.local-perception.detector.opencv-hog",
+    "neko-vrc-body.backend.local-perception.detector.decode",
+    "neko-vrc-body.backend.local-perception.detector.observe",
+    "neko-vrc-body.backend.local-perception.detector.status"
+  ]
+}

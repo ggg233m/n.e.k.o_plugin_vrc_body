@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-mapping.mapper",
+  "updated_at": "2026-10-03T16:01:30.425Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：init 建图器，poses 存关键帧位姿，accumulator 累积观测，ray-veto 否决不可信射线，rasterize 栅格化成地图；箭头是自观测累积到出图的顺序。",
+    "en": "Left to right: init creates the mapper, poses stores keyframe poses, accumulator accumulates observations, ray-veto vetoes rays that must not be trusted and rasterize turns it into the map; arrows run from accumulating to emitting the map."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-mapping.mapper.init",
+    "neko-vrc-body.backend.nav-mapping.mapper.poses",
+    "neko-vrc-body.backend.nav-mapping.mapper.accumulator",
+    "neko-vrc-body.backend.nav-mapping.mapper.ray-veto",
+    "neko-vrc-body.backend.nav-mapping.mapper.rasterize"
+  ]
+}

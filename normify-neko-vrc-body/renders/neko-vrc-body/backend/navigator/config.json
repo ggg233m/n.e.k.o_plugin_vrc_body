@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.config",
+  "updated_at": "2026-10-03T16:14:58.512Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先定安全上限与决策结构，再用取值助手收敛输入，最后读取目标观测与空间提示。",
+    "en": "Left to right: safety limits and decision structure first, then value helpers to tame the inputs, and finally target observations and spatial hints."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.config.limits",
+    "neko-vrc-body.backend.navigator.config.decision-types",
+    "neko-vrc-body.backend.navigator.config.value-helpers",
+    "neko-vrc-body.backend.navigator.config.target-observation"
+  ]
+}

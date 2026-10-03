@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.device-io.vmc",
+  "updated_at": "2026-10-03T15:01:55.447Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左组驱动宿主 VMC 输出与校准；右组把流入的骨骼流转成 AnyaDance 帧。",
+    "en": "Left group drives the host's VMC output and the calibration; right group turns the incoming bone stream into AnyaDance frames."
+  },
+  "order": [
+    "neko-vrc-body.device-io.vmc.host-controller",
+    "neko-vrc-body.device-io.vmc.relay-socket",
+    "neko-vrc-body.device-io.vmc.bones",
+    "neko-vrc-body.device-io.vmc.math",
+    "neko-vrc-body.device-io.vmc.relay-fk",
+    "neko-vrc-body.device-io.vmc.relay-calibration",
+    "neko-vrc-body.device-io.vmc.relay-frame"
+  ],
+  "groups": [
+    {
+      "id": "g-relay",
+      "title": {
+        "zh": "骨骼中继",
+        "en": "Skeleton Relay"
+      },
+      "children": [
+        "neko-vrc-body.device-io.vmc.bones",
+        "neko-vrc-body.device-io.vmc.math",
+        "neko-vrc-body.device-io.vmc.relay-fk",
+        "neko-vrc-body.device-io.vmc.relay-frame"
+      ]
+    },
+    {
+      "id": "g-host",
+      "title": {
+        "zh": "宿主 VMC 控制",
+        "en": "Host VMC Control"
+      },
+      "children": [
+        "neko-vrc-body.device-io.vmc.host-controller",
+        "neko-vrc-body.device-io.vmc.relay-calibration",
+        "neko-vrc-body.device-io.vmc.relay-socket"
+      ]
+    }
+  ]
+}

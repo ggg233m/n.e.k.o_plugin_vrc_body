@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.local-perception.detector.init",
+  "updated_at": "2026-10-03T16:14:55.281Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先构造检测器定下配置与设备选择，再按优先级逐个编译 OpenVINO 模型。",
+    "en": "Left to right: construct the detector to fix configuration and device choice, then compile the OpenVINO model candidate by candidate."
+  },
+  "order": [
+    "neko-vrc-body.backend.local-perception.detector.init.model-init",
+    "neko-vrc-body.backend.local-perception.detector.init.openvino-compile"
+  ]
+}

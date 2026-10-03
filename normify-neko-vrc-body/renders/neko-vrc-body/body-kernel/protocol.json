@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel.protocol",
+  "updated_at": "2026-10-03T15:00:44.755Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "未经校验的内容一律不得编码；只带头显的那一帧是刻意保留的例外，仅用于转向。",
+    "en": "Nothing is encoded before it has passed validation; the head-only frame is the deliberate exception used purely for turning."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.protocol.validation",
+    "neko-vrc-body.body-kernel.protocol.encoding"
+  ]
+}

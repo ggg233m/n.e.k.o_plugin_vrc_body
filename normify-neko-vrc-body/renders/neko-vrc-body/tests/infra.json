@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.infra",
+  "updated_at": "2026-10-03T16:04:53.093Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "先是支撑代码，然后是有界小工具，最后是把 research 代码挡在运行时之外的守卫。",
+    "en": "Support code first, then the small bounded utilities, and last the guard that keeps research code out of the runtime."
+  },
+  "order": [
+    "neko-vrc-body.tests.infra.bootstrap",
+    "neko-vrc-body.tests.infra.frame-budget",
+    "neko-vrc-body.tests.infra.stage-profile",
+    "neko-vrc-body.tests.infra.action-timeline",
+    "neko-vrc-body.tests.infra.research-isolation"
+  ]
+}

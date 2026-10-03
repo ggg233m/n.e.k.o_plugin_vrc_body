@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-xsession.index",
+  "updated_at": "2026-10-03T16:04:34.239Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先是内存中的索引模型，再是从世界目录扫描并缓存以重建它的过程。",
+    "en": "The in-memory index model, and the scan-and-cache that rebuilds it from the world directory."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-xsession.index.model",
+    "neko-vrc-body.backend.nav-xsession.index.build"
+  ]
+}

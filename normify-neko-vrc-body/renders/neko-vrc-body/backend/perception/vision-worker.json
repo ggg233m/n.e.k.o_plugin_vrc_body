@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.vision-worker",
+  "updated_at": "2026-10-03T15:59:50.345Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：capture 抓取帧，process 处理帧；箭头表示自抓帧到处理的单向流动。",
+    "en": "Left to right: capture grabs frames and process works on them; the arrow is the one-way flow from capture to processing."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.vision-worker.capture",
+    "neko-vrc-body.backend.perception.vision-worker.process"
+  ]
+}

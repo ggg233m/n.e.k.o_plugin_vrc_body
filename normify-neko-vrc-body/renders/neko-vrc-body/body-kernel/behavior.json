@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel.behavior",
+  "updated_at": "2026-10-03T15:01:45.361Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "策略规定每种命令的行为方式，表情解析决定意图的含义，状态机负责强制分层。",
+    "en": "Policies say how each command kind behaves; expression resolution decides what an intent means; the state machine enforces the layering."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.behavior.policies",
+    "neko-vrc-body.body-kernel.behavior.expression-resolve",
+    "neko-vrc-body.body-kernel.behavior.state-machine"
+  ]
+}

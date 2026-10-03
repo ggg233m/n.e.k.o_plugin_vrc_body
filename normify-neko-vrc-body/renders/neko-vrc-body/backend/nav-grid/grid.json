@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-grid.grid",
+  "updated_at": "2026-10-03T16:01:43.409Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：load 载入栅格，build 构建可行走区域，plan 跑 A* 规划；箭头是自载入了路径输出的三步。",
+    "en": "Left to right: load reads the grid, build derives the walkable area and plan runs A* planning; the arrows are the three steps from load to a path."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-grid.grid.load",
+    "neko-vrc-body.backend.nav-grid.grid.build",
+    "neko-vrc-body.backend.nav-grid.grid.plan"
+  ]
+}

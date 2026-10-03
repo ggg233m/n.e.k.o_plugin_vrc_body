@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.device-io.osc",
+  "updated_at": "2026-10-03T15:01:49.847Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左列是纯编解码，中列是桥发送的全部内容，右列是它接收并缓存的全部内容。",
+    "en": "Left is pure encoding, middle is everything the bridge sends, right is everything it receives and caches."
+  },
+  "order": [
+    "neko-vrc-body.device-io.osc.codec",
+    "neko-vrc-body.device-io.osc.decoder",
+    "neko-vrc-body.device-io.osc.bridge-socket",
+    "neko-vrc-body.device-io.osc.bridge-parameter",
+    "neko-vrc-body.device-io.osc.bridge-input",
+    "neko-vrc-body.device-io.osc.bridge-axes",
+    "neko-vrc-body.device-io.osc.bridge-input-schedule",
+    "neko-vrc-body.device-io.osc.bridge-timers",
+    "neko-vrc-body.device-io.osc.bridge-receive",
+    "neko-vrc-body.device-io.osc.bridge-motion-feedback",
+    "neko-vrc-body.device-io.osc.bridge-awareness",
+    "neko-vrc-body.device-io.osc.bridge-snapshot"
+  ],
+  "groups": [
+    {
+      "id": "g-codec",
+      "title": {
+        "zh": "线格式",
+        "en": "Wire Format"
+      },
+      "children": [
+        "neko-vrc-body.device-io.osc.codec",
+        "neko-vrc-body.device-io.osc.decoder"
+      ]
+    },
+    {
+      "id": "g-send",
+      "title": {
+        "zh": "出站",
+        "en": "Outbound"
+      },
+      "children": [
+        "neko-vrc-body.device-io.osc.bridge-socket",
+        "neko-vrc-body.device-io.osc.bridge-parameter",
+        "neko-vrc-body.device-io.osc.bridge-input",
+        "neko-vrc-body.device-io.osc.bridge-axes",
+        "neko-vrc-body.device-io.osc.bridge-input-schedule",
+        "neko-vrc-body.device-io.osc.bridge-timers"
+      ]
+    },
+    {
+      "id": "g-recv",
+      "title": {
+        "zh": "入站与状态",
+        "en": "Inbound and State"
+      },
+      "children": [
+        "neko-vrc-body.device-io.osc.bridge-receive",
+        "neko-vrc-body.device-io.osc.bridge-motion-feedback",
+        "neko-vrc-body.device-io.osc.bridge-awareness",
+        "neko-vrc-body.device-io.osc.bridge-snapshot"
+      ]
+    }
+  ]
+}

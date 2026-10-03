@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.obs-capture",
+  "updated_at": "2026-10-03T16:00:30.933Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：helpers 给公共助手，virtual-camera 接虚拟摄像头，websocket 接 obs-websocket；箭头表示两种采集后端并列产出帧。",
+    "en": "Left to right: helpers holds shared utilities, virtual-camera attaches the virtual camera and websocket attaches obs-websocket; the two arrows are parallel frame producers."
+  },
+  "order": [
+    "neko-vrc-body.backend.obs-capture.helpers",
+    "neko-vrc-body.backend.obs-capture.virtual-camera",
+    "neko-vrc-body.backend.obs-capture.websocket"
+  ]
+}

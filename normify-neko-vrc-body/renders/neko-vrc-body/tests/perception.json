@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.perception",
+  "updated_at": "2026-10-03T16:04:37.240Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "自上而下：采集，然后成帧，然后检测，然后身份，最后是导航所依赖的几何与时序。",
+    "en": "Read top-down: capture, then framing, then detection, then identity, then the geometry and timing that navigation depends on."
+  },
+  "order": [
+    "neko-vrc-body.tests.perception.vision-capture",
+    "neko-vrc-body.tests.perception.vision-frame",
+    "neko-vrc-body.tests.perception.vision-runtime-stale-reason",
+    "neko-vrc-body.tests.perception.local-perception",
+    "neko-vrc-body.tests.perception.avatar-identity",
+    "neko-vrc-body.tests.perception.reid-embedder",
+    "neko-vrc-body.tests.perception.obs-capture",
+    "neko-vrc-body.tests.perception.traversability",
+    "neko-vrc-body.tests.perception.time-alignment"
+  ]
+}

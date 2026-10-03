@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.conversation",
+  "updated_at": "2026-10-03T15:00:01.670Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "优先读实时总线；只有当总线没有更新内容时才回退到磁盘记录。",
+    "en": "Prefer the live bus; fall back to on-disk records only when the bus has nothing newer."
+  },
+  "order": [
+    "neko-vrc-body.plugin.conversation.fetch-turns",
+    "neko-vrc-body.plugin.conversation.disk-records",
+    "neko-vrc-body.plugin.conversation.send-line"
+  ]
+}

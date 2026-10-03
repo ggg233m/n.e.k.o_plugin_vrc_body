@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.direction-memory",
+  "updated_at": "2026-10-03T15:59:09.359Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：sectors 划定方向扇区，evidence 记录方向证据，store 存下记忆，progress 累加进度积分；箭头是证据汇入存储并更新进度的流向。",
+    "en": "Left to right: sectors define direction sectors, evidence records direction evidence, store persists it and progress accumulates the score; arrows show evidence flowing into storage and updating progress."
+  },
+  "order": [
+    "neko-vrc-body.backend.direction-memory.sectors",
+    "neko-vrc-body.backend.direction-memory.evidence",
+    "neko-vrc-body.backend.direction-memory.store",
+    "neko-vrc-body.backend.direction-memory.progress"
+  ]
+}

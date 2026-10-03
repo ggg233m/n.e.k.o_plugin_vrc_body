@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.packaging",
+  "updated_at": "2026-10-03T14:59:16.849Z",
+  "mode": "grid",
+  "max_columns": 4,
+  "reading": {
+    "zh": "先构建包，再通过复现旧冲突与跑一次真实推理来证明安装是干净的。",
+    "en": "Build the package, then prove the install is clean by reproducing the old conflict and by running a real inference."
+  },
+  "order": [
+    "neko-vrc-body.packaging.build",
+    "neko-vrc-body.packaging.profile-safe",
+    "neko-vrc-body.packaging.verify-profile-conflict",
+    "neko-vrc-body.packaging.verify-runtime"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.autonomy",
+  "updated_at": "2026-10-03T16:04:04.307Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "授权门控其下的一切；目标可跨调用持续解析，而闲逛步进是最弱的一种移动形式。",
+    "en": "Authorization gates everything below it; a target stays resolvable across calls, and a wander step is the weakest form of moving."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.autonomy.authorization",
+    "neko-vrc-body.backend.service.autonomy.goal",
+    "neko-vrc-body.backend.service.autonomy.target-refs",
+    "neko-vrc-body.backend.service.autonomy.intent",
+    "neko-vrc-body.backend.service.autonomy.wander"
+  ]
+}

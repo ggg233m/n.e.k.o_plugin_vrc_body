@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.avatar-identity.registry",
+  "updated_at": "2026-10-03T16:00:19.488Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：init 建表，descriptor-update 更新描述子，absorb 合并重复身份，assign 给轨迹分配身份；箭头是注册表逐级演进的顺序。",
+    "en": "Left to right: init builds the table, descriptor-update refreshes descriptors, absorb merges duplicate identities and assign gives tracks an identity; arrows are the order the registry evolves in."
+  },
+  "order": [
+    "neko-vrc-body.backend.avatar-identity.registry.init",
+    "neko-vrc-body.backend.avatar-identity.registry.descriptor-update",
+    "neko-vrc-body.backend.avatar-identity.registry.absorb",
+    "neko-vrc-body.backend.avatar-identity.registry.assign"
+  ]
+}

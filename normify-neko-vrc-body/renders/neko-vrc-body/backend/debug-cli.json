@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.debug-cli",
+  "updated_at": "2026-10-03T16:06:12.108Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "解析参数，然后要么发出一次请求，要么打开一个复用连接的持久 shell。",
+    "en": "Parse the arguments, then either issue one request or open a persistent shell that reuses the connection."
+  },
+  "order": [
+    "neko-vrc-body.backend.debug-cli.arg-parsing",
+    "neko-vrc-body.backend.debug-cli.frame-output",
+    "neko-vrc-body.backend.debug-cli.http-shell",
+    "neko-vrc-body.backend.debug-cli.main"
+  ]
+}

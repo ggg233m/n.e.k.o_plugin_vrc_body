@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-xsession.gauge",
+  "updated_at": "2026-10-03T16:04:34.835Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先从约束估计规范，再用弹性位姿图精化它。",
+    "en": "Estimate the gauge from constraints, then refine it with the elastic pose graph."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-xsession.gauge.estimate",
+    "neko-vrc-body.backend.nav-xsession.gauge.elastic"
+  ]
+}

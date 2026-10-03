@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.debug",
+  "updated_at": "2026-10-03T15:00:10.983Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "命令从面板进来，面板上下文为展示而组装，外部助手只在受限条件下运行。",
+    "en": "Commands come in from the panel, dashboard context is assembled for display, and external helpers only run bounded."
+  },
+  "order": [
+    "neko-vrc-body.plugin.debug.command-dispatch",
+    "neko-vrc-body.plugin.debug.ui-event",
+    "neko-vrc-body.plugin.debug.dashboard-context",
+    "neko-vrc-body.plugin.debug.bounded-command"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-online.navigator",
+  "updated_at": "2026-10-03T16:01:12.743Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：lifecycle 管线程起停，loops 跑各导航回路，commands 收命令，status 报状态；箭头是线程内自命令到状态的流向。",
+    "en": "Left to right: lifecycle owns thread start and stop, loops runs the navigation loops, commands takes commands and status reports; arrows run from commands to status inside the thread."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-online.navigator.lifecycle",
+    "neko-vrc-body.backend.nav-online.navigator.loops",
+    "neko-vrc-body.backend.nav-online.navigator.commands",
+    "neko-vrc-body.backend.nav-online.navigator.status"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.world-model",
+  "updated_at": "2026-10-03T15:59:18.537Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：identity 判定当前世界身份，core 承载世界模型内核；箭头是身份确认后进入内核的流向。",
+    "en": "Left to right: identity determines which world this is and core holds the world model proper; the arrow runs from identity confirmation into the core."
+  },
+  "order": [
+    "neko-vrc-body.backend.world-model.identity",
+    "neko-vrc-body.backend.world-model.core"
+  ]
+}

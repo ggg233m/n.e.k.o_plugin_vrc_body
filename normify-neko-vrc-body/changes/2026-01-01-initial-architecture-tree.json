@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "2026-01-01-initial-architecture-tree",
+  "title": {
+    "en": "Initial architecture tree for the N.E.K.O VRChat body plugin",
+    "zh": "N.E.K.O VRChat 身体插件初始架构树"
+  },
+  "status": "verified",
+  "intent": {
+    "en": "Generate a full Normify structure tree for the N.E.K.O AnyaDance body plugin, drilled to single functional unit, then render an explorable architecture diagram.",
+    "zh": "为 N.E.K.O AnyaDance 身体插件建立全量 Normify 结构树，粒度下钻到单一功能单元，并渲染可下钻的架构图。"
+  },
+  "modules": {},
+  "acceptance": [
+    "结构树覆盖插件外壳、身体内核、设备接入、动作片段、配置、后端、导航、感知、Web 控制台、工具、打包与测试全部子系统",
+    "大文件按单一功能单元下钻：__init__.py / service.py / vision.py / navigator.py / scheduler.py / nav_online.py / world_state.py 等均拆分到类内职责级",
+    "叶子模块携带真实 API 契约：24 个 LLM 工具、HTTP 路由、动作片段与事件通道",
+    "关键数据流（命令提交→调度→UDP、感知→世界状态→导航→OSC）以 deps 箭头表达并尽量锚定到具体 API",
+    "每个容器模块建立渲染数据（order/groups/reading），使架构图可下钻且可读",
+    "normify_validate 达到 0 error，normify_build 成功并产出 normify.html"
+  ],
+  "note": "初始架构树：567 模块（449 叶子 / 118 容器），1010 条 API，26 条依赖箭头，118 层渲染数据，最大深度 6。validate 0 error。",
+  "revision": {
+    "before": null,
+    "after": "c6cd0a7c9179d635671c54c1871c6d311878af48"
+  },
+  "created_at": "2026-10-03T14:18:04.426Z",
+  "updated_at": "2026-10-03T16:20:33.311Z",
+  "closed_at": "2026-10-03T16:20:33.311Z"
+}

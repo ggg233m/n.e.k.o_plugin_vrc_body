@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.cognition",
+  "updated_at": "2026-10-03T15:58:42.569Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右五步：value-safety 归一化取值，preconditions 判定前置条件，observation 做观测与状态估计，planning 出计划，runtime 驱动整轮循环；箭头是认知循环的前进方向。",
+    "en": "Five steps left to right: value-safety normalises inputs, preconditions checks the world preconditions, observation estimates state, planning produces the plan and runtime drives the whole loop; arrows point forward through the cycle."
+  },
+  "order": [
+    "neko-vrc-body.backend.cognition.value-safety",
+    "neko-vrc-body.backend.cognition.preconditions",
+    "neko-vrc-body.backend.cognition.observation",
+    "neko-vrc-body.backend.cognition.planning",
+    "neko-vrc-body.backend.cognition.runtime"
+  ]
+}

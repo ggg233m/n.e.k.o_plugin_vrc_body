@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.clips.vmd-bake",
+  "updated_at": "2026-10-03T15:02:14.564Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先是数学，再是基底求解，再是控制器重定向，最后是命令行驱动的文档转换。",
+    "en": "Maths, then basis solving, then controller retargeting, then the document conversion the CLI drives."
+  },
+  "order": [
+    "neko-vrc-body.clips.vmd-bake.math",
+    "neko-vrc-body.clips.vmd-bake.basis",
+    "neko-vrc-body.clips.vmd-bake.controller-retarget",
+    "neko-vrc-body.clips.vmd-bake.document",
+    "neko-vrc-body.clips.vmd-bake.cli"
+  ]
+}

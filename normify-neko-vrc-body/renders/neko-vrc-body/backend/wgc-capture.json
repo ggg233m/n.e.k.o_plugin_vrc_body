@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.wgc-capture",
+  "updated_at": "2026-10-03T16:00:36.710Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：constants 定常量，com 走 Windows.Graphics.Capture 通道，session 管理采集会话；箭头表示通道流向会话。",
+    "en": "Left to right: constants fix the values, com talks to the Windows.Graphics.Capture channel and session manages the capture session; the arrow runs from the channel into the session."
+  },
+  "order": [
+    "neko-vrc-body.backend.wgc-capture.constants",
+    "neko-vrc-body.backend.wgc-capture.com",
+    "neko-vrc-body.backend.wgc-capture.session"
+  ]
+}

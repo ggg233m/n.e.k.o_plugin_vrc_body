@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.nav-memory.codec",
+  "updated_at": "2026-10-03T16:15:42.792Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先定模式与原子读写，再编解码关键帧特征并生成缩略图，最后由插件配置桥接成记忆库配置。",
+    "en": "Left to right: fix the schema and atomic file I/O, encode/decode keyframe features and make thumbnails, and finally bridge the plugin configuration into a memory configuration."
+  },
+  "order": [
+    "neko-vrc-body.backend.nav-memory.codec.paths-and-io",
+    "neko-vrc-body.backend.nav-memory.codec.feature-codec",
+    "neko-vrc-body.backend.nav-memory.codec.thumbnail",
+    "neko-vrc-body.backend.nav-memory.codec.config-bridge"
+  ]
+}

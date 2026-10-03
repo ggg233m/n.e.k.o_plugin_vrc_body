@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.client",
+  "updated_at": "2026-10-03T15:58:37.118Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "从左到右三组：通道（errors、connection、request）打底，身体代理（remote-scheduler、remote-osc、remote-controller-input）把动作发往化身，世界代理（remote-autonomy、remote-telemetry、remote-vmc、remote-vision）取回世界与感知；箭头表示各代理调用远端的方向。",
+    "en": "Left to right in three groups: the channel (errors, connection, request) as the base, body proxies (remote-scheduler, remote-osc, remote-controller-input) driving the avatar, and world proxies (remote-autonomy, remote-telemetry, remote-vmc, remote-vision) fetching world and perception; arrows show each proxy's call direction to the remote."
+  },
+  "order": [
+    "neko-vrc-body.backend.client.errors",
+    "neko-vrc-body.backend.client.connection",
+    "neko-vrc-body.backend.client.request",
+    "neko-vrc-body.backend.client.remote-scheduler",
+    "neko-vrc-body.backend.client.remote-osc",
+    "neko-vrc-body.backend.client.remote-controller-input",
+    "neko-vrc-body.backend.client.remote-autonomy",
+    "neko-vrc-body.backend.client.remote-telemetry",
+    "neko-vrc-body.backend.client.remote-vmc",
+    "neko-vrc-body.backend.client.remote-vision"
+  ],
+  "groups": [
+    {
+      "id": "g-chan",
+      "title": {
+        "zh": "通道",
+        "en": "Channels"
+      },
+      "children": [
+        "neko-vrc-body.backend.client.errors",
+        "neko-vrc-body.backend.client.connection",
+        "neko-vrc-body.backend.client.request"
+      ]
+    },
+    {
+      "id": "g-body",
+      "title": {
+        "zh": "身体代理",
+        "en": "Body Proxies"
+      },
+      "children": [
+        "neko-vrc-body.backend.client.remote-scheduler",
+        "neko-vrc-body.backend.client.remote-osc",
+        "neko-vrc-body.backend.client.remote-controller-input"
+      ]
+    },
+    {
+      "id": "g-world",
+      "title": {
+        "zh": "世界代理",
+        "en": "World Proxies"
+      },
+      "children": [
+        "neko-vrc-body.backend.client.remote-autonomy",
+        "neko-vrc-body.backend.client.remote-telemetry",
+        "neko-vrc-body.backend.client.remote-vmc",
+        "neko-vrc-body.backend.client.remote-vision"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.cognition.preconditions",
+  "updated_at": "2026-10-03T15:58:45.287Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：model 定义前置条件模型，gate 用模型做放行或拦截；箭头表示模型流向闸门判定。",
+    "en": "Left to right: model defines the precondition model and gate uses it to admit or block; the arrow carries the model into the gate decision."
+  },
+  "order": [
+    "neko-vrc-body.backend.cognition.preconditions.model",
+    "neko-vrc-body.backend.cognition.preconditions.gate"
+  ]
+}

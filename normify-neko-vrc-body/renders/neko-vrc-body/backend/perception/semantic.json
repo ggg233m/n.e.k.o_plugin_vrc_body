@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.perception.semantic",
+  "updated_at": "2026-10-03T15:59:47.071Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：openai-backend 调远端语义模型，monitors 汇总监控，entity-mapping 映射到实体，descriptor 生成实体描述；箭头是模型输出流向实体描述。",
+    "en": "Left to right: openai-backend calls the remote semantic model, monitors aggregates telemetry, entity-mapping maps onto entities and descriptor writes the entity description; arrows run from model output to the entity description."
+  },
+  "order": [
+    "neko-vrc-body.backend.perception.semantic.openai-backend",
+    "neko-vrc-body.backend.perception.semantic.monitors",
+    "neko-vrc-body.backend.perception.semantic.entity-mapping",
+    "neko-vrc-body.backend.perception.semantic.descriptor"
+  ]
+}

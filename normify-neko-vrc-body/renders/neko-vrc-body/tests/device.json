@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.tests.device",
+  "updated_at": "2026-10-03T16:04:36.649Z",
+  "mode": "grid",
+  "max_columns": 3,
+  "reading": {
+    "zh": "先是单元测试，最后是那个证明真实 UDP 链路真能到达驱动的集成测试。",
+    "en": "Unit tests first, then the one integration test that proves the real UDP path actually reaches a driver."
+  },
+  "order": [
+    "neko-vrc-body.tests.device.osc",
+    "neko-vrc-body.tests.device.vmc-idle",
+    "neko-vrc-body.tests.device.host-vmc",
+    "neko-vrc-body.tests.device.driver-log",
+    "neko-vrc-body.tests.device.chatbox-relay",
+    "neko-vrc-body.tests.device.udp-integration"
+  ]
+}

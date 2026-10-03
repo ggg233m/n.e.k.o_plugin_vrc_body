@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.tools.world",
+  "updated_at": "2026-10-03T15:00:23.385Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先看再走：观测世界、导航到目标，转向只是最后的局部调整。",
+    "en": "Look, then move: observe the world, navigate towards a target, and turn as the last local adjustment."
+  },
+  "order": [
+    "neko-vrc-body.plugin.tools.world.observe",
+    "neko-vrc-body.plugin.tools.world.navigate",
+    "neko-vrc-body.plugin.tools.world.turn"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.llm-contract",
+  "updated_at": "2026-10-03T14:59:07.305Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "注入的行为文本与 24 个工具 Schema 争抢注意力，二者合起来就是模型看到的全部契约。",
+    "en": "The injected behaviour text competes for attention with the 24 tool schemas, which together form the whole contract the model sees."
+  },
+  "order": [
+    "neko-vrc-body.llm-contract.instructions",
+    "neko-vrc-body.llm-contract.tool-defs"
+  ]
+}

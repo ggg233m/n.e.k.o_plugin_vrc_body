@@ -1,0 +1,50 @@
+# Normify 架构规则（policy.yml）
+# 在项目设计阶段安装，normify_validate 强制执行；severity: error（默认，阻断）| warning（提示）。
+# 规则类型：forbid-dependency | dependency-direction | acyclic | max-depth | cross-tree | naming
+# id 模式：* 单段、** 任意段；例如 dsh-normify.engine.** 匹配引擎下全部模块。
+schema_version: 1
+updated_at: "2026-10-03T14:07:01.134Z"
+rules:
+  # 基础规则 1：依赖图禁止环（含跨树，自环由核心校验拦截）
+  - id: core-acyclic
+    type: acyclic
+    severity: error
+    includeCrossTree: true
+  # 基础规则 2：不新增指向已废弃模块的依赖（存量记 warning，便于迁移）
+  - id: core-no-deprecated-target
+    type: forbid-dependency
+    from: ["**"]
+    to: ["**"]
+    toState: deprecated
+    severity: warning
+
+  # ---- 以下为完整规则集的示例，按项目需要取消注释/改写 ----
+  # 依赖方向：层顺序 = 允许方向（前 → 后），同层是否允许由 allowSameLayer 控制
+  # - id: layer-order
+  #   type: dependency-direction
+  #   severity: error
+  #   allowSameLayer: true
+  #   layers:
+  #     - { name: engine,  match: ["<tree>.engine.**", "<tree>.engine"] }
+  #     - { name: surface, match: ["<tree>.tools.**", "<tree>.tools", "<tree>.skill.**"] }
+  #     - { name: boot,    match: ["<tree>.bootstrap.**", "<tree>.build"] }
+  # 禁止/只允许某些依赖
+  # - id: no-ui-to-core
+  #   type: forbid-dependency
+  #   from: ["<tree>.ui.**"]
+  #   to: ["<tree>.engine.**"]
+  #   kind: [call, reference]
+  # 跨树依赖策略：forbid 禁止 / require-to-api 必须写 to_api / allow 允许
+  # - id: cross-tree-api
+  #   type: cross-tree
+  #   mode: require-to-api
+  # 深度上限（含树名段）
+  # - id: depth-limit
+  #   type: max-depth
+  #   maxDepth: 10
+  #   scope: ["<tree>.ui.**"]
+  # 命名约束：作用域内每个 id 段必须匹配该正则
+  # - id: naming-no-underscore
+  #   type: naming
+  #   pattern: "^[a-z][a-z0-9-]*$"
+  #   scope: ["<tree>.**"]

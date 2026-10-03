@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.clips.nya",
+  "updated_at": "2026-10-03T15:02:10.452Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "先是数据模型，再是严格解析器，最后是按意图缓存与挑选片段的片段库。",
+    "en": "Data model, then the strict parser, then the library that caches and selects clips by intent."
+  },
+  "order": [
+    "neko-vrc-body.clips.nya.types",
+    "neko-vrc-body.clips.nya.parser",
+    "neko-vrc-body.clips.nya.library"
+  ]
+}

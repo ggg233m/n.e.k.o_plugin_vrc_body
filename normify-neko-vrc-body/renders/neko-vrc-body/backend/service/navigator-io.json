@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.navigator-io",
+  "updated_at": "2026-10-03T16:04:05.469Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "导航器只能通过下发动作、只能看到反馈 —— 绝不直接接触世界。",
+    "en": "The navigator may only act through dispatch and may only see feedback — never the world directly."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.navigator-io.dispatch",
+    "neko-vrc-body.backend.service.navigator-io.feedback"
+  ]
+}

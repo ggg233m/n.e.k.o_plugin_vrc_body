@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.body-kernel",
+  "updated_at": "2026-10-03T14:55:46.772Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "顺着数据流看：命令先在运动库里变成目标帧，由行为层仲裁，被调度器采样，最后由协议编码上线。",
+    "en": "Follow the data: a command becomes a target frame in the motion library, is arbitrated by behaviour, sampled by the scheduler, then encoded by the protocol onto the wire."
+  },
+  "order": [
+    "neko-vrc-body.body-kernel.model",
+    "neko-vrc-body.body-kernel.motion",
+    "neko-vrc-body.body-kernel.behavior",
+    "neko-vrc-body.body-kernel.scheduler",
+    "neko-vrc-body.body-kernel.protocol",
+    "neko-vrc-body.body-kernel.frame-budget"
+  ],
+  "groups": [
+    {
+      "id": "g-geometry",
+      "title": {
+        "zh": "模型与几何",
+        "en": "Models and Geometry"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.model",
+        "neko-vrc-body.body-kernel.motion",
+        "neko-vrc-body.body-kernel.behavior"
+      ]
+    },
+    {
+      "id": "g-loop",
+      "title": {
+        "zh": "实时循环",
+        "en": "Real-time Loop"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.scheduler",
+        "neko-vrc-body.body-kernel.protocol"
+      ]
+    },
+    {
+      "id": "g-support",
+      "title": {
+        "zh": "支撑",
+        "en": "Support"
+      },
+      "children": [
+        "neko-vrc-body.body-kernel.frame-budget"
+      ]
+    }
+  ]
+}

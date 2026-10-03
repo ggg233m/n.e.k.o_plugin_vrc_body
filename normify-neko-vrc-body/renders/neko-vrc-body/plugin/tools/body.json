@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.plugin.tools.body",
+  "updated_at": "2026-10-03T15:00:20.143Z",
+  "mode": "grid",
+  "max_columns": 4,
+  "reading": {
+    "zh": "上排是身体动作，中排是直接驱动 VRChat，下排是安全集合：停止、冻结、复位与状态。",
+    "en": "Top row moves the body, middle row drives VRChat directly, bottom row is the safety set: stop, freeze, reset and status."
+  },
+  "order": [
+    "neko-vrc-body.plugin.tools.body.enable-disable",
+    "neko-vrc-body.plugin.tools.body.arm-pose",
+    "neko-vrc-body.plugin.tools.body.hand",
+    "neko-vrc-body.plugin.tools.body.reach-grab",
+    "neko-vrc-body.plugin.tools.body.gesture",
+    "neko-vrc-body.plugin.tools.body.express",
+    "neko-vrc-body.plugin.tools.body.vrchat-input",
+    "neko-vrc-body.plugin.tools.body.chatbox",
+    "neko-vrc-body.plugin.tools.body.stop",
+    "neko-vrc-body.plugin.tools.body.freeze",
+    "neko-vrc-body.plugin.tools.body.reset",
+    "neko-vrc-body.plugin.tools.body.status"
+  ]
+}

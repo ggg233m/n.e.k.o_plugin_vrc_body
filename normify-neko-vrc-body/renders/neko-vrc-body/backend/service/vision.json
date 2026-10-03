@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service.vision",
+  "updated_at": "2026-10-03T16:04:03.153Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "按配置构建 worker，或接受宿主注入的那个，然后启停它。",
+    "en": "Build the worker from configuration, or accept one injected by the host, then start and stop it."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.vision.factory",
+    "neko-vrc-body.backend.service.vision.attach",
+    "neko-vrc-body.backend.service.vision.start-stop"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.navigator.lifecycle",
+  "updated_at": "2026-10-03T16:15:39.513Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：先构造局部导航器并启停线程，再进入十赫兹控制循环线程。",
+    "en": "Left to right: construct the local navigator and start/stop its thread, then enter the 10 Hz control-loop thread."
+  },
+  "order": [
+    "neko-vrc-body.backend.navigator.lifecycle.open-close",
+    "neko-vrc-body.backend.navigator.lifecycle.run-loop"
+  ]
+}

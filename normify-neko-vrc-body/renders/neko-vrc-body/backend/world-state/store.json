@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.world-state.store",
+  "updated_at": "2026-10-03T15:59:15.423Z",
+  "mode": "layers",
+  "reading": {
+    "zh": "从左到右：init 建库，ingest 摄取实体与事件，persistence 落盘，watermark 记录水位，query 查询，removal 清理删除；箭头是写入先于读出与删除的存储顺序。",
+    "en": "Left to right: init creates the store, ingest takes entities and events, persistence writes them to disk, watermark records the progress mark, query reads and removal deletes; arrows show writes coming before reads and deletes."
+  },
+  "order": [
+    "neko-vrc-body.backend.world-state.store.init",
+    "neko-vrc-body.backend.world-state.store.ingest",
+    "neko-vrc-body.backend.world-state.store.persistence",
+    "neko-vrc-body.backend.world-state.store.watermark",
+    "neko-vrc-body.backend.world-state.store.query",
+    "neko-vrc-body.backend.world-state.store.removal"
+  ]
+}

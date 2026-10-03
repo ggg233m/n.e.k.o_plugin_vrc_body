@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "id": "neko-vrc-body.backend.service",
+  "updated_at": "2026-10-03T16:04:01.961Z",
+  "mode": "groups",
+  "reading": {
+    "zh": "左列是装配，中间是感知与决策接线，右列是宿主真正能驱动的东西。OSC 接口单独成组，因为它是通往 VRChat 的唯一出口。",
+    "en": "Left is assembly, middle is the perception and decision wiring, right is what the host may actually drive. The OSC surface is deliberately its own group because it is the only way out to VRChat."
+  },
+  "order": [
+    "neko-vrc-body.backend.service.value-helpers",
+    "neko-vrc-body.backend.service.dry-run-transport",
+    "neko-vrc-body.backend.service.boot",
+    "neko-vrc-body.backend.service.lifecycle",
+    "neko-vrc-body.backend.service.vision",
+    "neko-vrc-body.backend.service.vision-frame",
+    "neko-vrc-body.backend.service.semantic",
+    "neko-vrc-body.backend.service.observation",
+    "neko-vrc-body.backend.service.autonomy",
+    "neko-vrc-body.backend.service.navmesh",
+    "neko-vrc-body.backend.service.navigator-io",
+    "neko-vrc-body.backend.service.osc-api",
+    "neko-vrc-body.backend.service.osc-alignment",
+    "neko-vrc-body.backend.service.cognition-sources",
+    "neko-vrc-body.backend.service.world-model",
+    "neko-vrc-body.backend.service.submit",
+    "neko-vrc-body.backend.service.clips"
+  ],
+  "groups": [
+    {
+      "id": "g-init",
+      "title": {
+        "zh": "装配与输入校验",
+        "en": "Assembly and Input Validation"
+      },
+      "children": [
+        "neko-vrc-body.backend.service.value-helpers",
+        "neko-vrc-body.backend.service.dry-run-transport",
+        "neko-vrc-body.backend.service.boot"
+      ]
+    },
+    {
+      "id": "g-perceive",
+      "title": {
+        "zh": "生命周期与感知",
+        "en": "Lifecycle and Perception"
+      },
+      "children": [
+        "neko-vrc-body.backend.service.lifecycle",
+        "neko-vrc-body.backend.service.vision",
+        "neko-vrc-body.backend.service.vision-frame",
+        "neko-vrc-body.backend.service.semantic",
+        "neko-vrc-body.backend.service.observation"
+      ]
+    },
+    {
+      "id": "g-decide",
+      "title": {
+        "zh": "自主与导航下发",
+        "en": "Autonomy and Navigation Dispatch"
+      },
+      "children": [
+        "neko-vrc-body.backend.service.autonomy",
+        "neko-vrc-body.backend.service.navmesh",
+        "neko-vrc-body.backend.service.navigator-io"
+      ]
+    },
+    {
+      "id": "g-osc",
+      "title": {
+        "zh": "OSC 接口",
+        "en": "OSC Surface"
+      },
+      "children": [
+        "neko-vrc-body.backend.service.osc-api"
+      ]
+    },
+    {
+      "id": "g-context",
+      "title": {
+        "zh": "上下文与回读",
+        "en": "Context and Read-outs"
+      },
+      "children": [
+        "neko-vrc-body.backend.service.osc-alignment",
+        "neko-vrc-body.backend.service.cognition-sources",
+        "neko-vrc-body.backend.service.world-model",
+        "neko-vrc-body.backend.service.submit",
+        "neko-vrc-body.backend.service.clips"
+      ]
+    }
+  ]
+}
