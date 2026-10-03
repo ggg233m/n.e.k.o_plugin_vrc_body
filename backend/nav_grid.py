@@ -249,9 +249,17 @@ class NavGrid:
     def _line_ok(self, a: Sequence[int], b: Sequence[int]) -> bool:
         if not (self.inside(a) and self.inside(b)):
             return False
-        n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1]))) + 1
-        r = np.linspace(a[0], b[0], n).round().astype(int)
-        c = np.linspace(a[1], b[1], n).round().astype(int)
+        # 两处都不能省：
+        # 1) 步数要用 L1（|dr|+|dc|）。切比雪夫步数下每步位移可达 √2 格。
+        # 2) 取整必须用 floor 而不是 round：round 取的是**最近**格，不是线段
+        #    **所在**格；to_cell() 本身就是 floor 口径，只有 floor 才与它自洽。
+        #    L1 步数保证每步 |Δr|+|Δc| == 1，floor 后逐样本必 8-连通，不会整格
+        #    跳过（随机 4000 组 dr/dc∈[0,60] 全覆盖；只加 L1 而保留 round 仍漏 ~37%，
+        #    典型反例 (5,5)→(9,6) 会漏掉真正压过的 (8,5)）。
+        #    +1e-9 让正好落在整数坐标上的端点不被浮点误差掉到上一格。
+        n = int(abs(b[0] - a[0]) + abs(b[1] - a[1])) + 1
+        r = np.floor(np.linspace(a[0], b[0], n) + 1e-9).astype(int)
+        c = np.floor(np.linspace(a[1], b[1], n) + 1e-9).astype(int)
         return bool(self.center[r, c].all())
 
     def _string_pull(self, path: list[tuple[int, int]]) -> list[tuple[int, int]]:

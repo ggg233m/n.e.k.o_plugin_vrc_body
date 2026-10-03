@@ -117,6 +117,27 @@ class NavGridTests(unittest.TestCase):
         ng = make(g)
         self.assertEqual(ng.classify(ng.to_world((40, 20))), "unknown")
 
+    def test_line_ok_visits_every_cell_the_segment_crosses(self):
+        """近轴向的斜线必须采到它真正压过的每一格。
+
+        两条反例各自针对一种漏法：切比雪夫步数（漏 (44,20)），以及只补 L1 步数
+        却仍用 round 取整（漏 (8,5)）。两格都是线段真正穿过的格。
+        """
+        ng = make(room())
+        ng.center = np.ones(ng.grid.shape, bool)
+        ng.center[44, 20] = False
+        self.assertFalse(ng._line_ok((42, 20), (45, 21)), "漏掉了真正压过的 (44,20)")
+        ng.center[44, 20] = True
+        ng.center[8, 5] = False
+        self.assertFalse(ng._line_ok((5, 5), (9, 6)), "漏掉了真正压过的 (8,5)")
+
+    def test_line_ok_stays_true_on_a_clean_run(self):
+        ng = make(room())
+        ng.center = np.ones(ng.grid.shape, bool)
+        self.assertTrue(ng._line_ok((10, 10), (13, 13)))   # 纯对角，不该被误伤
+        self.assertTrue(ng._line_ok((10, 10), (40, 10)))   # 纯直行，行为不变
+        self.assertTrue(ng._line_ok((20, 30), (20, 30)))   # 零长度
+
     def test_load_requires_sidecar(self):
         with tempfile.TemporaryDirectory() as d:
             pgm = Path(d) / "x_map.pgm"
