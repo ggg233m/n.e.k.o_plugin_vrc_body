@@ -307,6 +307,7 @@ _ACC_SLOTS: tuple[tuple[int, str], ...] = (
     (2, "_acc_g"), (3, "_acc_o"), (6, "_acc_near"), (7, "_acc_far"),
     (8, "_acc_on"), (9, "_acc_om"), (10, "_acc_gn"), (11, "_acc_omk"),
     (12, "_acc_b0"), (13, "_acc_b1"), (14, "_acc_b2"), (15, "_acc_b3"),
+    (16, "_acc_sb_n"), (17, "_acc_sb_h"), (18, "_acc_sb_h2"),
 )
 _ACC_NAMES: tuple[str, ...] = tuple(name for _slot, name in _ACC_SLOTS)
 
@@ -349,6 +350,11 @@ class KeyframeGridMapper:
         self._acc_b1: np.ndarray | None = None
         self._acc_b2: np.ndarray | None = None
         self._acc_b3: np.ndarray | None = None
+        # 头顶 obst_top_m 之上的三个**可加矩**（旁路，见 surface_counts）：n / Σw·h / Σw·h²。
+        # 众数不可加，矩可加——回环挪位时才能精确回退。
+        self._acc_sb_n: np.ndarray | None = None
+        self._acc_sb_h: np.ndarray | None = None
+        self._acc_sb_h2: np.ndarray | None = None
         self._acc_lo = (0, 0)
         # 最近一次 rasterize 用的栅格↔累加器格偏移 (lx, ly)：栅格列 c ↔ 累加器 x = lx + c，
         # 栅格行 r ↔ 累加器 y = ly + (h-1-r)（栅格行 0 是最大 y）。离屏分析/工具要靠它把
@@ -455,14 +461,15 @@ class KeyframeGridMapper:
     def _kf_base(self, k: int) -> tuple[np.ndarray, ...]:
         """关键帧 k 在"算它那一刻的平移 t0"下的格计数
         (ix, iy, n_ground, n_obst, t0, cam_h, n_near, n_far, o_near, o_mid, g_near_mid, o_mid_kf,
-         b_below, b_lo, b_mid, b_hi)。
+         b_below, b_lo, b_mid, b_hi, s_n, s_h, s_h2)。
 
         朝向或 cam_h 变了才重算；只有平移变了就按整格平移复用（见 ``_shift``）。
         n_near/n_far：近/远看（观测距离 ≤ cov_near_m）的点数，与 n_ground/n_obst 同格同权重，纯显示用。
         o_near/o_mid/g_near_mid/o_mid_kf：质量分层的票——障碍点按观测距离落带、近中距地面证据、
         以及"有多少个关键帧给这个格投过中距障碍票"（每帧最多 +1，减帧精确回退）。
-        b_*：高度分带的点计数（旁路，见 ``MapperConfig.hi_bands``）。**注意** ``n_ground``/
-        ``n_obst``/``n_near``/``n_far`` 的口径完全没变——分带只是把原本被丢掉的高度捡回来。"""
+        b_*：高度分带的点计数（旁路，见 ``MapperConfig.hi_bands``）；s_n/s_h/s_h2 是头顶
+        ``obst_top_m`` 之上的三个可加矩（见 ``surface_counts``）。**注意** ``n_ground``/
+        ``n_obst``/``n_near``/``n_far`` 的口径完全没变——分带与矩只是把原本被丢掉的高度捡回来。"""
         c = self.cfg
         cached = self._base.get(k)
         if cached is not None and cached[5] == self.cam_h:
@@ -486,7 +493,7 @@ class KeyframeGridMapper:
         sel = g | o | (hb >= 0)
         if not sel.any():
             z = np.zeros(0, np.int64)
-            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z)
+            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z, z, z, z)
             self._base[k] = out
             return out
         xy = rxy[sel].astype(np.float64) + t
@@ -524,14 +531,23 @@ class KeyframeGridMapper:
             on = om = gn = omk = zf
         if c.hi_bands:
             bands = tuple(np.bincount(flat, w * (shb == b), minlength=size) for b in range(4))
+            # 头顶之上的面：三个可加矩。shb>=1 恰好就是 h>obst_top_m（band 1 的下界），与带边界无关。
+            shb_hi = shb >= 1
+            hh = h[sel].astype(np.float64)
+            sbn = np.bincount(flat, w * shb_hi, minlength=size)
+            sbh = np.bincount(flat, w * shb_hi * hh, minlength=size)
+            sbh2 = np.bincount(flat, w * shb_hi * hh * hh, minlength=size)
         else:
             zf = np.zeros(size)
             bands = (zf, zf, zf, zf)
+            sbn = sbh = sbh2 = zf
         nz = np.flatnonzero((ng > 0) | (no > 0)
-                            | (bands[0] > 0) | (bands[1] > 0) | (bands[2] > 0) | (bands[3] > 0))
+                            | (bands[0] > 0) | (bands[1] > 0) | (bands[2] > 0) | (bands[3] > 0)
+                            | (sbn > 0))
         out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h, nn[nz], nf[nz],
                on[nz], om[nz], gn[nz], omk[nz],
-               bands[0][nz], bands[1][nz], bands[2][nz], bands[3][nz])
+               bands[0][nz], bands[1][nz], bands[2][nz], bands[3][nz],
+               sbn[nz], sbh[nz], sbh2[nz])
         self._base[k] = out
         return out
 
@@ -953,6 +969,28 @@ class KeyframeGridMapper:
                 "lo": self._acc_lo, "res_m": float(self.cfg.res_m),
                 "cov_near_m": float(self.cfg.cov_near_m)}
 
+    def _cut_acc(self, acc: np.ndarray) -> np.ndarray:
+        """把一个累加器（无翻转行序）裁成 ``NavGrid`` 行序（行 0 = 最大 y）。
+
+        换算照 ``rasterize`` 的切片式抄：``n_g[R] = acc[R + (ly - ay)]``，再 ``g[::-1]``
+        ⇒ NavGrid 行 = ``h-1-R``。**漏掉这个翻转不会报错，只会让旁路数据上下镜像**，
+        看着还挺像回事——本文件里已经栽过两次，抽出来是为了别有第三次。
+        """
+        if self._last_grid is None or self._grid_lo is None:
+            return np.zeros((0, 0))
+        h, w = self._last_grid
+        (ax, ay) = self._acc_lo
+        lx, ly = self._grid_lo
+        dh, dw = ly - ay, lx - ax
+        s_lo, s_hi = max(0, dh), min(acc.shape[0], h + dh)
+        c_lo, c_hi = max(0, dw), min(acc.shape[1], w + dw)
+        out = np.zeros((h, w), acc.dtype)
+        if s_hi > s_lo and c_hi > c_lo:
+            sub = acc[s_lo:s_hi, c_lo:c_hi]
+            r0 = h - s_hi + dh                 # sub[-1] 翻转后落到 NavGrid 行 h-1-(s_hi-1+dh)
+            out[r0:r0 + sub.shape[0], c_lo - dw:c_lo - dw + sub.shape[1]] = sub[::-1]
+        return out
+
     def band_counts(self) -> dict[str, Any] | None:
         """高度分带占用的只读快照（**仅建图线程可调**；旁路产物，不喂导航）。
 
@@ -974,30 +1012,47 @@ class KeyframeGridMapper:
                             float(c.hi_band_m), float(c.hi_band_top_m)]}
 
     def band_grid(self) -> np.ndarray | None:
-        """把分带计数按 NavGrid 布局裁好（行 0 = 最大 y，与 ``NavGrid.grid`` 同序）。
+        """把分带计数按 NavGrid 布局裁好（4, h, w）。调用方按 ``res_m`` 乘回世界米。
 
-        ``NavGrid`` 是翻转过的（``rasterize`` 末尾 ``g[::-1]``），累加器是翻转前的，
-        这里按 ``_grid_lo`` 换算并同时翻行——漏掉这一步不会报错，只会让带数据上下镜像。
-        返回 (4, h, w)；调用方需自己按 ``res_m`` 乘回世界米。
+        ⚠️ 只覆盖 NavGrid 图幅，而图幅是按 ``_acc_g``/``_acc_o`` 定的。真实场景总有地面，
+        所以图幅罩得住全部数据；但**只有头顶点、没有地面点**的格会被裁掉——那种格要拿全量的话
+        直接读 ``band_counts()`` 里的原始累加器（自带 ``lo_xy`` 原点）。
         """
-        if not self.cfg.hi_bands or self._grid_lo is None or self._acc_b1 is None:
+        if not self.cfg.hi_bands or self._acc_b1 is None:
             return None
-        if self._last_grid is None:
+        return np.stack([self._cut_acc(a) for a in
+                         (self._acc_b0, self._acc_b1, self._acc_b2, self._acc_b3)])
+
+    def surface_counts(self) -> dict[str, Any] | None:
+        """头顶 ``obst_top_m`` 之上那张面的三个**可加矩**（旁路，不喂导航）。
+
+        每格带 ``n``（点权重和）、``sum_h``（Σ w·h）、``sum_h2``（Σ w·h²），
+        由此得**均值高度** ``mean = sum_h/n`` 与**格内标准差** ``sd = sqrt(sum_h2/n − mean²)``。
+        为什么存矩而不是众数：现有累加器全靠 ``acc += 贡献`` 增减（回环挪位要能精确回退），
+        而**众数不可加**——两帧各投一批点，并集的众数不等于各自众数的平均。
+        h 是**离地高**，与带边界无关：改 ``hi_band_m`` 不用迁移历史。
+
+        ⚠️ 均值比众数**系统性偏高约 0.17 m**（044153 实测，格内分布有尾巴）。
+        判「这里有没有一张平整的面」够用；判「面正好在 3.0 m、能不能站上去」不够——
+        那要众数，也就是带内高度直方图，尚未做。详见 Docs/虚假障碍-根因与分层修复 §9。
+        """
+        if not self.cfg.hi_bands or self._acc_sb_h is None:
             return None
-        h, w = self._last_grid
-        (ax, ay) = self._acc_lo
-        lx, ly = self._grid_lo
-        # rasterize 的切片式：n_g[R] = acc[R + (ly - ay)]，再 g[::-1] ⇒ NavGrid 行 h-1-R。
-        dh, dw = ly - ay, lx - ax
-        out = np.zeros((4, h, w))
-        for b, acc in enumerate((self._acc_b0, self._acc_b1, self._acc_b2, self._acc_b3)):
-            # R ∈ [0, h) ⇒ acc 行 A = R + dh ∈ [max(0,dh), h+dh)
-            s_lo, s_hi = max(0, dh), min(acc.shape[0], h + dh)
-            c_lo, c_hi = max(0, dw), min(acc.shape[1], w + dw)
-            if s_hi > s_lo and c_hi > c_lo:
-                sub = acc[s_lo:s_hi, c_lo:c_hi]
-                r0 = h - s_hi + dh          # 翻转后 sub[0] 落到 NavGrid 行 h-1-(s_hi-1-dh)
-                out[b, r0:r0 + sub.shape[0], c_lo - dw:c_lo - dw + sub.shape[1]] = sub[::-1]
+        return {"n": self._acc_sb_n, "sum_h": self._acc_sb_h, "sum_h2": self._acc_sb_h2,
+                "lo_xy": self._acc_lo, "res_m": float(self.cfg.res_m),
+                "above_m": float(self.cfg.obst_top_m)}
+
+    def surface_grid(self) -> dict[str, np.ndarray] | None:
+        """``surface_counts`` 的矩按 NavGrid 布局裁好，另给出 mean_h / sd_h（追踪米）。"""
+        sc = self.surface_counts()
+        if sc is None:
+            return None
+        out = {k: self._cut_acc(sc[k]) for k in ("n", "sum_h", "sum_h2")}
+        nz = out["n"] > 0.5
+        n = np.where(nz, out["n"], 1.0)
+        out["mean_h"] = np.where(nz, out["sum_h"] / n, np.nan)
+        out["sd_h"] = np.where(nz, np.sqrt(np.maximum(out["sum_h2"] / n - out["mean_h"] ** 2, 0.0)),
+                               np.nan)
         return out
 
 

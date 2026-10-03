@@ -726,5 +726,77 @@ class HeightBandTests(unittest.TestCase):
         self.assertTrue((inc_b[1] > 0).any())         # 确实有票，不是两边都空蒙对了
 
 
+    def test_surface_moments_recover_a_known_slab_height(self) -> None:
+        # 一块已知高度的水平板：矩算出的 mean_h 必须落在板高附近（验符号与量纲，不是验精度）。
+        # 场景**必须带地面**：`rasterize` 的图幅是按 `_acc_g`/`_acc_o` 定的，只有头顶点、
+        # 没有地面点时图幅会缩到机位附近，头顶数据被裁掉（``band_grid``/``surface_grid`` 只覆盖
+        # NavGrid 图幅）。真实场景总有地板，所以这不是缺陷，但单测里不能这么造场景。
+        for target in (2.6, 3.2, 4.0):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+            scene = np.vstack([world_scene(), ghost_block(2.0, 3.0, -0.6, 0.6, target, target + 0.05)])
+            m.add_keyframe(0, scene.astype(np.float32), pose(0, 0))
+            m.rasterize()
+            sg = m.surface_grid()
+            vals = [v for v in sg["mean_h"].ravel() if np.isfinite(v) and 0 < v < 12]
+            self.assertTrue(vals, f"target={target}: 没抓到任何头顶点")
+            self.assertAlmostEqual(float(np.median(vals)), target, delta=0.12)
+            self.assertLess(float(np.nanmedian(sg["sd_h"])), 0.12)   # 单层板，格内应当很薄
+
+    def test_surface_moments_empty_when_bands_off(self) -> None:
+        m = self.build(hi_bands=False)
+        m.rasterize()
+        self.assertIsNone(m.surface_counts())
+        self.assertIsNone(m.surface_grid())
+
+    def test_surface_moments_reversible_on_drop(self) -> None:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        m.add_keyframe(0, self.stack(), pose(0, 0))
+        m.rasterize()
+        base = [a.copy() for a in (m._acc_sb_n, m._acc_sb_h, m._acc_sb_h2)]
+        m.add_keyframe(1, self.stack(), pose(0.5, 0.0))
+        m.rasterize()
+        self.assertGreater(float(m._acc_sb_n.sum()), float(base[0].sum()))
+        m.drop_points(1)
+        m.rasterize()
+        for a, b in zip((m._acc_sb_n, m._acc_sb_h, m._acc_sb_h2), base):
+            np.testing.assert_allclose(a, b, rtol=0, atol=1e-9)
+
+    def test_surface_moments_match_fresh_build_after_loop_shift(self) -> None:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i, T in enumerate((pose(0, 0), pose(1.0, 0.4), pose(2.0, -0.3))):
+            m.add_keyframe(i, self.stack(), T)
+        m.rasterize()
+        shifted = (pose(0.5, 0.0), pose(1.5, 0.4), pose(2.5, -0.3))
+        m.update_poses({i: T for i, T in enumerate(shifted)})
+        inc = m.surface_grid()
+        self.assertIsNotNone(inc)
+        fresh = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i, T in enumerate(shifted):
+            fresh.add_keyframe(i, self.stack(), T)
+        fresh.rasterize()
+        ref = fresh.surface_grid()
+        for k in ("n", "sum_h", "sum_h2", "mean_h"):
+            np.testing.assert_allclose(inc[k], ref[k], rtol=0, atol=1e-9)
+
+    def test_surface_moments_independent_of_band_edges(self) -> None:
+        # 矩存的是绝对离地高，不该随 hi_band_m 变——改带边界不用迁移历史。
+        def run(**kw):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+            m.add_keyframe(0, self.stack(), pose(0, 0))
+            m.rasterize()
+            return m.surface_grid()
+        a, b = run(hi_band_m=3.0, hi_band_top_m=4.5), run(hi_band_m=2.5, hi_band_top_m=8.0)
+        np.testing.assert_allclose(a["mean_h"], b["mean_h"], rtol=0, atol=1e-9)
+
+    def test_ground_layer_unchanged_by_moments(self) -> None:
+        # 加矩不能动地面层（与分带同一个不可让步的性质）。
+        a = self.build().rasterize().grid
+        m = self.build()
+        m.rasterize()
+        m._acc_sb_h[:] = 12345.0                    # 人为破坏矩
+        m.rasterize()
+        np.testing.assert_array_equal(a, m.rasterize().grid)
+
+
 if __name__ == "__main__":
     unittest.main()
