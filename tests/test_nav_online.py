@@ -201,6 +201,25 @@ class KeyframePolicyTest(unittest.TestCase):
         self.assertIsNone(self.p.decide(1.7, np.zeros(2), yaw * 2, 90.0))
         self.assertEqual(self.p.decide(1.8, np.zeros(2), yaw * 2, 10.0), "new")
 
+    def test_defer_timeout_never_yields_refresh(self) -> None:
+        """原地快摆头耗光推迟预算后必须按 new 取帧，不能判成 refresh。
+
+        refresh 会替换上一关键帧的点云（nav_online:925-927），并连带删掉那一帧的
+        回环词袋（nav_xsession.on_keyframe）与磁盘上的 kf npz / thumb jpg
+        （nav_memory._write_kf）——删掉的东西找不回来。而 new 只是多一份噪声。
+
+        触发形态：净位移 < kf_still_m、净转角 < kf_still_deg，但角速度持续超过
+        kf_defer_dps（原地摆头/抖动就是这种：净变化很小、瞬时角速度很大）。
+        注意 defer 分支只有到龄（kf_max_age_s=3.0）之后才进得去，所以时间点
+        必须跨过 3 s。
+        """
+        self.assertIsNone(self.p.decide(1.0, np.zeros(2), 0.0, 0.0))
+        self.assertIsNone(self.p.decide(3.0, np.zeros(2), math.radians(2.0), 90.0))
+        self.assertIsNone(self.p.decide(3.5, np.zeros(2), math.radians(-2.0), 90.0))
+        self.assertEqual(self.p.deferred, 2)
+        # 净位移 0、净转角 1° —— 按旧逻辑这里恰好满足 refresh 的三个条件。
+        self.assertEqual(self.p.decide(4.2, np.zeros(2), math.radians(1.0), 90.0), "new")
+
     def test_fast_turn_while_walking_falls_back_on_distance(self) -> None:
         self.assertIsNone(self.p.decide(0.2, np.array([0.5 / S, 0.0]), 0.0, 60.0))
         self.assertEqual(self.p.decide(0.4, np.array([0.85 / S, 0.0]), 0.0, 60.0), "new")

@@ -155,6 +155,17 @@ class KeyframePolicy:
             if t - self.defer_since < c.kf_defer_max_s and d < c.kf_defer_max_m:
                 self.deferred += 1
                 return None
+        # defer 一旦开过（defer_since 非 None，_take 才会清它），说明上一关键帧
+        # 之后有过一段「快转中被推迟」的时间，本帧要么是超时兜底取到的、要么是
+        # 转速刚回落时取到的——两者都还在快转的余波里。这种帧一律按 new 处理：
+        #   * refresh 的代价远大于 new —— 它替换上一关键帧的点云（:925-927），
+        #     并连带删掉那一帧的回环词袋（nav_xsession.on_keyframe）与磁盘上的
+        #     kf npz / thumb jpg（nav_memory._write_kf），删掉的东西找不回来；
+        #   * 判成 new 只是多一份噪声，判成 refresh 是拿模糊帧覆盖好帧并丢数据。
+        # 只在原地（d、dyaw 都很小）时才可能走到 refresh，而 defer 恰恰只在
+        # 净位移很小时才持续——原地快摆头/抖动是最典型的触发场景。
+        if self.defer_since is not None:
+            return self._take(t, xy, yaw, "new")
         kind = "refresh" if (not moved and d < c.kf_still_m and dyaw < c.kf_still_deg) else "new"
         return self._take(t, xy, yaw, kind)
 
