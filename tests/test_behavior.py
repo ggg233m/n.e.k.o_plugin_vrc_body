@@ -26,6 +26,25 @@ class BehaviorStateMachineTests(unittest.TestCase):
         self.assertEqual(resolved["energy"], 0.40)
         self.assertEqual(resolved["duration_ms"], 1500)
 
+    def test_unknown_intent_raises_a_readable_value_error(self) -> None:
+        """未知 intent 必须显式报错并列出合法值，不能是 KeyError。
+
+        上游只做 str(params.get("intent") or "")，VLM 编出来的 intent 或外部调用
+        都可能不合法；静默降级成某个默认表情会把「编错了」伪装成「角色莫名叹气」。
+        """
+        with self.assertRaises(ValueError) as ctx:
+            resolve_expression("不存在的意图", side="auto", intensity=None,
+                               duration_ms=None, alternate_side="left")
+        message = str(ctx.exception)
+        self.assertIn("unknown expression intent", message)
+        self.assertNotIn("KeyError", message)
+        for known in EXPRESSION_INTENTS:
+            self.assertIn(known, message)
+        # 空串同样要报，不能落到某个默认 profile 上
+        with self.assertRaises(ValueError):
+            resolve_expression("", side="auto", intensity=None,
+                               duration_ms=None, alternate_side="left")
+
     def test_state_machine_tracks_layers_transition_and_bounded_history(self) -> None:
         machine = BehaviorStateMachine(history_size=4)
         machine.activate_base(action_id="pose", kind="arm_pose", now=1.0, params={"side": "right"})

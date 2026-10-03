@@ -3078,7 +3078,9 @@ class BackendService:
 
     def semantic_express(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """在后端选择 VMD，然后提交生成的动作。"""
-        intent = str(params.get("intent") or "")
+        # 只 strip 不 lower：EXPRESSION_PROFILES 的键全是小写，lower 对行为路径没有
+        # 增益，却可能改变 VMD 目录里按原样登记的 intent 名的匹配结果。
+        intent = str(params.get("intent") or "").strip()
         side = str(params.get("side") or "auto")
         intensity = params.get("intensity")
         duration_ms = params.get("duration_ms")

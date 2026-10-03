@@ -86,7 +86,16 @@ def resolve_expression(
     duration_ms: int | None,
     alternate_side: str,
 ) -> dict[str, Any]:
-    profile = EXPRESSION_PROFILES[intent]
+    # 上游 service.semantic_express 只做 str(params.get("intent") or "")，并没有拿
+    # EXPRESSION_INTENTS 校验；VMD 分支未命中或 prefer_vmd_expressions=False 时会直接
+    # 掉到这里。VLM 返回或外部传入的 intent 都要当成不可信输入，静默 KeyError 只会在
+    # HTTP 400 里留下一句看不懂的消息。process.py 会把 ValueError 转成可读 400。
+    profile = EXPRESSION_PROFILES.get(intent)
+    if profile is None:
+        raise ValueError(
+            f"unknown expression intent: {intent or '<empty>'}; "
+            f"allowed: {', '.join(EXPRESSION_INTENTS)}"
+        )
     resolved_side = side
     if side == "auto":
         resolved_side = profile.default_side
