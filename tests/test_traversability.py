@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from tests import _bootstrap  # noqa: F401
+from neko_anyadance_body.backend import traversability as traversability_module
 from neko_anyadance_body.backend.traversability import (
     GroundExtentConfig,
     GroundExtentEstimator,
@@ -74,6 +76,52 @@ class TraversabilityTests(unittest.TestCase):
         self.assertEqual(result["state"], "unknown")
         self.assertEqual(result["reason"], "turning")
         self.assertTrue(result["turning"])
+
+    def test_turning_frame_is_dropped_from_the_reference(self) -> None:
+        """转向帧不能进参考，转向结束后必须重新起一次 warmup。
+
+        两种错法都会读成「畅通」——旋转光流的径向分量近零，是最不能出的假阳性：
+          * 把转向帧写进参考（旧行为）：转向结束后那一帧拿带旋转模糊的图算光流；
+          * 只「不播种」而不 reset：转向结束后那一帧拿转向**之前**的图算光流，
+            等于跨整段转向做差分，而 gap 可能还在 max_frame_gap_s 之内，于是
+            给出一个「有值」但失真的读数。
+        丢弃参考则是诚实地多报一帧 unknown。
+        """
+        estimator = OpticalFlowTraversability()
+        frame = _textured_frame()
+        estimator.estimate(frame, captured_at=0.0, moving=True, now=0.0)
+        turned = estimator.estimate(
+            np.roll(frame, 2, axis=1), captured_at=0.1, moving=True, turning=True, now=0.1
+        )
+        self.assertEqual(turned["reason"], "turning")
+
+        after = estimator.estimate(frame, captured_at=0.2, moving=True, now=0.2)
+        self.assertEqual(after["reason"], "warmup")
+        self.assertEqual(after["state"], "unknown")
+
+    def test_all_unknown_sectors_report_unknown_not_clear(self) -> None:
+        """没有任何扇区给出判定时顶层必须报 unknown，不能报 predicted_clear。
+
+        与模块自己的 ``_unknown`` 同口径（「绝不把缺数据写成畅通」）。安全门
+        ``navigator._traversability_guard_reason`` 只读 sectors 且只对
+        predicted_blocked 反应，所以这条改的是上报口径，不改变防撞行为。
+        """
+        # 每扇区 8 个样本：count_confidence = 8/(8*2) = 0.5 < min_confidence_for_state
+        # (0.55) ⇒ 三个扇区无论发散率多少都落到 unknown，但样本数已过
+        # min_feature_count(8)，会走到最终汇总而不是 insufficient_*。
+        flows = [
+            (x, 20.0, 1.0, 0.0, 30.0)
+            for x in (33.0, 79.5, 126.0)
+            for _ in range(8)
+        ]
+        estimator = OpticalFlowTraversability()
+        estimator.estimate(_textured_frame(), captured_at=0.0, moving=True, now=0.0)
+        with mock.patch.object(traversability_module, "_opencv_flow", return_value=flows), \
+             mock.patch.object(traversability_module, "_lucas_kanade_flow", return_value=flows):
+            result = estimator.estimate(_textured_frame(), captured_at=0.1, moving=True, now=0.1)
+        self.assertTrue(result["available"])
+        self.assertEqual([s["state"] for s in result["sectors"]], ["unknown"] * 3)
+        self.assertEqual(result["state"], "unknown")
 
     def test_numpy_fallback_returns_bounded_sector_predictions(self) -> None:
         estimator = OpticalFlowTraversability(

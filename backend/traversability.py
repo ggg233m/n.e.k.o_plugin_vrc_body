@@ -321,9 +321,10 @@ class OpticalFlowTraversability:
 
         previous = self._previous_gray
         previous_at = self._previous_at
-        self._previous_gray = gray
-        self._previous_at = current_at
         if previous is None or previous_at is None:
+            # warmup：本帧就是第一张参考，必须落下来，否则永远走不出这一支。
+            self._previous_gray = gray
+            self._previous_at = current_at
             return _unknown(
                 now=current_now,
                 captured_at=current_at,
@@ -333,6 +334,9 @@ class OpticalFlowTraversability:
             )
         gap = current_at - previous_at
         if gap <= 0.0 or gap > self.config.max_frame_gap_s:
+            # frame_gap：旧参考已失效，用本帧重新起头，否则会永久卡在这一支。
+            self._previous_gray = gray
+            self._previous_at = current_at
             return _unknown(
                 now=current_now,
                 captured_at=current_at,
@@ -341,9 +345,24 @@ class OpticalFlowTraversability:
                 sectors=self._sectors,
             )
         if turning:
+            # 转向帧带旋转模糊，**不能**当参考。这里丢弃（reset）而不是留着旧参考：
+            # 留着的话转向结束后那一帧会拿转向**之前**的图像去算光流，等于跨整段
+            # 转向做差分——gap 还可能在 max_frame_gap_s 之内，于是得出一个「有值」
+            # 但完全失真的读数。重新起一次 warmup 只多花一帧，而那一帧会诚实地
+            # 报 unknown。旋转光流的径向分量近零，两种错法都会读成「畅通」，
+            # 这是最不能出的假阳性。
+            self.reset()
             return _unknown(now=current_now, captured_at=current_at, reason="turning", turning=True, moving=moving, sectors=self._sectors)
         if moving is not True:
+            # 视场没有可信的前进运动，本帧不出读数，但**照旧播种**：静止帧画面是
+            # 清晰的，让它当参考，重新起步时就能立刻拿到正确量级的发散率。若在这
+            # 里停止播种，参考会一路旧到 max_frame_gap_s，重新起步那一帧的位移被
+            # 摊到整段 gap 上，发散率被稀释最多 1s/帧间隔倍——墙会读成畅通。
+            self._previous_gray = gray
+            self._previous_at = current_at
             return _unknown(now=current_now, captured_at=current_at, reason="motion_gate_unknown", moving=moving, sectors=self._sectors)
+        self._previous_gray = gray
+        self._previous_at = current_at
 
         flows = _opencv_flow(previous, gray, self.config)
         if flows:
@@ -425,7 +444,18 @@ class OpticalFlowTraversability:
                 "contact_time_s": contact_time,
             })
 
-        overall_state = "predicted_blocked" if blocked_sector_count else "predicted_clear"
+        # 与 _unknown 同口径：绝不把缺数据写成畅通。一个扇区都没给出判定时
+        # 顶层必须报 unknown，而不是「没测到 blocked 就算 clear」。
+        # 混合情形（部分扇区有判定）仍按 blocked 优先 / 否则 clear 汇总：安全门
+        # （navigator._traversability_guard_reason）只读 sectors 且只对
+        # predicted_blocked 反应，顶层只是给 LLM 的摘要；若改成「任一扇区 unknown
+        # 就报 unknown」，三扇区里边缘扇区经常收不到列，摘要会退化成常量。
+        if blocked_sector_count:
+            overall_state = "predicted_blocked"
+        elif all(sector["state"] == "unknown" for sector in sector_results):
+            overall_state = "unknown"
+        else:
+            overall_state = "predicted_clear"
         return {
             "available": True,
             "source": "optical_flow",
