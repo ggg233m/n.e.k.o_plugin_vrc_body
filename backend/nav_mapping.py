@@ -87,6 +87,20 @@ class MapperConfig:
     q_near_m: float = 1.5
     q_mid_m: float = 3.0
     q_mid_kf: int = 2
+    # 近带的独立票数门槛，**0 = 不启用**（默认，保持历史行为逐格不变）。调到 1~min_pts
+    # 才会让"近距票够、但被地面压制挡掉"的格独立定案。
+    #
+    # ⚠️ 实测（tools/q_near_pts_ab.py，044153，两把尺子同时看）：**开着是净亏，别开。**
+    #   q_near_pts  OCC    尺子1 走过∩OCC   尺子2 漏放
+    #        0     4057        1.35%          202      ← 基线
+    #        2     4320        1.51%          201      交换率 −6.1×
+    #        1     4414        1.84%          201      交换率 −2.0×
+    # 202 个漏放格只回来 1 个。原因是 **ray_clear 的看穿清零在 ``_by_quality`` 上游**：
+    # tools/low_ceiling_nav 量到 1368/1405 的 n_o 在进质量分层之前就已经被置 0，
+    # 票压根没走到这一层，降门槛降的是空气。
+    # 保留这个开关是因为它让"近带不带地面压制"这句文档从死代码变成真代码（单测覆盖），
+    # 而且**一旦上游 veto 修好，它就是现成的近距通道**。在那之前保持 0。
+    q_near_pts: int = 0
     # 单帧例外：一堵墙如果只被一个关键帧看到（刚走近就看见了），单帧多帧确认会把它误杀成 unknown。
     # 放宽的条件是"这张票干净"：格内障碍点够多（≥q_solo_pts）**且**远带票占比 ≤q_far_tol。
     # 实测（tools/q_tier_why.py，20261001_044153）：被清掉的格远带票占比中位数是 1.00、障碍点中位数 14；
@@ -949,12 +963,24 @@ class KeyframeGridMapper:
         # 单帧例外：票密集且不含远带成分 ⇒ 近/中距证据本身就够定案，不等第二个关键帧。
         far = np.maximum(n_o - o_n - o_m, 0.0)
         solo = (o_m > hi) & (n_o >= c.q_solo_pts) & (far <= c.q_far_tol * np.maximum(n_o, 1.0))
+        # ``q_near_pts`` 把文档里那句"近带**故意不带**地面压制"真正接上。历史上它是死代码：
+        # ``rasterize`` 的 base 规则先做了 (n_o > min_pts) & (n_o ≥ ratio·n_g)，而
+        # ``occ = (base_occ > 0) & (...)`` 只能给已有障碍加分，救不回被地面压制杀掉的格。
+        # 后果实测（tools/near_band_check.py，044153）：201 格票数是门槛 8 倍、99.5% 判成可走，
+        # 而它们的形状（n_g 中位 130 / n_o 中位 26）正是文档点名要保护的细障碍——桌腿、栏杆、矮墙。
+        # 0 = 关闭，此时 near_only 恒 False，**与改动前逐格相同**（见 tests 的 no-op 断言）。
+        if c.q_near_pts > 0:
+            near_pts = min(c.q_near_pts, c.min_pts) - 0.5
+            near_only = (o_n > near_pts) & (n_o > near_pts)
+        else:
+            near_only = np.zeros_like(near)
         # base_occ > 0 而不是 base_occ：base_occ 是 uint8，& 出来的还是 uint8，而
         # (a) numpy 把 uint8 数组当**整数下标**不是布尔掩码——g[那个数组] 会去写第 0 行、第 1 行，
         #     一格都改不到还不报错；(b) uint8 上做 ~ 是按位取反（0→254），不是逻辑非。
         # 三个返回值一律真 bool，调用方拿它当掩码用才对。
-        occ = (base_occ > 0) & (near | mid | solo)
-        rejected = (base_occ > 0) & ~occ
+        ok_rule = near | mid | solo | near_only
+        occ = ((base_occ > 0) & ok_rule) | near_only
+        rejected = (base_occ > 0) & ~ok_rule
         return occ, rejected & (g_n > 0.5), rejected
 
     def coverage_counts(self) -> dict[str, Any] | None:

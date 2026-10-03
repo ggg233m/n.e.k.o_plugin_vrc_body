@@ -609,6 +609,73 @@ class QualityTierTests(unittest.TestCase):
         self.assertEqual(grids[0].shape, grids[1].shape)
         self.assertGreater(int((grids[0] == OCC).sum() - (grids[1] == OCC).sum()), 0)  # 确实降了
 
+    def test_q_near_pts_off_matches_legacy_formula(self) -> None:
+        """``q_near_pts=0``（默认）必须与改动前的公式**逐格**一致。
+
+        不靠"跑两遍一样"那种自证——把 ``_by_quality`` 的入参截下来，按**旧公式**重算一遍
+        再比 occ/restored/rejected 三个返回值。``near_only`` 恒 False 时新公式退化成
+        ``occ = (base_occ>0) & ok``、``rejected = (base_occ>0) & ~ok``，这才是真正的 no-op。
+        """
+        box: dict[str, object] = {}
+
+        class Spy(KeyframeGridMapper):
+            def _by_quality(self, base_occ, n_g, n_o, o_n, o_m, g_n, o_mk):
+                out = super()._by_quality(base_occ, n_g, n_o, o_n, o_m, g_n, o_mk)
+                box["in"] = (base_occ.copy(), n_g.copy(), n_o.copy(),
+                             o_n.copy(), o_m.copy(), g_n.copy(), o_mk.copy())
+                box["out"] = tuple(a.copy() for a in out)
+                return out
+
+        scene = np.vstack([world_scene(), ghost_block(1.9, 2.4, -0.3, 0.3, 0.4, 1.2)])
+        m = Spy(MapperConfig(res_m=0.10))
+        for i, T in enumerate([pose(0, 0), pose(0.6, 0.3), pose(1.2, -0.2)]):
+            m.add_keyframe(i, observe(scene, T), T)
+        m.rasterize()
+
+        base_occ, n_g, n_o, o_n, o_m, g_n, o_mk = box["in"]
+        occ, restored, rejected = box["out"]
+        c = MapperConfig()
+        hi = c.min_pts - 0.5
+        near = o_n > hi
+        mid = (o_m > hi) & (o_mk >= c.q_mid_kf - 0.5) & (n_o >= c.occ_ground_ratio * n_g)
+        far = np.maximum(n_o - o_n - o_m, 0.0)
+        solo = (o_m > hi) & (n_o >= c.q_solo_pts) & (far <= c.q_far_tol * np.maximum(n_o, 1.0))
+        ok = near | mid | solo
+        self.assertTrue(np.array_equal(occ, (base_occ > 0) & ok))
+        self.assertTrue(np.array_equal(rejected, (base_occ > 0) & ~ok))
+        self.assertTrue(np.array_equal(restored, (base_occ > 0) & ~ok & (g_n > 0.5)))
+
+    def test_q_near_pts_low_rescues_near_thin_obstacle(self) -> None:
+        """近距、票少、但背后地面清楚的**细**障碍：关着不是障碍，调低门槛后应当是障碍。
+
+        直接调 ``_by_quality`` 并喂手工数组，不走整条管线——要复现的是
+        ``tools/near_band_check.py`` 在 044153 上量到的那种形状（n_g 中位 130 / n_o 中位 26）：
+        ``n_o`` 远大于 min_pts，却因为 ``n_o < occ_ground_ratio * n_g`` 被 base 规则判 0。
+        用真实场景去凑这个比值要靠点的疏密碰运气，测的就不是这条规则了。
+        """
+        m = KeyframeGridMapper(MapperConfig())
+        c = MapperConfig()
+        shape = (1, 6)
+        n_g = np.full(shape, 130.0)
+        n_o = np.array([[26.0, 26.0, 0.0, 40.0, 3.0, 3.0]])
+        # o_n 近距票：前两格全是近距（thin obstacle 的近距观测），后几格分别对应
+        # 远距、地面压制不够、票不足、票不足
+        o_n = np.array([[26.0, 26.0, 0.0, 1.0, 0.0, 0.0]])
+        base = np.array([[0, 0, 0, 1, 0, 0]], np.uint8)   # 只有第 3 格过了扁平规则
+
+        def call(q_near_pts: int) -> tuple:
+            m.cfg.q_near_pts = q_near_pts
+            occ, restored, rejected = m._by_quality(
+                base, n_g, n_o, o_n, np.zeros(shape), np.zeros(shape), np.zeros(shape))
+            return occ
+
+        off = call(0)
+        on1 = call(1)
+        self.assertFalse(off[0, 0], "默认关闭时近距细障碍不该被这条规则救回")
+        self.assertTrue(on1[0, 0], "q_near_pts=1 应当救回近距票够但被地面压制挡掉的格")
+        self.assertFalse(on1[0, 2], "纯远距票不能被救——判据是**近距**票，不是单纯降门槛")
+        self.assertTrue(on1[0, 3], "已经过了扁平规则的格不受影响")
+
     def test_bands_follow_configured_ranges(self) -> None:
         # 分带边界跟着 q_near_m/q_mid_m 走，不是写死的常数。
         wall = ghost_block(2.0, 2.6, -0.3, 0.3, 0.4, 1.2)

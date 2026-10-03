@@ -262,6 +262,9 @@ NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
     "q_near_m": (float, 0.1, 10.0),
     "q_mid_m": (float, 0.2, 20.0),
     "q_mid_kf": (int, 1, 1000),
+    # 近带独立票数门槛，0 = 关闭（默认，历史行为逐格不变）。调低才让"近距票够但被地面压制
+    # 挡掉"的格独立定案——那批格是桌腿/栏杆/矮墙这类细结构。见 _by_quality。
+    "q_near_pts": (int, 0, 1000000),
     "q_solo_pts": (int, 1, 1000000),
     "q_far_tol": (float, 0.0, 1.0),
     "q_free_m": (float, 0.1, 10.0),
