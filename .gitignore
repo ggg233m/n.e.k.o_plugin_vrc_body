@@ -28,3 +28,5 @@ models/depth_anything_v2_small/
 # 在线 navmesh 会话录制（大文件）
 navmesh_recordings/
 navmesh_memory/
+
+tools/*.png

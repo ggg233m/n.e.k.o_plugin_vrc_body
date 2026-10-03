@@ -1,0 +1,302 @@
+{
+  "20260929_045615": {
+    "off": {
+      "occ_cells": 23919,
+      "free_cells": 97640,
+      "unk_cells": 140454,
+      "walkable_center_m2": 377.9,
+      "regions": 124,
+      "corridor_blockers": 8832,
+      "R1.5": {
+        "known_obstacle_pct": 22.48,
+        "free_pct": 54.63,
+        "unknown_pct": 29.53
+      },
+      "R2.5": {
+        "known_obstacle_pct": 20.82,
+        "free_pct": 55.33,
+        "unknown_pct": 30.12
+      },
+      "R3.0": {
+        "known_obstacle_pct": 20.45,
+        "free_pct": 55.19,
+        "unknown_pct": 30.61
+      },
+      "n_kf": 3014,
+      "n_refresh": 0,
+      "replay_s": 13.9
+    },
+    "on": {
+      "occ_cells": 9692,
+      "free_cells": 97771,
+      "unk_cells": 154550,
+      "walkable_center_m2": 382.8,
+      "regions": 139,
+      "corridor_blockers": 3618,
+      "R1.5": {
+        "known_obstacle_pct": 11.3,
+        "free_pct": 54.73,
+        "unknown_pct": 38.3
+      },
+      "R2.5": {
+        "known_obstacle_pct": 10.47,
+        "free_pct": 55.43,
+        "unknown_pct": 38.09
+      },
+      "R3.0": {
+        "known_obstacle_pct": 10.12,
+        "free_pct": 55.29,
+        "unknown_pct": 38.48
+      },
+      "from_occ_to_free": 14227,
+      "from_occ_to_unk": 14096,
+      "freed_on_corridor": 5214,
+      "freed_off_corridor": 9013,
+      "comp_big": 55,
+      "comp_big_cells": 22363,
+      "comp_big_kept_frac": 0.401,
+      "comp_small": 165,
+      "comp_small_cells": 1556,
+      "comp_small_kept_frac": 0.467,
+      "n_kf": 3014,
+      "n_refresh": 0,
+      "replay_s": 14.3
+    },
+    "on_mid": {
+      "occ_cells": 9692,
+      "free_cells": 103193,
+      "unk_cells": 149128,
+      "walkable_center_m2": 402.8,
+      "regions": 138,
+      "corridor_blockers": 3618,
+      "R1.5": {
+        "known_obstacle_pct": 10.56,
+        "free_pct": 59.06,
+        "unknown_pct": 33.97
+      },
+      "R2.5": {
+        "known_obstacle_pct": 9.85,
+        "free_pct": 59.32,
+        "unknown_pct": 34.2
+      },
+      "R3.0": {
+        "known_obstacle_pct": 9.54,
+        "free_pct": 59.05,
+        "unknown_pct": 34.72
+      },
+      "from_occ_to_free": 14227,
+      "from_occ_to_unk": 8674,
+      "freed_on_corridor": 5214,
+      "freed_off_corridor": 9013,
+      "comp_big": 55,
+      "comp_big_cells": 22363,
+      "comp_big_kept_frac": 0.401,
+      "comp_small": 165,
+      "comp_small_cells": 1556,
+      "comp_small_kept_frac": 0.467,
+      "n_kf": 3014,
+      "n_refresh": 0,
+      "replay_s": 15.7
+    }
+  },
+  "20261001_044120": {
+    "off": {
+      "occ_cells": 559,
+      "free_cells": 6062,
+      "unk_cells": 10199,
+      "walkable_center_m2": 12.9,
+      "regions": 13,
+      "corridor_blockers": 38,
+      "R1.5": {
+        "known_obstacle_pct": 4.61,
+        "free_pct": 68.02,
+        "unknown_pct": 28.7
+      },
+      "R2.5": {
+        "known_obstacle_pct": 4.65,
+        "free_pct": 65.46,
+        "unknown_pct": 31.34
+      },
+      "R3.0": {
+        "known_obstacle_pct": 4.5,
+        "free_pct": 62.37,
+        "unknown_pct": 34.69
+      },
+      "n_kf": 11,
+      "n_refresh": 2,
+      "replay_s": 0.5
+    },
+    "on": {
+      "occ_cells": 48,
+      "free_cells": 6062,
+      "unk_cells": 10710,
+      "walkable_center_m2": 12.9,
+      "regions": 13,
+      "corridor_blockers": 0,
+      "R1.5": {
+        "known_obstacle_pct": 0.0,
+        "free_pct": 68.02,
+        "unknown_pct": 31.98
+      },
+      "R2.5": {
+        "known_obstacle_pct": 0.85,
+        "free_pct": 65.46,
+        "unknown_pct": 33.98
+      },
+      "R3.0": {
+        "known_obstacle_pct": 0.8,
+        "free_pct": 62.37,
+        "unknown_pct": 37.13
+      },
+      "from_occ_to_free": 511,
+      "from_occ_to_unk": 511,
+      "freed_on_corridor": 38,
+      "freed_off_corridor": 473,
+      "comp_big": 2,
+      "comp_big_cells": 514,
+      "comp_big_kept_frac": 0.078,
+      "comp_small": 5,
+      "comp_small_cells": 45,
+      "comp_small_kept_frac": 0.178,
+      "n_kf": 11,
+      "n_refresh": 2,
+      "replay_s": 0.1
+    },
+    "on_mid": {
+      "occ_cells": 48,
+      "free_cells": 6092,
+      "unk_cells": 10680,
+      "walkable_center_m2": 13.0,
+      "regions": 13,
+      "corridor_blockers": 0,
+      "R1.5": {
+        "known_obstacle_pct": 0.0,
+        "free_pct": 68.13,
+        "unknown_pct": 31.87
+      },
+      "R2.5": {
+        "known_obstacle_pct": 0.84,
+        "free_pct": 65.84,
+        "unknown_pct": 33.6
+      },
+      "R3.0": {
+        "known_obstacle_pct": 0.8,
+        "free_pct": 62.72,
+        "unknown_pct": 36.78
+      },
+      "from_occ_to_free": 511,
+      "from_occ_to_unk": 481,
+      "freed_on_corridor": 38,
+      "freed_off_corridor": 473,
+      "comp_big": 2,
+      "comp_big_cells": 514,
+      "comp_big_kept_frac": 0.078,
+      "comp_small": 5,
+      "comp_small_cells": 45,
+      "comp_small_kept_frac": 0.178,
+      "n_kf": 11,
+      "n_refresh": 2,
+      "replay_s": 0.1
+    }
+  },
+  "20261001_044153": {
+    "off": {
+      "occ_cells": 14078,
+      "free_cells": 61724,
+      "unk_cells": 87694,
+      "walkable_center_m2": 234.8,
+      "regions": 45,
+      "corridor_blockers": 2164,
+      "R1.5": {
+        "known_obstacle_pct": 18.58,
+        "free_pct": 55.55,
+        "unknown_pct": 31.77
+      },
+      "R2.5": {
+        "known_obstacle_pct": 18.74,
+        "free_pct": 53.95,
+        "unknown_pct": 33.61
+      },
+      "R3.0": {
+        "known_obstacle_pct": 19.03,
+        "free_pct": 52.67,
+        "unknown_pct": 34.94
+      },
+      "n_kf": 391,
+      "n_refresh": 6,
+      "replay_s": 1.9
+    },
+    "on": {
+      "occ_cells": 4080,
+      "free_cells": 61747,
+      "unk_cells": 97669,
+      "walkable_center_m2": 235.6,
+      "regions": 49,
+      "corridor_blockers": 502,
+      "R1.5": {
+        "known_obstacle_pct": 5.47,
+        "free_pct": 55.55,
+        "unknown_pct": 41.24
+      },
+      "R2.5": {
+        "known_obstacle_pct": 5.86,
+        "free_pct": 53.95,
+        "unknown_pct": 42.69
+      },
+      "R3.0": {
+        "known_obstacle_pct": 6.18,
+        "free_pct": 52.68,
+        "unknown_pct": 43.85
+      },
+      "from_occ_to_free": 9998,
+      "from_occ_to_unk": 9975,
+      "freed_on_corridor": 1662,
+      "freed_off_corridor": 8336,
+      "comp_big": 26,
+      "comp_big_cells": 13476,
+      "comp_big_kept_frac": 0.289,
+      "comp_small": 59,
+      "comp_small_cells": 602,
+      "comp_small_kept_frac": 0.309,
+      "n_kf": 391,
+      "n_refresh": 6,
+      "replay_s": 1.8
+    },
+    "on_mid": {
+      "occ_cells": 4080,
+      "free_cells": 64448,
+      "unk_cells": 94968,
+      "walkable_center_m2": 246.1,
+      "regions": 50,
+      "corridor_blockers": 502,
+      "R1.5": {
+        "known_obstacle_pct": 5.23,
+        "free_pct": 58.22,
+        "unknown_pct": 38.57
+      },
+      "R2.5": {
+        "known_obstacle_pct": 5.61,
+        "free_pct": 56.54,
+        "unknown_pct": 40.1
+      },
+      "R3.0": {
+        "known_obstacle_pct": 5.91,
+        "free_pct": 55.22,
+        "unknown_pct": 41.31
+      },
+      "from_occ_to_free": 9998,
+      "from_occ_to_unk": 7274,
+      "freed_on_corridor": 1662,
+      "freed_off_corridor": 8336,
+      "comp_big": 26,
+      "comp_big_cells": 13476,
+      "comp_big_kept_frac": 0.289,
+      "comp_small": 59,
+      "comp_small_cells": 602,
+      "comp_small_kept_frac": 0.309,
+      "n_kf": 391,
+      "n_refresh": 6,
+      "replay_s": 2.1
+    }
+  }
+}

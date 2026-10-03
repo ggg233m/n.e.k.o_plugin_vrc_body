@@ -257,6 +257,19 @@ NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
     "obst_top_m": (float, 0.2, 5.0),
     "min_pts": (int, 1, 1000),
     "occ_ground_ratio": (float, 0.0, 10.0),
+    # 观测质量分层（近/中/远）。q_tiers=false 回到改动前的扁平计数规则，便于现场 A/B。
+    "q_tiers": (bool, 0, 1),
+    "q_near_m": (float, 0.1, 10.0),
+    "q_mid_m": (float, 0.2, 20.0),
+    "q_mid_kf": (int, 1, 1000),
+    "q_solo_pts": (int, 1, 1000000),
+    "q_far_tol": (float, 0.0, 1.0),
+    "q_free_m": (float, 0.1, 10.0),
+    # 高度分带占用（多层/飞行；旁路产物，不进地面层导航判定）。实测 044153 有 28.7% 的双目点
+    # 落在 obst_top_m 之上被整段丢弃——在 VRChat 里那正是二楼、阳台、天桥和下层天花板。
+    "hi_bands": (bool, 0, 1),
+    "hi_band_m": (float, 0.5, 20.0),
+    "hi_band_top_m": (float, 0.6, 40.0),
     "ray_clear": (bool, 0, 1),
     "ray_beta": (float, 0.1, 20.0),
     "ray_step_m": (float, 0.02, 1.0),

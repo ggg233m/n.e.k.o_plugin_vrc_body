@@ -88,8 +88,8 @@ class MapperTests(unittest.TestCase):
     def test_unmodelled_pitch_ground_tilt_is_fitted_out(self) -> None:
         # 位姿里没有的 14° 俯仰（HMD 与相机外参误差）：远处地面在关键帧里一路抬高，常数偏移修不掉，
         # 地面上冒出一片假障碍。斜面拟合后假障碍消失，墙不受影响。
-        def occ_cells(cap: float):
-            m = KeyframeGridMapper(MapperConfig(res_m=0.10, ground_plane_max_deg=cap))
+        def occ_cells(cap: float, **kw):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, ground_plane_max_deg=cap, **kw))
             m.add_keyframe(0, observe(self.scene, pose(1.0, 0, pitch=math.radians(14))), pose(1.0, 0))
             ng = m.rasterize()
             s, occ = ng.meta.world_scale, ng.grid == OCC
@@ -100,12 +100,23 @@ class MapperTests(unittest.TestCase):
                 return int(occ[r0:r1 + 1, c0:c1 + 1].sum())
             return box(1.3, 3.3, -1.4, 1.4) + box(3.3, 4.0, 0.4, 1.4), box(3.3, 3.7, -1.4, 0.2)
 
-        ground_off, wall_off = occ_cells(0.0)
-        ground_on, wall_on = occ_cells(15.0)
+        # 扁平计数口径（q_tiers=False）：斜面拟合是唯一防线，不拟合就冒一片假障碍。
+        ground_off, wall_off = occ_cells(0.0, q_tiers=False)
+        ground_on, wall_on = occ_cells(15.0, q_tiers=False)
         self.assertGreater(ground_off, 20)          # 证明这条用例确实需要斜面
         self.assertLessEqual(ground_on, 3)
-        self.assertEqual(wall_on, wall_off)
+        # 差 1 格是 BORDER_CONSTANT 带来的：3×3 多数滤波在图外沿不再镜像回填自己，
+        # 边缘的障碍格少一票支撑。跟"斜面拟合有没有吃掉墙"无关，放 2 格的容差。
+        self.assertAlmostEqual(wall_on, wall_off, delta=2)
         self.assertGreater(wall_on, 20)
+        # 默认口径：质量分层已经把远场票否掉了，斜面拟合退成第二道防线（两道都留着）。
+        # 要保证的不是"更干净"，而是 ① 墙不会因为分层而被当成量化倾斜清掉，② 光靠分层
+        # 也不会在斜面上冒出成片假障碍（6 格量级，而不是扁平口径下那 20+ 格）。
+        g_tier_off, w_tier_off = occ_cells(0.0)
+        g_tier_on, w_tier_on = occ_cells(15.0)
+        self.assertGreater(w_tier_on, 20)
+        self.assertLessEqual(g_tier_off, 10)
+        self.assertLess(g_tier_on, g_tier_off)
 
     def test_trajectory_z_drift_ignored(self) -> None:
         # 轨迹 z 漂了 0.4 m 且点跟着一起漂（同一个关键帧内一致）：高度相对该关键帧，结果不变。
@@ -493,6 +504,226 @@ class CoverageCountsTests(unittest.TestCase):
         cc, _ = self._cov(m)
         self.assertAlmostEqual(float(cc["near"].sum()), 1.0, places=6)
         self.assertAlmostEqual(float(cc["far"].sum()), 1.0, places=6)
+
+
+class QualityTierTests(unittest.TestCase):
+    """观测质量分层：按"票是几米外打的"复核扁平计数的障碍判定。
+
+    物理依据：视差深度误差 δz = z²/(fx·b)·δd，fx 202.5 / 基线 0.126 下 1 像素 ≈ z²/25.5 m
+    （3 m→35 cm、5 m→98 cm），而障碍高度带 (0.3, 2.0) 有 1.7 m 宽。1.5 m 以外真地面被抖进
+    障碍带是必然的，min_pts / 3×3 多数 / occ_ground_ratio 只压密度补不回信息。
+    """
+
+    NEAR, MID = 1.5, 3.0            # 与 MapperConfig 默认 q_near_m / q_mid_m 对齐
+
+    def one_shot(self, at: tuple[float, float], *blocks: np.ndarray, **kw) -> KeyframeGridMapper:
+        """单关键帧：站在 at 看一次 ``blocks``（点已是 base 系，机位在原点）。
+
+        场景**必须带真地板**：``_ground_correction`` 与 cam_h 直方图都是拿地面当参照的，
+        没有地板时它们会把墙本身当地面拟合（实测 cam_h 漂到 1.26，墙被判成空地），
+        测的就不是分层规则而是地面估计的边角行为。
+        """
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+        T = pose(*at)
+        m.add_keyframe(0, np.vstack([world_scene(), *blocks]).astype(np.float32), T)
+        return m
+
+    def test_far_only_phantom_demoted_to_unknown_not_free(self) -> None:
+        # 4 m 外的孤岛：票全在远带。旧规则判障碍；分层后不再是障碍——
+        # 但那块地板也只在 4 m 外看过（远带地面同样不可信），所以降级成 unknown 而不是 free。
+        blob = ghost_block(4.0, 4.6, -0.3, 0.3, 0.5, 1.0)
+        cell = (4.3, 0.0)
+        self.assertEqual(value_at(self.one_shot((0, 0), blob, q_tiers=False).rasterize(), cell), OCC)
+        self.assertEqual(value_at(self.one_shot((0, 0), blob).rasterize(), cell), UNK)
+
+    def test_far_phantom_over_near_seen_floor_becomes_free(self) -> None:
+        # 真实的假障碍长法：远机位（3 m 外）把地板抖成了障碍票，后来走近了、1 m 内看清是地板，
+        # 但远机位的票还在累加器里。没有近距地面证据时它只能降级成 unknown；走近看清了就判回空地。
+        # 这就是"走过的地方变障碍、点了不动"的正解。
+        blob = ghost_block(2.9, 3.3, -0.3, 0.3, 0.5, 1.0)
+        cell = (3.1, 0.0)
+
+        def walk(**kw) -> object:
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+            m.add_keyframe(0, np.vstack([world_scene(), blob]).astype(np.float32), pose(0, 0))
+            m.add_keyframe(1, world_scene().astype(np.float32), pose(2.5, 0))   # 1 m 内看清是地板
+            return m.rasterize()
+
+        self.assertEqual(value_at(walk(q_tiers=False), cell), OCC)   # 旧规则：走近了也还是障碍
+        self.assertEqual(value_at(walk(), cell), FREE)
+
+    def test_near_confirmed_obstacle_survives(self) -> None:
+        # 1 m 内看的墙：近距票即决定性，任何分层参数都该留住它。
+        wall = ghost_block(0.8, 1.0, -0.6, 0.6, 0.4, 1.2)
+        self.assertEqual(value_at(self.one_shot((0, 0), wall).rasterize(), (0.9, 0.0)), OCC)
+
+    def test_single_keyframe_dense_mid_wall_survives(self) -> None:
+        # 只被一个关键帧看到的中距墙（刚走近就看见了）：票全在中距、够密 ⇒ 单帧例外定案。
+        # 这是"分层别把真墙误杀"的保证。关掉单帧例外后它降级——但**降级成 unknown 而不是 free**，
+        # 墙仍然不可走（nav_grid：unknown 不进可走区），所以不会因为分层就穿墙。
+        wall = ghost_block(2.2, 2.8, -0.5, 0.5, 0.4, 1.2)
+        cell = (2.5, 0.0)
+        self.assertEqual(value_at(self.one_shot((0, 0), wall).rasterize(), cell), OCC)
+        strict = self.one_shot((0, 0), wall, q_solo_pts=10 ** 6).rasterize()
+        self.assertEqual(value_at(strict, cell), UNK)
+        self.assertNotEqual(value_at(strict, cell), FREE)
+        strict.build(radius_m=0.25, walked=[])
+        self.assertFalse(strict.center[strict.to_cell((cell[0] * strict.meta.world_scale,
+                                                       cell[1] * strict.meta.world_scale))])
+
+    def test_mid_needs_multi_frame_confirmation(self) -> None:
+        # 中距多帧确认这一条本身：中距鬼影被两个机位看到才定案，只有一个看到就不定案。
+        # 两条都关掉单帧例外（q_solo_pts 抬到天上）测纯多帧逻辑；ray_clear 也关掉，
+        # 否则第二个机位看穿它的那条视线会先把票清掉，测的就不是分层了。
+        ghost = ghost_block(2.2, 2.4, -0.05, 0.05, 0.5, 0.7)
+        cell = (2.3, 0.0)
+        kw = dict(q_solo_pts=10 ** 6, ray_clear=False)
+
+        def seen_by(*ats):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+            for i, at in enumerate(ats):
+                m.add_keyframe(i, np.vstack([world_scene(), ghost]).astype(np.float32), pose(*at))
+            return m.rasterize()
+
+        self.assertEqual(value_at(self.one_shot((0, 0), ghost, q_tiers=False, ray_clear=False).rasterize(),
+                                  cell), OCC)                    # 旧规则：单帧就判障碍
+        self.assertNotEqual(value_at(seen_by((0, 0)), cell), OCC)  # 只看过一次 ⇒ 不定案
+        # 第二个机位错开半格（0.05 m = 一个体素）：两帧的体素正好对进同一批格，才谈得上"多帧一致"。
+        self.assertEqual(value_at(seen_by((0, 0), (0.05, 0.0)), cell), OCC)
+        m3 = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=False,
+                                             q_solo_pts=10 ** 6, q_mid_kf=3))
+        for i, at in enumerate(((0, 0), (0.05, 0.0))):
+            m3.add_keyframe(i, np.vstack([world_scene(), ghost]).astype(np.float32), pose(*at))
+        # q_mid_kf 抬到 3 又变回不定案：门槛是跟着配的，不是写死"两个"。
+        self.assertNotEqual(value_at(m3.rasterize(), cell), OCC)
+    def test_q_tiers_off_reproduces_flat_count_rule(self) -> None:
+        # 开关关掉必须**逐格**等于历史规则：别让新参数在关闭时还悄悄改别的东西。
+        scene = np.vstack([world_scene(), ghost_block(2.9, 3.3, -0.3, 0.3, 0.5, 1.0)])
+        poses = [pose(0, 0), pose(1.0, 0.4), pose(2.0, -0.3)]
+        grids = []
+        for tiers in (False, True):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, q_tiers=tiers))
+            for i, T in enumerate(poses):
+                m.add_keyframe(i, observe(scene, T), T)
+            grids.append(m.rasterize().grid)
+        self.assertEqual(grids[0].shape, grids[1].shape)
+        self.assertGreater(int((grids[0] == OCC).sum() - (grids[1] == OCC).sum()), 0)  # 确实降了
+
+    def test_bands_follow_configured_ranges(self) -> None:
+        # 分带边界跟着 q_near_m/q_mid_m 走，不是写死的常数。
+        wall = ghost_block(2.0, 2.6, -0.3, 0.3, 0.4, 1.2)
+        cell = (2.3, 0.0)
+        # 把 q_near_m 抬到 3.0 ⇒ 2.3 m 处变成"近距" ⇒ 单帧即定案。
+        self.assertEqual(value_at(self.one_shot((0, 0), wall, q_near_m=3.0).rasterize(), cell), OCC)
+        # 把 q_mid_m 压到 1.0 ⇒ 同一块只剩远场票 ⇒ 降级。
+        all_far = self.one_shot((0, 0), wall, q_near_m=0.5, q_mid_m=1.0).rasterize()
+        self.assertNotEqual(value_at(all_far, cell), OCC)
+
+
+class HeightBandTests(unittest.TestCase):
+    """高度分带占用：把 ``obst_top_m`` 之上（和地面之下）被整段丢弃的高度捡回来。
+
+    这层是**旁路产物**，不喂导航。所以本类最要紧的不是"分带对不对"，而是
+    **地面层三态栅格必须逐格不变**——分带只多记几段高度，没资格改动任何既有判定。
+    """
+
+    @staticmethod
+    def stack() -> np.ndarray:
+        """地面 + 一堵 0.4~1.2 m 的墙（world_scene 自带）+ 头顶 2.6 m 的一块板（模拟二楼/天桥）。"""
+        return np.vstack([world_scene(), ghost_block(2.2, 2.8, -0.6, 0.6, 2.6, 2.8)]).astype(np.float32)
+
+    def build(self, **kw) -> KeyframeGridMapper:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, **kw))
+        m.add_keyframe(0, self.stack(), pose(0, 0))
+        return m
+
+    def band_at(self, m: KeyframeGridMapper, xy: tuple[float, float]) -> list[float]:
+        """某格四条带的累计点数（取 band_grid 的 NavGrid 序，行 0 = 最大 y）。"""
+        bg = m.band_grid()
+        self.assertIsNotNone(bg)
+        r, c = self._cell(m, xy)
+        return [float(bg[b][r, c]) for b in range(4)]
+
+    @staticmethod
+    def _cell(m: KeyframeGridMapper, xy: tuple[float, float]) -> tuple[int, int]:
+        """地图系(追踪米) → (NavGrid 行, 列)。按 rasterize 的映射手算，不依赖内部缓存。"""
+        bg = m.band_grid()
+        h, w = bg.shape[1], bg.shape[2]
+        (ax, ay) = m._acc_lo
+        lx, ly = m._grid_lo
+        res = m.cfg.res_m
+        acc_r = int(np.floor(xy[1] / res)) - ay        # 累加器行
+        acc_c = int(np.floor(xy[0] / res)) - ax        # 累加器列
+        unflipped = acc_r - (ly - ay)                   # n_g 行 = 累加器行 + (ly - ay)
+        return h - 1 - unflipped, acc_c - (lx - ax)
+
+    def test_ground_layer_is_bit_identical_with_and_without_bands(self) -> None:
+        # 这是本改动唯一不可让步的性质：分带开关不许动地面层一个格。
+        a = self.build(hi_bands=False).rasterize().grid
+        b = self.build(hi_bands=True).rasterize().grid
+        self.assertEqual(a.shape, b.shape)
+        np.testing.assert_array_equal(a, b)
+
+    def test_above_obst_top_lands_in_a_band_not_in_obstacle(self) -> None:
+        # 2.6 m 的板在 obst_top_m=2.0 之上：地面层判不了它，带里必须有票。
+        m = self.build()
+        ng = m.rasterize()
+        self.assertGreater(self.band_at(m, (2.5, 0.0))[1], 0)      # lo 带 = (2.0, 3.5]
+        self.assertEqual(value_at(ng, (2.5, 0.0)), FREE)           # 地面层没把它当障碍
+
+    def test_band_edges_follow_config(self) -> None:
+        # 带边界跟着 hi_band_m / hi_band_top_m 走，不是写死的常数。
+        m = self.build(hi_band_m=2.2, hi_band_top_m=2.4)
+        m.rasterize()
+        self.assertEqual(m.band_counts()["edges_m"], [-0.3, 2.0, 2.2, 2.4])
+        v = self.band_at(m, (2.5, 0.0))
+        self.assertEqual(v[1], 0.0)           # 2.6 m 不再落 lo 带
+        self.assertGreater(v[3], 0.0)         # 落到最高带
+
+    def test_bands_off_gives_empty(self) -> None:
+        m = self.build(hi_bands=False)
+        m.rasterize()
+        self.assertIsNone(m.band_grid())
+        self.assertIsNone(m.band_counts())
+
+    def test_bands_are_reversible_on_drop(self) -> None:
+        # 增删记账：加一帧再撤掉，累加器要精确回到原点（refresh 走的就是这条路）。
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        m.add_keyframe(0, self.stack(), pose(0, 0))
+        m.rasterize()
+        base = [b.copy() for b in (m._acc_b0, m._acc_b1, m._acc_b2, m._acc_b3)]
+        m.add_keyframe(1, self.stack(), pose(0.5, 0.0))
+        m.rasterize()
+        self.assertTrue(any(float(b.sum()) > float(o.sum()) for b, o in
+                            zip((m._acc_b0, m._acc_b1, m._acc_b2, m._acc_b3), base)))
+        m.drop_points(1)
+        m.rasterize()
+        for b, o in zip((m._acc_b0, m._acc_b1, m._acc_b2, m._acc_b3), base):
+            np.testing.assert_allclose(b, o, rtol=0, atol=1e-9)
+
+    def test_bands_match_a_fresh_build_after_loop_closure_shift(self) -> None:
+        # 回环整体平移 0.5 m（整格）：分带要像地面层一样"只挪下标"，增量结果与
+        # 按终态位姿重建**逐格相同**。注意整格平移后栅格窗口也跟着挪（这是 _shift 的本意），
+        # 所以不能断言数组整体右移——那才是错的。
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        poses = {0: pose(0, 0), 1: pose(1.0, 0.4), 2: pose(2.0, -0.3)}
+        for i, T in poses.items():
+            m.add_keyframe(i, self.stack(), T)
+        m.rasterize()
+        shifted = {0: pose(0.5, 0.0), 1: pose(1.5, 0.4), 2: pose(2.5, -0.3)}
+        m.update_poses(shifted)
+        inc = m.rasterize()
+        inc_b = m.band_grid()
+        fresh = KeyframeGridMapper(MapperConfig(res_m=0.10))
+        for i, T in shifted.items():
+            fresh.add_keyframe(i, self.stack(), T)
+        ref = fresh.rasterize()
+        ref_b = fresh.band_grid()
+        self.assertEqual(inc.grid.shape, ref.grid.shape)
+        np.testing.assert_array_equal(inc.grid, ref.grid)
+        self.assertEqual(inc_b.shape, ref_b.shape)
+        np.testing.assert_allclose(inc_b, ref_b, rtol=0, atol=1e-9)
+        self.assertTrue((inc_b[1] > 0).any())         # 确实有票，不是两边都空蒙对了
 
 
 if __name__ == "__main__":

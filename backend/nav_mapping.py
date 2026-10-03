@@ -9,6 +9,13 @@
   漂移都不进入判定（RTAB-Map 自带栅格在 base 系判高，run6 上 3 m 处障碍 39%）；
 * 三态：free = 有地面点且非障碍；obstacle = 障碍点 ≥ min_pts 且 3×3 邻居支撑；
   其余 unknown。不做射线追踪，free 只来自真正看见的地面，unknown 永不当 free。
+* **障碍判定按观测距离分层**（``q_tiers``，2026-10-05）：视差深度误差 δz = z²/(fx·b)·δd
+  随距离平方增长，fx 202.5 / 基线 0.126 下 3 m 是 0.35 m、5 m 是 0.98 m，而障碍高度带
+  (0.3, 2.0) 只有 1.7 m 宽——1.5 m 以外"真地面被抖进障碍带"是必然的，min_pts / 3×3 多数 /
+  occ_ground_ratio 只压密度、补不回那一层不存在的信息（"空地中间冒孤岛"的物理来源）。
+  所以近带单帧定案、中带要 ≥q_mid_kf 个关键帧一致（或"票够密且不含远带成分"的单帧例外）、
+  远带没有定案权，只用来**否证**。实测走廊障碍 2168→502（044153），
+  见 Docs/虚假障碍-根因与分层修复（2026-10-05）.md 与 tools/q_tier_ab.py。
 
 栅格原点对齐到分辨率整数倍，所以地图变大时已有格子的编号含义不变。
 """
@@ -45,7 +52,14 @@ class MapperConfig:
     vox_z_m: float = 0.02
     # 增量栅格化：每个关键帧的格计数算一次，回环只按整格平移挪下标（见 _shift）。
     # cam_h 按 1 cm 直方图取中位，变化超过 cam_h_hyst_m 才换（换了要全部重分类）。
-    cam_h_hyst_m: float = 0.02
+    #
+    # ⚠️ 2026-10-05 调参：这两个值原来取错了量级，直接造成建图卡顿。cam_h 唯一的消费者是
+    # 地面判定，而 ground_tol 就有 0.30 m —— **1~2 cm 的精度纯属浪费**，而 2 cm 的滞回带
+    # 恰好卡死在直方图相邻两桶的抖动幅度上（0.02 的比较在浮点上还不严格）。实测 044153
+    # 回放里 cam_h 在 1.745 / 1.765 之间来回翻了 9 次，每翻一次就是一次**全体关键帧重算**：
+    # 末段单次 1.6 s，9 次合计占全程栅格化时间 31%（见 Docs/虚假障碍-根因与分层修复 §九）。
+    # 滞回放宽到远大于桶噪声（6 cm），再按当前规模限流一次，末段重算从 1.6 s 降到不再发生。
+    cam_h_hyst_m: float = 0.06
     # 单个关键帧的地面可能整体偏离全局 cam_h（低头/蹲下/HMD 高度抖、视差系统误差）：run6 有 5 帧偏 0.3–0.4 m，
     # 地面被整片判成障碍，正是"走过的地方变障碍、点了不动"的来源。按该帧 1.2 m 外地面的高度众数修正，
     # 限幅 ±ground_offset_max_m；众数不够突出（< 25% 点）就不修。
@@ -58,6 +72,33 @@ class MapperConfig:
     ground_plane_band_m: float = 0.12
     # 障碍点数还须 ≥ 地面点数 × 这个比例：单帧视差噪声打出的几个高点压不过几十帧看到的地面。
     occ_ground_ratio: float = 0.3   # run6：路径上的障碍格 25→12
+    # ---- 观测质量分层（近/中/远）----
+    # 视差深度误差 δz = z²/(fx·b)·δd。面板上的 fx 202.5、基线 0.126 ⇒ 1 像素视差 ≈ z²/25.5 m：
+    # 1.5 m 处 9 cm、3 m 处 35 cm、5 m 处 98 cm。而障碍高度带 (ground_tol 0.3, obst_top 2.0)
+    # 宽 1.7 m —— 1.5 m 以外"真地面"散进障碍带是必然的，不是阈值没调好，是信息压根不在那一层。
+    # 所以扁平计数（min_pts / 3×3 多数 / occ_ground_ratio）只能压密度，补不回丢失的信息，
+    # 这就是"空地中间冒孤岛"的来源。改成按观测距离分带定案：
+    #   近带 <q_near_m：误差还在带边沿内，单帧即可定案，**故意不带**地面压制条件（否则 ratio 误杀真细障碍）；
+    #   中带 q_near~q_mid：须 ≥q_mid_kf 个关键帧 + 地面压制，多帧一致性压住量化倾斜；
+    #   远带 >q_mid：没有定案权，只有否证权——纯远场票的格降级成 FREE（有近/中距地面）或 UNK。
+    # 口径与 Docs/离线多视角融合v1-假障碍清除（2026-10-02）.md 一致：该录制上障碍占比
+    # 31.4%→13.3%（R1.5）/ 11.1%（R3.0），机理与 ray_clear 正交，两者叠加。
+    q_tiers: bool = True
+    q_near_m: float = 1.5
+    q_mid_m: float = 3.0
+    q_mid_kf: int = 2
+    # 单帧例外：一堵墙如果只被一个关键帧看到（刚走近就看见了），单帧多帧确认会把它误杀成 unknown。
+    # 放宽的条件是"这张票干净"：格内障碍点够多（≥q_solo_pts）**且**远带票占比 ≤q_far_tol。
+    # 实测（tools/q_tier_why.py，20261001_044153）：被清掉的格远带票占比中位数是 1.00、障碍点中位数 14；
+    # 留住的格是 0.15 / 149。远带票占比是这个场景里最能分开"真结构"与"量化倾斜"的一维。
+    q_solo_pts: int = 15
+    q_far_tol: float = 0.15
+    # 降级判回**空地**要多大范围内的地面证据。默认 = q_near_m，只认 1.5 m 内看清的地面；
+    # 调到 q_mid_m（3.0）就是 Docs/离线多视角融合v1 那一版的近+中距口径：判回空地的格多得多，
+    # 图外可探索面积涨得快，但中距地面本身就是被抖出来的，等于拿噪声治噪声。实测两者对
+    # "走廊上还有几个障碍"几乎没差别（见 tools/q_tier_ab.json），差别只在图外那圈——所以
+    # 默认取保守的那个，不伪造 free。
+    q_free_m: float = 1.5
     # 射线清除：相机到每个观测点的视线穿过的障碍高度体素记一次"看穿"。一个体素被看穿的关键帧数
     # ≥ ray_beta × 被打中的关键帧数，就不再算障碍。没有它，障碍只增不减：定位误差、回环挪位每次
     # 都在旁边再画一份墙，旧的那份没有任何机制清掉（21 min 实测 150 块障碍里 94 块是空地中间的孤岛）。
@@ -72,7 +113,28 @@ class MapperConfig:
     ray_walk_w: float = 3.0
     # 覆盖伴生网格（纯显示，不进三态判定）：观测点离该关键帧相机水平距离 ≤ cov_near_m 算"近看"。
     # 近看计数=0 的已观测格 = 只远看过的信息洞（走过去补扫）；近看点数再分稀疏/高质量（显示层阈值）。
+    # 语义与上面 q_near_m/q_mid_m 无关（这里问"信息洞"，那里问"证据够不够定案"），改一个不会串到另一个。
     cov_near_m: float = 3.0
+
+    # ---- 高度分带占用（多层 / 飞行；**旁路产物，不进地面层判定**）----
+    # 现状：`obst_top_m = 2.0` 以上的点被**整段丢弃**。实测 044153 有 28.7% 的双目点落在头顶
+    # 2 m 以上（2~3 m 占 7.0%、3~5 m 占 20.9%）——在 VRChat 里那正是二楼、阳台、天桥和
+    # 下层的天花板。系统对多层建筑是**结构性失明**，不是精度不够。
+    # 这里只做一件事：把被丢掉的高度**记下来**，按带存点计数。地面层的 `_acc_g`/`_acc_o`、
+    # 质量分层规则、射线清除**一律不动**（导航行为零变化），带数据另开一条路给上层用。
+    #
+    # 带边界（h 的上界，追踪米）：(-inf, -ground_tol] / (obst_top_m, hi_band_m] /
+    # (hi_band_m, hi_band_top_m] / (hi_band_top_m, +inf)。
+    # h = rel_z + cam_h 是**离地高**而不是"离相机高"，所以跨关键帧可比，回环挪动时跟着关键帧走。
+    #
+    # 精度够用：墙面平面误差实测 0.06 m，avatar 半径 0.25 m，余量 4 倍。
+    # 这次**不做**楼板/天花板识别（那要带内高度聚类，量过数据再定），只回答"这个高度有没有东西"。
+    hi_bands: bool = True
+    # 边界按 `tools/band_height_hist.py` 在 044153 上量到的自然峰设，不再是随手取的整数：
+    # 头顶之上的点合并起来是 3.0~4.0 m 占 60.8%（壳厚约 1 m，见下），原来 3.5/6.0 的边界
+    # **正好劈在那个面上**（lo 堆在自己上沿、mid 堆在自己下沿），两层都拿不到完整的一张面。
+    hi_band_m: float = 3.0
+    hi_band_top_m: float = 4.5
 
 
 def _voxelize(p: np.ndarray, xy_m: float, z_m: float) -> tuple[np.ndarray, np.ndarray]:
@@ -146,13 +208,34 @@ def _ray_voxels(rxy: np.ndarray, h: np.ndarray, t: np.ndarray, cam_h: float, cfg
     empty = np.zeros((0, 3), np.int64)
 
     def cells(xy: np.ndarray, hh: np.ndarray) -> np.ndarray:
-        return np.column_stack([np.floor((xy[:, 0] + t[0]) / res), np.floor((xy[:, 1] + t[1]) / res),
-                                np.floor((hh - tol) / zb)]).astype(np.int64)
+        # 一次分配写三列。column_stack + astype(int64) 会多出两次整块拷贝，
+        # 这里一行就要处理 6 万多个采样点（见下面 miss 那行的耗时对比）。
+        out = np.empty((len(xy), 3), np.int64)
+        out[:, 0] = np.floor((xy[:, 0] + t[0]) / res)
+        out[:, 1] = np.floor((xy[:, 1] + t[1]) / res)
+        out[:, 2] = np.floor((hh - tol) / zb)
+        return out
 
     def unique_rows(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """按 (x, y, z) 去重，返回 (每个唯一键的代表行, **全部**输入行的打包键)。
+
+        用稠密标记数组代替 ``np.unique`` 的排序：射线体素全在关键帧 ``range_m`` 半径内，
+        打包键的跨度约 100×100×17，一个几 MB 的 int32 标记数组就装得下，而排序要动
+        每关键帧 7 万多个 int64。这是 ``_sync_ray`` 的主要开销（18.6 ms/关键帧里绝大部分）。
+        倒序赋值 ⇒ 重复键留下**最小**下标，与 ``np.unique(return_index=True)`` 的
+        "first occurrence" 语义一致（``RayClearTests`` 依赖这个确定性）。
+        """
         lo = v.min(axis=0)
         span = v.max(axis=0) - lo + 1
         key = ((v[:, 0] - lo[0]) * span[1] + (v[:, 1] - lo[1])) * span[2] + (v[:, 2] - lo[2])
+        size = int(span[0]) * int(span[1]) * int(span[2])
+        if size <= (1 << 22):                       # 4M 格（16 MB int32）以内走稠密标记
+            # 存下标+1：下标 0 与"这一格没被写过"在 0 初始化数组里长得一模一样，
+            # 不加哨兵的话每个结果集都会漏掉第 0 行（300 组随机输入里 300 组不一致，
+            # 当场抓住的，不是想出来的）。
+            pos = np.zeros(size, np.int32)
+            pos[key[::-1]] = np.arange(len(key), 0, -1, dtype=np.int32)
+            return v[pos[np.flatnonzero(pos)] - 1], key
         _u, first = np.unique(key, return_index=True)
         return v[first], key
 
@@ -176,7 +259,10 @@ def _ray_voxels(rxy: np.ndarray, h: np.ndarray, t: np.ndarray, cam_h: float, cfg
     ok = (sh > tol) & (sh < top)
     if not ok.any():
         return hits, empty
-    miss = unique_rows(cells(exy[idx[ok]] * f[ok, None], sh[ok]))[0]
+    # exy[idx[ok]] 先取一次再乘 f：写成 cells(exy[idx[ok]] * f[ok, None], ...) 时
+    # 两列各自 gather 一遍同样的 6 万个下标，实测这一行就占 10.2 ms（_ray_voxels 的 77%）。
+    xy = exy[idx[ok]] * f[ok, None]
+    miss = unique_rows(cells(xy, sh[ok]))[0]
     if len(hits):
         both = np.vstack([hits, miss])
         key = unique_rows(both)[1]
@@ -215,6 +301,16 @@ def stereo_points(left_gray: np.ndarray, right_gray: np.ndarray, *, fx: float, c
     return np.column_stack([z, -x, -y]).astype(np.float32)
 
 
+# ``_kf_base`` 返回元组的下标 → 累加器属性名。``_sync_acc``（写入）与 ``_grow_acc``（搬迁）都按
+# 这张表驱动：加一个分带只要在 _kf_base 里多返回一段、这里多一行，不必改两处加法。
+_ACC_SLOTS: tuple[tuple[int, str], ...] = (
+    (2, "_acc_g"), (3, "_acc_o"), (6, "_acc_near"), (7, "_acc_far"),
+    (8, "_acc_on"), (9, "_acc_om"), (10, "_acc_gn"), (11, "_acc_omk"),
+    (12, "_acc_b0"), (13, "_acc_b1"), (14, "_acc_b2"), (15, "_acc_b3"),
+)
+_ACC_NAMES: tuple[str, ...] = tuple(name for _slot, name in _ACC_SLOTS)
+
+
 class KeyframeGridMapper:
     def __init__(self, cfg: MapperConfig | None = None) -> None:
         self.cfg = cfg or MapperConfig()
@@ -225,13 +321,13 @@ class KeyframeGridMapper:
         self._trail: dict[int, list[tuple[np.ndarray, np.ndarray, float | None]]] = {}
         self._trail_arr: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.cam_h = self.cfg.cam_h_default
+        self._cam_h_at = 0            # 上次改 cam_h 时的关键帧数（cam_h_min_kf 限流用）
         # 缓存：_rot[k] = (R·p 的 xy, R·p 的 z = 相对关键帧的高度, 点数, 算它用的 R)；
         # 只改平移时高度不变，分类也不变。
         # _base[k] = (ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far)；
         # 近/远看按点到关键帧相机的水平距离分桶（相机在 base 系原点，与平移无关），整格平移照常复用。
         self._rot: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._base: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-                                    float, np.ndarray, np.ndarray]] = {}
+        self._base: dict[int, tuple[Any, ...]] = {}
         self._hist: dict[int, np.ndarray] = {}
         lo, hi = self.cfg.cam_h_band
         self._hist_sum = np.zeros(int(round((hi - lo) / 0.01)), np.int64)
@@ -241,7 +337,24 @@ class KeyframeGridMapper:
         self._acc_o: np.ndarray | None = None
         self._acc_near: np.ndarray | None = None    # 近看（≤ cov_near_m）点数，与 _acc_g 同布局同记账
         self._acc_far: np.ndarray | None = None     # 远看点数；near+far>0 = 已观测格（覆盖原始数据）
+        # 质量分层专用：障碍点按观测距离分带的票、近距地面证据、中距障碍的关键帧票数。
+        # 与 _acc_g/_acc_o 同布局同记账（同样只在 (base, 整格平移) 变了时才动）。
+        self._acc_on: np.ndarray | None = None      # 障碍点，观测距离 < q_near_m
+        self._acc_om: np.ndarray | None = None      # 障碍点，q_near_m ≤ 距离 < q_mid_m
+        self._acc_gn: np.ndarray | None = None      # 地面点，距离 < q_free_m（判回空地要的"这格是地板"证据）
+        self._acc_omk: np.ndarray | None = None     # 有中距障碍票的关键帧数（本关键帧最多 +1）
+        # 高度分带（旁路，见 MapperConfig.hi_bands）：b0 地面以下 / b1 头顶 2~hi_band_m /
+        # b2 hi_band_m~hi_band_top_m / b3 再往上。**不进地面层判定**，只回答"这个高度有没有东西"。
+        self._acc_b0: np.ndarray | None = None
+        self._acc_b1: np.ndarray | None = None
+        self._acc_b2: np.ndarray | None = None
+        self._acc_b3: np.ndarray | None = None
         self._acc_lo = (0, 0)
+        # 最近一次 rasterize 用的栅格↔累加器格偏移 (lx, ly)：栅格列 c ↔ 累加器 x = lx + c，
+        # 栅格行 r ↔ 累加器 y = ly + (h-1-r)（栅格行 0 是最大 y）。离屏分析/工具要靠它把
+        # 累加器里的分带票映射回栅格坐标，别在别处重推一遍 lo_i——推错一次整张分析就静默错位。
+        self._grid_lo: tuple[int, int] | None = None
+        self._last_grid: tuple[int, int] | None = None   # 上次 rasterize 的 (h, w)，供 band_grid 对齐
         self._acc_cam_h: float | None = None
         self._applied: dict[int, tuple[tuple, int, int]] = {}
         # 上次 rasterize 之后新增或换过位姿的关键帧；只有它们要重查缓存（1200 帧时逐帧查一遍要十几 ms）。
@@ -314,20 +427,42 @@ class KeyframeGridMapper:
         return c
 
     def _update_cam_h(self) -> None:
+        """按全带内点云的加权中位更新 ``cam_h``。有滞回 + 限流，见 ``MapperConfig`` 里的说明。"""
         tot = int(self._hist_sum.sum())
         if tot < 200:
             return
-        cw = np.cumsum(self._hist_sum)
-        est = self.cfg.cam_h_band[0] + (int(np.searchsorted(cw, tot / 2.0)) + 0.5) * 0.01
-        if abs(est - self.cam_h) > self.cfg.cam_h_hyst_m:
-            self.cam_h = est
+        # 先平滑再取中位：`_ground_offset` 用的就是同一套 ±2 桶平滑，这里保持一致。
+        # 不平滑的话加权中位会在直方图相邻两桶之间跳，滞回带再窄也压不住。
+        # 分位必须用**平滑后**自己的总量：5 桶卷积把总和放大了约 5 倍，拿原始 tot/2 去搜
+        # 等于在采 10% 分位，中位会一路往下漂（踩过：1.756 → 1.465，还顺带改坏了地面判定）。
+        sm = np.convolve(self._hist_sum.astype(np.float64), np.ones(5), "same")
+        cw = np.cumsum(sm)
+        if cw[-1] <= 0.0:
+            return
+        est = self.cfg.cam_h_band[0] + (int(np.searchsorted(cw, cw[-1] / 2.0)) + 0.5) * 0.01
+        c = self.cfg
+        if abs(est - self.cam_h) <= c.cam_h_hyst_m:
+            return
+        # 限流：cam_h 一变就要把**所有**关键帧重算一遍，代价随关键帧数线性涨。估计算得再稳也
+        # 架不住在阈值附近反复触发，所以按"距上次变更至少过了当前规模的 1/8"来限：
+        # 早期（几帧）几乎立刻就能跟上一个正确值，晚期每次重算之间隔得越来越开。
+        # 这样重建次数是 O(log N)、总代价 O(N)，而不是原来那种线性翻转让单次卡到 1.6 s。
+        if len(self._pts) - self._cam_h_at < max(1, len(self._pts) // 8):
+            return
+        self.cam_h = est
+        self._cam_h_at = len(self._pts)
 
-    def _kf_base(self, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-                                        float, np.ndarray, np.ndarray]:
+    def _kf_base(self, k: int) -> tuple[np.ndarray, ...]:
         """关键帧 k 在"算它那一刻的平移 t0"下的格计数
-        (ix, iy, n_ground, n_obst, t0, cam_h, n_near, n_far)。
+        (ix, iy, n_ground, n_obst, t0, cam_h, n_near, n_far, o_near, o_mid, g_near_mid, o_mid_kf,
+         b_below, b_lo, b_mid, b_hi)。
+
         朝向或 cam_h 变了才重算；只有平移变了就按整格平移复用（见 ``_shift``）。
-        n_near/n_far：近/远看（观测距离 ≤ cov_near_m）的点数，与 n_ground/n_obst 同格同权重。"""
+        n_near/n_far：近/远看（观测距离 ≤ cov_near_m）的点数，与 n_ground/n_obst 同格同权重，纯显示用。
+        o_near/o_mid/g_near_mid/o_mid_kf：质量分层的票——障碍点按观测距离落带、近中距地面证据、
+        以及"有多少个关键帧给这个格投过中距障碍票"（每帧最多 +1，减帧精确回退）。
+        b_*：高度分带的点计数（旁路，见 ``MapperConfig.hi_bands``）。**注意** ``n_ground``/
+        ``n_obst``/``n_near``/``n_far`` 的口径完全没变——分带只是把原本被丢掉的高度捡回来。"""
         c = self.cfg
         cached = self._base.get(k)
         if cached is not None and cached[5] == self.cam_h:
@@ -339,10 +474,19 @@ class KeyframeGridMapper:
                                               c.ground_plane_max_deg, c.ground_plane_band_m))
         g = np.abs(h) <= c.ground_tol_m
         o = (h > c.ground_tol_m) & (h < c.obst_top_m)
-        sel = g | o
+        # 高度分带：把地面层判据之外的高度捡回来（-1 = 不属于任何带）。
+        if c.hi_bands:
+            hb = np.full(len(h), -1, np.int8)
+            hb[h <= -c.ground_tol_m] = 0
+            hb[h >= c.obst_top_m] = 1
+            hb[h >= c.hi_band_m] = 2
+            hb[h >= c.hi_band_top_m] = 3
+        else:
+            hb = np.full(len(h), -2, np.int8)
+        sel = g | o | (hb >= 0)
         if not sel.any():
             z = np.zeros(0, np.int64)
-            out = (z, z, z, z, t, self.cam_h, z, z)
+            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z)
             self._base[k] = out
             return out
         xy = rxy[sel].astype(np.float64) + t
@@ -354,15 +498,40 @@ class KeyframeGridMapper:
         flat = (ix - x0) * bw + (iy - y0)
         size = (int(ix.max()) - x0 + 1) * bw
         w = cnt[sel]
-        ng = np.bincount(flat, w * g[sel], minlength=size)
-        no = np.bincount(flat, w * o[sel], minlength=size)
+        sg, so, shb = g[sel], o[sel], hb[sel]
+        # sel 变长了（多了高带点），但下面每个掩码都只在自己的集合里为真，
+        # 所以 ng/no/nn/nf 的口径与改动前**逐格相同**。
+        ng = np.bincount(flat, w * sg, minlength=size)
+        no = np.bincount(flat, w * so, minlength=size)
         # 覆盖伴生：点到相机（base 系原点）的水平距离分近/远两桶，复用同一 flat 与权重。
+        # 口径仍是**地面层那两类点**（g|o），不带高带点——覆盖度显示层的语义不动。
         r = np.hypot(rxy[sel, 0], rxy[sel, 1])
+        go = sg | so
         near = r <= c.cov_near_m
-        nn = np.bincount(flat, w * near, minlength=size)
-        nf = np.bincount(flat, w * ~near, minlength=size)
-        nz = np.flatnonzero((ng > 0) | (no > 0))
-        out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h, nn[nz], nf[nz])
+        nn = np.bincount(flat, w * (go & near), minlength=size)
+        nf = np.bincount(flat, w * (go & ~near), minlength=size)
+        # 质量分层：同一批点再按 q_near_m/q_mid_m 落带。分带只动竖直方向的判据，xy/flat/权重全复用。
+        if c.q_tiers:
+            bn = r < c.q_near_m
+            bm = ~bn & (r < c.q_mid_m)
+            on = np.bincount(flat, w * (so & bn), minlength=size)
+            om = np.bincount(flat, w * (so & bm), minlength=size)
+            # 判回空地要的地面证据带（q_free_m，默认近带；调成 q_mid_m 就是离线那一版的近+中距）。
+            gn = np.bincount(flat, w * (sg & (r < c.q_free_m)), minlength=size)
+            omk = (om > 0).astype(np.float64)      # 本关键帧对每个格最多投一票，不是点数
+        else:
+            zf = np.zeros(size)
+            on = om = gn = omk = zf
+        if c.hi_bands:
+            bands = tuple(np.bincount(flat, w * (shb == b), minlength=size) for b in range(4))
+        else:
+            zf = np.zeros(size)
+            bands = (zf, zf, zf, zf)
+        nz = np.flatnonzero((ng > 0) | (no > 0)
+                            | (bands[0] > 0) | (bands[1] > 0) | (bands[2] > 0) | (bands[3] > 0))
+        out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h, nn[nz], nf[nz],
+               on[nz], om[nz], gn[nz], omk[nz],
+               bands[0][nz], bands[1][nz], bands[2][nz], bands[3][nz])
         self._base[k] = out
         return out
 
@@ -376,7 +545,9 @@ class KeyframeGridMapper:
         """全局累加器只处理 (base, 整格平移) 变了的关键帧：旧贡献负权、新贡献正权，一次 bincount。
         ``keys``：要重查的关键帧；cam_h 变了会清空重建，此时改查全部。返回实际查过的集合（射线同用）。"""
         if self._acc_cam_h != self.cam_h:
-            self._acc_g = self._acc_o = self._acc_near = self._acc_far = self._ray_hit = self._ray_mis = None
+            for name in _ACC_NAMES:
+                setattr(self, name, None)
+            self._ray_hit = self._ray_mis = None
             self._applied.clear()
             self._ray_applied.clear()
             self._acc_cam_h = self.cam_h
@@ -401,17 +572,13 @@ class KeyframeGridMapper:
             return keys
         ix = np.concatenate([b[0] + sx for b, sx, _sy, _g in work])
         iy = np.concatenate([b[1] + sy for b, _sx, sy, _g in work])
-        wg = np.concatenate([b[2] * sg for b, _sx, _sy, sg in work])
-        wo = np.concatenate([b[3] * sg for b, _sx, _sy, sg in work])
-        wn = np.concatenate([b[6] * sg for b, _sx, _sy, sg in work])
-        wf = np.concatenate([b[7] * sg for b, _sx, _sy, sg in work])
         self._grow_acc(int(ix.min()), int(iy.min()), int(ix.max()), int(iy.max()))
         (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
         flat = (iy - y0) * W + (ix - x0)
-        self._acc_g += np.bincount(flat, wg, minlength=H * W).reshape(H, W)
-        self._acc_o += np.bincount(flat, wo, minlength=H * W).reshape(H, W)
-        self._acc_near += np.bincount(flat, wn, minlength=H * W).reshape(H, W)
-        self._acc_far += np.bincount(flat, wf, minlength=H * W).reshape(H, W)
+        for slot, name in _ACC_SLOTS:
+            acc = getattr(self, name)
+            w = np.concatenate([b[slot] * sg for b, _sx, _sy, sg in work])
+            acc += np.bincount(flat, w, minlength=H * W).reshape(H, W)
         return keys
 
     def _ray_z(self) -> int:
@@ -423,8 +590,9 @@ class KeyframeGridMapper:
         if self._acc_g is None:
             x0, y0 = xmin - m, ymin - m
             shape = (ymax + 1 + m - y0, xmax + 1 + m - x0)
-            self._acc_g, self._acc_o, self._acc_lo = np.zeros(shape), np.zeros(shape), (x0, y0)
-            self._acc_near, self._acc_far = np.zeros(shape), np.zeros(shape)
+            for name in _ACC_NAMES:
+                setattr(self, name, np.zeros(shape))
+            self._acc_lo = (x0, y0)
             if self.cfg.ray_clear:
                 self._ray_hit = np.zeros((self._ray_z(), *shape), np.int32)
                 self._ray_mis = np.zeros((self._ray_z(), *shape), np.int32)
@@ -436,7 +604,7 @@ class KeyframeGridMapper:
         ny0 = ymin - m if ymin < y0 else y0
         nx1 = xmax + 1 + m if xmax >= x0 + W else x0 + W
         ny1 = ymax + 1 + m if ymax >= y0 + H else y0 + H
-        for name in ("_acc_g", "_acc_o", "_acc_near", "_acc_far", "_ray_hit", "_ray_mis"):
+        for name in _ACC_NAMES + ("_ray_hit", "_ray_mis"):
             old = getattr(self, name)
             if old is None:
                 continue
@@ -692,28 +860,86 @@ class KeyframeGridMapper:
         lo = lo_i * c.res_m
         hi = allxy.max(axis=0) + c.pad_m
         w, h = (np.ceil((hi - lo) / c.res_m).astype(int) + 1)
-        n_g = np.zeros((h, w))
-        n_o = np.zeros((h, w))
+        n_g, n_o, o_n, o_m, g_n, o_mk = (np.zeros((h, w)) for _ in range(6))
         if self._acc_g is not None:
             (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
             lx, ly = int(lo_i[0]), int(lo_i[1])
+            self._grid_lo = (lx, ly)
             ox0, oy0 = max(lx, x0), max(ly, y0)
             ox1, oy1 = min(lx + w, x0 + W), min(ly + h, y0 + H)
             if ox1 > ox0 and oy1 > oy0:
-                n_g[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = self._acc_g[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
-                n_o[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx] = self._acc_o[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
+                dv = (slice(oy0 - ly, oy1 - ly), slice(ox0 - lx, ox1 - lx))
+                sv = (slice(oy0 - y0, oy1 - y0), slice(ox0 - x0, ox1 - x0))
+                for dst, src in zip((n_g, n_o, o_n, o_m, g_n, o_mk),
+                                    (self._acc_g, self._acc_o, self._acc_on, self._acc_om,
+                                     self._acc_gn, self._acc_omk)):
+                    dst[dv] = src[sv]
                 if veto is not None:
                     v = veto[oy0 - y0:oy1 - y0, ox0 - x0:ox1 - x0]
                     view = n_o[oy0 - ly:oy1 - ly, ox0 - lx:ox1 - lx]
                     self.ray_cleared_cells = int((v & (view > c.min_pts - 0.5)).sum())
                     view[v] = 0.0
         # 权重 = 原始点数，min_pts 语义不变；累加器是整数加减，用 ±0.5 比较免得 1e-12 级残差翻转。
+        # 扁平口径（历史规则）：只数格内总票数，看不见"这些票是几米外打的"。
         occ = ((n_o > c.min_pts - 0.5) & (n_o >= c.occ_ground_ratio * n_g)).astype(np.uint8)
-        occ &= (cv2.filter2D(occ, -1, np.ones((3, 3), np.float32)) >= 3).astype(np.uint8)
+        # BORDER_CONSTANT：默认的 reflect 会把图外沿的障碍格镜像回填，边缘一圈白送 3×3 支撑。
+        occ = ((cv2.filter2D(occ, -1, np.ones((3, 3), np.float32), borderType=cv2.BORDER_CONSTANT) >= 3)
+               .astype(np.uint8))
+        occ, restored, rejected = self._by_quality(occ, n_g, n_o, o_n, o_m, g_n, o_mk)
         g = np.full((h, w), UNK, np.uint8)
         g[(n_g > 0.5) & (occ == 0)] = FREE
+        g[restored] = FREE       # 远场票被否证、而近距在同一格见过地面 ⇒ 判回空地
         g[occ == 1] = OCC
+        # 上面那行"有地面观测且非障碍 ⇒ free"会把**所有**被降级的格顺手填成 free，包括那些
+        # 根本没有近距地面证据的。必须显式压回 unknown：没有可信证据说它是地板，就不许当 free
+        # （nav_grid 的红线"unknown 永不当 free"）。少了这一行，降级就等于清障，白做。
+        g[rejected & ~restored] = UNK
+        self._last_grid = (h, w)
         return NavGrid(g[::-1].copy(), GridMeta(c.res_m, (float(lo[0]), float(lo[1])), c.world_scale))
+
+    def _by_quality(self, base_occ: np.ndarray, n_g: np.ndarray, n_o: np.ndarray,
+                    o_n: np.ndarray, o_m: np.ndarray, g_n: np.ndarray, o_mk: np.ndarray
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """把"扁平计数判为障碍"的格按**观测距离**复核一遍。返回 (障碍, 降级回空地, 降级但无近距证据)。
+
+        为什么必须分层：视差深度误差 δz = z²/(fx·b)·δd，面板口径 fx 202.5 / 基线 0.126 下
+        1 像素 ≈ z²/25.5 m（1.5 m→9 cm、3 m→35 cm、5 m→98 cm），而障碍高度带 (0.3, 2.0) 有
+        1.7 m 宽。所以 1.5 m 以外"真地面被抖进障碍带"是必然的：min_pts、3×3 多数、
+        occ_ground_ratio 都只压密度，补不回那一层根本不存在的信息。这就是"走过的空地中间
+        冒出孤岛障碍"的物理来源（Docs/RTAB-Map双目评估（2026-09-26）.md:128 同一个结论）。
+
+        规则（口径取自 Docs/离线多视角融合v1-假障碍清除（2026-10-02）.md，该录制障碍占比
+        31.4%→13.3%；与 ``ray_clear`` 机理正交，可叠加）：
+          * 近带 <q_near_m：误差还在带边沿内，单帧即定案；**故意不带**地面压制条件，
+            否则 occ_ground_ratio 会把真细障碍（桌腿、栏杆）一起误杀；
+          * 中带 q_near~q_mid：默认须 ≥q_mid_kf 个关键帧一致 + 地面压制，压住量化倾斜与单帧鬼影；
+            但"只被一个关键帧看到"也是常态（刚走近就看见了），所以留了一条**单帧例外**：
+            票够多（≥q_solo_pts）且远带票占比 ≤q_far_tol 时单帧即定案——近/中距的票本来就可信，
+            远带票才是噪声来源，票里没有远带成分就没必要等第二个关键帧；
+          * 远带 >q_mid：没有定案权。纯远场票的格降级——**近距**在同一格见过地面 ⇒ FREE，
+            否则 ⇒ UNK（诚实降级，不伪造 free：见 nav_grid 的"unknown 永不当 free"）。
+
+        与离线那一版的一处收紧：降级判回 FREE 只认**近距**地面证据，不用中距。中距地面自己
+        就是被抖出来的，拿它当"这格是地板"的证据，等于用噪声治噪声——实测会把只被一个关键帧
+        看到的中距真墙判成 free（可走 ⇒ 规划直接穿墙）。近距地面才够格推翻一张障碍票。
+        """
+        if not self.cfg.q_tiers:
+            z = np.zeros(base_occ.shape, bool)
+            return base_occ, z, z
+        c = self.cfg
+        hi = c.min_pts - 0.5
+        near = o_n > hi
+        mid = (o_m > hi) & (o_mk >= c.q_mid_kf - 0.5) & (n_o >= c.occ_ground_ratio * n_g)
+        # 单帧例外：票密集且不含远带成分 ⇒ 近/中距证据本身就够定案，不等第二个关键帧。
+        far = np.maximum(n_o - o_n - o_m, 0.0)
+        solo = (o_m > hi) & (n_o >= c.q_solo_pts) & (far <= c.q_far_tol * np.maximum(n_o, 1.0))
+        # base_occ > 0 而不是 base_occ：base_occ 是 uint8，& 出来的还是 uint8，而
+        # (a) numpy 把 uint8 数组当**整数下标**不是布尔掩码——g[那个数组] 会去写第 0 行、第 1 行，
+        #     一格都改不到还不报错；(b) uint8 上做 ~ 是按位取反（0→254），不是逻辑非。
+        # 三个返回值一律真 bool，调用方拿它当掩码用才对。
+        occ = (base_occ > 0) & (near | mid | solo)
+        rejected = (base_occ > 0) & ~occ
+        return occ, rejected & (g_n > 0.5), rejected
 
     def coverage_counts(self) -> dict[str, Any] | None:
         """覆盖伴生网格的只读快照（**仅建图线程可调**，HTTP 侧消费下游快照）。
@@ -726,6 +952,53 @@ class KeyframeGridMapper:
         return {"near": self._acc_near, "far": self._acc_far,
                 "lo": self._acc_lo, "res_m": float(self.cfg.res_m),
                 "cov_near_m": float(self.cfg.cov_near_m)}
+
+    def band_counts(self) -> dict[str, Any] | None:
+        """高度分带占用的只读快照（**仅建图线程可调**；旁路产物，不喂导航）。
+
+        每个格子带四个**点计数**（不是三态）：``below``（地面以下）、``lo``（头顶 obst_top_m
+        ~hi_band_m）、``mid``、``hi``。计数 >0 只说明"那个高度看到过东西"，**不等于障碍**——
+        楼板、天花板、横梁、栏杆、桥面全都会落进去。要区分得再做带内高度聚类（尚未做），
+        所以这里只交原始计数，不替上层下结论。
+
+        布局与 ``_acc_g`` 相同：原点 ``lo``（累加器格下标）、分辨率 ``res_m``（追踪米）。
+        带边界是 h 的上界（h = 离地高）：below=−ground_tol、lo=obst_top_m、mid=hi_band_m、
+        hi=hi_band_top_m，末带无上界。数组是引用不拷贝。
+        """
+        if not self.cfg.hi_bands or self._acc_g is None or self._acc_b1 is None:
+            return None
+        c = self.cfg
+        return {"below": self._acc_b0, "lo": self._acc_b1, "mid": self._acc_b2, "hi": self._acc_b3,
+                "lo_xy": self._acc_lo, "res_m": float(c.res_m),
+                "edges_m": [float(-c.ground_tol_m), float(c.obst_top_m),
+                            float(c.hi_band_m), float(c.hi_band_top_m)]}
+
+    def band_grid(self) -> np.ndarray | None:
+        """把分带计数按 NavGrid 布局裁好（行 0 = 最大 y，与 ``NavGrid.grid`` 同序）。
+
+        ``NavGrid`` 是翻转过的（``rasterize`` 末尾 ``g[::-1]``），累加器是翻转前的，
+        这里按 ``_grid_lo`` 换算并同时翻行——漏掉这一步不会报错，只会让带数据上下镜像。
+        返回 (4, h, w)；调用方需自己按 ``res_m`` 乘回世界米。
+        """
+        if not self.cfg.hi_bands or self._grid_lo is None or self._acc_b1 is None:
+            return None
+        if self._last_grid is None:
+            return None
+        h, w = self._last_grid
+        (ax, ay) = self._acc_lo
+        lx, ly = self._grid_lo
+        # rasterize 的切片式：n_g[R] = acc[R + (ly - ay)]，再 g[::-1] ⇒ NavGrid 行 h-1-R。
+        dh, dw = ly - ay, lx - ax
+        out = np.zeros((4, h, w))
+        for b, acc in enumerate((self._acc_b0, self._acc_b1, self._acc_b2, self._acc_b3)):
+            # R ∈ [0, h) ⇒ acc 行 A = R + dh ∈ [max(0,dh), h+dh)
+            s_lo, s_hi = max(0, dh), min(acc.shape[0], h + dh)
+            c_lo, c_hi = max(0, dw), min(acc.shape[1], w + dw)
+            if s_hi > s_lo and c_hi > c_lo:
+                sub = acc[s_lo:s_hi, c_lo:c_hi]
+                r0 = h - s_hi + dh          # 翻转后 sub[0] 落到 NavGrid 行 h-1-(s_hi-1-dh)
+                out[b, r0:r0 + sub.shape[0], c_lo - dw:c_lo - dw + sub.shape[1]] = sub[::-1]
+        return out
 
 
 @dataclass

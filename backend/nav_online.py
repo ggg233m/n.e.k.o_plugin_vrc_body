@@ -1091,6 +1091,9 @@ class OnlineNavigator:
         return {
             "running": self.running,
             "mode": mode,
+            # 高度分带（旁路产物，不进导航）：obst_top_m 之上的几何量。044153 实测 28.7% 的
+            # 双目点落在那儿，此前被整段丢弃——多层建筑/天桥/天花板对地面层是不可见的。
+            "height_bands": self._band_summary(),
             # 回环只修平移（朝向来自 HMD），修正发生在关键帧上；关掉时地图与位姿共用一条漂移链。
             "pose_source": "dead_reckoning" if self.loops is None else "dead_reckoning+loop_closure",
             "loop_closure": loop,
@@ -1269,6 +1272,23 @@ class OnlineNavigator:
         x = xy_world[0] / meta.world_scale - meta.origin_xy_m[0]
         y = xy_world[1] / meta.world_scale - meta.origin_xy_m[1]
         return rows - 1 - int(math.floor(y / coarse_m)), int(math.floor(x / coarse_m))
+
+    def _band_summary(self) -> dict[str, Any] | None:
+        """高度分带的**摘要**（给 status 看；原始 (4,h,w) 数组走 ``mapper.band_grid()``）。
+
+        只报"每条带有多少个格见过东西、总共多少点"——不替上层下"这是障碍还是楼板"的结论，
+        那个要带内高度聚类，目前还没做。cells 是格子数、points 是原始点计数。
+        """
+        bc = self.mapper.band_counts()
+        if bc is None:
+            return None
+        edges = bc["edges_m"]
+        out: dict[str, Any] = {"edges_m": edges, "res_m": bc["res_m"], "bands": {}}
+        for name in ("below", "lo", "mid", "hi"):
+            a = bc[name]
+            out["bands"][name] = {"cells": int((a > 0.5).sum()), "points": int(a.sum())}
+        out["obst_top_m"] = float(self.mapper.cfg.obst_top_m)
+        return out
 
     def coverage_view(self) -> dict[str, Any] | None:
         """覆盖快照（HTTP 线程只读 mapping 线程产出的整 dict 引用）；PNG 按快照代数惰性编码缓存。"""

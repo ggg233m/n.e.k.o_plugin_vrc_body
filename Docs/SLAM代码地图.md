@@ -6,7 +6,7 @@
 > `relocalization_observer.py` —— 源码已删，仅剩孤儿 `.pyc`，因此原版多处已失效）。
 > 原版全文见 git `688e420` 之前的历史。
 >
-> **权威口径与 20 组冲突登记见 [`Docs/README.md`](README.md)。** 本文只描述**现状**。
+> **权威口径与 21 组冲突登记见 [`Docs/README.md`](README.md)。** 本文只描述**现状**。
 > ⚠️ 2026-10-04 复核：§三「活跃链」表**漏了** 2026-10 起上线的 `nav_xsession.py`（跨会话 P0 主体，默认开）、
 > `nav_bow.py`、`nav_memory.py`，已补入 `Docs/README.md` §二 权威矩阵。
 
