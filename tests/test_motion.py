@@ -10,10 +10,21 @@ from neko_anyadance_body.motion import (
     GESTURE_NAMES,
     apply_hand_pose,
     arm_pose_target,
+    axis_angle,
     gesture_frame,
     move_hand_target,
+    quat_multiply,
     reach_target,
 )
+
+
+def apply_quat(quat: tuple[float, float, float, float],
+               vec: tuple[float, float, float]) -> tuple[float, float, float]:
+    """把四元数作用到向量上（q ⊗ v ⊗ q⁻¹）。用来做不依赖实现公式的物理判据。"""
+    x, y, z, w = quat
+    inverse = (-x, -y, -z, w)
+    rotated = quat_multiply(quat_multiply(quat, (vec[0], vec[1], vec[2], 0.0)), inverse)
+    return (rotated[0], rotated[1], rotated[2])
 
 
 class MotionGeometryTests(unittest.TestCase):
@@ -174,6 +185,35 @@ class MotionGeometryTests(unittest.TestCase):
             forward.devices["right_controller"].rotation,
             outward.devices["right_controller"].rotation,
         )
+
+    def test_head_gestures_rotate_about_the_head_local_axis(self) -> None:
+        """头部手势必须绕**头自身**的轴转，不是绕世界轴——否则角色一转身，点头就变侧倾。
+
+        判据用物理不变量：绕哪个轴转，那个轴在世界系的方向就不变。两个细节很关键：
+
+        * base 必须给非零朝向。IDENTITY_QUAT 下前乘与后乘等价，改不改都看不出来
+          （现有用例的 base 全是 identity，所以这条是唯一能验它的）；
+        * progress 必须落在手势幅度非零处。nod 的包络是 sin(2πp)²，在 p=0.5 处
+          恰好为 0；shake_head 的 sin(4πp) 在 p=0.25/0.5 也都是 0——取到零点这条
+          会变成恒真。
+        """
+        for name, axis, progress, base_axis, base_deg in (
+            ("nod", (1.0, 0.0, 0.0), 0.25, (0.0, 1.0, 0.0), 90.0),
+            ("bow", (1.0, 0.0, 0.0), 0.50, (0.0, 1.0, 0.0), 90.0),
+            ("sigh", (1.0, 0.0, 0.0), 0.50, (0.0, 1.0, 0.0), 90.0),
+            # 摇头绕 Y：base 只有 yaw 时头的本地 Y 恰好等于世界 Y，前乘后乘同解，
+            # 判据天然区分不了。改用俯仰 base 让它成为有效用例。
+            ("shake_head", (0.0, 1.0, 0.0), 0.375, (1.0, 0.0, 0.0), 30.0),
+        ):
+            base = neutral_frame()
+            base.devices["hmd"].rotation = axis_angle(base_axis, base_deg)
+            before = apply_quat(base.devices["hmd"].rotation, axis)
+            moved = gesture_frame(base, name=name, side="right", intensity=1.0,
+                                  progress=progress, profile=self.profile)
+            after = apply_quat(moved.devices["hmd"].rotation, axis)
+            for actual, expected in zip(after, before):
+                self.assertAlmostEqual(actual, expected, places=6,
+                                       msg=f"{name} 把旋转施加在了世界系而不是头本地系")
 
     def test_gestures_restore_start_frame(self) -> None:
         for name in GESTURE_NAMES:

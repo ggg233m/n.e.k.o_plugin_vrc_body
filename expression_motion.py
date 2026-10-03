@@ -61,24 +61,26 @@ def _phase_frames(reference: FrameState, gesture: str, side: str, energy: float,
     stroke = reference.clone()
     selected = ("left", "right") if side == "both" else (side,)
 
+    # 头部/躯干一律**后乘**：quat_multiply(a, b) = a⊗b 里 b 的轴是在 a 的局部系解释的，
+    # 前乘则是世界系——角色有 yaw 时点头会变成侧倾。见 motion.quat_multiply 的约定。
     if gesture == "nod":
-        anticipation.devices["hmd"].rotation = quat_multiply(axis_angle((1.0, 0.0, 0.0), -4.0 * energy), reference.devices["hmd"].rotation)
-        stroke.devices["hmd"].rotation = quat_multiply(axis_angle((1.0, 0.0, 0.0), 22.0 * energy), reference.devices["hmd"].rotation)
+        anticipation.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((1.0, 0.0, 0.0), -4.0 * energy))
+        stroke.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((1.0, 0.0, 0.0), 22.0 * energy))
         return anticipation, stroke
     if gesture == "deny":
-        anticipation.devices["hmd"].rotation = quat_multiply(axis_angle((0.0, 1.0, 0.0), -8.0 * energy), reference.devices["hmd"].rotation)
-        stroke.devices["hmd"].rotation = quat_multiply(axis_angle((0.0, 1.0, 0.0), 20.0 * energy), reference.devices["hmd"].rotation)
+        anticipation.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((0.0, 1.0, 0.0), -8.0 * energy))
+        stroke.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((0.0, 1.0, 0.0), 20.0 * energy))
         return anticipation, stroke
     if gesture == "tilt":
-        anticipation.devices["hmd"].rotation = quat_multiply(axis_angle((0.0, 0.0, 1.0), -2.0 * energy), reference.devices["hmd"].rotation)
-        stroke.devices["hmd"].rotation = quat_multiply(axis_angle((0.0, 0.0, 1.0), 15.0 * energy), reference.devices["hmd"].rotation)
+        anticipation.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((0.0, 0.0, 1.0), -2.0 * energy))
+        stroke.devices["hmd"].rotation = quat_multiply(reference.devices["hmd"].rotation, axis_angle((0.0, 0.0, 1.0), 15.0 * energy))
         return anticipation, stroke
     if gesture in {"sigh", "laugh"}:
         anticipation = reference.clone()
         stroke = reference.clone()
         pitch = 16.0 * energy if gesture == "sigh" else 10.0 * energy
         stroke.devices["hmd"].rotation = quat_multiply(
-            axis_angle((1.0, 0.0, 0.0), pitch), reference.devices["hmd"].rotation
+            reference.devices["hmd"].rotation, axis_angle((1.0, 0.0, 0.0), pitch)
         )
         if gesture == "sigh":
             hmd = stroke.devices["hmd"]
@@ -198,7 +200,7 @@ def _phase_frames(reference: FrameState, gesture: str, side: str, energy: float,
         hmd = stroke.devices["hmd"]
         hmd.position = (hmd.position[0], hmd.position[1] - 0.08 * energy, hmd.position[2] - 0.03 * energy)
         hmd.rotation = quat_multiply(
-            axis_angle((1.0, 0.0, 0.0), 22.0 * energy), hmd.rotation
+            hmd.rotation, axis_angle((1.0, 0.0, 0.0), 22.0 * energy)
         )
     return anticipation, stroke
 
@@ -219,7 +221,7 @@ def sample_expression(overlay: ExpressionOverlay, now: float, profile: BodyProfi
                 device.position = (device.position[0] + swing, device.position[1], device.position[2])
         elif overlay.gesture == "deny":
             yaw = math.sin((p - 0.48) / 0.22 * math.pi * 2.0) * 14.0 * overlay.energy
-            sampled.devices["hmd"].rotation = quat_multiply(axis_angle((0.0, 1.0, 0.0), yaw), stroke.devices["hmd"].rotation)
+            sampled.devices["hmd"].rotation = quat_multiply(stroke.devices["hmd"].rotation, axis_angle((0.0, 1.0, 0.0), yaw))
         elif overlay.gesture == "beckon":
             for current_side in (("left", "right") if overlay.side == "both" else (overlay.side,)):
                 bend = (0.25 + 0.55 * (math.sin((p - 0.48) / 0.22 * math.pi * 2.0) ** 2)) * overlay.energy
@@ -236,7 +238,7 @@ def sample_expression(overlay: ExpressionOverlay, now: float, profile: BodyProfi
         elif overlay.gesture == "laugh":
             pitch = math.sin((p - 0.48) / 0.22 * math.pi * 3.0) * 7.0 * overlay.energy
             sampled.devices["hmd"].rotation = quat_multiply(
-                axis_angle((1.0, 0.0, 0.0), pitch), stroke.devices["hmd"].rotation
+                stroke.devices["hmd"].rotation, axis_angle((1.0, 0.0, 0.0), pitch)
             )
     else:
         sampled = interpolate_frame(stroke, overlay.reference, (p - 0.70) / 0.30)
@@ -261,9 +263,14 @@ def apply_expression_overlay(base: FrameState, reference: FrameState, sampled: F
         target = result.devices[name]
         delta_position = tuple(gesture.position[index] - source.position[index] for index in range(3))
         target.position = tuple(target.position[index] + delta_position[index] * weight for index in range(3))
-        delta_rotation = quat_multiply(gesture.rotation, _quat_inverse(source.rotation))
+        # 手势帧现在是「参考姿态 ⊗ 本地增量」（见 _phase_frames / sample_expression），
+        # 所以 delta 必须**左除**才能取出那个本地增量 D = R⁻¹ ⊗ gesture，再**右乘**到
+        # 当前基帧上：target = B ⊗ D。旧写法 gesture ⊗ R⁻¹ + 左乘只对「世界系增量」
+        # 成立。这两行必须与 _phase_frames 的乘法顺序成对地改——只改一半，叠加结果
+        # 仍然按世界系解释，而且 base 为 IDENTITY 时看不出区别。
+        delta_rotation = quat_multiply(_quat_inverse(source.rotation), gesture.rotation)
         weighted_delta = quat_slerp(IDENTITY_QUAT, delta_rotation, weight)
-        target.rotation = quat_multiply(weighted_delta, target.rotation)
+        target.rotation = quat_multiply(target.rotation, weighted_delta)
         if name in CONTROLLER_IDS:
             # Expression overlays may shape fingers but never synthesize controller clicks.
             source_controller = reference.controllers[name]

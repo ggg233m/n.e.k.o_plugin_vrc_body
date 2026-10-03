@@ -54,6 +54,12 @@ def vec_lerp(a: Vec3, b: Vec3, t: float) -> Vec3:
 
 
 def quat_multiply(a: Quat, b: Quat) -> Quat:
+    """返回 a ⊗ b：先施加 b（在 b 自己的局部系），再在父/世界系施加 a。
+
+    于是"绕某个设备**自身**轴 x 转角 θ"必须写成 ``quat_multiply(姿态, axis_angle(x, θ))``；
+    写成 ``quat_multiply(axis_angle(x, θ), 姿态)`` 的话，x 是在**世界系**解释的——
+    角色一旦有 yaw，点头就会变成侧倾。头部/躯干手势一律用前者。
+    """
     ax, ay, az, aw = a
     bx, by, bz, bw = b
     return normalized_quat((
@@ -400,15 +406,17 @@ def gesture_frame(
     if name == "nod":
         result = start.clone()
         pitch = 24.0 * intensity * (math.sin(p * math.pi * 2.0) ** 2)
-        result.devices["hmd"].rotation = quat_multiply(axis_angle((1.0, 0.0, 0.0), pitch), start.devices["hmd"].rotation)
+        result.devices["hmd"].rotation = quat_multiply(start.devices["hmd"].rotation,
+                                                       axis_angle((1.0, 0.0, 0.0), pitch))
         return result
 
     if name == "bow":
         target = start.clone()
         hmd = target.devices["hmd"]
         hmd.position = (hmd.position[0], hmd.position[1] - 0.16 * intensity, hmd.position[2] - 0.10 * intensity)
-        hmd.rotation = quat_multiply(axis_angle((1.0, 0.0, 0.0), 35.0 * intensity), hmd.rotation)
-        target.devices["hip"].rotation = quat_multiply(axis_angle((1.0, 0.0, 0.0), 22.0 * intensity), target.devices["hip"].rotation)
+        hmd.rotation = quat_multiply(hmd.rotation, axis_angle((1.0, 0.0, 0.0), 35.0 * intensity))
+        target.devices["hip"].rotation = quat_multiply(target.devices["hip"].rotation,
+                                                       axis_angle((1.0, 0.0, 0.0), 22.0 * intensity))
         if p < 0.35:
             return interpolate_frame(start, target, p / 0.35)
         if p > 0.65:
@@ -419,8 +427,8 @@ def gesture_frame(
         envelope = math.sin(p * math.pi)
         yaw = math.sin(p * math.pi * 4.0) * 20.0 * intensity * envelope
         result.devices["hmd"].rotation = quat_multiply(
-            axis_angle((0.0, 1.0, 0.0), yaw),
             start.devices["hmd"].rotation,
+            axis_angle((0.0, 1.0, 0.0), yaw),
         )
         return result
     if name == "shrug":
@@ -509,8 +517,8 @@ def gesture_frame(
         hmd = target.devices["hmd"]
         hmd.position = (hmd.position[0], hmd.position[1] - 0.06 * intensity, hmd.position[2])
         hmd.rotation = quat_multiply(
-            axis_angle((1.0, 0.0, 0.0), 18.0 * intensity),
             hmd.rotation,
+            axis_angle((1.0, 0.0, 0.0), 18.0 * intensity),
         )
         return held(target, attack=0.32, release=0.7)
     raise ValueError(f"unknown gesture: {name}")
