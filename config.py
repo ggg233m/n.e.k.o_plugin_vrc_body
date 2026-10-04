@@ -274,6 +274,13 @@ NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
     "hi_band_m": (float, 0.5, 20.0),
     "hi_band_top_m": (float, 0.6, 40.0),
     "ray_clear": (bool, 0, 1),
+    # 近距票豁免看穿清零（默认关，**实测净亏**，2026-10-04 两段录制）。打开前必须用
+    # tools/ray_exempt_conn.py 量连通性——tools/ray_exempt_ab.py 的"交换比"数的是格数，
+    # 与真实代价反向（赔率最好看的那段断裂最多），不能拿它定案。
+    "ray_near_exempt": (bool, 0, 1),
+    "ray_plane_pts": (int, 1, 1000000),
+    "ray_plane_near": (float, 0.0, 1.0),
+    "ray_plane_tol": (float, 0.01, 5.0),
     "ray_beta": (float, 0.1, 20.0),
     "ray_step_m": (float, 0.02, 1.0),
 }

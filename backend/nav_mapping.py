@@ -100,6 +100,29 @@ class MapperConfig:
     # 票压根没走到这一层，降门槛降的是空气。
     # 保留这个开关是因为它让"近带不带地面压制"这句文档从死代码变成真代码（单测覆盖），
     # 而且**一旦上游 veto 修好，它就是现成的近距通道**。在那之前保持 0。
+    # ─────────────────────────────────────────────────────────────────────────
+    # ⚠️ 想改"真结构被误清掉"？**不要在这里调票数**。往这边看：
+    #
+    #   1. 症状一般在**上游**，不在这一层。``ray_clear`` 的看穿清零在 ``_by_quality``
+    #      之前就把 n_o 削了（tools/low_ceiling_nav.py 在 044153 上量到 1368/1405 个
+    #      有票的格 n_o 被置 0）。票没走到这一层，这里怎么调都是调空气。
+    #   2. 先量，再改。跑 ``python -m tools.nav_audit <录制>``——它给两把尺子：
+    #        尺子 1  走过∩OCC 率        抓**路径上**的虚假障碍
+    #        尺子 2  近距平面证据的漏放  抓**路径外**的真结构被清掉
+    #      **只报尺子 1 会把人往反方向推**：放宽阈值总能降低尺子 1，而尺子 1 对
+    #      "真结构被清掉"权重为零。044153 上单看尺子 1 会得出"别动 ray_clear"的结论，
+    #      实际情况是它一次清掉 14210 格、其中有 200 来格是坐在沙发后面的真矮墙。
+    #   3. 🎯 **票数门和几何门都试过，都净亏**（见 ``ray_near_exempt`` 处的实测表）。
+    #      真要继续，判据不是"回收几格 / 封死几格"的比值，而是
+    #      ``tools/ray_exempt_conn.py`` 的连通性——比值数的是格数，代价取决于位置。
+    #
+    # 本开关保留只为让"近带不带地面压制"这句文档从死代码变成真代码（单测覆盖），
+    # 实测净亏，**保持 0**：
+    #        q_near_pts  OCC    尺子1        尺子2 漏放
+    #             0     4057    1.35%           202      ← 基线
+    #             2     4320    1.51%           201      回收 1 格
+    #             1     4414    1.84%           201      回收 1 格
+    # ─────────────────────────────────────────────────────────────────────────
     q_near_pts: int = 0
     # 单帧例外：一堵墙如果只被一个关键帧看到（刚走近就看见了），单帧多帧确认会把它误杀成 unknown。
     # 放宽的条件是"这张票干净"：格内障碍点够多（≥q_solo_pts）**且**远带票占比 ≤q_far_tol。
@@ -125,6 +148,33 @@ class MapperConfig:
     ray_step_m: float = 0.10        # 视线水平采样步长 = 一格；0.05 时 5 m 视距每帧多花 ~25 ms，结果几乎不变
     ray_stop_m: float = 0.20        # 离端点这么近就不算看穿（端点本身的深度噪声）
     ray_walk_w: float = 3.0
+    # 近距票豁免看穿清零，**默认关，实测净亏**（几何门版，2026-10-04，044153 + 045615）。
+    #
+    # 🎯 **判据是 tools/ray_exempt_conn.py 的连通性，不是 tools/ray_exempt_ab.py 的交换比。**
+    #   ab 报的是"回收的真结构格 / 新封死的路径格"，两段录制都 >1，看着像划算：
+    #         044153   135/29 = 4.7:1        045615   47/33 = 1.4:1
+    #   但连通性量下来两段都是亏的：
+    #         044153   可达域 −1104 格、隔离出 1 块区域、4 对走过的路变得走不通、绕行 +13%
+    #         045615   可达域 −954 格、隔离出 2 块区域、0 对断裂、绕行 +3%
+    #   交换比与真实代价**反向**：赔率最好看的那段（4.7:1）损伤反而最重。因为代价不取决于
+    #   格数，取决于那几格**卡在什么位置**——窄处一格就能掐断一条道，29 格可以是 3 条通路。
+    #   ⚠️ 别拿 ab 的比值当定案依据，它只是"这一刀动了哪些格"的规模感。
+    #
+    # 门是"这里有没有一张连贯的近距水平面"（``_near_plane``），**不是**票数：按票数试过一次，
+    # 045615 上回收 123 个真结构却封死 1155 个路径格，赔率 9:1。
+    ray_near_exempt: bool = False
+    # _near_plane 的门。三个变体在 044153 + 045615 上量过（tools/ray_exempt_ab.py，
+    # 括号里是**票面**比值"回收的真结构格 / 新封死的路径格"——它不是判据，见上一条注释）：
+    #   每格平均高度 + 邻居≥6   135/29 (4.7:1)   47/33  (1.4:1)   ← 三个里最不差，代码里留它
+    #   众数层     + 邻居≥6      59/10 (5.9:1)   30/127 (0.2:1)   亏
+    #   众数层     + 边缘感知      70/16 (4.4:1)   44/145 (0.3:1)   亏
+    # ⚠️ "留它"≠"该打开"：三个变体**没有一个**在 tools/ray_exempt_conn.py 的连通性上翻正，
+    #    开关保持 False。留着是因为它是几何门这个方向的现成实现（单测覆盖）。
+    # 后两个都是"看见错杀就去修"，结果更差——flat 与 inside 是一对互相支撑的误杀集合。
+    # **别再盲调这两个门**，细节见 ``_near_plane_parts`` 的注释。要继续先得第三段录制。
+    ray_plane_pts: int = 20        # 原始点票数（噪声地板：1.5 m 外真地面散进障碍带是必然的）
+    ray_plane_near: float = 0.5     # 近距票占障碍票的比例（1.5 m 处 δz 9 cm，地面抖不出 1 m）
+    ray_plane_tol: float = 0.15     # 3×3 邻域每格平均高度极差（随机置换对照 16×/30× 信噪比）
     # 覆盖伴生网格（纯显示，不进三态判定）：观测点离该关键帧相机水平距离 ≤ cov_near_m 算"近看"。
     # 近看计数=0 的已观测格 = 只远看过的信息洞（走过去补扫）；近看点数再分稀疏/高质量（显示层阈值）。
     # 语义与上面 q_near_m/q_mid_m 无关（这里问"信息洞"，那里问"证据够不够定案"），改一个不会串到另一个。
@@ -322,6 +372,7 @@ _ACC_SLOTS: tuple[tuple[int, str], ...] = (
     (8, "_acc_on"), (9, "_acc_om"), (10, "_acc_gn"), (11, "_acc_omk"),
     (12, "_acc_b0"), (13, "_acc_b1"), (14, "_acc_b2"), (15, "_acc_b3"),
     (16, "_acc_sb_n"), (17, "_acc_sb_h"), (18, "_acc_sb_h2"),
+    (19, "_acc_ob_h"), (20, "_acc_ob_h2"),
 )
 _ACC_NAMES: tuple[str, ...] = tuple(name for _slot, name in _ACC_SLOTS)
 
@@ -369,6 +420,11 @@ class KeyframeGridMapper:
         self._acc_sb_n: np.ndarray | None = None
         self._acc_sb_h: np.ndarray | None = None
         self._acc_sb_h2: np.ndarray | None = None
+        # 障碍带（ground_tol, obst_top）内每格的 Σw·h / Σw·h²。给"这里有没有一张连贯的
+        # 水平面"用（见 ``_near_plane`` 与 ``ray_near_exempt``）。**不是** n_o 的副本：n_o 会被
+        # 看穿清零削掉，而这里要的恰恰是那些被清零之后**本该留住**的格。
+        self._acc_ob_h: np.ndarray | None = None
+        self._acc_ob_h2: np.ndarray | None = None
         self._acc_lo = (0, 0)
         # 最近一次 rasterize 用的栅格↔累加器格偏移 (lx, ly)：栅格列 c ↔ 累加器 x = lx + c，
         # 栅格行 r ↔ 累加器 y = ly + (h-1-r)（栅格行 0 是最大 y）。离屏分析/工具要靠它把
@@ -520,7 +576,7 @@ class KeyframeGridMapper:
         sel = g | o | (hb >= 0)
         if not sel.any():
             z = np.zeros(0, np.int64)
-            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z, z, z, z)
+            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z)
             self._base[k] = out
             return out
         xy = rxy[sel].astype(np.float64) + t
@@ -533,6 +589,7 @@ class KeyframeGridMapper:
         size = (int(ix.max()) - x0 + 1) * bw
         w = cnt[sel]
         sg, so, shb = g[sel], o[sel], hb[sel]
+        hh = h[sel].astype(np.float64)
         # sel 变长了（多了高带点），但下面每个掩码都只在自己的集合里为真，
         # 所以 ng/no/nn/nf 的口径与改动前**逐格相同**。
         ng = np.bincount(flat, w * sg, minlength=size)
@@ -560,7 +617,6 @@ class KeyframeGridMapper:
             bands = tuple(np.bincount(flat, w * (shb == b), minlength=size) for b in range(4))
             # 头顶之上的面：三个可加矩。shb>=1 恰好就是 h>obst_top_m（band 1 的下界），与带边界无关。
             shb_hi = shb >= 1
-            hh = h[sel].astype(np.float64)
             sbn = np.bincount(flat, w * shb_hi, minlength=size)
             sbh = np.bincount(flat, w * shb_hi * hh, minlength=size)
             sbh2 = np.bincount(flat, w * shb_hi * hh * hh, minlength=size)
@@ -568,13 +624,18 @@ class KeyframeGridMapper:
             zf = np.zeros(size)
             bands = (zf, zf, zf, zf)
             sbn = sbh = sbh2 = zf
+        # 障碍带内的两个矩。与头顶矩同一批点、同一套 bincount，只是掩码换成 so。
+        # **无条件算**（不进 hi_bands 分支）：看穿豁免要的恰恰是被清零之后仍然存在的那部分证据。
+        obh = np.bincount(flat, w * so * hh, minlength=size)
+        obh2 = np.bincount(flat, w * so * hh * hh, minlength=size)
         nz = np.flatnonzero((ng > 0) | (no > 0)
                             | (bands[0] > 0) | (bands[1] > 0) | (bands[2] > 0) | (bands[3] > 0)
                             | (sbn > 0))
         out = (nz // bw + x0, nz % bw + y0, ng[nz], no[nz], t, self.cam_h, nn[nz], nf[nz],
                on[nz], om[nz], gn[nz], omk[nz],
                bands[0][nz], bands[1][nz], bands[2][nz], bands[3][nz],
-               sbn[nz], sbh[nz], sbh2[nz])
+               sbn[nz], sbh[nz], sbh2[nz],
+               obh[nz], obh2[nz])
         self._base[k] = out
         return out
 
@@ -752,6 +813,78 @@ class KeyframeGridMapper:
             # 一维下标 np.add.at（numpy ≥2 已向量化）：比 np.unique 去重快一个量级，也不用分配整块三维 bincount。
             np.add.at(acc.reshape(-1), idx, sg)
 
+    def _near_plane_parts(self) -> dict[str, np.ndarray]:
+        """``_near_plane`` 的逐项判据（**累加器行序**）。返回各条的掩码，供归因用。"""
+        c = self.cfg
+        if self._acc_o is None or self._acc_ob_h is None:
+            z = np.zeros((0, 0), bool)
+            return {"pts": z, "near": z, "inside": z, "flat": z, "all": z}
+        n_o = self._acc_o
+        pts = n_o >= c.ray_plane_pts
+        near = pts & (self._acc_on >= c.ray_plane_near * np.maximum(n_o, 1e-9))
+        H, W = n_o.shape
+        hi = np.full((H, W), -np.inf, np.float32)
+        lo = np.full((H, W), np.inf, np.float32)
+        cnt = np.zeros((H, W), np.int8)
+        mean = np.where(pts, self._acc_ob_h / np.maximum(n_o, 1e-9), -np.inf)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                ys0, ys1 = max(0, dy), H + min(0, dy)
+                xs0, xs1 = max(0, dx), W + min(0, dx)
+                s = mean[ys0 - dy:ys1 - dy, xs0 - dx:xs1 - dx]
+                v = pts[ys0 - dy:ys1 - dy, xs0 - dx:xs1 - dx]
+                np.fmax(hi[ys0:ys1, xs0:xs1], np.where(v, s, -np.inf), out=hi[ys0:ys1, xs0:xs1])
+                np.fmin(lo[ys0:ys1, xs0:xs1], np.where(v, s, np.inf), out=lo[ys0:ys1, xs0:xs1])
+                cnt[ys0:ys1, xs0:xs1] += v
+        # 三个变体在 044153 + 045615 上量过的结果（tools/ray_exempt_ab.py，
+        # 括号里是**票面**比值"回收的真结构格 / 新封死的路径格"——不是判据）：
+        #
+        #   每格平均高度 + 邻居≥6      135/29 (4.7:1)    47/33  (1.4:1)   ← 三个里最不差
+        #   众数层     + 邻居≥6         59/10 (5.9:1)    30/127 (0.2:1)   亏
+        #   众数层     + 边缘感知邻居     70/16 (4.4:1)    44/145 (0.3:1)   亏
+        #
+        # ⚠️ 三个变体在 tools/ray_exempt_conn.py 的连通性上**全部净亏**，开关保持 False：
+        # 后两个都是在修真问题（均值被立面+顶面混拉散、邻居≥6 误杀 0.4 m 细墙），结果更差：
+        #   * 换成 ``_ray_hit`` 的众数层（``ray_z_m=0.10`` 已经切好层，argmax 零额外成本）
+        #     确实把"卡在平面这一项"的漏放从 60~78% 降到 36~55%，但**同时放进大量幻影**：
+        #     045615 回收几乎没涨（44 vs 47），路径封死从 33 涨到 145。
+        #   * 邻居≥6 改成"只看数组边缘"确实收回部分细墙，但也是往放幻影那一侧走，127→145。
+        # ``flat`` 和 ``inside`` 是一对**互相支撑**的误杀集合：均值版里 ``flat`` 顺手拦掉的
+        # 幻影，正是众数版放进来的那批。只放松一个，另一个就顶上。
+        #
+        # **这两个门在两段录制上调不出一个共同好的版本，别再盲调。** 要继续先得有第三段录制
+        # ——现在是在两点之间过拟合，分不清哪个门真的更好。归因看 tools/plane_gate_why.py。
+        inside = pts & (cnt >= 6)
+        flat = inside & ((hi - lo) <= c.ray_plane_tol)
+        return {"pts": pts, "near": near, "inside": inside, "flat": flat, "all": near & flat}
+
+    def _near_plane(self) -> np.ndarray:
+        """障碍带里"有一张连贯水平面"的格（**累加器行序**，可以直接喂给 ``_ray_veto``）。
+
+        这是 ``ray_near_exempt`` 的门。用票数当门已经实测是净亏（tools/ray_exempt_ab.py：
+        044153 回收 195 但封死 129 个路径格，045615 回收 123 封死 1155）——``_acc_on > min_pts``
+        把"近距看过一次"和"近距看清一张面"混成了一件事。
+
+        ⚠️ **换成这个几何门之后仍然是净亏**，只是亏的方式变了：票面比值变成 4.7:1 / 1.4:1
+        看着划算，但 tools/ray_exempt_conn.py 量连通性——044153 可达域 −1104 格、隔离出 1 块
+        区域、4 对走过的路变得走不通、绕行 +13%；045615 可达域 −954 格、+3%。
+        **格数比值与真实代价反向**（赔率最好看的那段损伤最重），所以别拿 ab 的比值定案。
+
+        判据三项（逐项掩码见 ``_near_plane_parts``）：
+
+          票够    ``n_o >= ray_plane_pts``。1.5 m 外真地面被抖进障碍带是必然的（δz=z²/25.5，
+                  带宽 1.7 m），所以票数先要压过噪声地板。
+          近距    近距票占障碍票 ≥ ``ray_plane_near``。1.5 m 处 δz 只有 9 cm，地面抖不出 1 m，
+                  所以近距离成片出现的面不可能是散点。
+          平面    3×3 邻域**每格平均高度**的极差 ≤ ``ray_plane_tol``。同一张面在邻域里高度
+                  应当基本一致；散点会摊开。随机置换对照里这个判据 16×/30× 信噪比。
+
+        用每格**平均**高度而不是众数：矩可加、增量账（回环挪位/撤帧）能精确回退，众数不行——
+        和 ``surface_counts`` 选矩不选众数是同一个理由。代价是单格内的双峰会拉高均值，
+        所以平面这一项只是必要条件，单靠它不能定案。
+        """
+        return self._near_plane_parts()["all"]
+
     def _ray_veto(self, walked: list[np.ndarray] | None) -> np.ndarray | None:
         """累加器坐标下"障碍被看穿清掉"的格：没有任何一层体素满足 看穿 < ray_beta × 打中。"""
         if not self.cfg.ray_clear or self._ray_hit is None:
@@ -773,6 +906,13 @@ class KeyframeGridMapper:
                 cv2.polylines(line, [p.reshape(-1, 1, 2)], False, 1, 1)
             mis += line.reshape(-1)[cand].astype(np.float32) * np.float32(c.ray_walk_w)
         veto.reshape(-1)[cand] = ~((hit > 0) & (mis < c.ray_beta * hit)).any(axis=0)
+        # 近距票豁免（默认关）。1.5 m 处 δz 只有 9 cm，一次近距打中本身就是可信的，不该让
+        # **远距离**的"看穿"统计把它抹掉。现有判据要求整列**所有** z 层都不通过才清零，而一根
+        # 从相机掠过矮墙顶、往墙后地面俯冲的射线会在墙顶那一层 0.80~0.90 m 处穿过去记一次看穿，
+        # 于是真实矮墙被"自己上方的空间"判成透明。实测（tools/low_ceiling_nav.py，044153）：
+        # 0.85 m 那一层 349 个有打中的格，**349 个全部**被看穿票压过。
+        if c.ray_near_exempt:
+            veto &= ~self._near_plane()
         return veto
 
     def add_trail(self, node_id: int, pose_map_frame: np.ndarray, osc_dist_m: float | None = None) -> None:

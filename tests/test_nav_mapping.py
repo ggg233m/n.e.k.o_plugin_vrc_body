@@ -275,6 +275,80 @@ class RayClearTests(unittest.TestCase):
         self.assertIsNone(m._ray_hit)
         self.assertEqual(value_at(ng, (3.52, -0.8)), OCC)
 
+    def test_ray_near_exempt_off_changes_nothing(self) -> None:
+        # 默认关：veto 掩码必须与改动前逐格相同。跑两遍比栅格不够——把 _ray_veto 的返回值比掉。
+        got: list[np.ndarray] = []
+
+        class Spy(KeyframeGridMapper):
+            def _ray_veto(self, walked):
+                v = super()._ray_veto(walked)
+                got.append(v.copy())
+                return v
+
+        for _ in (0, 1):
+            m = Spy(MapperConfig(res_m=0.10))
+            for i, T in enumerate(self.poses):
+                scene = np.vstack([self.scene, self.ghost]) if i == 0 else self.scene
+                m.add_keyframe(i, observe(scene, T), T)
+            m.rasterize()
+        self.assertEqual(len(got), 2)
+        self.assertTrue(np.array_equal(got[0], got[1]))
+        self.assertGreater(int(got[0].sum()), 0)          # 确实有格被清，不是空掩码糊弄过去
+
+    def _plane_grid(self, mean_h: np.ndarray, on_ratio: float = 0.8):
+        """摆一张累加器网格，让 ``_near_plane`` 的门只由 mean_h / on_ratio 决定。
+
+        ``mean_h`` 给每格的**平均**高度——平面这一项看的就是它（见 ``_near_plane_parts``
+        里三个变体的对照：换成 ``_ray_hit`` 的众数层在 045615 上是净亏）。
+        """
+        c = MapperConfig(ray_clear=True)
+        m = KeyframeGridMapper(c)
+        m._acc_lo = (0, 0)
+        m._acc_g = np.zeros(mean_h.shape)
+        m._acc_o = np.full(mean_h.shape, 30.0)                       # ≥ ray_plane_pts
+        m._acc_on = np.full(mean_h.shape, 30.0 * on_ratio)           # 近距成分
+        m._acc_ob_h = m._acc_o * mean_h
+        m._acc_ob_h2 = m._acc_o * mean_h * mean_h
+        nlay = int(np.ceil((c.obst_top_m - c.ground_tol_m) / c.ray_z_m))
+        hit = np.zeros((nlay, *mean_h.shape), np.int32)
+        mis = np.zeros((nlay, *mean_h.shape), np.int32)
+        hit[5] = 1
+        mis[5] = 10                                                   # 看穿远多于打中 ⇒ 默认会被清
+        m._ray_hit, m._ray_mis = hit, mis
+        return m
+
+    def test_ray_near_exempt_gate_is_geometry_not_vote_count(self) -> None:
+        """门必须是"有没有一张连贯的面"，不是"票多不多"。
+
+        平的那张：默认被看穿清掉，豁免后保回来。
+        高度乱跳的那张（不是一张面）：豁免也不该动它——纯远场假障碍照清。
+        """
+        flat = np.full((5, 5), 0.85)
+        m = self._plane_grid(flat)
+        # 只断言中心区：5×5 网格的角点在 3×3 窗口里只有 4 个有效邻居，够不到 cnt≥6，
+        # 那是有意的（图沿的"高度一致"是采样边界凑出来的，不作数）。
+        self.assertTrue(m._near_plane()[1:4, 1:4].all(), "等高近距网格应当判为有面")
+        self.assertTrue(m._ray_veto(None)[2, 2], "默认应被判成看穿而清掉")
+        m.cfg.ray_near_exempt = True
+        self.assertFalse(m._ray_veto(None)[2, 2], "豁免后应当保它")
+
+        noisy = np.tile(np.array([0.35, 0.85, 1.60, 0.85, 1.60]), (5, 1))   # 邻域极差 1.25 m
+        m2 = self._plane_grid(noisy)
+        self.assertFalse(m2._near_plane().any(), "高度乱跳的网格不是一张面")
+        m2.cfg.ray_near_exempt = True
+        self.assertTrue(m2._ray_veto(None)[2, 2], "不是面 ⇒ 豁免不动它")
+
+    def test_ray_near_exempt_gate_needs_near_votes(self) -> None:
+        """同一张面，但票几乎全是远距离打的 ⇒ 不得豁免。
+
+        δz=z²/25.5，3 m 外已经 35 cm，"远处的面"和"近处的面"不是一回事，
+        不能只看形状就把远场票的假障碍也保回来。
+        """
+        m = self._plane_grid(np.full((5, 5), 0.85), on_ratio=0.05)
+        self.assertFalse(m._near_plane().any(), "远距票不构成近距平面证据")
+        m.cfg.ray_near_exempt = True
+        self.assertTrue(m._ray_veto(None)[2, 2], "纯远场仍应被看穿清掉")
+
     def test_walked_centerline_clears_obstacle_nobody_saw_through(self) -> None:
         # 障碍旁边只有一条侧面的地面（定地面高度用），没有视线穿过它，只能靠"身体从这里走过去了"。
         gx, gy = np.meshgrid(np.arange(0.3, 3.0, 0.03), np.arange(0.8, 1.5, 0.03))
