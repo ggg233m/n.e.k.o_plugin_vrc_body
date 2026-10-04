@@ -169,6 +169,25 @@ def main() -> int:
             print(f"    对照(其余多峰格 {int(rest.sum())}) 峰间距中位 = {np.nanmedian(r):.3f} m，"
                   f"落在踢面尺度的 {int(((r>=RISER_LO)&(r<=RISER_HI)).sum())} 格 "
                   f"({100.0*((r>=RISER_LO)&(r<=RISER_HI)).mean():.1f}%)")
+        # 空间结构：**这一步才是否定"楼梯"解释的关键**，峰间距只说明"格内有两个高度"。
+        # 真正的楼梯是一条连续的细长带 ⇒ 少数几个大而扁的连通块；
+        # 若 A 类碎成大量单格块、长宽比接近 1（圆点），那它是"地板上散落的 25cm 物件"
+        # （门槛、椅腿、花盆边沿），不是台阶。见 Docs/建图实测能力边界（2026-10-05）§3.2。
+        n_lab, _lab, bst, _bc = cv2.connectedComponentsWithStats(
+            stair.astype(np.uint8), connectivity=8)
+        bareas = bst[1:, cv2.CC_STAT_AREA]
+        bwh = bst[1:, [cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT]]
+        wide = bareas >= 20
+        top5 = int(np.sort(bareas)[::-1][:5].sum())
+        print(f"    连通块 {n_lab - 1} 块 / {int(stair.sum())} 格；"
+              f"单格块 {100.0*(bareas == 1).mean():.1f}%；"
+              f"面积 p50/p90 = {np.median(bareas):.0f}/{np.percentile(bareas,90):.0f} 格；"
+              f"前5大块占比 {100.0*top5/int(stair.sum()):.1f}%")
+        if wide.any():
+            asp = (np.maximum(bwh[wide, 0], bwh[wide, 1])
+                   / np.maximum(np.minimum(bwh[wide, 0], bwh[wide, 1]), 1))
+            print(f"    面积≥20 的块 {int(wide.sum())} 个，长宽比中位 {np.median(asp):.2f}"
+                  f"（>3 才是带，接近 1 是圆点）")
     else:
         print("    —— 全图找不到。**要么该录制没有楼梯，要么格内直方图救不回来。**")
 

@@ -176,6 +176,22 @@ def main() -> int:
             print(f"{tag:>12} {cnt[i]:7d} {med[i]*100:8.2f}cm {p90[i]*100:8.2f}cm "
                   f"{p99[i]*100:8.2f}cm   {bias*100:+.2f}cm")
 
+        # ---- 众数 vs 均值：**中位几乎相同，差别全在尾部** ----
+        # 这一节是 `nav_mapping.surface_counts` docstring 那条"均值偏高 0.17 m"的判据来源
+        # （Docs/建图实测能力边界（2026-10-05）§二）：中位只差约 1 cm，但均值的尾部松一倍，
+        # 所以做"有没有 15 cm 台阶"这类硬阈值判断时只有众数稳定。
+        rm = rms_mode[np.isfinite(rms_mode)]
+        ra = rms_mean[np.isfinite(rms_mean)]
+        dif = (mean_h - peak)[ground & np.isfinite(mean_h)]
+        print(f"  残差 众数场 p50/p90/p99 = {np.median(rm)*100:.2f}/"
+              f"{np.percentile(rm,90)*100:.2f}/{np.percentile(rm,99)*100:.2f}cm"
+              f"   <5cm {100.0*(rm<0.05).mean():.1f}%")
+        print(f"  残差 均值场 p50/p90/p99 = {np.median(ra)*100:.2f}/"
+              f"{np.percentile(ra,90)*100:.2f}/{np.percentile(ra,99)*100:.2f}cm"
+              f"   <5cm {100.0*(ra<0.05).mean():.1f}%")
+        print(f"  (均值-众数) 中位 {np.median(dif)*100:+.3f}cm  "
+              f"p90 {np.percentile(dif,90)*100:+.2f}cm")
+
         # ---- 出图 ----
         args.out.mkdir(parents=True, exist_ok=True)
         top = panel_stats(np.array(med), np.array(p90), np.array(p99), np.array(cnt))
