@@ -1317,19 +1317,41 @@ class OnlineNavigator:
             out["grid"]["png_base64"] = self._cov_png[1]
         return out
 
-    def grid_view(self) -> dict[str, Any] | None:
+    def grid_view(self, layer: str = "tristate") -> dict[str, Any] | None:
         """当前栅格的 base64 PNG（一格一像素，第 0 行 = 北/+y 最大）+ 像素↔导航系世界米的换算。
-        白 = 可走中心区，浅灰 = 观测 free，深灰 = unknown，黑 = 障碍；
-        蓝线 = 规划路径，红点 = 当前位姿，绿点 = 目标。"""
+
+        ``layer`` 选画什么底图（``_GRID_LAYERS``）：
+
+        * ``tristate`` 白 = 可走中心区，浅灰 = 观测 free，深灰 = unknown，黑 = 障碍
+        * ``surface``  头顶 ``obst_top_m`` 之上那张**面**的离地高（热力图，0–``hi_band_top_m`` m）
+        * ``bands``    四条高度带里**点数最多**的那一条（离散色，见 ``_BAND_COLORS``）
+        * ``clearance`` 到最近非可走格的距离（热力图，0–1 m）
+
+        路径 / 位姿 / 目标在**所有**图层上都画 —— 否则没法把地形和"实际走哪儿"对起来。
+        配色范围是**固定**的（不从数据取分位），这样两帧之间颜色可直接比较；
+        每层都随 ``ramp`` 返回自己的取值范围，UI 照着画色条。
+        """
         with self._nav_lock:
             ng = self.session.ng
             if ng is None:
                 return None
             g = ng.grid
-            img = np.full(g.shape + (3,), 90, np.uint8)
-            img[g == FREE] = (170, 170, 170)
-            img[g == OCC] = (0, 0, 0)
-            img[ng.center] = (255, 255, 255)
+            if layer == "tristate":
+                img = np.full(g.shape + (3,), 90, np.uint8)
+                img[g == FREE] = (170, 170, 170)
+                img[g == OCC] = (0, 0, 0)
+                img[ng.center] = (255, 255, 255)
+                ramp: dict[str, Any] = {}
+            elif layer == "surface":
+                img, ramp = self._surface_layer(ng, g)
+            elif layer == "bands":
+                img, ramp = self._band_layer(ng, g)
+            elif layer == "clearance":
+                img, ramp = _ramp_layer(ng.clearance, float(np.nanmax(ng.clearance) or 0.0),
+                                        lambda v: np.isfinite(v), 0.0, 1.0, "m")
+                img[~ng.center] = (90, 90, 90)
+            else:
+                raise ValueError(f"layer 只能是 {_GRID_LAYERS}，收到 {layer!r}")
             contract = self.session.contract
             goal = self.session.goal_xy()
         if contract is not None and contract.accepted and len(contract.waypoints_xy_m) >= 2:
@@ -1348,11 +1370,82 @@ class OnlineNavigator:
         m = ng.meta
         return {"png_base64": base64.b64encode(buf.tobytes()).decode("ascii"),
                 "rows": int(g.shape[0]), "cols": int(g.shape[1]),
+                "layer": layer, "ramp": ramp,
                 # 列 c、行 r 的格中心：x = (ox + (c+0.5)·res)·s，y = (oy + (rows−1−r+0.5)·res)·s
                 "origin_xy_track_m": [float(m.origin_xy_m[0]), float(m.origin_xy_m[1])],
                 "resolution_track_m": float(m.resolution_m), "world_scale": float(m.world_scale),
                 "frame": "nav_map_xy_world_m"}
 
+    # ---- 深度/高度相关图层（只读旁路，不参与任何判定）----
+    def _surface_layer(self, ng, g) -> tuple[np.ndarray, dict[str, Any]]:
+        """头顶那张**面**的离地高。用 ``surface_grid`` 的均值 —— 注意它系统性偏高约 0.1 m
+        （见 ``Docs/建图实测能力边界（2026-10-05）.md` §二），**只用于肉眼找结构，不当米制**。"""
+        sg = self.mapper.surface_grid()
+        hi = float(self.mapper.cfg.hi_band_top_m)
+        if sg is None:
+            return np.full(g.shape + (3,), 90, np.uint8), {"available": False,
+                                                          "reason": "hi_bands_disabled"}
+        mean_h = sg["mean_h"]
+        n = sg["n"]
+        img, ramp = _ramp_layer(mean_h, hi, lambda v: np.isfinite(v) & (v > -1.0),
+                                0.0, hi, "m")
+        img[n <= 0.5] = (60, 60, 60)          # 没观测到面
+        ramp.update({"available": True, "field": "surface_mean_h", "above_m": float(self.mapper.cfg.obst_top_m)})
+        return img, ramp
+
+    def _band_layer(self, ng, g) -> tuple[np.ndarray, dict[str, Any]]:
+        """四条高度带里点数最多的那条。**不替上层下"这是障碍还是楼板"的结论** ——
+        那个要带内高度聚类（``surface_counts`` docstring 原话），尚未做。"""
+        bg = self.mapper.band_grid()
+        if bg is None:
+            return np.full(g.shape + (3,), 90, np.uint8), {"available": False,
+                                                          "reason": "hi_bands_disabled"}
+        stacked = np.stack(bg)                       # (4, h, w)：below / lo / mid / hi
+        dom = np.argmax(stacked, axis=0)
+        any_pts = stacked.max(axis=0) > 0.5
+        img = np.full(g.shape + (3,), 55, np.uint8)
+        for i, col in enumerate(_BAND_COLORS):
+            img[(dom == i) & any_pts] = col
+        edges = self.mapper.band_counts()["edges_m"] if self.mapper.band_counts() else []
+        return img, {"available": True, "field": "dominant_height_band",
+                     "bands": [{"name": n, "rgb": list(c)}
+                               for n, c in zip(("below", "lo", "mid", "hi"), _BAND_COLORS)],
+                     "edges_m": [float(v) for v in edges]}
+
 
 def _wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+# ---- 栅格底图图层 ----
+# 为什么不加"地面高度"层：在线 mapper 每格只留 7 个数（4 个分带计数 + 3 个矩），
+# **没有逐格的地面高度**。要它就得给热路径加累加器（`_kf_base` 每帧多两次 bincount），
+# 而本轮改动先走"零热路径"路线。⇒ 现有四层里，深度信息最直接的是 `surface`
+# （头顶 obst_top_m 之上那张面的绝对高度）—— 那是天花板/楼板的高度，不是脚下。
+_GRID_LAYERS = ("tristate", "surface", "bands", "clearance")
+
+# 四条高度带（below=地面以下 / lo=2~hi_band / mid / hi）的固定配色，顺序与
+# ``MapperConfig`` 里 hb 的赋值顺序一致（nav_mapping.py:568-574）。
+# below 用**冷色**：它代表"地面以下有东西"，是坑的候选，必须一眼能挑出来。
+_BAND_COLORS = ((60, 60, 255), (40, 190, 255), (60, 210, 90), (40, 70, 240))
+
+
+def _ramp_layer(field: np.ndarray, vmax: float, valid, vmin: float, top: float,
+                unit: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """标量场 → 热力图。范围**固定**（不从数据取分位），这样帧与帧之间颜色可比。
+
+    ⚠️ NaN/Inf 必须在**转 uint8 之前**清掉：``(NaN*255).astype(uint8)`` 在 numpy 里是
+    未定义行为（实测会打 ``invalid value encountered in cast`` 警告并写出垃圾像素）。
+    做法是先按掩码把无效格压到 ``vmin``，再 clip、再转 —— 这样后面那句
+    ``img[~ok] = 灰`` 只是"把无效格显式涂灰"，不再承担修正垃圾的责任。
+    """
+    f = np.asarray(field, np.float32)
+    ok = np.asarray(valid(f), bool)
+    safe = np.where(ok, f, np.float32(vmin))
+    t = np.clip((safe - vmin) / max(top - vmin, 1e-9), 0, 1)
+    img = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    img[~ok] = (70, 70, 70)
+    return img, {"available": True, "vmin": vmin, "vmax": top, "unit": unit,
+                 "data_max": (round(float(np.max(np.where(ok, f, -np.inf))), 3)
+                              if ok.any() else None),
+                 "valid_cells": int(ok.sum())}

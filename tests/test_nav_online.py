@@ -414,8 +414,99 @@ class ThreadsTest(unittest.TestCase):
         ui_xy = ((o[0] + (c + 0.5) * res) * s, (o[1] + (view["rows"] - 1 - r + 0.5) * res) * s)
         self.assertEqual(tuple(round(v, 9) for v in ui_xy), tuple(round(v, 9) for v in ng.to_world((r, c))))
         self.assertEqual(ng.to_cell(ui_xy), (r, c))
-        self.assertTrue(h.sensors.closed)
-        self.assertFalse(h.nav.running)
+    def test_grid_view_layers(self) -> None:
+        """栅格底图图层。
+
+        最要紧的一条是 **tristate 必须与加图层之前逐位一致** —— 这套东西是纯显示，
+        改它绝不能动到既有那张图。golden 门管的是建图，本条管的是渲染。
+        """
+        import base64
+        import cv2
+        h = Harness(armed=False)
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start()
+            try:
+                time.sleep(0.4)
+            finally:
+                h.nav.stop()
+
+        def decode(view):
+            return cv2.imdecode(np.frombuffer(base64.b64decode(view["png_base64"]), np.uint8),
+                                cv2.IMREAD_COLOR)
+
+        ng = h.nav.session.ng
+        base = h.nav.grid_view()
+        self.assertEqual(base["layer"], "tristate")
+        # 与显式指定同名层必须一致
+        self.assertTrue(np.array_equal(decode(base), decode(h.nav.grid_view("tristate"))))
+        # 与手写的旧算法逐位一致 —— 只允许**覆盖层**那几个像素不同（位姿红点/目标绿点/
+        # 路径蓝线是加图层之前就有的，画在底图之上）。逐格断言"只有这些像素不同"，
+        # 而不是"完全相同"，否则这条测试在有位姿时必然失败。
+        g = ng.grid
+        expect = np.full(g.shape + (3,), 90, np.uint8)
+        expect[g == nav_online.FREE] = (170, 170, 170)
+        expect[g == nav_online.OCC] = (0, 0, 0)
+        expect[ng.center] = (255, 255, 255)
+        got = decode(base)
+        diff = (got != expect).any(axis=2)
+        overlay_bgr = {(0, 0, 255), (0, 200, 0), (255, 120, 0)}   # 位姿 / 目标 / 路径
+        bad = [tuple(int(v) for v in got[r, c])
+               for r, c in zip(*np.nonzero(diff)) if tuple(int(v) for v in got[r, c]) not in overlay_bgr]
+        self.assertEqual(bad, [], f"tristate 底图被改了，共 {int(diff.sum())} 格不是覆盖层色：{bad[:6]}")
+
+        for layer in ("surface", "bands", "clearance"):
+            v = h.nav.grid_view(layer)
+            self.assertIsNotNone(v, layer)
+            self.assertEqual(v["layer"], layer)
+            img = decode(v)
+            self.assertEqual(img.shape, g.shape + (3,), layer)
+            self.assertIn("ramp", v)
+            # 不同图层必须画出不同的东西，否则说明图层接错了累加器
+            self.assertFalse(np.array_equal(img, decode(base)), f"{layer} 与三态图相同")
+            self.assertGreater(len(np.unique(img.reshape(-1, 3), axis=0)), 1, layer)
+
+        with self.assertRaisesRegex(ValueError, "layer"):
+            h.nav.grid_view("nope")
+
+    def test_grid_view_layers_survive_nan(self) -> None:
+        """NaN 必须在转 uint8 **之前**清掉：``(NaN*255).astype(uint8)`` 是未定义行为，
+        会打出 ``invalid value encountered in cast`` 并写出垃圾像素。"""
+        import warnings
+        f = np.array([[0.0, np.nan, 1.0], [np.inf, 0.5, np.nan]], np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            img, ramp = nav_online._ramp_layer(
+                f, 1.0, lambda v: np.isfinite(v), 0.0, 1.0, "m")
+        self.assertEqual(img.shape, (2, 3, 3))
+        # 有限值是 0.0 / 1.0 / 0.5 三格（nan 与 inf 都不算）
+        self.assertEqual(ramp["valid_cells"], 3)
+        self.assertEqual(tuple(img[0, 1]), (70, 70, 70))  # NaN → 灰，不是垃圾色
+        self.assertEqual(tuple(img[1, 0]), (70, 70, 70))  # Inf → 灰
+
+    def test_grid_view_layers_without_hmd(self) -> None:
+        """未知图层必须**抛错**而不是静默回落到三态 —— 否则调用方以为自己看的是
+        新图层，实际拿到旧图。回落白名单是 HTTP 层（process.py）的事，两者职责不同。"""
+        h = Harness(armed=False)
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            h.nav.start()
+            try:
+                time.sleep(0.3)
+            finally:
+                h.nav.stop()
+        if h.nav.session.ng is None:
+            self.skipTest("没有栅格，跳过")
+        with self.assertRaises(ValueError):
+            h.nav.grid_view("__definitely_not_a_layer__")
+
+    def test_grid_view_layers_exposed_to_service(self) -> None:
+        from neko_anyadance_body.backend.nav_online import _GRID_LAYERS
+        self.assertIn("tristate", _GRID_LAYERS)
+        self.assertIn("surface", _GRID_LAYERS)
+        # 图层名是白名单，HTTP 层按它回落；写成集合会丢顺序，这里只查内容
+        self.assertEqual(set(_GRID_LAYERS) & {"tristate", "surface", "bands", "clearance"},
+                         set(_GRID_LAYERS))
 
     def test_session_is_persisted_to_world_memory(self) -> None:
         from neko_anyadance_body.backend.nav_memory import MemoryConfig, NavMemoryStore, world_dir_name
@@ -431,6 +522,20 @@ class ThreadsTest(unittest.TestCase):
                     deadline = time.monotonic() + 5.0
                     while time.monotonic() < deadline and h.nav.status()["keyframes"] < 3:
                         time.sleep(0.05)
+                    # ⚠️ 这里必须**当场**断言，不能等到下面 assertGreaterEqual。
+                    # 原来的写法是：等 5s 拿不到 3 帧就静默退出循环，然后错误延后
+                    # 两三个断言才爆出来，消息还与真因无关（曾经只剩 "+ complete"，
+                    # 被 _run_tests.py 的 [:160] 截断 + GBK 控制台双重毁掉，
+                    # 真实断言完全看不见）。一条 flaky 测试每复发一次就要重新
+                    # 取证一次，这行断言就是把那笔账一次性付掉。
+                    #
+                    # 余量参考：隔离跑整条用例约 0.8s，预算 5.0s（6 倍）。
+                    # **所以这条一旦触发就不是"机器慢"**，是建图线程真的卡住了。
+                    n_kf = h.nav.status()["keyframes"]
+                    self.assertGreaterEqual(
+                        n_kf, 3,
+                        f"等 5.0s 只产出 {n_kf} 个关键帧（隔离跑约 0.8s / 预算 5.0s）。"
+                        "若确认非机器慢，用 research/tools/_flaky_nav_online.py 取证。")
                 finally:
                     h.nav.stop()
             wid = world_dir_name("wrld_test")

@@ -542,10 +542,11 @@ class BackendService:
             return "autonomy_goal_active"
         return None
 
-    def navmesh_status(self, include_grid: bool = False) -> dict[str, Any]:
+    def navmesh_status(self, include_grid: bool = False,
+                       layer: str = "tristate") -> dict[str, Any]:
         status = self.navmesh.status()
         if include_grid:
-            view = self.navmesh.grid_view()
+            view = self.navmesh.grid_view(layer)
             status["grid_png_base64"] = None if view is None else view.pop("png_base64")
             status["grid_meta"] = view
         return status

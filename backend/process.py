@@ -236,9 +236,17 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._json(200, self.server.service.world_model_status())
             return
         if path == "/worldmodel/navmesh":
-            grid = parse_qs(urlsplit(self.path).query).get("grid", ["0"])[0]
+            q = parse_qs(urlsplit(self.path).query)
+            grid = q.get("grid", ["0"])[0]
+            # 图层名来自查询串，**未白名单则回落到默认**而不是让后端抛 ValueError：
+            # 一个手输的 ?layer=xxx 不该把整个状态轮询打断。真正的校验在
+            # OnlineNavigator.grid_view 里，它对未知图层仍会抛。
+            layer = str(q.get("layer", ["tristate"])[0])
+            from .nav_online import _GRID_LAYERS
+            if layer not in _GRID_LAYERS:
+                layer = "tristate"
             self._json(200, self.server.service.navmesh_status(
-                include_grid=str(grid).lower() in {"1", "true", "yes"}))
+                include_grid=str(grid).lower() in {"1", "true", "yes"}, layer=layer))
             return
         if path == "/worldmodel/navmesh/coverage":
             self._json(200, self.server.service.navmesh_coverage())

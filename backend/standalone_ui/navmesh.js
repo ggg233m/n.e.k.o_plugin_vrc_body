@@ -172,18 +172,70 @@ function render(s, auto) {
   if (!png) { lastPng = null; draw(); }
   else if (png !== lastPng) { lastPng = png; img.src = `data:image/png;base64,${png}`; }
   else draw();
+  paintLegend(meta);
   if (!pending && meta) $("clickInfo").textContent = "点击栅格选择目标。";
+}
+
+// 底图图例：三态用离散色块，其余用色条。色条两端读后端回的 ramp.vmin/vmax
+// ——后端刻意用**固定**范围（不从数据取分位），这样帧与帧之间颜色可直接比较。
+const LAYER_NOTE = {
+  surface: "头顶那张面的离地高。均值系统性偏高约 0.1 m，只用于肉眼找结构，不当米制。",
+  bands: "四条高度带里点数最多的那条。分不出"障碍还是楼板"——那要带内高度聚类，尚未做。",
+  clearance: "格中心到最近非可走格的距离（世界米）。越大越宽裕。",
+  tristate: "",
+};
+const OVERLAY = [
+  ["#0078ff", "规划路径"], ["#f00", "当前位姿"], ["#0c0", "目标"],
+];
+function paintLegend(m) {
+  const layer = (m && m.layer) || "tristate";
+  const bar = $("rampBar"), lg = $("legend");
+  if ($("layerNote")) $("layerNote").textContent = LAYER_NOTE[layer] || "";
+  if (layer === "tristate") {
+    bar.style.display = "none"; lg.style.display = "";
+    lg.innerHTML = [["#fff", "可走中心区"], ["#aaa", "观测 free"], ["#5a5a5a", "unknown"],
+                    ["#000", "障碍"]].concat(OVERLAY)
+                   .map(([c, t]) => `<span><i style="background:${c}"></i>${t}</span>`).join("");
+    return;
+  }
+  const r = (m && m.ramp) || {};
+  lg.style.display = "none"; bar.style.display = "";
+  if (r.available === false) {
+    $("rampNote").textContent = "不可用：" + (r.reason || "");
+    $("rampLo").textContent = $("rampHi").textContent = "—";
+    return;
+  }
+  if (r.bands) {
+    $("rampNote").innerHTML = r.bands.map(b =>
+      `<span style="margin-right:10px"><i style="display:inline-block;width:10px;height:10px;` +
+      `margin-right:3px;background:rgb(${b.rgb.join(",")});border:1px solid #666"></i>${b.name}</span>`
+    ).join("");
+    $("rampLo").textContent = (r.edges_m || []).map(v => v.toFixed(1)).join(" / ");
+    $("rampHi").textContent = "m（离地高上界）";
+    $("rampStrip").style.background = "#333";
+    return;
+  }
+  $("rampStrip").style.background = "";
+  $("rampLo").textContent = (r.vmin ?? 0).toFixed(1) + (r.unit || "");
+  $("rampHi").textContent = (r.vmax ?? 0).toFixed(1) + (r.unit || "") +
+    (r.data_max != null ? `（图上最大 ${r.data_max}）` : "");
+  $("rampNote").textContent = "";
 }
 
 async function poll() {
   if (pollBusy) return;
   pollBusy = true;
   try {
-    const [nav, auto] = await Promise.allSettled([api("/worldmodel/navmesh?grid=1"), api("/autonomy")]);
+    const layer = ($("layer") && $("layer").value) || "tristate";
+    const [nav, auto] = await Promise.allSettled([
+      api(`/worldmodel/navmesh?grid=1&layer=${encodeURIComponent(layer)}`), api("/autonomy")]);
     if (nav.status === "fulfilled") render(nav.value, auto.status === "fulfilled" ? auto.value : null);
     else { $("state").textContent = "后端不可达"; $("state").className = "state lost"; $("msg").textContent = String(nav.reason); }
   } finally { pollBusy = false; }
 }
+
+// 切图层：立刻重画，不必等下一拍。也清掉 lastPng，否则同一张图会不刷新。
+if ($("layer")) $("layer").addEventListener("change", () => { lastPng = null; poll(); });
 
 if ($("memoryLink") && token) $("memoryLink").href = `/navmesh/memory#token=${encodeURIComponent(token)}`;
 if (!token) $("msg").textContent = "URL 里没有 token：用 /navmesh#token=… 打开。";

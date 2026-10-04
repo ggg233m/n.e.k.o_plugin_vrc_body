@@ -15,6 +15,10 @@
     .state.running { color:var(--good); } .state.stopped { color:var(--muted); }
     .flag { font-weight:700; } .flag.ok { color:var(--good); } .flag.bad { color:var(--bad); } .flag.warn { color:var(--warn); }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; color:var(--muted); margin:6px 0 0; }
+    .rampstrip { display:inline-block; width:180px; height:10px; border:1px solid var(--line); vertical-align:-1px; }
+    .rampstrip i { display:block; width:100%; height:100%;
+      background:linear-gradient(to right,#30123b,#4145ab,#2fb47c,#f9e721,#f66b19,#900c00); }
+    select { background:#11151c; color:#e6edf3; border:1px solid var(--line); padding:4px 6px; }
   </style>
 </head>
 <body>
@@ -26,16 +30,28 @@
   <main>
     <section class="map card">
       <div class="title">实时栅格（导航系世界米，上 = +y，右 = +x）</div>
+      <div class="controls" style="margin-bottom:8px">
+        <label class="muted">底图</label>
+        <select id="layer">
+          <option value="tristate">可通行性（三态）</option>
+          <option value="surface">深度：头顶那张面的高度</option>
+          <option value="bands">高度分带（主带）</option>
+          <option value="clearance">离非可走区的余隙</option>
+        </select>
+        <span class="muted" id="layerNote"></span>
+      </div>
       <canvas id="grid" width="900" height="600"></canvas>
-      <div class="legend">
+      <div class="legend" id="legend">
         <span><i style="background:#fff"></i>可走中心区</span>
         <span><i style="background:#aaa"></i>观测 free</span>
         <span><i style="background:#5a5a5a"></i>unknown</span>
         <span><i style="background:#000"></i>障碍</span>
-        <span><i style="background:#0078ff"></i>规划路径</span>
-        <span><i style="background:#f00"></i>当前位姿</span>
-        <span><i style="background:#0c0"></i>目标</span>
-        <span><i style="background:transparent;border-color:#f85149"></i>待确认点击</span>
+      </div>
+      <div class="legend" id="rampBar" style="display:none">
+        <span id="rampLo">—</span>
+        <span class="rampstrip"><i id="rampStrip"></i></span>
+        <span id="rampHi">—</span>
+        <span class="muted" id="rampNote"></span>
       </div>
       <div class="controls" style="margin-top:10px">
         <button id="gotoConfirm" class="primary" disabled>确认前往</button>

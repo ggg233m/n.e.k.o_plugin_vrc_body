@@ -1,0 +1,298 @@
+{
+  "20260929_045615": {
+    "R1.5": {
+      "free_pct": 42.745,
+      "known_obstacle_pct": 22.875
+    },
+    "R2.5": {
+      "free_pct": 43.202,
+      "known_obstacle_pct": 22.252
+    },
+    "R3.0": {
+      "free_pct": 42.644,
+      "known_obstacle_pct": 22.413
+    },
+    "astar_probes": [
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.4072,
+        "goal": 60,
+        "len_m": 1.238,
+        "n_wp": 2,
+        "reason": "ok",
+        "start": 0,
+        "start_snapped_m": 0.0,
+        "wp_sha": "01b54c2567cde658e7ba95c68b4603a0376e134d3bc89ff6f08e34ac0c80719c"
+      },
+      {
+        "accepted": false,
+        "goal": 3013,
+        "n_wp": 0,
+        "reason": "goal_too_narrow",
+        "start": 2953
+      },
+      {
+        "accepted": false,
+        "goal": 3013,
+        "n_wp": 0,
+        "reason": "goal_too_narrow",
+        "start": 2953
+      },
+      {
+        "accepted": false,
+        "goal": 3013,
+        "n_wp": 0,
+        "reason": "goal_too_narrow",
+        "start": 2953
+      }
+    ],
+    "build": {
+      "avatar_radius_m": 0.25,
+      "cell_world_m": 0.0755,
+      "largest_region_share": 0.515,
+      "observed_free_m2": 398.4,
+      "obstacle_m2": 103.1,
+      "regions": 192,
+      "walkable_center_m2": 209.8
+    },
+    "config": {
+      "range_m": 3.0,
+      "recorded_keys": 23,
+      "recorded_not_in_dataclass": [],
+      "started": "2026-09-29 04:56"
+    },
+    "corridor_blockers": 5902,
+    "free_cells": 69895,
+    "grid_sha256": "3abfd9531bd4590376ea658d7e59078b25e3d57bfbc7f9c74d1e127e8a185e2d",
+    "occ_cells": 18093,
+    "origin_xy_m": [
+      -31.1,
+      -30.1
+    ],
+    "replay": {
+      "n_kf": 3014,
+      "n_refresh": 0
+    },
+    "resolution_m": 0.1,
+    "sensors": {
+      "baseline_m": 0.12600000202655792,
+      "cx": 360.0,
+      "cy": 202.5,
+      "fx": 202.49999849125743,
+      "size": [
+        720,
+        405
+      ]
+    },
+    "shape": [
+      441,
+      524
+    ],
+    "unk_cells": 143096,
+    "world_scale": 0.755
+  },
+  "20261001_044120": {
+    "R1.5": {
+      "free_pct": 68.018,
+      "known_obstacle_pct": 0.0
+    },
+    "R2.5": {
+      "free_pct": 65.464,
+      "known_obstacle_pct": 0.848
+    },
+    "R3.0": {
+      "free_pct": 62.349,
+      "known_obstacle_pct": 0.802
+    },
+    "astar_probes": [
+      {
+        "accepted": false,
+        "goal": 3,
+        "n_wp": 0,
+        "reason": "goal_disconnected",
+        "start": 0
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.2716,
+        "goal": 12,
+        "len_m": 1.046,
+        "n_wp": 4,
+        "reason": "ok",
+        "start": 9,
+        "start_snapped_m": 0.0,
+        "wp_sha": "251d56dd5d0865c2420d289daa77a8dcf771f08dd66ee7926456c00a7ef6ba22"
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.2716,
+        "goal": 12,
+        "len_m": 1.046,
+        "n_wp": 4,
+        "reason": "ok",
+        "start": 9,
+        "start_snapped_m": 0.0,
+        "wp_sha": "251d56dd5d0865c2420d289daa77a8dcf771f08dd66ee7926456c00a7ef6ba22"
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.2716,
+        "goal": 12,
+        "len_m": 1.046,
+        "n_wp": 4,
+        "reason": "ok",
+        "start": 9,
+        "start_snapped_m": 0.0,
+        "wp_sha": "251d56dd5d0865c2420d289daa77a8dcf771f08dd66ee7926456c00a7ef6ba22"
+      }
+    ],
+    "build": {
+      "avatar_radius_m": 0.25,
+      "cell_world_m": 0.0755,
+      "largest_region_share": 0.81,
+      "observed_free_m2": 34.5,
+      "obstacle_m2": 0.3,
+      "regions": 12,
+      "walkable_center_m2": 12.9
+    },
+    "config": {
+      "range_m": 5.0,
+      "recorded_keys": 23,
+      "recorded_not_in_dataclass": [],
+      "started": "2026-10-01 04:41"
+    },
+    "corridor_blockers": 0,
+    "free_cells": 6059,
+    "grid_sha256": "bad7be4f494dac760254dbb0ada27f98227009b217e3167bdccde645ff1b55a8",
+    "occ_cells": 48,
+    "origin_xy_m": [
+      -11.2,
+      -10.5
+    ],
+    "replay": {
+      "n_kf": 11,
+      "n_refresh": 2
+    },
+    "resolution_m": 0.1,
+    "sensors": {
+      "baseline_m": 0.12600000202655792,
+      "cx": 360.0,
+      "cy": 202.5,
+      "fx": 202.49999849125743,
+      "size": [
+        720,
+        405
+      ]
+    },
+    "shape": [
+      116,
+      145
+    ],
+    "unk_cells": 10713,
+    "world_scale": 0.755
+  },
+  "20261001_044153": {
+    "R1.5": {
+      "free_pct": 55.48,
+      "known_obstacle_pct": 5.517
+    },
+    "R2.5": {
+      "free_pct": 53.867,
+      "known_obstacle_pct": 5.949
+    },
+    "R3.0": {
+      "free_pct": 52.563,
+      "known_obstacle_pct": 6.286
+    },
+    "astar_probes": [
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.6033,
+        "goal": 60,
+        "len_m": 7.712,
+        "n_wp": 3,
+        "reason": "ok",
+        "start": 0,
+        "start_snapped_m": 0.0,
+        "wp_sha": "47e53e1a495b408a8cee34d89e19b5db83e3c4dbf5caff74369033f495abec66"
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.7692,
+        "goal": 396,
+        "len_m": 4.686,
+        "n_wp": 2,
+        "reason": "ok",
+        "start": 336,
+        "start_snapped_m": 0.0,
+        "wp_sha": "383f1fb47ab1ce105dd9561471180f49e2f9e24aefa94756fdd3eb9b425bc726"
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.7692,
+        "goal": 396,
+        "len_m": 4.686,
+        "n_wp": 2,
+        "reason": "ok",
+        "start": 336,
+        "start_snapped_m": 0.0,
+        "wp_sha": "383f1fb47ab1ce105dd9561471180f49e2f9e24aefa94756fdd3eb9b425bc726"
+      },
+      {
+        "accepted": true,
+        "corridor_half_width_m": 0.7692,
+        "goal": 396,
+        "len_m": 4.686,
+        "n_wp": 2,
+        "reason": "ok",
+        "start": 336,
+        "start_snapped_m": 0.0,
+        "wp_sha": "383f1fb47ab1ce105dd9561471180f49e2f9e24aefa94756fdd3eb9b425bc726"
+      }
+    ],
+    "build": {
+      "avatar_radius_m": 0.25,
+      "cell_world_m": 0.0755,
+      "largest_region_share": 0.979,
+      "observed_free_m2": 351.5,
+      "obstacle_m2": 23.5,
+      "regions": 52,
+      "walkable_center_m2": 234.3
+    },
+    "config": {
+      "range_m": 5.0,
+      "recorded_keys": 23,
+      "recorded_not_in_dataclass": [],
+      "started": "2026-10-01 04:41"
+    },
+    "corridor_blockers": 505,
+    "free_cells": 61660,
+    "grid_sha256": "6317b070b61ffb1b49f244799029be329080c3503d7a1022aa4b6784e8d2757d",
+    "occ_cells": 4122,
+    "origin_xy_m": [
+      -17.9,
+      -33.0
+    ],
+    "replay": {
+      "n_kf": 391,
+      "n_refresh": 6
+    },
+    "resolution_m": 0.1,
+    "sensors": {
+      "baseline_m": 0.12600000202655792,
+      "cx": 360.0,
+      "cy": 202.5,
+      "fx": 202.49999849125743,
+      "size": [
+        720,
+        405
+      ]
+    },
+    "shape": [
+      428,
+      382
+    ],
+    "unk_cells": 97714,
+    "world_scale": 0.755
+  }
+}
