@@ -2116,14 +2116,25 @@ class SemanticCandidateCache:
             bbox = _semantic_bbox(raw.get("bbox"))
 
             if candidate is None and bbox is not None:
-                # ID 注册表短暂重建时先尝试严格同屏框重叠；仍不匹配才计算 8x8
-                # 外观描述子。阈值刻意偏高，宁可等下一轮 VLM 也不把相似角色串号。
+                # ID 注册表短暂重建时先尝试严格同屏框重叠；**没有一个候选**在空间
+                # 上匹配，才退回去计算 8x8 外观描述子。两轮必须分开：混在一轮里
+                # 取 max 的话，一个 IoU=0 却长得像的候选会反超真正同屏的那个
+                # （旧实现 ``score <= best_score`` 正是这样，空间匹配 0.6 会被
+                # 外观 0.94 盖掉），而且结果还随 dict 迭代顺序变。外观阈值刻意
+                # 偏高，宁可等下一轮 VLM 也不把相似角色串号。
                 best_score = 0.0
-                current_descriptor: tuple[float, ...] | None = None
                 for cached_id, item in cached.items():
                     overlap = _semantic_iou(bbox, item.get("bbox"))
-                    score = overlap if overlap >= 0.55 else 0.0
-                    if score <= best_score and item.get("descriptor") is not None:
+                    if overlap >= 0.55 and overlap > best_score:
+                        best_score = overlap
+                        candidate = item
+                        candidate_id = cached_id
+                if candidate is None:
+                    current_descriptor: tuple[float, ...] | None = None
+                    for cached_id, item in cached.items():
+                        descriptor = item.get("descriptor")
+                        if descriptor is None:
+                            continue
                         if encoded_frame is None:
                             try:
                                 encoded_frame, _, _ = encode_frame_jpeg(frame, max_width=960, quality=65)
@@ -2133,13 +2144,13 @@ class SemanticCandidateCache:
                             current_descriptor = _semantic_descriptor(
                                 _semantic_crop(encoded_frame, bbox)
                             )
-                        appearance = _semantic_similarity(current_descriptor, item.get("descriptor"))
-                        if appearance >= 0.94:
-                            score = max(score, appearance)
-                    if score > best_score:
-                        best_score = score
-                        candidate = item
-                        candidate_id = cached_id
+                        if current_descriptor is None:
+                            break
+                        appearance = _semantic_similarity(current_descriptor, descriptor)
+                        if appearance >= 0.94 and appearance > best_score:
+                            best_score = appearance
+                            candidate = item
+                            candidate_id = cached_id
 
             semantic_type = str((candidate or {}).get("semantic_type") or "unknown")
             if candidate is None or semantic_type == "unknown":

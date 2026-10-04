@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
+from pathlib import Path
 
 from tests import _bootstrap  # noqa: F401
+from neko_anyadance_body.backend import vision as vision_module
 from neko_anyadance_body.backend.vision import (
     MssFrameSource,
     SemanticCandidateCache,
@@ -650,6 +652,94 @@ class WorldStateStoreTests(unittest.TestCase):
         }, job=job)
 
         self.assertNotEqual(first["id"], second["id"])
+
+    def _semantic_pair_cache(self, far_first: bool) -> tuple[SemanticCandidateCache, str, str]:
+        """建一个含「同屏候选」与「远处撞脸候选」的缓存，返回 (cache, 同屏 id, 远处 id)。"""
+        job = SemanticJob(
+            data=b"not-an-image",
+            captured_at=1.0,
+            frame_id="frame-1",
+            revision=1,
+            world={"entities": []},
+        )
+        cache = SemanticCandidateCache(clock=lambda: 1.0, session_token="test")
+        on_screen = {"label": "npc on screen", "semantic_type": "npc",
+                     "confidence": 0.9, "bbox": [0.0, 0.0, 0.5, 0.5]}
+        lookalike = {"label": "lookalike across the room", "semantic_type": "npc",
+                     "confidence": 0.9, "bbox": [0.8, 0.8, 1.0, 1.0]}
+        order = [lookalike, on_screen] if far_first else [on_screen, lookalike]
+        bound: dict[str, str] = {}
+        for raw in order:
+            candidate, _ = cache.bind(raw, job=job)
+            bound[candidate["label"]] = candidate["id"]
+        near_id = bound["npc on screen"]
+        far_id = bound["lookalike across the room"]
+        self.assertNotEqual(near_id, far_id)
+        # 描述子直接注入：本用例验的是「匹配优先级」，不该受 PIL 是否可用影响。
+        cache._items[near_id]["descriptor"] = tuple([0.10] * 192)
+        cache._items[far_id]["descriptor"] = tuple([0.90] * 192)
+        return cache, near_id, far_id
+
+    def test_spatial_match_is_not_overruled_by_a_lookalike_elsewhere(self) -> None:
+        """空间上真正同屏的候选不能被「远处长得像」的候选反超。
+
+        enrich_observation 的注释说「先尝试严格同屏框重叠；仍不匹配才计算外观
+        描述子」。旧实现把两件事混在一轮里取 max：同屏候选先拿到 0.85，轮到远处
+        候选时 ``score <= best_score`` 成立，外观 1.0 就把 0.85 盖掉了。而且掺不
+        掺得进还取决于 dict 的迭代顺序——同屏候选在后时，它自己的外观 0.2 又救不
+        回来。两种插入顺序都必须选出同屏那个。
+        """
+        for far_first in (False, True):
+            with self.subTest(far_first=far_first):
+                cache, near_id, _ = self._semantic_pair_cache(far_first)
+                observation = VisionObservation(
+                    entities=({"id": "local_det_1", "label": "avatar", "confidence": 0.9,
+                               "bbox": [0.02, 0.02, 0.48, 0.48]},),
+                    source="fake_yolo",
+                    observed_at=1.0,
+                )
+                with unittest.mock.patch.object(
+                    vision_module, "_semantic_descriptor",
+                    return_value=tuple([0.90] * 192),
+                ):
+                    enriched = cache.enrich_observation(observation, frame=b"frame", now=1.0)
+
+                entity = dict(enriched.entities[0])
+                self.assertEqual(
+                    entity.get("attributes", {}).get("semantic_candidate_id"), near_id,
+                    "远处撞脸的候选反超了真正同屏的候选",
+                )
+                self.assertEqual(entity.get("label"), "npc on screen")
+
+    def test_appearance_still_matches_when_nothing_overlaps(self) -> None:
+        """没有任何候选在框上重叠时，外观兜底必须还在。
+
+        上一条把空间轮和外观轮拆开了，这条守住「拆开不等于砍掉」：只剩远处一个
+        候选、外观又极像时，仍然要认。
+        """
+        cache, _, far_id = self._semantic_pair_cache(False)
+        with cache._lock:
+            cache._items.pop(
+                next(key for key, item in cache._items.items()
+                     if item.get("label") == "npc on screen"),
+                None,
+            )
+        observation = VisionObservation(
+            entities=({"id": "local_det_1", "label": "avatar", "confidence": 0.9,
+                       "bbox": [0.02, 0.02, 0.48, 0.48]},),
+            source="fake_yolo",
+            observed_at=1.0,
+        )
+        with unittest.mock.patch.object(
+            vision_module, "_semantic_descriptor", return_value=tuple([0.90] * 192),
+        ):
+            enriched = cache.enrich_observation(observation, frame=b"frame", now=1.0)
+
+        entity = dict(enriched.entities[0])
+        self.assertEqual(
+            entity.get("attributes", {}).get("semantic_candidate_id"), far_id,
+            "无空间匹配时外观兜底失效了",
+        )
 
 
 class _Detector:
