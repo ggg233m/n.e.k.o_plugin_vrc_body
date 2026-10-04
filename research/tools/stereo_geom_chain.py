@@ -8,11 +8,23 @@ r"""自建几何链：SGBM 视差 + ORB + PnP，量出**独立于 OSC** 的米�
 
 结论（2026-10-05，详见 `Docs/漂移形态诊断（2026-10-05）.md` §十）
 ------------------------------------------------------------
-三场里样本最多的那档 s 都**显著 > 1**：045615 **1.0776**、044153 **1.0593**、
-run5_ipd126 **1.0332**（CI 全不含 1）⇒ **DR/OSC 链比几何链长 3–8%，方向一致**。
-但它**不是常量**：随基线变长而增大、在 044153 会话内还单调上升（1.021→1.103），
-run5 上却随基线递减 ⇒ **不能拿去改 `world_scale` 常数**，该做的是**按会话自标定**
-（`world_scale` 本就"随 avatar 变"）。
+**这个工具分不出几趴的尺度差——但它的"分不出"本身是有信息的。**
+
+🔴 **s 必须按弦长分档看，否则一定得出假结论**（本工具前两版都栽在这里）。
+三场实测，同一个 s：
+
+| 会话 | <0.5 m 弦 | 0.5–1 m | 1–2 m |
+|---|---|---|---|
+| 045615 | 1.4427(n=1517) | 1.0821(n=314) | 0.8443(n=26) |
+| 044153 | 1.3889(n=64)   | 1.0453(n=119) | 0.8500(n=8)  |
+| run5   | 1.1832(n=74)   | 1.0978(n=71)  | 0.9573(n=40) |
+
+**s 随弦长单调下降 ⇒ 它测的是几何链在短基线上的位移收缩（PnP 用带噪双目深度解平移，
+短位移被解小），不是尺度。** 不分档的 1.03–1.08 是长短弦混合平均的假象。
+
+⇒ 能确认的只有：三场**都没有 17% 级的尺度差**（支持 `045615` 的 17% 是会话特异）；
+中长弦上两链落在 1 的 **±15%** 内，更细的界本工具给不出。
+**要尺度约束就只取长基线（≥1.5–2 m）**，那条路 `research/tools/loop_selfcal.py` 已经走通。
 
 为什么要它
 ----------
@@ -276,7 +288,7 @@ def analyse(kfs: list[KeyframeFeatures], idx: list[int], cfg: LoopConfig,
     s_lo, s_hi = (float(v) for v in np.percentile(bs, [2.5, 97.5]))
     res.update({"s_sim": float(s_sim), "s_sim_ci95": [s_lo, s_hi],
                 "sim_rot_deg": rot_deg, "sim_resid_m": res_sim, "sim_resid_norm_m": res0,
-                "geo_step_rms_m": g_rms})
+                "geo_step_rms_m": g_rms, "band_s": band_s(gw, Dw)})
     # 分量回归：只是"头部不转"会话上的诊断量（那时 DR 侧向恒 0，左移应当是纯噪声）。
     kf, cf = np.polyfit(gf, df, 1)
     kl, cl = np.polyfit(gl, dl, 1)
@@ -370,9 +382,35 @@ def analyse_recorded(kfs: list[KeyframeFeatures], T: np.ndarray, cfg: LoopConfig
     res.update({"s_sim": float(s_sim), "s_sim_ci95": [s_lo, s_hi],
                 "sim_rot_deg": float(np.degrees(np.arctan2(R_sim[1, 0], R_sim[0, 0]))),
                 "sim_resid_m": res_sim, "geo_step_rms_m": g_rms, "seg_s": seg_s,
+                "band_s": band_s(gw, Dw),
                 "geo_path_m": float(sum(r["d_geo_m"] for r in ok)),
                 "dr_path_m": float(sum(r["d_dr_m"] for r in ok))})
     return res
+
+
+def band_s(gw: np.ndarray, Dw: np.ndarray,
+           edges: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 1e9)
+           ) -> list[tuple[float, float, int, float]]:
+    """**按几何弦长分档各算一个 s** —— 这是"差到底是不是尺度"的判据：
+
+    * 真尺度偏差 ⇒ 各档都给**同一个常数**（偏离 1 的程度与弦长无关）；
+    * 短基线测量偏向（PnP 把短位移解小）⇒ **只有短档偏高**，弦长一长就回到 1。
+
+    分档内直接做 Umeyama，不再做任何基线外推——避免"拿短基线偏差去校长基线"。
+    """
+    g = np.linalg.norm(gw, axis=1)
+    out = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (g >= a) & (g < b)
+        if int(m.sum()) >= 8:
+            out.append((a, b, int(m.sum()), float(umeyama2d(gw[m], Dw[m], True)[0])))
+    return out
+
+
+def _fmt_band_s(bands: list[tuple[float, float, int, float]]) -> str:
+    return "  ".join(
+        f"{a:g}–{b:g}m(n={n}):{s:.4f}" if b < 1e8 else f">{a:g}m(n={n}):{s:.4f}"
+        for a, b, n, s in bands)
 
 
 def chain(traj_rows: list[dict], use_pnp_rot: bool) -> tuple[float, float, float]:
@@ -455,6 +493,14 @@ def main_recorded(seq: Path, args: argparse.Namespace) -> int:
                   + f"   极差 {seg.max() - seg.min():.4f}"
                   + ("  ⇒ 稳定，是**系统性尺度偏差**" if seg.max() - seg.min() < 0.06
                      else "  ⇒ 段间摆动大，更像噪声"))
+    # ★ 决定性判据：按弦长分档各算 s。
+    for r in results:
+        if r.get("band_s"):
+            print(f"  跳帧 {r['skip']} 按弦长分档 s：{_fmt_band_s(r['band_s'])}")
+            lo_b = [(a, n, s) for a, b, n, s in r["band_s"] if a >= 1.0]
+            if lo_b:
+                print(f"     只看 ≥1 m 的弦：s = "
+                      + "  ".join(f"{s:.4f}(n={n})" for _, n, s in lo_b))
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(
@@ -462,7 +508,8 @@ def main_recorded(seq: Path, args: argparse.Namespace) -> int:
              "sweep": [{"skip": r["skip"], "n_kf": r["n_kf"], "n_ok": r["n_ok"],
                         "path_m": r["path_m"], "step_med_m": r["step_med_m"],
                         "step_rms_m": r["step_rms_m"], "rejects": r["rejects"],
-                        **{k: r[k] for k in ("s_sim", "s_sim_ci95", "seg_s", "sim_resid_m",
+                        **{k: r[k] for k in ("s_sim", "s_sim_ci95", "seg_s", "band_s",
+                                             "sim_resid_m",
                                              "geo_step_rms_m", "sim_rot_deg",
                                              "geo_path_m", "dr_path_m") if k in r}}
                        for r in results]},
@@ -643,6 +690,12 @@ def main() -> int:
     print(f"  挑中的 yaw 符号 {yaw_sign:+.0f}；头部最大转角 {hm['max_angle_deg']:.2f}°"
           + ("（k/r 两列只在朝向不变时有意义）" if head_ok else
              " ⇒ 头部在转，**只看 s 相似列**，k/r 两列作废"))
+    if prim.get("band_s"):
+        print(f"  主配置按弦长分档 s：{_fmt_band_s(prim['band_s'])}")
+        lo_b = [(a, n, s) for a, b, n, s in prim["band_s"] if a >= 1.0]
+        if lo_b:
+            print(f"     只看 ≥1 m 的弦：s = "
+                  + "  ".join(f"{s:.4f}(n={n})" for _, n, s in lo_b))
 
     if "s_sim" in prim:
         print(f"\n=== 主配置（子步长 {prim['mult']}、深度上限 {prim['depth_m']:g} m）细节 ===")
