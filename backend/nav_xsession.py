@@ -187,10 +187,17 @@ class XSessionIndex:
         for i in range(len(kfs)):
             self._bow.add_words(i, words[indptr[i]:indptr[i + 1]])
         self._kf_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._kf_index: dict[tuple[str, int], int] | None = None
 
     @property
     def n_docs(self) -> int:
         return len(self.kfs)
+
+    def index_of(self, sid: str, kf: int) -> int | None:
+        """(sid, kf) → doc 下标（惰性建一次全表；索引 ≤ ``max_docs`` 条，内存不成问题）。"""
+        if self._kf_index is None:
+            self._kf_index = {(str(s), int(k)): i for i, (s, k) in enumerate(zip(self.sids, self.kfs))}
+        return self._kf_index.get((str(sid), int(kf)))
 
     def sessions(self) -> list[str]:
         return sorted(set(self.sids))
@@ -1102,6 +1109,7 @@ class XSessionTracker:
         self._recent: deque = deque(maxlen=8)
         self._last_confirm_dist: dict[int, float] = {}
         self._yaw_pool: dict[tuple[str, str], deque] = {}   # (new, old) → 带符号 yaw 残差样本
+        self._base_cache: dict[str, str | None] = {}        # old_sid → 其位姿表坐标系根（table_base）
         self._query_ms: float | None = None
         self._written: dict[str, Any] = {"written": False}
         self._words: dict[int, np.ndarray] = {}       # k → des3d 的 word id（写回收集，建图线程写）
@@ -1147,6 +1155,55 @@ class XSessionTracker:
     def join(self, timeout: float = 30.0) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+
+    # ---- 只读查询（在线 gauge 估计 / 先验消费用；建图线程调）----
+    def old_pose(self, sid: str, kf: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """旧关键帧在**本索引快照**系里的 ``(R(3,3), xy(2,))``；查不到返回 None。
+
+        取向与会话末采纳一致：索引的 xy/R 来自 ``session_pose_table``（merged 优先），
+        即"该会话位姿表所在的坐标系"——约束验证用的正是这份坐标。在线估 gauge 必须拿
+        同一份，而不是重新读盘（盘上可能已是另一张表 ⇒ 混 gauge）。
+        """
+        with self._lock:
+            idx = self._index
+        if idx is None:
+            return None
+        i = idx.index_of(sid, kf)
+        if i is None:
+            return None
+        _sid, _k, xy, R = idx.doc(i)
+        return np.asarray(R, np.float64), np.asarray(xy, np.float64)
+
+    def table_base(self, sid: str) -> str | None:
+        """``sid`` 的位姿表在**当前索引快照**里所处坐标系的根：merged → 其 base_sid；raw → 自己。
+
+        给"绝不混 gauge"的闸用（``nav_prior.PriorConsumer`` 要求先验坐标系根与约束引用
+        的旧会话同根）。会话不在快照里 / merged 文件读不到 ⇒ None（无据可依，不猜）。
+        """
+        with self._lock:
+            idx = self._index
+        if idx is None:
+            return None
+        if sid in self._base_cache:
+            return self._base_cache[sid]
+        marker: str | None = None
+        for s in idx.manifest.get("sessions", []):
+            if s.get("sid") == sid:
+                marker = str(s.get("table", "raw"))
+                break
+        if marker is None:
+            base: str | None = None
+        elif marker.startswith("merged:"):
+            name = marker.split(":", 2)[1]
+            try:
+                with np.load(self.world_dir / "xsession" / name) as z:
+                    base = str(z["base_sid"]) if "base_sid" in z.files else sid
+            except (OSError, KeyError, ValueError):
+                base = None
+        else:
+            base = sid
+        self._base_cache[sid] = base
+        return base
 
     # ---- 每关键帧（建图线程）----
     def on_keyframe(self, k: int, feat: Any, dist_m: float, R_map: np.ndarray, refresh: bool) -> list[dict[str, Any]]:

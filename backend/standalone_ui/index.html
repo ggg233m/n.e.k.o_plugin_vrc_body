@@ -214,6 +214,7 @@
           <div id="wmNoWorldBanner" class="notice warning hidden">
             ⚠ 尚未设置世界标识：记忆<strong>不会加载</strong>，去过的路线也<strong>不会被记录</strong>。请在下方填入 <code>wrld_…</code> 世界 ID（或世界名）后立即保存。
           </div>
+          <div id="wmRestoredBanner" class="notice muted hidden">—</div>
           <div id="wmConflictBanner" class="notice warning hidden">
             当前以「世界名」作为标识，同名世界会共用同一份记忆——可能把 A 世界记住的路线用错到 B 世界。建议改用 <code>wrld_</code> 开头的稳定 ID。
           </div>
@@ -239,13 +240,26 @@
         </article>
 
         <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">NAVMESH</p><h2>在线建图与导航页</h2></div></div>
+          <p class="help">这三页读同一份 navmesh 状态：实时栅格与驾驶、按世界的会话记忆、覆盖质量俯视。链接会自动带上当前后端 token。</p>
+          <div class="button-row">
+            <a id="linkNavmesh" class="button secondary" href="/navmesh">实时栅格 / 导航</a>
+            <a id="linkNavmeshMemory" class="button secondary" href="/navmesh/memory">记忆管理</a>
+            <a id="linkNavmeshCoverage" class="button secondary" href="/navmesh/coverage">覆盖俯视</a>
+          </div>
+          <small class="muted">栅格页显示"世界先验 / 跨会话检索"是否在生效；<strong>没设世界标识就整条链都不会启动</strong>（下方「世界标识」）。</small>
+        </article>
+
+        <article class="panel">
           <div class="panel-heading"><div><p class="eyebrow">IDENTITY</p><h2>世界标识</h2></div></div>
           <p class="help">VRChat 的 OSC 拿不到世界标识，必须由你手动填写。优先填 <code>wrld_</code> 开头的稳定 ID；只填世界名时同名世界会冲突。</p>
           <div class="form-grid">
+            <label class="field span-2"><span>已记录的世界（从记忆里读，选一个自动填入）</span><select id="wmWorldPick"><option value="">— 选择已记录的世界 —</option></select></label>
             <label class="field span-2"><span>世界标识（wrld_xxx… 或世界名）</span><input id="wmWorldKeyInput" placeholder="wrld_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 或 世界名称"></label>
             <label class="field span-2"><span>世界名称（可选，便于识别）</span><input id="wmWorldNameInput" placeholder="例如：My Cool World"></label>
           </div>
           <button id="wmSaveWorld" class="button primary wide">保存世界标识</button>
+          <small class="muted">标识会<strong>落盘</strong>（只记你显式设过的值）：重启后端后自动沿用，并在上方标出"沿用上次"。换了世界直接改这里即可。</small>
         </article>
       </section>
     </main>

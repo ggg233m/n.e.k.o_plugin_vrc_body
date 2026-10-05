@@ -15,9 +15,12 @@
 3. 名字作 key 有同名冲突风险。这是已知且要暴露的风险，不假装它不存在：
    当 ``world_source == "manual_name"`` 时 ``world_conflict_risk`` 为 ``true``。
 
-4. 重启后 ``world_key`` 应为 ``unknown``，等待用户再次输入。世界身份**不自动
-   跨进程恢复**——自动沿用旧 key 正是那个危险的失效模式。本模块不读写世界
-   身份文件，``persist`` 只用于门控后续阶段才落盘的记忆分区。
+4. 重启后从 ``<state_dir>/world_identity.json`` **恢复上一次用户显式设置过的 key**
+   （2026-10-06 用户裁决）。原来"绝不跨进程恢复"的理由是怕自动沿用错 key —— 但那份风险
+   来自**推断**世界，不来自**记住用户亲手设过的值**：文件里只存 ``set_world`` 落下的东西，
+   本模块从不从画面/环境/OSC 猜世界（见第 2 条）。恢复出来的身份带 ``restored=true``，
+   UI 必须显示成"沿用上次"，用户随时可改；用户显式清空后文件即删，不会复活。
+   ``persist=false`` 时整个机制关闭（不写不读）。
 
 5. 不实现深度模型、地点识别、路径规划、日志解析。只留空接口与 TODO，绝不
    伪造 ``hypothesis`` / ``confirmed`` 这类需要后端能力才有的定位状态。
@@ -33,14 +36,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
 # VRChat 世界 ID 固定以 ``wrld_`` 开头（大小写不敏感）。把它和普通世界名区分开，
 # 是因为只有它能作为稳定的世界 key；世界名随时可能重名。
 _WORLD_ID_PREFIX = "wrld_"
+
+# 身份落盘的文件名（在 ``<state_dir>`` 下）。只存用户显式设过的值，见模块 docstring 第 4 条。
+IDENTITY_FILENAME = "world_identity.json"
 
 # 文件名里只保留这些字符，避免 world_key 里的路径分隔符/空字节污染分区路径。
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9._-]+")
@@ -73,10 +81,13 @@ class WorldModel:
         self._enabled = bool(enabled)
         self._persist = bool(persist)
         self._state_dir = Path(state_dir)
-        # 当前世界身份。重启后这里永远是 unknown——刻意不读任何持久化文件。
+        # 当前世界身份。启动时**只**从自己落下的 world_identity.json 恢复用户显式设过的值
+        # （见模块 docstring 第 4 条）；没有任何推断成分。
         self._world_key: str | None = None
         self._world_name: str | None = None
         self._world_source: str = "unknown"
+        self._restored_wall: float | None = None       # 恢复来源文件的写入时刻（UI 用）
+        self._restore_identity()
         # 启停状态。
         self._running = False
         self._starting = False
@@ -84,6 +95,65 @@ class WorldModel:
         self._start_thread: threading.Thread | None = None
 
     # ---- 世界身份 ----------------------------------------------------------
+
+    @property
+    def identity_path(self) -> Path:
+        """身份文件的完整路径（管理页/测试要看它；不落盘时也就没人读）。"""
+        return self._state_dir / IDENTITY_FILENAME
+
+    def _restore_identity(self) -> None:
+        """启动时恢复上次**用户显式设置**的世界身份。只读自己写的文件，失败一律当没有。"""
+        if not self._persist:
+            return
+        try:
+            doc = json.loads(self.identity_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(doc, dict):
+            return
+        key = doc.get("world_key")
+        if not isinstance(key, str) or not key.strip():
+            return
+        # 恢复也要走一遍归一化：文件可能是手改的，来源因此必须是 manual_*，不许是别的。
+        normalized, source = self._normalize(key, doc.get("world_name"))
+        if normalized is None:
+            return
+        name = doc.get("world_name")
+        with self._lock:
+            self._world_key = normalized
+            self._world_source = source
+            self._world_name = (str(name).strip() or None) if isinstance(name, str) else None
+            if source == "manual_name" and not self._world_name:
+                self._world_name = normalized
+            self._restored_wall = float(doc.get("saved_wall") or 0.0) or None
+
+    def _save_identity(self) -> None:
+        """把当前身份原子写到 ``<state_dir>/world_identity.json``；清空则删文件。
+
+        为什么清空要**删**而不是写 null：文件存在 = 有可沿用的身份。留一个 null 文件
+        只会让"用户明确清过"和"从没设过"两种状态长得一样，下次启动的判断就要多一层。
+        """
+        if not self._persist:
+            return
+        path = self.identity_path
+        if self._world_key is None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        doc = {"world_key": self._world_key, "world_name": self._world_name,
+               "world_source": self._world_source, "saved_wall": time.time()}
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(path)                      # 原子写：不许读到半个文件
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _normalize(raw_key: Any, raw_name: Any) -> tuple[str | None, str]:
@@ -127,6 +197,8 @@ class WorldModel:
             else:  # manual_name：名字本身就是 key，展示优先用给出的 name。
                 name = str(world_name).strip() if isinstance(world_name, str) else None
                 self._world_name = name or normalized_key
+            self._restored_wall = None                # 用户亲手设的，不再算"沿用上次"
+            self._save_identity()
             return self._identity_payload()
 
     def _identity_payload(self) -> dict[str, Any]:
@@ -137,13 +209,22 @@ class WorldModel:
             "world_key": self._world_key,
             "world_source": source,
             "world_conflict_risk": source == "manual_name",
+            # 本次进程启动时是从文件恢复的（不是用户刚设的）：UI 必须显示成"沿用上次"，
+            # 否则用户会以为是自己设过的、或者以为系统在猜世界。
+            "restored": self._restored_wall is not None and self._world_key is not None,
         }
 
     def identity(self) -> dict[str, Any]:
-        """当前世界身份快照：``{"world_key", "world_name", "world_source"}``；未知时 key 为 None。"""
+        """当前世界身份快照：``{"world_key", "world_name", "world_source", "restored", "restored_wall"}``。
+
+        ``restored=true`` 表示这一份是**启动时从 world_identity.json 恢复的**（用户上次显式设过），
+        不是用户在本进程里刚设的 —— 也**不是**推断出来的。未知时 ``world_key`` 为 None。
+        """
         with self._lock:
             return {"world_key": self._world_key, "world_name": self._world_name,
-                    "world_source": self._world_source}
+                    "world_source": self._world_source,
+                    "restored": self._restored_wall is not None and self._world_key is not None,
+                    "restored_wall": self._restored_wall}
 
     # ---- 记忆分区 ----------------------------------------------------------
 

@@ -55,6 +55,35 @@ class NavMemoryStoreTest(unittest.TestCase):
         self.assertEqual(off.begin(WORLD, {})[1], "memory_disabled")
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_list_worlds_can_skip_the_size_walk(self) -> None:
+        """``sizes=False`` 必须**真的不扫目录**：体积是纯展示值，但 ``_dir_bytes`` 递归 stat
+        上万个文件（现役 10957 个 / 126 MB），会把只想要"有哪些世界"的调用方超时打爆
+        （2026-10-06 实况：栅格页读世界列表 8 s 超时 → 面板报 abort）。"""
+        from neko_anyadance_body.backend import nav_memory
+        self._session(5)
+        calls: list[int] = []
+        real = nav_memory._dir_bytes
+
+        def spy(path):
+            calls.append(1)
+            return real(path)
+
+        nav_memory._dir_bytes = spy
+        try:
+            light = self.store.list_worlds(sizes=False)
+            self.assertEqual(calls, [], "sizes=False 时一次都不该扫")
+            self.assertIsNone(light[0]["mb"], "没缓存过就如实报 None，不假装知道体积")
+            full = self.store.list_worlds()
+            self.assertEqual(len(calls), 1, "要体积时扫一次")
+            self.assertGreater(full[0]["mb"], 0)
+            self.store.list_worlds()                      # 命中 TTL 缓存
+            self.assertEqual(len(calls), 1, "60 s 内不该重复扫")
+            again = self.store.list_worlds(sizes=False)
+            self.assertIsNotNone(again[0]["mb"], "缓存过的体积可以白给")
+            self.assertIsInstance(self.store.summary(sizes=False), dict)
+        finally:
+            nav_memory._dir_bytes = real
+
     def test_session_roundtrip_and_refresh_replaces_previous(self) -> None:
         sid = self._session(5, refresh_last=True)
         wid = world_dir_name(WORLD["world_key"])

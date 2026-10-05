@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import time
@@ -69,6 +70,80 @@ class WorldModelNormalizationTests(unittest.TestCase):
         result = self.model.set_world(None)
         self.assertIsNone(result["world_key"])
         self.assertEqual(result["world_source"], "unknown")
+
+
+class WorldIdentityPersistenceTests(unittest.TestCase):
+    """重启后沿用**上一次用户显式设置**的世界身份（2026-10-06 用户裁决）。
+
+    为什么这不是"猜世界"：文件里只有 ``set_world`` 落下的东西，没有任何推断成分。
+    所以要点有三：① 设了会落盘、重启能恢复；② 恢复出来的必须标 ``restored``（UI 要显示
+    "沿用上次"，不能冒充用户刚设的）；③ 用户显式清空后文件即删，**不许复活**。
+    """
+
+    def setUp(self) -> None:
+        self.state_dir = Path(tempfile.mkdtemp(prefix="world_identity_test_"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
+    def _model(self, **kw) -> world_model.WorldModel:
+        return world_model.WorldModel(enabled=True, persist=True, state_dir=self.state_dir, **kw)
+
+    def test_roundtrip_across_processes(self) -> None:
+        first = self._model()
+        self.assertFalse(first.identity()["restored"], "刚启动、没设过 ⇒ 不是沿用")
+        first.set_world("wrld_home", "My Home")
+        self.assertTrue(first.identity_path.is_file(), "显式设置要落盘")
+
+        second = self._model()                       # 模拟重启
+        got = second.identity()
+        self.assertEqual(got["world_key"], "wrld_home")
+        self.assertEqual(got["world_name"], "My Home")
+        self.assertEqual(got["world_source"], "manual_id")
+        self.assertTrue(got["restored"], "恢复来的必须标出来")
+        self.assertTrue(got["restored_wall"])
+        self.assertEqual(second.status()["world_key"], "wrld_home")
+
+    def test_cleared_identity_does_not_come_back(self) -> None:
+        first = self._model()
+        first.set_world("wrld_home")
+        first.set_world("")                          # 显式清空
+        self.assertFalse(first.identity_path.exists(), "清空要删文件")
+        self.assertIsNone(self._model().identity()["world_key"], "清过就不许复活")
+
+    def test_name_identity_keeps_conflict_risk_after_restore(self) -> None:
+        first = self._model()
+        first.set_world("home")                      # 名字作 key：同名冲突风险
+        second = self._model()
+        self.assertEqual(second.identity()["world_source"], "manual_name")
+        self.assertTrue(second.identity()["restored"])
+        self.assertTrue(second.status()["world_conflict_risk"], "恢复不许洗掉风险标记")
+
+    def test_persist_false_disables_the_whole_thing(self) -> None:
+        """``[world_model].persist=false`` = 不写不读：既不留文件，也不许从旧文件恢复。"""
+        on = self._model()
+        on.set_world("wrld_home")
+        off = world_model.WorldModel(enabled=True, persist=False, state_dir=self.state_dir)
+        self.assertIsNone(off.identity()["world_key"], "关掉持久化时不许读")
+        off.set_world("wrld_other")
+        self.assertEqual(on.identity_path.read_text(encoding="utf-8").count("wrld_home"), 1,
+                         "关掉时也不许覆盖已有的身份文件")
+
+    def test_broken_file_is_ignored_not_fatal(self) -> None:
+        (self.state_dir / world_model.IDENTITY_FILENAME).write_text("{ not json", encoding="utf-8")
+        self.assertIsNone(self._model().identity()["world_key"])
+        (self.state_dir / world_model.IDENTITY_FILENAME).write_text('{"world_key": "   "}',
+                                                                   encoding="utf-8")
+        self.assertIsNone(self._model().identity()["world_key"], "空白 key 当没有")
+
+    def test_restore_renormalizes_a_hand_edited_file(self) -> None:
+        """文件可能被手改：恢复也要走归一化，来源只能是 manual_*，不许变成别的东西。"""
+        (self.state_dir / world_model.IDENTITY_FILENAME).write_text(
+            json.dumps({"world_key": "  WRLD_ABC  ", "world_name": "N", "world_source": "guessed"}),
+            encoding="utf-8")
+        got = self._model().identity()
+        self.assertEqual(got["world_key"], "wrld_abc", "大小写与空白要归一")
+        self.assertEqual(got["world_source"], "manual_id", "来源按 key 重新判定，不信文件里的")
 
 
 class WorldModelPartitionTests(unittest.TestCase):

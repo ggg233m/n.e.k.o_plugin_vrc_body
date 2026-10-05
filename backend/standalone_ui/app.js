@@ -206,6 +206,17 @@ function renderWorldModel() {
   const noWorld = wm.world_key == null;
   byId("wmNoWorldBanner").classList.toggle("hidden", !noWorld);
   byId("wmConflictBanner").classList.toggle("hidden", !wm.world_conflict_risk);
+  // 「沿用上次」：身份是**启动时从 world_identity.json 恢复的**（用户上次显式设过的那份），
+  // 不是推断出来的。必须显示出来，否则用户会以为是系统自己猜的世界。
+  const restored = byId("wmRestoredBanner");
+  if (restored) {
+    restored.classList.toggle("hidden", !wm.restored);
+    if (wm.restored) {
+      const when = wm.restored_wall ? new Date(wm.restored_wall * 1000).toLocaleString() : "?";
+      restored.textContent = `↻ 沿用上次设置的世界标识（${when} 保存）：只记住你**显式设过**的值，` +
+        `不是系统猜的。换了世界请直接改成新的。`;
+    }
+  }
 
   text("wmAvailable", wm.available == null ? "—" : (wm.available ? "已启用" : "未启用"));
   text("wmRunning", wm.running == null ? "—" : (wm.running ? "运行中" : (wm.starting ? "启动中…" : "已停止")));
@@ -225,6 +236,61 @@ function renderWorldModel() {
 
 function value(id, fallback = "") { return byId(id).value.trim() || fallback; }
 function numericValue(id) { return Number(byId(id).value); }
+
+// 跨页入口：这些页面各自读 URL hash 里的 token（见 navmesh.js 顶部），所以链接要带上它。
+function paintPageLinks() {
+  const q = state.token ? `#token=${encodeURIComponent(state.token)}` : "";
+  for (const id of ["linkNavmesh", "linkNavmeshMemory", "linkNavmeshCoverage"]) {
+    const el = byId(id);
+    if (el) el.href = el.getAttribute("href").split("#")[0] + q;
+  }
+}
+
+// 「已记录的世界」下拉：直接读记忆分区（/worldmodel/navmesh/memory 的 world_list），
+// 省得用户手抄 wrld_ id —— 世界标识是必填项，抄错一个字符就静默落到另一个分区。
+// ⚠️ 这个接口会逐个世界扫目录算占用（_dir_bytes），**不能跟着 1 Hz 的刷新一起打**：
+// 只在首次进入、保存标识之后、以及用户点刷新时拉。
+async function loadKnownWorlds() {
+  const pick = byId("wmWorldPick");
+  if (!pick) return;
+  try {
+    // sizes=0：只是要"有哪些世界、几场会话、有没有先验"，别让后端递归扫目录算体积
+    // （上万个文件、秒级；管理页那一列才需要）。见 NavMemoryStore.list_worlds。
+    const memory = await api("/worldmodel/navmesh/memory?sizes=0");
+    const list = memory.world_list || [];
+    const priors = memory.priors || {};
+    const hasPriors = Object.prototype.hasOwnProperty.call(memory, "priors");
+    const keep = pick.value;
+    pick.replaceChildren(new Option("— 选择已记录的世界 —", ""));
+    for (const w of list) {
+      const key = w.world_key || w.world_id;
+      // 以 **key** 打头并标出"有先验"：同一物理世界可能被按名字另存成第二个分区
+      // （`home` 与 `wrld_home`），只显示名字根本分不出来，选错就等于换了一套记忆。
+      const label = `${key}${w.world_name && w.world_name !== key ? `（${w.world_name}）` : ""}` +
+        ` · ${w.sessions} 会话${(hasPriors && priors[w.world_id]) ? " · 有先验" : ""}${w.active ? " · 正在写" : ""}`;
+      pick.append(new Option(label, key));
+    }
+    if (list.length) pick.append(new Option(`（共 ${list.length} 个）`, ""));
+    if (keep && list.some((w) => (w.world_key || w.world_id) === keep)) pick.value = keep;
+  } catch (error) {
+    pick.replaceChildren(new Option("记忆不可用，请手填", ""));
+  }
+}
+
+function bindWorldPicker() {
+  const pick = byId("wmWorldPick");
+  if (!pick) return;
+  pick.addEventListener("change", () => {
+    const key = pick.value;
+    if (!key) return;
+    byId("wmWorldKeyInput").value = key;
+    const found = [...pick.options].find((o) => o.value === key);
+    if (found && found.textContent.includes("·")) {
+      const name = found.textContent.split("·")[0].trim();
+      if (name && name !== key) byId("wmWorldNameInput").value = name;
+    }
+  });
+}
 
 function populateConfig() {
   if (!state.config || state.configInitialized) return;
@@ -354,7 +420,10 @@ function bind() {
     document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === tab));
     document.querySelectorAll(".page").forEach((page) => page.classList.toggle("active", page.id === tab.dataset.tab));
   }));
-  byId("refreshButton").addEventListener("click", () => refresh({ includeConfig: true }));
+  byId("refreshButton").addEventListener("click", async () => {
+    await refresh({ includeConfig: true });
+    await loadKnownWorlds();
+  });
   byId("enableBody").addEventListener("click", () => command("启用身体", "/action", { kind: "enable", params: {} }));
   byId("disableBody").addEventListener("click", () => command("禁用身体", "/action", { kind: "disable", params: {} }));
   byId("emergencyStop").addEventListener("click", () => command("急停", "/action", { kind: "stop", params: {} }));
@@ -373,9 +442,10 @@ function bind() {
       if (result.accepted === false) {
         toast(`保存世界标识：${result.reason || "被拒绝"}`, true);
       } else {
-        toast("世界标识已保存。");
+        toast("世界标识已保存；栅格页要**重新启动会话**才会用上它。");
       }
       await refresh();
+      await loadKnownWorlds();
     } catch (error) {
       toast(`保存世界标识：${error.message || error}`, true);
     }
@@ -445,8 +515,13 @@ function bind() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   bind();
+  bindWorldPicker();
   readToken();
-  if (state.token) await refresh({ includeConfig: true });
+  paintPageLinks();
+  if (state.token) {
+    await refresh({ includeConfig: true });
+    await loadKnownWorlds();          // 只在这里 + 保存后 + 点刷新时拉（见 loadKnownWorlds 注释）
+  }
   state.timer = window.setInterval(() => {
     if (!document.hidden) refresh();
   }, 1000);

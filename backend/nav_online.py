@@ -31,7 +31,8 @@ import numpy as np
 from .nav_grid import FREE, OCC, UNK
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
-from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto
+from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
+from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, align_world_tree
 from .nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
                           make_sgbm, stereo_disparity, stereo_points)
 
@@ -96,9 +97,19 @@ class OnlineNavConfig:
     mapper: MapperConfig = field(default_factory=MapperConfig)
     # 跨会话地点检索（P0）：世界索引装载/查询/约束写回。确认对只写约束不碰位姿图（隔离层）。
     xsession: XSessionConfig = field(default_factory=XSessionConfig)
+    # 世界先验消费（P0.3b）：会话中攒够跨会话约束 ⇒ 在线估 gauge ⇒ 注入 <world>/prior/
+    # 的三态先验（产出见 research/tools/offline_fusion.py --write-prior）。默认开，带质量闸；
+    # 没有先验文件 / gauge 不够格时零注入（状态如实进 status()["prior"]）。
+    prior: PriorConfig = field(default_factory=PriorConfig)
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
     record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
+    # 会话末自动**并树**（P0 §洞4 的世界树 pass，跑在采纳线程里、逐对采纳之后）。
+    # 为什么需要它：逐对采纳只把本场挂到"它看见最多的那一个"旧会话上，看不到**别的会话之间的桥** ——
+    # 实测漏过：`050848→035644` 有 18 条够格约束，但 035644 自己从没被采纳 ⇒ 那 18 条因
+    # "坐标系不同根"被丢（先验的 gauge 因此少了最有用的一批票）。世界树按整张约束图选根 + 链式采纳，
+    # 顺手把孤立会话收进来。关掉它 = 回到"要手动跑 tools/xsession_align.py --world-tree"。
+    xsession_world_tree: bool = True
     # 覆盖可视化（纯显示，不进三态/规划）：粗格边长（追踪米）、走过走廊的 hull 半径（世界米）、
     # "近看且密"的近看点数阈值（粗格）、趋势历史条数（≈5 min @2 Hz）。
     cov_coarse_m: float = 0.30
@@ -114,12 +125,13 @@ class OnlineNavConfig:
 
     @classmethod
     def from_plugin(cls, nav: Any) -> "OnlineNavConfig":
-        """由 ``config.NavmeshConfig`` 构造：顶层字段 + online/mapper/loop 三组覆盖项（键已在 config 校验）。"""
+        """由 ``config.NavmeshConfig`` 构造：顶层字段 + online/mapper/loop/prior 四组覆盖项（键已在 config 校验）。"""
         mapper = replace(MapperConfig(), **dict(nav.mapper))
         loop = replace(LoopConfig(), **dict(nav.loop))
+        prior = replace(PriorConfig(), **dict(getattr(nav, "prior", ())))
         return cls(world_scale=nav.world_scale, expected_baseline_m=nav.expected_baseline_m,
                    baseline_tol_m=nav.baseline_tol_m, loop_closure=nav.loop_closure,
-                   mapper=mapper, loop=loop, **dict(nav.online))
+                   mapper=mapper, loop=loop, prior=prior, **dict(nav.online))
 
 
 def check_baseline(measured_m: float, cfg: OnlineNavConfig) -> dict[str, Any]:
@@ -417,6 +429,43 @@ class DeadReckoner:
         self._t = t
 
 
+#: 打开 SteamVR 时的自检/报错话术。为什么需要：``openvr.init()`` 本身只检查 ``VR_InitInternal2``
+#: 的错误码，失败时**抛异常没问题**；但"错误码是 OK、拿到的 IVRSystem 却是空指针"这条路径
+#: 不会报错，直到第一次调用（``getEyeToHeadTransform``）才在原生层**读空指针崩掉**
+#: （2026-10-06 实况：``sensors_open: OSError: exception: access violation reading 0x0000000000000000``）。
+#: 所以先用两个**不需要初始化**的自检函数（官方注释写明它们就是为了"判断有没有可能初始化"）
+#: 把"SteamVR 没开 / 头显没接"挡在 init 之前，再把任何原生崩翻译成人能照着做的话。
+_STEAMVR_TIPS = ("先启动 SteamVR 并等头显就绪，再点「启动」；"
+                 "若刚重启过 SteamVR，请把后端也重启一次——本进程持有的本地 VR 上下文可能已失效。")
+
+
+def _steamvr_preflight(openvr: Any) -> str | None:
+    """返回拒绝原因（None = 可以试 init）。只调**不需要 VR_Init 的安全函数**。"""
+    try:
+        installed = bool(openvr.isRuntimeInstalled())
+    except Exception:                                     # noqa: BLE001 - 探测不了就别拦
+        installed = True
+    if not installed:
+        return f"OpenVR runtime 未安装（isRuntimeInstalled=False）。{_STEAMVR_TIPS}"
+    try:
+        hmd = bool(openvr.isHmdPresent())
+    except Exception:                                     # noqa: BLE001
+        return None
+    if not hmd:
+        return (f"SteamVR 没在运行或头显未就绪（isHmdPresent=False，这个检查不需要初始化 VR）。"
+                f"{_STEAMVR_TIPS}")
+    return None
+
+
+def _steamvr_failed(exc: BaseException | None) -> str:
+    """原生层失败 → 人话（**保留原始文本**：它是现场证据，不许吞）。"""
+    raw = "" if exc is None else f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, OSError):
+        return (f"打开 SteamVR 时原生层崩了（{raw}）。这通常是 SteamVR 没运行/正在退出"
+                f"（拿到了空指针）。{_STEAMVR_TIPS}")
+    return f"打开 SteamVR 失败（{raw or '未知原因'}）。{_STEAMVR_TIPS}"
+
+
 class OpenVRSensors:
     """同一个 OpenVR Background 会话里取 HMD 姿态和镜像双目。
 
@@ -428,6 +477,7 @@ class OpenVRSensors:
         self.target_width = int(target_width)
         self._vr: Any = None
         self._system: Any = None
+        self._inited = False          # init 成功过才允许 shutdown（见 close）
         self._device = self._context = None
         self._eyes: list[Any] = []
         self._poses: Any = None
@@ -440,8 +490,18 @@ class OpenVRSensors:
 
         from .openvr_mirror import MirrorEye, create_device, projection_intrinsics
 
+        reason = _steamvr_preflight(openvr)
+        if reason:
+            raise RuntimeError(reason)
         self._vr = openvr
-        self._system = openvr.init(openvr.VRApplication_Background)
+        try:
+            self._system = openvr.init(openvr.VRApplication_Background)
+        except Exception as exc:                          # noqa: BLE001 - openvr 的错误码异常
+            raise RuntimeError(_steamvr_failed(exc)) from exc
+        if self._system is None:                          # 空指针：下面第一句调用就会崩
+            raise RuntimeError("openvr.init() 返回了空对象（SteamVR 没就绪/正在启停）；"
+                               f"继续调用会在原生层读空指针。{_STEAMVR_TIPS}")
+        self._inited = True
         try:
             eye_x = [self._system.getEyeToHeadTransform(e)[0][3] for e in (openvr.Eye_Left, openvr.Eye_Right)]
             self.baseline_m = float(eye_x[1] - eye_x[0])
@@ -454,6 +514,9 @@ class OpenVRSensors:
             self.size = self._eyes[0].gpu_size or src
             self.fx, _fy, self.cx, self.cy = projection_intrinsics(self._system, openvr.Eye_Left, self.size, src)
             self._poses = (openvr.TrackedDevicePose_t * 1)()
+        except OSError as exc:                            # 原生崩（空指针/dll 失效）走这里
+            self.close()
+            raise RuntimeError(_steamvr_failed(exc)) from exc
         except Exception:
             self.close()
             raise
@@ -498,9 +561,15 @@ class OpenVRSensors:
         if self._device is not None:
             _release(self._device)
         self._device = self._context = None
-        if self._system is not None:
-            self._vr.shutdown()
-            self._system = None
+        # 只有 init 成功过才 shutdown：失败路径上再调一次 VR_Shutdown，本身就是又一次
+        # 读已失效上下文的机会（同一个 0x0 崩法）。
+        if self._system is not None and self._inited and self._vr is not None:
+            try:
+                self._vr.shutdown()
+            except Exception:                             # noqa: BLE001 - 关闭路径尽力而为
+                pass
+            self._inited = False
+        self._system = None
 
 
 def near_obstacle(points_base: np.ndarray, r_ob: np.ndarray, *, cam_h: float, scale: float,
@@ -610,6 +679,8 @@ class OnlineNavigator:
         # 跨会话地点检索（P0）：tracker 在 start() 里创建，mapping 线程喂数据。
         self._xs: XSessionTracker | None = None
         self._xs_reason = "not_started"
+        # 世界先验消费（P0.3b）：constraints 喂给 consumer，由它在线估 gauge 后注入。
+        self._prior: PriorConsumer | None = None
         # 会话末自动采纳（P0.3b）：write_back 成功后后台线程跑 align_into_auto。
         self._align_out: dict | None = None
         self._align_thread: threading.Thread | None = None
@@ -686,6 +757,19 @@ class OnlineNavigator:
         except Exception as exc:                  # noqa: BLE001 - 检索坏了导航照常
             self._xs, self._xs_reason = None, f"init_error:{type(exc).__name__}"
             self._fail("xsession", exc)
+            return
+        # 世界先验消费：约束（gauge 的原料）只能从 tracker 来 ⇒ 与 tracker 同生共死。
+        # 位姿源：新帧 = mapper（回环修正后）；旧帧 = 索引快照（merged 优先，与其验证口径同源）。
+        try:
+            if self.cfg.prior.enabled:
+                self._prior = PriorConsumer(
+                    self.cfg.prior, wdir, world_scale=self.cfg.world_scale,
+                    pose_of=self.mapper.pose, pose_of_old=self._xs.old_pose,
+                    table_base=self._xs.table_base)
+                self.session.prior = self._prior.overlay
+        except Exception as exc:                  # noqa: BLE001 - 先验坏了导航照常
+            self._prior = None
+            self._fail("prior", exc)
 
     def _end_xsession(self, mem_sid: str | None = None) -> None:
         """会话末把本会话并入世界索引。在 ``_end_memory`` 之后调用（特征已落盘、线程已 join）。
@@ -718,13 +802,39 @@ class OnlineNavigator:
             self._fail("xsession_align", exc)
 
     def _align_xsession(self, mem_sid: str, world_dir: Path) -> None:
-        """后台采纳线程体：挑约束最多的旧会话对齐，结果进 status()["xsession_align"]。"""
+        """后台采纳线程体：挑约束最多的旧会话对齐 → 再跑**世界树**收孤立会话。
+
+        两步都要：``align_into_auto`` 只把**本场**挂到它看见最多的那个旧会话上；世界树才看得见
+        "别的会话之间的桥"（实测漏过 `050848→035644` 那 18 条够格约束，原因就是 035644 自己
+        从没被采纳过）。世界树失败不影响逐对采纳的结果，各自进 status。
+        """
         try:
             out = align_into_auto(world_dir, mem_sid, self.cfg.xsession)
         except Exception as exc:                  # noqa: BLE001 - 采纳只是锦上添花
             self._fail("xsession_align", exc)
             out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+        if self.cfg.xsession_world_tree:
+            tree = self._world_tree_pass(world_dir)
+            if isinstance(out, dict):
+                out = {**out, "world_tree": tree}
         self._align_out = out
+
+    def _world_tree_pass(self, world_dir: Path) -> dict[str, Any]:
+        """世界树 pass（**后台线程**跑，代价是逐桥一次弹性优化，与导航线程无关）。
+
+        只在会话末跑：它要读整张约束图，且会写 ``merged_*.npz``（原子写）与 ``world_tree.json``。
+        对自己的会话是否已采纳**不敏感** —— 它收的是"别的会话之间的桥"（正是逐对采纳漏掉的那批）。
+        """
+        try:
+            out = align_world_tree(world_dir, self.cfg.xsession)
+        except Exception as exc:                  # noqa: BLE001 - 并树失败不影响本场记录
+            self._fail("xsession_tree", exc)
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+        comps = out.get("components") or []
+        return {"ok": bool(out.get("ok")), "reason": out.get("reason"),
+                "aligned": out.get("aligned"), "skipped": out.get("skipped"),
+                "refused": out.get("refused"), "components": len(comps),
+                "report": out.get("report")}
 
     # ---- 持久记忆 ----
     def _begin_memory(self) -> None:
@@ -916,6 +1026,9 @@ class OnlineNavigator:
                             if new_kf:
                                 self._map_event.set()
                 self._stop.wait(max(0.0, period - (self._clock() - tick)))
+        except OSError as exc:  # noqa: BLE001 - 原生层崩（SteamVR 被关掉/退出）走这里
+            # 本地 VR 上下文已失效，本场不可能自愈：把话说到"该怎么办"，并保留原始错误文本。
+            self._fail("perception", RuntimeError(_steamvr_failed(exc)))
         except Exception as exc:  # noqa: BLE001 - 线程死了控制线程会因位姿过期而停车
             self._fail("perception", exc)
         finally:
@@ -964,7 +1077,10 @@ class OnlineNavigator:
                         if self._xs is not None:
                             try:
                                 # 跨会话查询+验证；T 的旋转来自 HMD（yaw 门的外部真值）。
-                                self._xs.on_keyframe(k, feat, float(dist), T[:3, :3], refresh)
+                                # 返回值 = 本帧确认的约束 —— 先验消费拿它当 gauge 的原料。
+                                confirmed = self._xs.on_keyframe(k, feat, float(dist), T[:3, :3], refresh)
+                                if confirmed and self._prior is not None:
+                                    self._prior.add_constraints(confirmed)
                             except Exception as exc:  # noqa: BLE001 - 检索出错禁用自身，不杀建图线程
                                 self._fail("xsession", exc)
                                 self._xs = None
@@ -977,6 +1093,9 @@ class OnlineNavigator:
                                 moved = self.mapper.update_poses(self.loops.poses())
                                 self._last_loop = {"keyframe": k, "loops": found,
                                                    "map_shift_m": round(moved * c.world_scale, 3)}
+                                if self._prior is not None:
+                                    # 回环改了全表位姿 ⇒ 会话帧内容变了，先验的 gauge 必须重估。
+                                    self._prior.note_map_moved()
                             loop_status = self.loops.status()
                             with self._state_lock:
                                 self._offset = self.loops.offset()
@@ -1170,6 +1289,11 @@ class OnlineNavigator:
             "recording": None if self.recorder is None else self.recorder.status(),
             "memory": self._mem.status() if self._mem is not None else {"active": False, "reason": self._mem_reason},
             "xsession": self._xs.status() if self._xs is not None else {"active": False, "reason": self._xs_reason},
+            # 世界先验消费（P0.3b）：state = ok / gauge_*（质量闸）/ no_prior / ...；applied = 最近一次
+            # 叠进栅格的格数（in_crop / applied_free / applied_occ / blocked_walked）。
+            "prior": (self._prior.status() if self._prior is not None else
+                      {"enabled": bool(self.cfg.prior.enabled),
+                       "state": "no_xsession" if self._xs is None else "not_started"}),
             # P0.3b 会话末自动采纳：None=还没跑到，running=后台线程在算，其余为结果/跳过原因
             "xsession_align": ({"state": "running"} if self._align_out is None and self._align_thread is not None
                                and self._align_thread.is_alive() else
@@ -1343,6 +1467,8 @@ class OnlineNavigator:
         ``layer`` 选画什么底图（``_GRID_LAYERS``）：
 
         * ``tristate`` 白 = 可走中心区，浅灰 = 观测 free，深灰 = unknown，黑 = 障碍
+        * ``prior``    世界先验在本场会话帧的投影：**绿/红 = 先验真补进去的格**，
+                        暗绿/暗红 = 先验有意见但 live 已有证据（没被采纳），其余为 live 灰阶
         * ``surface``  头顶 ``obst_top_m`` 之上那张**面**的离地高（热力图，0–``hi_band_top_m`` m）
         * ``bands``    四条高度带里**点数最多**的那一条（离散色，见 ``_BAND_COLORS``）
         * ``clearance`` 到最近非可走格的距离（热力图，0–1 m）
@@ -1362,6 +1488,8 @@ class OnlineNavigator:
                 img[g == OCC] = (0, 0, 0)
                 img[ng.center] = (255, 255, 255)
                 ramp: dict[str, Any] = {}
+            elif layer == "prior":
+                img, ramp = self._prior_layer(ng, g)
             elif layer == "surface":
                 img, ramp = self._surface_layer(ng, g)
             elif layer == "bands":
@@ -1397,6 +1525,46 @@ class OnlineNavigator:
                 "frame": "nav_map_xy_world_m"}
 
     # ---- 深度/高度相关图层（只读旁路，不参与任何判定）----
+    def _prior_layer(self, ng, g) -> tuple[np.ndarray, dict[str, Any]]:
+        """世界先验（P0.3b）在本场会话帧的投影。**只显示，不参与任何判定**。
+
+        配色只说一件事："这些格是先验补的，还是 live 自己看的"——
+        亮绿/亮红 = 先验**真写进去了**（当时那格是 unknown，见 ``PriorOverlay.applied_mask``）；
+        暗绿/暗红 = 先验有意见但 live 已有证据（或走廊规则挡下）⇒ 没被采纳。
+        底图与三态同色，切回 tristate 就能看纯 live，两层对一眼就知道先验补得对不对。
+        """
+        img = np.full(g.shape + (3,), 90, np.uint8)
+        img[g == FREE] = (170, 170, 170)
+        img[g == OCC] = (0, 0, 0)
+        info: dict[str, Any] = {"available": False, "reason": "no_prior"}
+        if self._prior is None:
+            info["reason"] = "disabled"
+            return img, info
+        ovl, pst = self._prior.view()
+        if ovl is None:
+            info["reason"] = str(pst.get("state") or "no_prior")
+            return img, info
+        row, col, inb = ovl.cells_of(ng)
+        applied = ovl.applied_mask
+        if applied is None or len(applied) != len(ovl.labels):
+            # 还没跑过 apply_into（正常路径不会发生：compute 先叠加再 build）⇒ 只画位置不置色。
+            applied = np.zeros(len(ovl.labels), bool)
+        sel = np.flatnonzero(inb)
+        rs, cs = row[inb], col[inb]
+        lab, app = ovl.labels[inb], applied[inb]
+        for is_occ in (False, True):
+            want = (lab == (L_OCC if is_occ else L_FREE))
+            img[rs[want & app], cs[want & app]] = _PRIOR_COLORS[("occ" if is_occ else "free")]
+            img[rs[want & ~app], cs[want & ~app]] = _PRIOR_COLORS[("occ_ignored" if is_occ
+                                                                   else "free_ignored")]
+        info = {"available": True, "cells_in_crop": int(len(sel)),
+                "applied_free": int((lab[app] == L_FREE).sum()),
+                "applied_occ": int((lab[app] == L_OCC).sum()),
+                "not_applied": int((~app).sum()),
+                "state": str(pst.get("state") or ""),
+                "base_sid": (pst.get("prior") or {}).get("base_sid")}
+        return img, info
+
     def _surface_layer(self, ng, g) -> tuple[np.ndarray, dict[str, Any]]:
         """头顶那张**面**的离地高。用 ``surface_grid`` 的均值 —— 注意它系统性偏高约 0.1 m
         （见 ``Docs/建图实测能力边界（2026-10-05）.md` §二），**只用于肉眼找结构，不当米制**。"""
@@ -1428,8 +1596,10 @@ class OnlineNavigator:
             img[(dom == i) & any_pts] = col
         edges = self.mapper.band_counts()["edges_m"] if self.mapper.band_counts() else []
         return img, {"available": True, "field": "dominant_height_band",
+                     # ⚠️ 图例要用 **RGB**（前端写 background:rgb(...)），图里要用 BGR ——
+                     # 同一份意图导出两套，见 _BAND_COLORS_RGB 的注释。
                      "bands": [{"name": n, "rgb": list(c)}
-                               for n, c in zip(("below", "lo", "mid", "hi"), _BAND_COLORS)],
+                               for n, c in zip(("below", "lo", "mid", "hi"), _BAND_COLORS_RGB)],
                      "edges_m": [float(v) for v in edges]}
 
 
@@ -1442,12 +1612,29 @@ def _wrap(a: float) -> float:
 # **没有逐格的地面高度**。要它就得给热路径加累加器（`_kf_base` 每帧多两次 bincount），
 # 而本轮改动先走"零热路径"路线。⇒ 现有四层里，深度信息最直接的是 `surface`
 # （头顶 obst_top_m 之上那张面的绝对高度）—— 那是天花板/楼板的高度，不是脚下。
-_GRID_LAYERS = ("tristate", "surface", "bands", "clearance")
+_GRID_LAYERS = ("tristate", "prior", "surface", "bands", "clearance")
 
-# 四条高度带（below=地面以下 / lo=2~hi_band / mid / hi）的固定配色，顺序与
+# 四条高度带（below=地面以下 / lo=2~hi_band / mid / hi）的配色，顺序与
 # ``MapperConfig`` 里 hb 的赋值顺序一致（nav_mapping.py:568-574）。
 # below 用**冷色**：它代表"地面以下有东西"，是坑的候选，必须一眼能挑出来。
-_BAND_COLORS = ((60, 60, 255), (40, 190, 255), (60, 210, 90), (40, 70, 240))
+#
+# ⚠️ 颜色有**两个口径**，写成一份必错（2026-10-06 修）：
+#   * 图里的像素走 ``np 数组 → cv2.imencode`` ⇒ OpenCV 认 **BGR**；
+#   * 图例（``_band_layer`` 回给前端的 ``rgb``）走 CSS ``background:rgb(...)`` ⇒ 认 **RGB**。
+# 原来只有一份 RGB 意图，被当成 BGR 画进图里 ⇒ "below 冷色"实际显示成红，而且**图例与图不一致**。
+# 现在意图只写一份（RGB），画图时取反：改动只此一处。
+_BAND_COLORS_RGB = ((60, 60, 255), (40, 190, 255), (60, 210, 90), (40, 70, 240))
+_BAND_COLORS = tuple(c[::-1] for c in _BAND_COLORS_RGB)      # BGR，只给 cv2 用
+
+#: ``prior`` 图层的四色。⚠️ **BGR**：整条链是 ``np 数组 → cv2.imencode``，OpenCV 认的是 BGR，
+#: 写成 RGB 会把红画成蓝（灰阶色调掩盖了这个坑，彩色的那几层才碰得到）。
+#: UI 图例写 ``#rrggbb``（石绿/红/暗绿/暗红），两边必须成对改。
+_PRIOR_COLORS = {
+    "free": (150, 225, 150),          # #96e196 先验补 free（真写进去了）
+    "occ": (60, 60, 225),             # #e13c3c 先验补 障碍
+    "free_ignored": (110, 160, 110),  # #6ea06e 先验说 free，但 live 已有证据 ⇒ 没采纳
+    "occ_ignored": (50, 50, 130),     # #823232 先验说障碍，但 live 已有证据 ⇒ 没采纳
+}
 
 
 def _ramp_layer(field: np.ndarray, vmax: float, valid, vmin: float, top: float,

@@ -91,6 +91,25 @@ def _dir_bytes(path: Path) -> int:
     return total
 
 
+#: 世界目录体积的缓存 TTL（秒）。为什么需要它：`_dir_bytes` 是**递归 stat 每个文件**
+#: （现役 10957 个文件 / 126 MB，实测单趟 2 s+），而 `list_worlds` 每次请求都对每个世界算一遍 ——
+#: 管理页刷新一次就是好几秒；再加上正在写关键帧的导航会话，很容易把**调用方**的超时打爆
+#:（2026-10-06 实况：栅格页读世界列表 8 s 超时，提示报 abort）。体积是纯展示用的近似值，
+#: 允许陈旧几十秒。
+_SIZE_TTL_S = 60.0
+
+
+def _cached_dir_bytes(path: Path, cache: dict[str, tuple[float, int]]) -> int:
+    key = str(path)
+    hit = cache.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] <= _SIZE_TTL_S:
+        return hit[1]
+    n = _dir_bytes(path)
+    cache[key] = (now, n)
+    return n
+
+
 def encode_features(feat: Any) -> bytes:
     import io
 
@@ -290,6 +309,7 @@ class NavMemoryStore:
         self._active_world: Path | None = None
         self._recovered = 0
         self._last_prune: dict[str, Any] | None = None
+        self._size_cache: dict[str, tuple[float, int]] = {}
 
     # ---- 生命周期 ----
     def recover(self) -> int:
@@ -348,24 +368,35 @@ class NavMemoryStore:
             return None if self._active is None else self._active.status()
 
     # ---- 查询 ----
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *, sizes: bool = True) -> dict[str, Any]:
         with self._lock:
-            worlds = self.list_worlds()
+            worlds = self.list_worlds(sizes=sizes)
+            mbs = [w["mb"] for w in worlds if w.get("mb") is not None]
             return {"root": str(self.root), "enabled": self.cfg.enabled, "worlds": len(worlds),
                     "sessions": sum(w["sessions"] for w in worlds),
-                    "mb": round(sum(w["mb"] for w in worlds), 2), "max_total_mb": self.cfg.max_total_mb,
+                    "mb": round(sum(mbs), 2) if mbs else None, "max_total_mb": self.cfg.max_total_mb,
                     "active": self.active_status(), "recovered": self._recovered, "last_prune": self._last_prune}
 
-    def list_worlds(self) -> list[dict[str, Any]]:
+    def list_worlds(self, *, sizes: bool = True) -> list[dict[str, Any]]:
+        """列世界分区。``sizes=False`` 时**不扫目录算体积**（``mb`` 给上一次缓存的、没有就给 None）。
+
+        体积是纯展示（管理页那一列），但要递归 stat 上万个文件 —— 只想要"有哪些世界 / 各几场会话"
+        的调用方（栅格页、主页面下拉）必须能躲开它，否则会把它们的请求超时打爆。见 ``_SIZE_TTL_S``。
+        """
         with self._lock:
             out = []
             for wdir in self._world_dirs():
                 info = _read_json(wdir / "world.json") or {}
                 sessions = self._session_dirs(wdir)
+                hit = self._size_cache.get(str(wdir))
+                if sizes:
+                    mb = round(_cached_dir_bytes(wdir, self._size_cache) / 1e6, 2)
+                else:
+                    mb = round(hit[1] / 1e6, 2) if hit is not None else None
                 out.append({"world_id": wdir.name, "world_key": info.get("world_key"),
                             "world_name": info.get("world_name"), "world_source": info.get("world_source"),
                             "last_used_wall": info.get("last_used_wall"), "sessions": len(sessions),
-                            "mb": round(_dir_bytes(wdir) / 1e6, 2), "active": self._active_world == wdir})
+                            "mb": mb, "active": self._active_world == wdir})
             return sorted(out, key=lambda w: -(w["last_used_wall"] or 0))
 
     def list_sessions(self, world_id: str) -> list[dict[str, Any]]:

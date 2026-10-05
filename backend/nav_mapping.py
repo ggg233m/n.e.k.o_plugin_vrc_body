@@ -1001,6 +1001,15 @@ class KeyframeGridMapper:
                 self._ver += 1
         return moved
 
+    def pose(self, node_id: int) -> np.ndarray | None:
+        """关键帧在**当前**地图系的位姿（回环修正后）；没有这个关键帧返回 None。
+
+        跨会话 gauge 估计拿它当"新帧位姿"（``nav_prior``）：回环只改平移（朝向来自
+        HMD，见 nav_online 模块 docstring），所以约束验证时的朝向与这里始终一致。
+        """
+        T = self._pose.get(int(node_id))
+        return None if T is None else np.array(T, np.float64, copy=True)
+
     def anchor(self, xy_track: tuple[float, float]) -> tuple[int, tuple[float, float]] | None:
         """把地图系一点挂到最近的关键帧上（该关键帧水平系下的偏移）。回环后地图系会动，
         目标用 ``resolve`` 跟着关键帧走，而不是钉死在旧坐标上。"""
@@ -1343,11 +1352,15 @@ class NavSession:
 
     def __init__(self, mapper: KeyframeGridMapper, *, radius_m: float = 0.25,
                  keep_m: float = 1.0, follow_cfg: Any = None,
-                 request_update: Callable[[], Any] | None = None) -> None:
+                 request_update: Callable[[], Any] | None = None,
+                 prior: Callable[[], Any] | None = None) -> None:
         self.mapper = mapper
         self.radius_m = radius_m
         self.keep_m = keep_m
         self.follow_cfg = follow_cfg
+        # 跨会话世界先验（P0.3b）：callable 返回已投影到本会话帧的 ``nav_prior.PriorOverlay``，
+        # 没有 gauge / 过不了质量闸时返回 None —— 先验一格不许用（见 backend/nav_prior.py）。
+        self.prior = prior
         # 给了就异步：跟随器要重规划 / 到达 frontier 时只发请求，由建图线程去算；
         # 不给（离线回放、测试）就当场 on_map_update。
         self.request_update = request_update
@@ -1406,12 +1419,22 @@ class NavSession:
         mode, anchor = snap["mode"], snap["anchor"]
         here = est.get("xy") if est.get("state") == "localized" else None
         extra = None if here is None else np.array([[here[0] / self._s, here[1] / self._s]])
+        # 先验视图（已投影到会话帧）：过了质量闸才有；四角并进裁剪范围，先验覆盖区
+        # （本场还没走到的部分）也要在图里，goto 才可能规划到那儿。
+        ovl = None if self.prior is None else self.prior()
+        if ovl is not None:
+            extra = ovl.corners if extra is None else np.vstack([extra, ovl.corners])
         ng = self.mapper.rasterize(extra)
+        walked = self.mapper.walked()
         # 脚下 ~1.6 m 双目看不到，身体走过的走廊（OSC 门控）是当前位置可走的唯一证据。
-        stats = ng.build(radius_m=self.radius_m, walked=self.mapper.walked())
+        # 先验必须在 build 之前叠：可走区/中心区都从三态图算，晚一步等于没叠。
+        prior_info = None if ovl is None else ovl.apply_into(ng, walked)
+        stats = ng.build(radius_m=self.radius_m, walked=walked)
         res: dict[str, Any] = {"gen": snap["gen"], "ng": ng, "mode": mode, "anchor": anchor,
                                "contract": None, "follower": None}
         info: dict[str, Any] = {"mode": mode, "grid": stats}
+        if prior_info is not None:
+            info["prior"] = prior_info
         res["info"] = info
         if mode in ("idle", "done") or here is None:
             info["reason"] = "not_localized" if here is None else mode

@@ -43,7 +43,7 @@
 | 相机内参 —— **OBS / 桌面窗口路径** | `config.py::CAMERA_HORIZONTAL_FOV_DEG = 102.45` | 由正交性自标定得出（fx=385.61@960×540） |
 | 相机内参 —— **SteamVR 镜像路径** | `openvr_mirror.projection_intrinsics()`（定义 `backend/openvr_mirror.py:289`；调用 `backend/nav_online.py:370`） | `getProjectionRaw`，2880×1620 经 mip 降到 720×405 ⇒ fx=202.5。⚠️ 原写的 `nav_online.py:280` 是错的，见 **C20** |
 | 在线导航架构 | `backend/nav_online.py` + `nav_mapping.py` + `nav_loop.py` + `nav_grid.py` + `nav_follow.py` + **`nav_xsession.py`** + **`nav_memory.py`** + `nav_bow.py` | `nav_xsession` 是**跨会话 P0 的主体且默认开**（2026-10-02 起），前次修订漏登。`nav_follow` 由 `nav_mapping.py:882` 惰性 import |
-| 跨会话重定位现状 | 代码 `backend/nav_xsession.py` / `nav_online.py`；过程记录 `Docs/P0*（2026-10-02~03）` | ⚠️ 拆两行读，见 **C18**（检索 ✅ / 采纳下游消费 ❌） |
+| 跨会话重定位现状 | 代码 `backend/nav_xsession.py` / `nav_online.py` / **`nav_prior.py`**；过程记录 `Docs/P0*（2026-10-02~03）` | ⚠️ 拆两行读，见 **C18**（检索 ✅ / 采纳下游消费 ✅；**prior/ 注入在线 ✅ 但差 live 端到端**） |
 | 离线 2.5D 流水线 | `.slam_probe/offline_probe/recorder/` + `research/recorder/` | ⚠️ 编排器 `map_from_capture.py` 曾因迁移断裂，已修 |
 | 航位推算公式 | `backend/pose_math.py` | **唯一实现**；`online_pose.py`/`pose_graph.py` 已删除 |
 | 米制标定配方（待执行） | `Docs/标定录制SOP（2026-09-24）.md` | 段 B 尚未录制；P4 依赖它。⚠️ **2026-10-05**：`.tmp/calib_anchor_dr.json` 存在但**非合规录制**（见 **C22**） |
@@ -321,8 +321,9 @@
 | 跨会话**检索**（世界级索引 + 验证） | ✅ **已上线且默认开** | `backend/nav_xsession.py:57` `enabled: bool = True`；`nav_online.py:34` import、`:866` 关键帧分支调用、`:1058` 进 `status()["xsession"]` |
 | 确认约束质量 | ✅ 6 → **529 条**（10-06 收盘：live 单场 111 + 录制重放补 277；早前 252 的抽检 16/16 零误检） | `跨会话地点检索接线P0（2026-10-02）.md:36`；live 见 `ROADMAP.md` P0 §洞 2、§洞 4 |
 | 会话末**采纳**（gauge + 弹性位姿图） | ✅ **已接线自动跑**（⚠️ **2026-10-05 live 抓到"从未真正跑过"**：`stop()` 先清 `_mem` ⇒ 线程恒报 `memory_gone`；已修 + 回归测试 `test_stop_hands_sid_to_align_thread_body`） | `P0.3b会话末自动采纳（2026-10-03）.md:5-6`；live 记录见 `ROADMAP.md` P0 §洞 2 |
-| 采纳结果**被下游消费** | ✅ **2026-10-05 已接（索引 / 再对齐）** —— `nav_xsession.session_pose_table` merged 优先、换表令索引缓存失效（`SCHEMA=2`）；**离线融合侧 2026-10-06 已接**（`research/tools/offline_fusion.py`，A/B 结论：融合默认 `--pose rigid`）；**prior/ 固化产出与在线消费仍未接** | `P0.3b…:22`、`:55-56`；实现见 `tests/test_nav_xsession.py::TestMergedConsumption`；融合见 `Docs/离线多视角融合v1-假障碍清除` 更新段 |
-| 全链 live 实测 | ✅ **2026-10-06 跑通**（两场）：确认 111 → 采纳 99 锚（gauge R_dev 0.22°、holdout 中位 **0.283 m**）→ `merged_...npz` 落盘 → 索引消费（`tables`：044153 / 001523 = `merged`）。⚠️ 世界身份不落盘，重启后必重设 | `ROADMAP.md` P0 §洞 2；`plugin.toml` world_model 注释 |
+| 采纳结果**被下游消费** | ✅ **2026-10-05 已接（索引 / 再对齐）** —— `nav_xsession.session_pose_table` merged 优先、换表令索引缓存失效（`SCHEMA=2`）；**离线融合侧 2026-10-06 已接**（`research/tools/offline_fusion.py`，A/B 结论：融合默认 `--pose rigid`）；**2026-10-06 收尾：prior/ 固化产出与在线消费也已接**（`--write-prior` + `backend/nav_prior.py`，见 `Docs/离线多视角融合v1-假障碍清除` 更新二） | `P0.3b…:22`、`:55-56`；实现见 `tests/test_nav_xsession.py::TestMergedConsumption`；融合见 `Docs/离线多视角融合v1-假障碍清除` 更新段 |
+| 世界先验（prior/）注入在线 | ✅ **2026-10-06 已接**：会话中跨会话约束攒够 ⇒ **在线** `estimate_gauge` ⇒ 五道质量闸 + "约束引用的旧会话表须与先验同根" ⇒ 投影进会话帧叠进在线栅格（live 优先、UNK 保持 unknown、先验 OCC 不写走过走廊）；不过闸 = 零注入 + `status()["prior"]` 报因。实测各场 OCC 落先验 OCC **97.1 / 97.8 / 84.9%**。**面板有 `跨会话检索` / `世界先验` 两行 + `世界先验（补了哪些格）` 图层**（亮色 = 真补进去的格）；主页面有导航三页入口，栅格页可就地设世界身份（↻ 身份**已落盘**：只记显式设过的值，重启沿用并标 `restored`；**没设 = 整条链不启动**）。⚠️ **live 端到端未跑** | `backend/nav_prior.py`；`nav_online.py` `_begin_xsession` / 建图线程喂约束 / `_prior_layer`；`tests/test_nav_prior.py` ×19 |
+| 全链 live 实测 | ✅ **2026-10-06 跑通**（两场）：确认 111 → 采纳 99 锚（gauge R_dev 0.22°、holdout 中位 **0.283 m**）→ `merged_...npz` 落盘 → 索引消费（`tables`：044153 / 001523 = `merged`）。↻ 世界身份**已落盘**（只记显式设过的值，重启沿用并标 `restored`） | `ROADMAP.md` P0 §洞 2；`backend/world_model.py` |
 | 多会话并树（spanning tree） | ✅ **2026-10-06 闭环成一棵树**：根因是 tracker 的**绝对 6° yaw 门吞真重合**（回放：真匹配成簇在 signed −6…−15°、内点中位 ~210）；`yaw_consensus`（默认开：θ=会话对带符号中位数、±6° 窗、20° 硬顶）修复后重放补约束（252→529）并树——4 场同系，holdout 中位 **0.169 / 0.27 m**，025013 零新约束 | `ROADMAP.md` P0 §洞 4；`tests/test_nav_xsession.py::TestYawConsensusGate` + `TestWorldTree` |
 
 ⚠️ **两句必须一起读**：`ROADMAP.md:92` 原句的前半截「`_candidates()` 只按会话内路径距离取候选」
@@ -593,7 +594,7 @@ Read the metric baseline, intrinsics and poses out of OpenVR"）。
 | `P0.1跨会话gauge对齐（2026-10-02）.md` | 📊 | gauge 刚体初值；头部段残差 med 0.29 m |
 | `P0.2跨会话位姿图合并v1（2026-10-03）.md` | 📊 | 弹性锚定位姿图；留出残差 **6.27→0.552 m**。与 P0.3a 的 0.486 差 0.07 属实现细节，已解释 |
 | `P0.3a跨会话采纳工具化（2026-10-03）.md` | 📊 | `tools/xsession_align.py` 固化；⚠️ `:60` 的"下一步 P0.3b"**已于同日完成**，见下一行 |
-| `P0.3b会话末自动采纳（2026-10-03）.md` | ✅ | **P0 的最后一公里**：`stop()` 后台线程自动跑采纳，结果进 `status()["xsession_align"]`。✅ **2026-10-05**：`merged_*.npz` 已被世界索引 / 再次对齐消费（原表不碰）。⚠️ 仍差 **全链 live 实测** 与**离线融合/固化档侧消费** —— 见 **C18** |
+| `P0.3b会话末自动采纳（2026-10-03）.md` | ✅ | **P0 的最后一公里**：`stop()` 后台线程自动跑采纳，结果进 `status()["xsession_align"]`。✅ **2026-10-05**：`merged_*.npz` 已被世界索引 / 再次对齐消费（原表不碰）。✅ **2026-10-06**：离线融合（`--pose rigid`）+ **prior/ 固化产出与在线消费**全接（`--write-prior` → `backend/nav_prior.py`；`status()["prior"]`）。⚠️ 仅差 prior 注入的 **live 端到端** —— 见 **C18** |
 | `离线多视角融合v1-假障碍清除（2026-10-02）.md` | 📊 | 离线多视角假障碍清除。⚠️ **该口径已于 2026-10-05 接线到在线 mapper**，见下一行 |
 | `虚假障碍-根因与分层修复（2026-10-05）.md` | ✅ | **在线侧假障碍根治 + 建图卡死根治**：按观测距离分近/中/远三层定案（离线 v1 那套口径终于接线）。真实录制实测走廊障碍 044153 **2168→502**、045615 **8737→3554**；建图单次最大 **1529→62 ms**（`cam_h` 在两个值间反复翻转、每次翻转全体重算，详见 §八）。工具 `tools/q_tier_{ab,why,bench}.py` 可复现；⚠️ unknown 会涨、没走近过的墙按 UNK 算，代价见该文 §七 |
 | `开放世界具身智能体-项目计划.md` | 📑 | **外部参考设计，非本项目实测产物**（0 处仓库引用 / 0 个实测数字 / 无日期）；**已在文首加性质声明**。⚠️ `:755,770,1197` 用「世界模型」造**第四义**（生成式），撞 C7/C15 命名禁令 + `ROADMAP.md` 明确不做第 7 条 |

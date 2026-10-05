@@ -25,7 +25,10 @@
   <header>
     <h1>在线 navmesh（镜像双目 + 航位推算 + 回环）</h1>
     <span>点栅格选目标 → 确认才发 goto；驾驶还需要自主已武装，否则只规划不动</span>
-    <span><a href="/navmesh/memory" id="memoryLink" style="color:#58a6ff">记忆管理 →</a></span>
+    <span>
+      <a href="/ui" id="consoleLink" style="color:#58a6ff">← 控制台</a>
+      <a href="/navmesh/memory" id="memoryLink" style="color:#58a6ff;margin-left:10px">记忆管理 →</a>
+    </span>
   </header>
   <main>
     <section class="map card">
@@ -34,6 +37,7 @@
         <label class="muted">底图</label>
         <select id="layer">
           <option value="tristate">可通行性（三态）</option>
+          <option value="prior">世界先验（补了哪些格）</option>
           <option value="surface">深度：头顶那张面的高度</option>
           <option value="bands">高度分带（主带）</option>
           <option value="clearance">离非可走区的余隙</option>
@@ -70,6 +74,15 @@
         <label class="muted"><input type="checkbox" id="record"> 录制本次会话</label>
       </div>
       <p id="recInfo" class="muted"></p>
+      <!-- 世界身份：跨会话检索 / 采纳 / 世界先验消费**全都**挂在它上面，没设就是整条链不启动。
+           症状（下面那两行）与修法放同一屏，省得去控制台翻。 -->
+      <div class="controls">
+        <span class="muted">世界身份</span>
+        <select id="worldPick"><option value="">— 已记录的世界 —</option></select>
+        <input id="worldKeyInput" placeholder="wrld_… 或世界名" style="width:170px">
+        <button id="worldSet">设为当前世界</button>
+      </div>
+      <p id="worldHint" class="muted"></p>
       <div class="controls">
         <button id="arm">武装自主 5 分钟</button>
         <button id="disarm">解除武装</button>
@@ -89,6 +102,8 @@
         <span>相机高度</span><b id="camH">—</b>
         <span>回环 / 降权 / 修正</span><b id="loops">—</b>
         <span>朝向校验 / 跳变</span><b id="yawDiag">—</b>
+        <span>跨会话检索</span><b id="xsession">—</b>
+        <span>世界先验</span><b id="prior">—</b>
         <span>近距障碍</span><b id="near">—</b>
         <span>自主</span><b id="autonomy">—</b>
         <span>驾驶阻塞</span><b id="block">—</b>

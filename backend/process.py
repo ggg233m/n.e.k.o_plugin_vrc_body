@@ -260,7 +260,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
             svc = self.server.service
             if path == "/worldmodel/navmesh/memory":
-                self._json(200, svc.navmesh_memory_summary())
+                # sizes=0：不递归扫目录算体积（上万个文件、秒级）。管理页要那一列体积才用默认档。
+                self._json(200, svc.navmesh_memory_summary(sizes=q.get("sizes", "1") != "0"))
             elif path == "/worldmodel/navmesh/memory/sessions":
                 self._json(200, svc.navmesh_memory_sessions(q.get("world")))
             elif path == "/worldmodel/navmesh/memory/session":

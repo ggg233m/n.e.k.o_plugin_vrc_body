@@ -252,6 +252,10 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "radius_m": (float, 0.05, 2.0),
     "move_hold_ms": (int, 100, 5000),
     "record_max_mb": (float, 1.0, 100000.0),
+    # 会话末自动**并树**（世界树 pass，逐对采纳之后跑一次）：收掉"别的会话之间的桥"，
+    # 否则孤立会话的匹配会因"坐标系不同根"被丢（2026-10-06 实测漏过 18 条）。
+    # 代价是会话末后台线程里逐桥跑一次弹性优化；关掉 = 手动跑 tools/xsession_align.py --world-tree。
+    "xsession_world_tree": (bool, 0, 1),
 }
 NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
     "res_m": (float, 0.02, 1.0),
@@ -300,6 +304,21 @@ NAVMESH_LOOP_KEYS: dict[str, tuple[type, float, float]] = {
     # 只是没有外观候选 —— 见 nav_loop.LoopCloser.status()["bow_reason"]。
     "bow_candidates": (int, 0, 64),
     "bow_shortlist": (int, 1, 256),
+}
+# [navmesh.prior]：世界先验（<world>/prior/，由 research/tools/offline_fusion.py --write-prior 产出）
+# 的**在线消费**闸门。默认值 = 保守档：gauge 过不了闸就一格都不注入（见 backend/nav_prior.py）。
+# 这些是"要不要信这张先验"，不是"平台参数"——放宽前先看 status()["prior"] 的实测残差。
+NAVMESH_PRIOR_KEYS: dict[str, tuple[type, float, float]] = {
+    "enabled": (bool, 0, 1),
+    "min_constraints": (int, 3, 100000),      # 参与 gauge 的原始约束数下限（3 = estimate_gauge 硬下限）
+    "min_inlier": (int, 3, 100000),           # IRLS 内点数下限
+    "min_inlier_frac": (float, 0.0, 1.0),     # 内点占比下限
+    "max_pos_med_m": (float, 0.0, 10.0),      # 内点位置残差（中位）上限
+    "max_rot_med_deg": (float, 0.0, 180.0),   # 内点旋转残差（中位）上限
+    # 前后半交叉验证（见 backend/nav_prior._cross_check）：池化残差好看但前后半各估的 gauge
+    # 对不上 = 会话帧在漂移（2026-10-06 live 就因为这条缺失注入了错 6° 的先验）。
+    "max_split_m": (float, 0.0, 20.0),
+    "max_split_yaw_deg": (float, 0.0, 180.0),
 }
 
 NavmeshOverrides = tuple[tuple[str, "float | int | bool"], ...]
@@ -379,6 +398,7 @@ class NavmeshConfig:
     online: NavmeshOverrides = ()
     mapper: NavmeshOverrides = ()
     loop: NavmeshOverrides = ()
+    prior: NavmeshOverrides = ()
     memory: NavmeshMemoryConfig = NavmeshMemoryConfig()
 
 
@@ -682,8 +702,9 @@ class PluginConfig:
             persist=_boolean(world_model.get("persist"), True, name="world_model.persist"),
         )
         navmesh = _section(root, "navmesh")
-        navmesh_top = {"world_scale", "expected_baseline_m", "baseline_tol_m", "loop_closure", "mapper", "loop", "memory"}
-        for sub in ("mapper", "loop", "memory"):
+        navmesh_top = {"world_scale", "expected_baseline_m", "baseline_tol_m", "loop_closure",
+                       "mapper", "loop", "prior", "memory"}
+        for sub in ("mapper", "loop", "prior", "memory"):
             if sub in navmesh and not isinstance(navmesh[sub], Mapping):
                 raise ValueError(f"navmesh.{sub} must be a table")
         navmesh_config = NavmeshConfig(
@@ -694,6 +715,7 @@ class PluginConfig:
             online=_navmesh_overrides(navmesh, NAVMESH_ONLINE_KEYS, prefix="navmesh", nested=frozenset(navmesh_top)),
             mapper=_navmesh_overrides(_section(navmesh, "mapper"), NAVMESH_MAPPER_KEYS, prefix="navmesh.mapper"),
             loop=_navmesh_overrides(_section(navmesh, "loop"), NAVMESH_LOOP_KEYS, prefix="navmesh.loop"),
+            prior=_navmesh_overrides(_section(navmesh, "prior"), NAVMESH_PRIOR_KEYS, prefix="navmesh.prior"),
             memory=_navmesh_memory(_section(navmesh, "memory")),
         )
         vision_source = str(vision.get("source", "none")).strip().lower() or "none"

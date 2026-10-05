@@ -470,6 +470,48 @@ class TestMergedConsumption(XSessionTestBase):
         self.assertEqual(info["tables"]["B"], "raw")
 
 
+class TestTrackerPosesForPrior(XSessionTestBase):
+    """P0.3b：在线 gauge 估计的两把勺子 —— 旧帧位姿（索引快照系）与表坐标系根。
+
+    ``old_pose`` 必须与索引**实际用的表**同源（重读盘可能已是另一张表 ⇒ 混 gauge）；
+    ``table_base`` 是"先验坐标系根必须与约束同根"那道闸的判据。
+    """
+
+    def _tracker(self) -> XSessionTracker:
+        tr = XSessionTracker(self.cfg, self.wdir, "NEW")
+        self.assertTrue(tr.wait_ready(30.0), "索引装载超时")
+        self.tr = tr
+        return tr
+
+    def _write_merged(self, sid: str, base: str) -> Path:
+        xdir = self.wdir / "xsession"
+        xdir.mkdir(parents=True, exist_ok=True)
+        with np.load(self.wdir / "sessions" / sid / "poses.npz") as z:
+            ids = np.asarray(z["ids"], np.int64)
+            T = np.asarray(z["T_map"], np.float64)
+            dist = np.asarray(z["dist_m"], np.float64)
+        p = xdir / f"merged_{sid}_into_{base}.npz"
+        np.savez_compressed(p, ids=ids, T_map=T, dist_m=dist, base_sid=base)
+        return p
+
+    def test_old_pose_reads_index_snapshot(self) -> None:
+        tr = self._tracker()
+        got = tr.old_pose("A", 0)
+        self.assertIsNotNone(got)
+        R, xy = got
+        self.assertTrue(np.allclose(R, np.eye(3)))
+        self.assertTrue(np.allclose(xy, 0.0))
+        self.assertIsNone(tr.old_pose("A", 77), "快照里没有的帧 = None（不猜）")
+        self.assertIsNone(tr.old_pose("ghost", 0))
+
+    def test_table_base_raw_then_merged(self) -> None:
+        tr = self._tracker()
+        self.assertEqual(tr.table_base("A"), "A", "原表：坐标系根是会话自己")
+        self._write_merged("A", "B")
+        self.assertEqual(self._tracker().table_base("A"), "B", "已采纳：根 = merged 的 base_sid")
+        self.assertIsNone(self.tr.table_base("ghost"))
+
+
 class TestAlignBaseComposition(unittest.TestCase):
     """旧会话自己已被采纳时：再对齐按 ``base_sid`` **链式往上传**（C→B、B→A ⇒ C 落 A 系）。"""
 

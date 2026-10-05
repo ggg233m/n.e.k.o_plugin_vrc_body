@@ -11,11 +11,20 @@ main { display:grid; grid-template-columns:minmax(420px,2fr) minmax(280px,1fr); 
 .state { font-size:24px; font-weight:700; margin:12px 0; color:var(--warn); }
 .state.localized { color:var(--good); } .state.lost { color:var(--bad); }
 .state.mapping { color:#58a6ff; }
-.controls { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; }
+.controls { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; align-items:center; }
 .controls button { background:#21262d; color:#e6edf3; border:1px solid var(--line); border-radius:6px; padding:7px 10px; cursor:pointer; }
 .controls button:hover { border-color:#58a6ff; }
-.grid { display:grid; grid-template-columns:1fr auto; gap:8px 14px; align-items:center; }
-.grid span { color:var(--muted); } .grid b { font-variant-numeric:tabular-nums; }
+/* 世界身份那一行有 select + input + button：不设上限时 select 的固有宽度（最长选项）
+   会把整个右栏的 min-content 顶大，进而把下面的状态网格挤成一字一行（2026-10-06 实况）。 */
+.controls select, .controls input { max-width:100%; min-width:0; }
+.controls select { max-width:230px; }
+.controls input { flex:1 1 130px; }
+/* 标签列必须是 max-content：写 1fr 时，长的值（auto = max-content）会把标签列压到
+   一个字宽 —— `OSC 静默 / 封顶丢弃` 会竖成一列（2026-10-06 实况）。 */
+.grid { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:8px 14px; align-items:baseline; }
+.grid span { color:var(--muted); white-space:nowrap; }
+.grid b { font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+#worldHint { overflow-wrap:anywhere; }
 .reason { min-height:38px; color:#f0f6fc; overflow-wrap:anywhere; }
 .map-inline { margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
 .map-inline .title { font-size:12px; line-height:1.35; }

@@ -219,18 +219,31 @@ class NavGrid:
         return 0 <= rc[0] < self.grid.shape[0] and 0 <= rc[1] < self.grid.shape[1]
 
     # ---- 建可走区 ----
+    def walked_mask(self, walked: Iterable[np.ndarray], half_m: float = 0.20) -> np.ndarray:
+        """走过走廊的**格掩码**（``walked``：导航系世界米折线，与 ``build`` 同口径加粗）。
+
+        身体走过 = 活的通行证据。先验障碍消费要它：gauge 有残余误差时，一张错位的
+        先验障碍守在走廊上会把规划自己的起点困住，所以那一圈格上一律不落先验障碍。
+        """
+        m = np.zeros(self.grid.shape, np.uint8)
+        thick = max(1, int(round(2 * half_m / self.meta.cell_world_m)))
+        for poly in walked:
+            pts = np.array([self.to_cell(p)[::-1] for p in np.asarray(poly, float)], np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(m, [pts.reshape(-1, 1, 2)], False, 1, thick)
+        return m > 0
+
     def build(self, radius_m: float = 0.25, walked: Iterable[np.ndarray] = (),
               walked_half_m: float = 0.20) -> dict[str, Any]:
         """``walked``：导航系世界米的折线列表，**调用方已用 OSC 门控切掉位姿跳变**。"""
         g, cw = self.grid, self.meta.cell_world_m
         occ, free_obs = g == OCC, g == FREE
-        walked_mask = np.zeros(g.shape, np.uint8)
+        walked = list(walked)          # 下面要走两遍（掩码 + 中心线），生成器只许消费一次
+        walked_mask = self.walked_mask(walked, walked_half_m).astype(np.uint8)
         line = np.zeros(g.shape, np.uint8)
-        thick = max(1, int(round(2 * walked_half_m / cw)))
         for poly in walked:
             pts = np.array([self.to_cell(p)[::-1] for p in np.asarray(poly, float)], np.int32)
             if len(pts) >= 2:
-                cv2.polylines(walked_mask, [pts.reshape(-1, 1, 2)], False, 1, thick)
                 cv2.polylines(line, [pts.reshape(-1, 1, 2)], False, 1, 1)
         passable = (free_obs | (walked_mask > 0)) & ~occ
         # pad 一圈 0：图外与未知、障碍一样算"非可走"。

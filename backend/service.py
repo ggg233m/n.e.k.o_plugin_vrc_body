@@ -48,6 +48,7 @@ from .world_model import WorldModel
 from .time_alignment import TimeAlignmentBuffer
 from .nav_memory import NavMemoryStore, config_from_plugin as nav_memory_config
 from .nav_online import OnlineNavConfig, OnlineNavigator
+from .nav_prior import prior_meta
 
 
 _VMC_CALIBRATION_RETRY_SECONDS = 5.0
@@ -349,9 +350,9 @@ class BackendService:
                     max_per_minute=self.config.vision.semantic_max_per_minute,
                 )
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
-        # W1 世界身份子系统。世界身份不自动跨进程恢复：重启后 world_key 为 unknown，
-        # 等待用户再次手动输入，因此这里不读取任何持久化身份文件。具体启停由
-        # /worldmodel/start|stop 接口驱动，不随后端 service.start() 自动拉起。
+        # W1 世界身份子系统。身份会落盘（`<state_dir>/world_identity.json`）：重启后自动沿用
+        # **用户显式设过**的值并标 `restored`；系统仍不猜世界（见 world_model 模块 docstring）。
+        # 具体启停由 /worldmodel/start|stop 接口驱动，不随后端 service.start() 自动拉起。
         self.world_model = WorldModel(
             enabled=self.config.world_model.enabled,
             persist=self.config.world_model.persist,
@@ -578,9 +579,17 @@ class BackendService:
         return self.navmesh.cancel()
 
     # ---- navmesh 记忆管理（列/看/改标签/钉住/删/清理）----
-    def navmesh_memory_summary(self) -> dict[str, Any]:
-        return {**self.navmesh_memory.summary(), "world_list": self.navmesh_memory.list_worlds(),
+    def navmesh_memory_summary(self, sizes: bool = True) -> dict[str, Any]:
+        """``sizes=False``：不扫目录算体积（见 ``NavMemoryStore.list_worlds``）。
+        栅格页/主页面只要"有哪些世界、几场会话、有没有先验"，用轻的那档，别把请求超时打爆。"""
+        base = {**self.navmesh_memory.summary(sizes=sizes),
+                "world_list": self.navmesh_memory.list_worlds(sizes=sizes),
                 "current_world": self.world_model.identity()}
+        # 每个世界的**世界先验**在不在（只读 prior.json 摘要，不加载 npz）——"没设世界身份"
+        # 与"设了但那个世界还没固化先验"是两件事，UI 要把它们分开说。
+        base["priors"] = {w["world_id"]: prior_meta(self.navmesh_memory.root / w["world_id"])
+                          for w in base["world_list"]}
+        return base
 
     def navmesh_memory_sessions(self, world_id: Any) -> dict[str, Any]:
         return self._memory_call(lambda: {"world_id": world_id,

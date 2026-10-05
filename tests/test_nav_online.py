@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import tempfile
 import threading
 import time
@@ -18,6 +19,7 @@ from neko_anyadance_body.backend import nav_online
 from neko_anyadance_body import config
 from neko_anyadance_body.backend.nav_loop import LoopConfig
 from neko_anyadance_body.backend.nav_mapping import MapperConfig
+from neko_anyadance_body.backend.nav_prior import PriorConfig
 from neko_anyadance_body.backend.nav_online import (DeadReckoner, KeyframePolicy, OnlineNavConfig, OnlineNavigator,
                                                     SessionRecorder, check_baseline, hmd_to_base_rotation,
                                                     near_obstacle)
@@ -354,6 +356,94 @@ class ControlTickTest(unittest.TestCase):
         self.assertFalse(Harness().nav.goto(float("nan"), 0.0)["ok"])
 
 
+class SteamVROpenGuardTest(unittest.TestCase):
+    """打开 SteamVR 的**前置自检**与**原生崩翻译**。
+
+    2026-10-06 实况：`sensors_open: OSError: exception: access violation reading
+    0x0000000000000000` —— `openvr.init()` 的错误码是 OK，但拿到的 IVRSystem 是空指针，
+    直到第一次调用才在原生层崩。这里钉住三件事：① SteamVR 没在运行/没装时**不许去 init**
+    （那正是崩的来源）；② init 成功过才允许 shutdown；③ 原生崩要翻成"该怎么办"，且**保留原始文本**。
+    """
+
+    class _FakeOpenVR:
+        VRApplication_Background = 3
+        Eye_Left, Eye_Right = 0, 1
+
+        def __init__(self, *, installed=True, hmd=True, system="stub", init_exc=None,
+                     call_exc=None):
+            self.installed, self.hmd = installed, hmd
+            self._system, self._init_exc, self._call_exc = system, init_exc, call_exc
+            self.init_calls = self.shutdown_calls = 0
+
+        def isRuntimeInstalled(self):
+            return self.installed
+
+        def isHmdPresent(self):
+            return self.hmd
+
+        def init(self, app_type, startup_info=None):
+            self.init_calls += 1
+            if self._init_exc is not None:
+                raise self._init_exc
+            return self._system
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    def _open(self, fake):
+        with mock.patch.dict(sys.modules, {"openvr": fake}):
+            sensors = nav_online.OpenVRSensors()
+            try:
+                sensors.open()
+            finally:
+                sensors.close()
+
+    def test_refuses_before_init_when_steamvr_is_not_running(self) -> None:
+        fake = self._FakeOpenVR(hmd=False)
+        with self.assertRaises(RuntimeError) as raised:
+            self._open(fake)
+        self.assertIn("SteamVR 没在运行", str(raised.exception))
+        self.assertEqual(fake.init_calls, 0, "SteamVR 没开时不许去 init —— 那正是读空指针的来源")
+        self.assertEqual(fake.shutdown_calls, 0)
+
+    def test_refuses_when_runtime_is_missing(self) -> None:
+        fake = self._FakeOpenVR(installed=False)
+        with self.assertRaises(RuntimeError) as raised:
+            self._open(fake)
+        self.assertIn("未安装", str(raised.exception))
+        self.assertEqual(fake.init_calls, 0)
+
+    def test_null_system_is_reported_not_dereferenced(self) -> None:
+        fake = self._FakeOpenVR(system=None)
+        with self.assertRaises(RuntimeError) as raised:
+            self._open(fake)
+        self.assertIn("空对象", str(raised.exception))
+        self.assertEqual(fake.init_calls, 1)
+        self.assertEqual(fake.shutdown_calls, 0, "没 init 成功就不许 shutdown")
+
+    def test_native_crash_becomes_actionable_and_keeps_raw_text(self) -> None:
+        raw = "exception: access violation reading 0x0000000000000000"
+
+        class DeadSystem:
+            def getEyeToHeadTransform(self, eye):
+                raise OSError(raw)
+
+        fake = self._FakeOpenVR(system=DeadSystem())
+        with self.assertRaises(RuntimeError) as raised:
+            self._open(fake)
+        msg = str(raised.exception)
+        self.assertIn("access violation", msg, "原始文本是现场证据，不许吞")
+        self.assertIn("先启动 SteamVR", msg)
+        self.assertEqual(fake.shutdown_calls, 1, "init 成功过才允许 shutdown")
+
+    def test_error_code_failure_is_translated(self) -> None:
+        fake = self._FakeOpenVR(init_exc=RuntimeError("VRInitError_Init_HmdNotFound"))
+        with self.assertRaises(RuntimeError) as raised:
+            self._open(fake)
+        self.assertIn("HmdNotFound", str(raised.exception))
+        self.assertEqual(fake.shutdown_calls, 0, "init 抛错时不许 shutdown")
+
+
 class ThreadsTest(unittest.TestCase):
     def test_slow_map_rebuild_does_not_block_status_or_control(self) -> None:
         # 实机：853 帧回环后一次重建 >1 s，旧实现握着 _nav_lock，status 请求 30 s 超时、控制线程停拍。
@@ -504,9 +594,100 @@ class ThreadsTest(unittest.TestCase):
         from neko_anyadance_body.backend.nav_online import _GRID_LAYERS
         self.assertIn("tristate", _GRID_LAYERS)
         self.assertIn("surface", _GRID_LAYERS)
+        self.assertIn("prior", _GRID_LAYERS)
         # 图层名是白名单，HTTP 层按它回落；写成集合会丢顺序，这里只查内容
-        self.assertEqual(set(_GRID_LAYERS) & {"tristate", "surface", "bands", "clearance"},
+        self.assertEqual(set(_GRID_LAYERS) & {"tristate", "prior", "surface", "bands", "clearance"},
                          set(_GRID_LAYERS))
+
+    def test_prior_layer_marks_what_the_prior_actually_filled(self) -> None:
+        """``prior`` 图层：亮色 = 先验**真补进去**的格，暗色 = 先验有意见但 live 已有证据。
+
+        这一层是"先验注入到底生效了没有"的唯一肉眼入口 —— 没有它，``applied_mask``
+        只有 status 里的计数，看不出补在哪、跟 live 冲突在哪。
+        """
+        import base64 as b64
+        import cv2
+        from neko_anyadance_body.backend.nav_prior import PriorConsumer, PriorConfig, project_prior
+        from tests.test_nav_prior import make_grid, sample_prior, cell_of, SAMPLE_XY
+        import tempfile as _tf
+
+        with _tf.TemporaryDirectory() as tmp:
+            wdir = Path(tmp) / "wrld_x"
+            h = Harness(armed=False)
+            h.nav._prior = PriorConsumer(
+                PriorConfig(), wdir, world_scale=S,
+                pose_of=lambda k: None,
+                pose_of_old=lambda sid, kf: None, table_base=lambda sid: None)
+            ovl = project_prior(sample_prior(), np.eye(2), np.zeros(2))
+            h.nav._prior._overlay = ovl
+            h.nav.session.ng = make_grid(world_scale=S)      # 全 UNK 的会话帧栅格
+            # live 先看了一格：先把先验唯一的 OCC 格改成 live FREE（先验不许动它）
+            r, c = cell_of(h.nav.session.ng, *SAMPLE_XY[4])
+            h.nav.session.ng.grid[r, c] = nav_online.FREE
+            ovl.apply_into(h.nav.session.ng)
+            view = h.nav.grid_view("prior")
+            img = cv2.imdecode(np.frombuffer(b64.b64decode(view["png_base64"]), np.uint8),
+                               cv2.IMREAD_COLOR)                       # BGR，与后端 _PRIOR_COLORS 同序
+            self.assertTrue(view["ramp"]["available"])
+            self.assertEqual(view["ramp"]["applied_free"], 4)
+            self.assertEqual(view["ramp"]["applied_occ"], 0)           # 被 live free 挡住了
+            self.assertEqual(view["ramp"]["not_applied"], 1)
+            r, c = cell_of(h.nav.session.ng, *SAMPLE_XY[0])
+            self.assertEqual(tuple(int(v) for v in img[r, c]), (150, 225, 150), "先验补 free 应是亮绿")
+            r, c = cell_of(h.nav.session.ng, *SAMPLE_XY[4])
+            self.assertEqual(tuple(int(v) for v in img[r, c]), (50, 50, 130), "未采纳的先验障碍应是暗红")
+            r, c = cell_of(h.nav.session.ng, -1.5, -1.5)               # 先验范围外
+            self.assertEqual(tuple(int(v) for v in img[r, c]), (90, 90, 90), "先验不知道的格保持 unknown 灰")
+
+    def test_prior_layer_occ_color_is_red_not_blue(self) -> None:
+        """BGR 陷阱回归：``cv2.imencode`` 认 BGR，写 RGB 会让"先验障碍"显示成蓝色。
+
+        triatate / 灰阶那几层看不出来（对称色），彩色层才暴露 —— 用一组已知格把它钉住。
+        """
+        import base64 as b64
+        import cv2
+        from neko_anyadance_body.backend.nav_prior import (L_OCC, PriorMap, PriorConsumer,
+                                                           PriorConfig, project_prior)
+        from tests.test_nav_prior import make_grid, cell_of
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Harness(armed=False)
+            h.nav._prior = PriorConsumer(PriorConfig(), Path(tmp) / "w", world_scale=S,
+                                         pose_of=lambda k: None)
+            lab = np.zeros((40, 40), np.uint8)
+            lab[15, 20] = L_OCC
+            ovl = project_prior(PriorMap(labels=lab, origin_xy=np.array([-2.0, -2.0]), res_m=0.1,
+                                         world_scale=S, base_sid="R", meta={}, path=Path("x")),
+                                np.eye(2), np.zeros(2))
+            h.nav._prior._overlay = ovl
+            h.nav.session.ng = make_grid(world_scale=S)
+            ovl.apply_into(h.nav.session.ng)
+            img = cv2.imdecode(np.frombuffer(b64.b64decode(
+                h.nav.grid_view("prior")["png_base64"]), np.uint8), cv2.IMREAD_COLOR)
+            r, c = cell_of(h.nav.session.ng, 0.05, -0.45)
+            b, g, rr = (int(v) for v in img[r, c])
+            self.assertEqual((rr, g, b), (225, 60, 60), f"先验障碍应显示为红，实际 RGB=({rr},{g},{b})")
+
+    def test_prior_layer_without_prior_is_honest(self) -> None:
+        import base64 as b64
+        import cv2
+        h = Harness(armed=False)
+        h.nav.session.ng = None                      # 未建图 → grid_view 直接 None
+        h.nav._prior = None
+        self.assertIsNone(h.nav.grid_view("prior"))
+        from neko_anyadance_body.backend.nav_prior import PriorConsumer, PriorConfig
+        from tests.test_nav_prior import make_grid
+        h.nav._prior = PriorConsumer(PriorConfig(), Path("nowhere"), world_scale=S,
+                                     pose_of=lambda k: None)
+        h.nav.session.ng = make_grid(world_scale=S)
+        # 还没跑过第一次栅格化 ⇒ 状态是 idle（建图线程一调 overlay() 就变 no_prior）
+        self.assertEqual(h.nav.grid_view("prior")["ramp"]["reason"], "idle")
+        self.assertIsNone(h.nav._prior.overlay())        # 没有先验文件 ⇒ 一格都不注入
+        view = h.nav.grid_view("prior")
+        self.assertFalse(view["ramp"]["available"])
+        self.assertEqual(view["ramp"]["reason"], "no_prior")
+        decoded = cv2.imdecode(np.frombuffer(b64.b64decode(view["png_base64"]), np.uint8),
+                              cv2.IMREAD_COLOR)
+        self.assertEqual(tuple(int(v) for v in decoded[0, 0]), (90, 90, 90))
 
     def test_session_is_persisted_to_world_memory(self) -> None:
         from neko_anyadance_body.backend.nav_memory import MemoryConfig, NavMemoryStore, world_dir_name
@@ -588,6 +769,56 @@ class ThreadsTest(unittest.TestCase):
                 h.nav.stop()
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+    def test_confirmed_constraints_feed_prior_consumer(self) -> None:
+        """P0.3b 先验消费接线：建图线程把 ``on_keyframe`` 的确认约束喂进 PriorConsumer。
+
+        先验（世界系）能不能注入，全靠这批约束估出的 gauge；旧实现把返回值丢了，
+        这一步断了在线消费就永远是 no gauge（空转不报错，只有 status 能看出来）。
+        """
+        from neko_anyadance_body.backend.nav_memory import MemoryConfig, NavMemoryStore
+        from neko_anyadance_body.backend.nav_prior import PriorConsumer
+
+        class FakeTracker:
+            def __init__(self, cfg, world_dir, sid, session_dir=None):
+                self.world_dir = Path(world_dir)
+                self.seen: list[int] = []
+
+            def status(self):
+                return {"active": True, "reason": "ok"}
+
+            def write_back(self, table):
+                return {"written": False}
+
+            def on_keyframe(self, k, feat, dist, R, refresh):
+                self.seen.append(int(k))
+                return [{"new_sid": "S", "new_kf": int(k), "old_sid": "O", "old_kf": 0,
+                         "inliers": 40, "t_ab": [0.0, 0.0, 0.0], "R_ab": np.eye(3).tolist()}]
+
+            def old_pose(self, sid, kf):
+                return np.eye(3), np.zeros(2)
+
+            def table_base(self, sid):
+                return "O"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            h = Harness(armed=False, vz=0.5)
+            h.nav.memory = NavMemoryStore(Path(tmp), MemoryConfig(min_session_keyframes=1))
+            h.nav._world_identity = lambda: {"world_key": "wrld_test", "world_name": "t",
+                                             "world_source": "manual"}
+            with mock.patch.object(nav_online, "XSessionTracker", FakeTracker),                     mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+                h.nav.start()
+                try:
+                    self.assertIsInstance(h.nav._prior, PriorConsumer)
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline and h.nav.status()["prior"]["n_constraints"] < 1:
+                        time.sleep(0.05)
+                    st = h.nav.status()["prior"]
+                finally:
+                    h.nav.stop()
+        self.assertGreaterEqual(st["n_constraints"], 1,
+                                f"确认约束没进先验消费（n={st['n_constraints']}）：{st}")
+        self.assertEqual(st["state"], "no_prior", "临时世界没有 prior/ ⇒ 如实报 no_prior")
+
     def test_external_hmd_yaw_snap_reported(self) -> None:
         h = Harness(armed=False)
         yaw = {"deg": 0.0}
@@ -664,7 +895,7 @@ class ConfigSurfaceTest(unittest.TestCase):
 
     def test_config_keys_match_backend_fields(self) -> None:
         for spec, cls in ((config.NAVMESH_ONLINE_KEYS, OnlineNavConfig), (config.NAVMESH_MAPPER_KEYS, MapperConfig),
-                          (config.NAVMESH_LOOP_KEYS, LoopConfig)):
+                          (config.NAVMESH_LOOP_KEYS, LoopConfig), (config.NAVMESH_PRIOR_KEYS, PriorConfig)):
             names = {f.name: f for f in fields(cls)}
             for key, (kind, _lo, _hi) in spec.items():
                 self.assertIn(key, names, f"{cls.__name__}.{key}")
@@ -684,13 +915,16 @@ class ConfigSurfaceTest(unittest.TestCase):
     def test_overrides_and_validation(self) -> None:
         nav = config.PluginConfig.from_mapping({"navmesh": {
             "world_scale": 0.8, "kf_dist_m": 0.5, "stop_min_pts": 20, "loop_closure": False,
-            "mapper": {"range_m": 4.0, "ray_clear": False}, "loop": {"min_inliers": 40}}}).navmesh
+            "mapper": {"range_m": 4.0, "ray_clear": False}, "loop": {"min_inliers": 40},
+            "prior": {"min_constraints": 12, "max_pos_med_m": 0.25}}}).navmesh
         c = OnlineNavConfig.from_plugin(nav)
         self.assertEqual((c.world_scale, c.kf_dist_m, c.stop_min_pts, c.loop_closure), (0.8, 0.5, 20, False))
         self.assertEqual((c.mapper.range_m, c.mapper.ray_clear, c.mapper.world_scale), (4.0, False, 0.8))
         self.assertEqual((c.loop.min_inliers, c.loop.world_scale), (40, 0.8))
+        self.assertEqual((c.prior.min_constraints, c.prior.max_pos_med_m), (12, 0.25))
         for bad in ({"world_scale": 0}, {"kf_dst_m": 0.5}, {"mapper": {"world_scale": 0.9}},
-                    {"mapper": {"range_m": "far"}}, {"loop": {"min_inliers": 1.5}}, {"mapper": 3}):
+                    {"mapper": {"range_m": "far"}}, {"loop": {"min_inliers": 1.5}}, {"mapper": 3},
+                    {"prior": {"max_pos_med_m": "tight"}}, {"prior": 1}):
             with self.assertRaises(ValueError, msg=str(bad)):
                 config.PluginConfig.from_mapping({"navmesh": bad})
 
@@ -831,6 +1065,60 @@ class XSessionAlignTest(unittest.TestCase):
             self.assertTrue(out["ok"], out)
             self.assertEqual(out["old_sid"], "OLD")
             self.assertTrue(Path(out["merged"]).is_file())
+            # 逐对采纳之后必须再跑一次世界树：它才看得见"别的会话之间的桥"
+            tree = out.get("world_tree")
+            self.assertIsNotNone(tree, out)
+            self.assertIn("aligned", tree)
+
+    def test_world_tree_pass_runs_after_pairwise_align(self) -> None:
+        seen: dict = {}
+
+        nav = OnlineNavigator.__new__(OnlineNavigator)
+        nav._state_lock = threading.Lock()
+        nav._errors = []
+        nav._align_out = None
+        nav.cfg = OnlineNavConfig()
+        wd = Path("wrld_probe")                       # 只作实参比对，不碰盘
+        with mock.patch.object(nav_online, "align_into_auto",
+                               return_value={"ok": True, "old_sid": "OLD"}), \
+             mock.patch.object(nav_online, "align_world_tree",
+                               side_effect=lambda d, c: seen.update(dir=d) or
+                               {"ok": True, "aligned": 1, "skipped": 3, "refused": 0,
+                                "components": [1], "report": "r"}):
+            nav._align_xsession("NEW", wd)
+        self.assertEqual(seen.get("dir"), wd, "并树必须作用在同一个世界目录上")
+        out = nav._align_out
+        self.assertTrue(out["ok"], "并树不影响逐对采纳的结果字段")
+        self.assertEqual(out["world_tree"]["aligned"], 1)
+        self.assertEqual(out["world_tree"]["components"], 1)
+
+    def test_world_tree_can_be_switched_off(self) -> None:
+        from neko_anyadance_body.backend.nav_xsession import XSessionConfig
+        nav = OnlineNavigator.__new__(OnlineNavigator)
+        nav._state_lock = threading.Lock()
+        nav._errors = []
+        nav._align_out = None
+        nav.cfg = OnlineNavConfig(xsession_world_tree=False)
+        with mock.patch.object(nav_online, "align_into_auto", return_value={"ok": True}), \
+             mock.patch.object(nav_online, "align_world_tree") as tree:
+            nav._align_xsession("NEW", Path("wrld_probe"))
+        tree.assert_not_called()
+        self.assertNotIn("world_tree", nav._align_out)
+        self.assertIsInstance(XSessionConfig(), XSessionConfig)
+
+    def test_world_tree_failure_keeps_align_result_and_records_error(self) -> None:
+        nav = OnlineNavigator.__new__(OnlineNavigator)
+        nav._state_lock = threading.Lock()
+        nav._errors = []
+        nav._align_out = None
+        nav.cfg = OnlineNavConfig()
+        with mock.patch.object(nav_online, "align_into_auto", return_value={"ok": True, "old_sid": "OLD"}), \
+             mock.patch.object(nav_online, "align_world_tree", side_effect=RuntimeError("boom")):
+            nav._align_xsession("NEW", Path("wrld_probe"))
+        self.assertTrue(nav._align_out["ok"], "并树炸了不能把采纳结果也带下去")
+        self.assertFalse(nav._align_out["world_tree"]["ok"])
+        self.assertIn("boom", nav._align_out["world_tree"]["reason"])
+        self.assertTrue(any("xsession_tree" in e for e in nav._errors), nav._errors)
 
 
 if __name__ == "__main__":

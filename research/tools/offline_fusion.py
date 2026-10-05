@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-r"""离线多视角融合（固化档第一步）—— 用**已采纳（merged）位姿**重建三态地图，清远场假障碍。
+r"""离线多视角融合（固化档第一步）—— 用**已采纳（merged）位姿**重建三态地图，清远场假障碍；
+多场录制可融合成同一张**世界先验**（``--write-prior``，在线由 ``backend/nav_prior.py`` 消费）。
 
     python research/tools/offline_fusion.py 20261001_044153                  # auto：会话有 merged 就用它
     python research/tools/offline_fusion.py 20261001_044153 --pose final     # A/B 对照：录制自带 final_poses
     python research/tools/offline_fusion.py 20261005_235232 --session 20261005_235237 --pose merged
+    # 世界先验（P0.3b 下一步②后半）：多场录制融合，落 <world>/prior/（原子写，rigid 口径）
+    python research/tools/offline_fusion.py 20261001_044153 20261005_235232 20261006_001523 --write-prior
 
 **它是什么**：把 2026-10-02 实验 `Docs/离线多视角融合v1-假障碍清除（2026-10-02）.md`
 （原脚本 `.tmp/_fusion_v1.py`）收编成正式工具。方法 = 重放录制关键帧，与在线 mapper 相同
@@ -42,6 +45,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import MapperConfig, _ground_correction   # noqa: E402
+from backend.nav_prior import write_prior                          # noqa: E402
 from backend.nav_xsession import session_pose_table                # noqa: E402
 
 C = MapperConfig()
@@ -65,22 +69,27 @@ def find_world(sid: str) -> Path | None:
     return None
 
 
-def table_poses(world_dir: Path, sid: str) -> tuple[dict[int, np.ndarray], list[int], str] | None:
-    """会话位姿表 → ({kf_id: T}, 排序后的 id 列表, 来源描述)。表读不到返回 None。"""
+def table_poses(world_dir: Path, sid: str) -> tuple[dict[int, np.ndarray], list[int], str, str | None] | None:
+    """会话位姿表 → ({kf_id: T}, 排序后的 id 列表, 来源描述, 坐标系根 base_sid)。表读不到返回 None。
+
+    base_sid 是**全名**（来源描述里只截后 6 位给人看）：写先验时要拿它跟其它会话比根，
+    截断的名字比不出"同根"。
+    """
     tab = session_pose_table(world_dir, sid)
     if tab is None:
         return None
     ids = [int(k) for k in tab["ids"]]
     pose_of = {int(k): np.asarray(T, np.float64) for k, T in zip(ids, tab["T_map"])}
-    base = tab.get("base_sid") or "-"
-    return pose_of, sorted(pose_of), f"{tab['source']}(base={str(base)[-6:]})"
+    base = str(tab["base_sid"]) if tab.get("base_sid") else None
+    return pose_of, sorted(pose_of), f"{tab['source']}(base={(base or '-')[-6:]})", base
 
 
 def load_poses(rec: Path, events: list[dict], mode: str, world_dir: Path | None, sid: str):
-    """返回 (kf_npz, pose, src, fallback_count)。
+    """返回 (kf_npz, pose, src, fallback_count, base_sid)。
 
     merged 模式绝不混 gauge：表里没有的 k（如 refresh 撤下的帧）用**最近的表内 id** 兜底，
     不从 kf ``T_map``（原表系）取；final 模式保持原脚本行为（final_poses → kf T_map）。
+    ``base_sid`` 只在从会话表取位姿时给出（merged/rigid），final 模式为 None。
     """
     cache: dict[int, np.lib.npyio.NpzFile] = {}
 
@@ -100,7 +109,7 @@ def load_poses(rec: Path, events: list[dict], mode: str, world_dir: Path | None,
             raise SystemExit(f"[fail] 读不到会话原表 {raw_path}")
         if got is None:
             raise SystemExit(f"[fail] 世界目录里没有会话 {sid} 的位姿表")
-        merged_of, _ids, src = got
+        merged_of, _ids, src, base = got
         common = sorted(set(raw_of) & set(merged_of))
         P = np.array([raw_of[k][:2, 3] for k in common])
         Q = np.array([merged_of[k][:2, 3] for k in common])
@@ -127,12 +136,12 @@ def load_poses(rec: Path, events: list[dict], mode: str, world_dir: Path | None,
             out[:3, :3] = Rz @ T[:3, :3]
             return out
 
-        return kf_npz, pose, f"rigid({src})", n_fallback
+        return kf_npz, pose, f"rigid({src})", n_fallback, base
 
     if mode in ("auto", "merged") and world_dir is not None:
         got = table_poses(world_dir, sid)
         if got is not None:
-            pose_of, ids_sorted, src = got
+            pose_of, ids_sorted, src, base = got
             arr_ids = np.asarray(ids_sorted)
 
             def pose(k: int) -> np.ndarray:
@@ -144,7 +153,7 @@ def load_poses(rec: Path, events: list[dict], mode: str, world_dir: Path | None,
                 j = int(np.clip(np.searchsorted(arr_ids, int(k)), 0, len(arr_ids) - 1))
                 return pose_of[int(arr_ids[j])]
 
-            return kf_npz, pose, src, n_fallback
+            return kf_npz, pose, src, n_fallback, base
         if mode == "merged":
             raise SystemExit(f"[fail] 世界目录里找不到会话 {sid}（--world {world_dir}）；"
                              f"或改用 --pose final")
@@ -163,7 +172,7 @@ def load_poses(rec: Path, events: list[dict], mode: str, world_dir: Path | None,
             return hit
         return np.asarray(kf_npz(int(k))["T_map"], np.float64)
 
-    return kf_npz, pose, src, n_fallback
+    return kf_npz, pose, src, n_fallback, None
 
 
 def estimate_cam_h(kf_npz, events, alive_check) -> float:
@@ -240,7 +249,7 @@ def kf_rows(k, pts, T, cam_h):
 
 def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str) -> dict:
     events = load_events(rec)
-    kf_npz, pose, src, n_fb = load_poses(rec, events, mode, world_dir, sid)
+    kf_npz, pose, src, n_fb, base = load_poses(rec, events, mode, world_dir, sid)
     # refresh 语义（replay 同款）：kf k 事件带 refresh ⇒ 上一帧 k-1 的点让出（不计入终态）。
     alive = []
     prev = None
@@ -290,7 +299,36 @@ def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str) -> dict:
     iy = (uk & (4 * KOFF - 1)) - KOFF
     return dict(cam_h=cam_h, cam_h_est_s=round(n_est, 1), fusion_s=round(dt, 1),
                 n_kf=len(alive), n_refresh=n_refresh, pose_src=src, pose_fallback=n_fb,
+                base=base, rec=rec.name, sid=sid,
                 ix=ix, iy=iy, G=G, S=S, traj=np.asarray(traj))
+
+
+def merge_aggs(aggs: list[dict]) -> dict:
+    """多场录制 → 一份聚合（**同一世界系**：各自 rigid 位姿已落并树根坐标系）。
+
+    先验的"世界级"就在这里：跨会话的票合并后，`classify` 的"中距多帧确认"与射线式
+    降级都多看几场会话的眼睛——单场没看全的角落，另一场看见了。
+    ⚠️ 混不同世界系/不同 world_scale 的会话是**错的**，调用方负责先验（--write-prior 有闸）。
+    """
+    keys = np.concatenate([(a["ix"] + KOFF) * (4 * KOFF) + (a["iy"] + KOFF) for a in aggs])
+    vals = np.concatenate([a["G"] for a in aggs])
+    sup = np.concatenate([a["S"] for a in aggs])
+    uk, inv = np.unique(keys, return_inverse=True)
+    G = np.zeros((len(uk), 6), np.float64)
+    S = np.zeros((len(uk), 6), np.float64)
+    for j in range(6):
+        G[:, j] = np.bincount(inv, weights=vals[:, j], minlength=len(uk))
+        S[:, j] = np.bincount(inv, weights=sup[:, j], minlength=len(uk))
+    ix = (uk >> 22) - KOFF
+    iy = (uk & (4 * KOFF - 1)) - KOFF
+    return dict(ix=ix, iy=iy, G=G, S=S,
+                traj=np.concatenate([a["traj"] for a in aggs]),
+                n_kf=sum(a["n_kf"] for a in aggs),
+                n_refresh=sum(a["n_refresh"] for a in aggs),
+                pose_fallback=sum(a["pose_fallback"] for a in aggs),
+                cam_h=[a["cam_h"] for a in aggs],
+                fusion_s=round(sum(a["fusion_s"] for a in aggs), 1),
+                per=aggs)
 
 
 def dense(agg):
@@ -402,27 +440,62 @@ def panel(labels, title, traj, x0, y0):
     return cv2.copyMakeBorder(img, 28, 8, 8, 8, cv2.BORDER_CONSTANT, value=(60, 60, 60))
 
 
+def session_world_scale(world_dir: Path, sid: str) -> float | None:
+    """会话 session.json 里的 world_scale（换过 avatar 就变）。缺字段/读不到返回 None。"""
+    try:
+        meta = json.loads((Path(world_dir) / "sessions" / sid / "session.json").read_text(encoding="utf-8"))
+        ws = float(meta.get("world_scale"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return ws if ws > 0.0 and np.isfinite(ws) else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("rec", help="录制目录名（navmesh_recordings/ 下）")
+    ap.add_argument("rec", nargs="+", help="录制目录名（navmesh_recordings/ 下）；给多个 = 多场融合成同一张图")
     ap.add_argument("--session", default=None,
-                    help="会话 sid（默认与录制同名；录制名与会话 sid 不同时指名，如 20261005_235232 ↔ 20261005_235237）")
+                    help="会话 sid，逗号分隔、与 rec 一一对应（默认与录制同名；录制名与会话 sid 不同时指名，"
+                         "如 20261005_235232 ↔ 20261005_235237）")
     ap.add_argument("--world", default=None, help="世界目录（默认自动在 navmesh_memory/*/sessions/<sid> 找）")
     ap.add_argument("--pose", choices=("auto", "final", "merged", "rigid"), default="auto",
                     help="auto=会话在世界上就用已采纳(merged)表；final=录制自带 final_poses；"
                          "merged=强制用会话表；rigid=原表位姿只加并树的刚体分量（保会话内部形状）")
+    ap.add_argument("--write-prior", action="store_true",
+                    help="把融合结果固化为**世界先验** <world>/prior/prior.npz+json（原子写）。"
+                         "强制 rigid 口径（弹性形变会拉坏多视一致性，见 ROADMAP 2026-10-06 A/B）")
     ap.add_argument("--out", default=None, help="输出目录（默认 .tmp/offline_fusion）")
     args = ap.parse_args()
 
-    rec = ROOT / "navmesh_recordings" / args.rec
-    sid = args.session or args.rec
+    recs = [ROOT / "navmesh_recordings" / r for r in args.rec]
+    for r in recs:
+        if not (r / "events.jsonl").is_file():
+            raise SystemExit(f"[fail] 没有这个录制：{r}")
+    sids = [s.strip() for s in (args.session or "").split(",") if s.strip()]
+    if sids and len(sids) != len(recs):
+        raise SystemExit(f"[fail] --session 给了 {len(sids)} 个 sid，录制有 {len(recs)} 个（一一对应）")
+    if not sids:
+        sids = [r.name for r in recs]
+    mode = args.pose
+    if args.write_prior:
+        if args.pose not in ("auto", "rigid"):
+            raise SystemExit("[fail] --write-prior 只接受 --pose rigid（默认 auto 即 rigid）："
+                             "merged/final 的位姿会混 gauge 或带弹性形变")
+        mode = "rigid"
+
     world_dir = Path(args.world) if args.world else None
-    if world_dir is None and args.pose in ("auto", "merged", "rigid"):
-        world_dir = find_world(sid)
+    if world_dir is None and mode in ("auto", "merged", "rigid"):
+        found = {w for w in (find_world(s) for s in sids) if w is not None}
+        if len(found) > 1:
+            raise SystemExit(f"[fail] 多场录制落在不同世界目录：{sorted(str(w) for w in found)}")
+        if found:
+            world_dir = found.pop()
+    if args.write_prior and world_dir is None:
+        raise SystemExit("[fail] --write-prior 需要世界目录（会话没在世界里找到 ⇒ 无坐标系可固化）")
     out_dir = Path(args.out) if args.out else (ROOT / ".tmp" / "offline_fusion")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    agg = aggregate(rec, args.pose, world_dir, sid)
+    aggs = [aggregate(rec, mode, world_dir, sid) for rec, sid in zip(recs, sids)]
+    agg = aggs[0] if len(aggs) == 1 else merge_aggs(aggs)
     x0, y0, gband, oband, sband = dense(agg)
     occ_b, labels_f, occ_b3, st = classify(gband, oband, sband)
     H, W = occ_b.shape
@@ -447,15 +520,43 @@ def main() -> None:
     canvas = np.full((max(pb.shape[0], pf.shape[0]), pb.shape[1] + pf.shape[1] + 20, 3), 40, np.uint8)
     canvas[:pb.shape[0], :pb.shape[1]] = pb
     canvas[:pf.shape[0], pb.shape[1] + 20:] = pf
-    tag = f"{args.rec}_pose{args.pose}"
+    tag = f"{args.rec[0]}_pose{mode}" if len(recs) == 1 else f"{args.rec[0]}+{len(recs) - 1}_pose{mode}"
     cv2.imwrite(str(out_dir / f"compare_{tag}.png"), canvas)
 
-    result = dict(rec=args.rec, session=sid,
-                  world=str(world_dir) if world_dir else None, pose_mode=args.pose,
-                  cam_h=round(agg["cam_h"], 3), cam_h_est_s=agg["cam_h_est_s"],
-                  fusion_s=agg["fusion_s"], n_kf=agg["n_kf"], n_refresh=agg["n_refresh"],
-                  pose_src=agg["pose_src"], pose_fallback=agg["pose_fallback"],
+    result = dict(recs=args.rec, sessions=sids, world=str(world_dir) if world_dir else None,
+                  pose_mode=mode, n_kf=agg["n_kf"], n_refresh=agg["n_refresh"],
+                  pose_fallback=agg["pose_fallback"],
+                  cam_h=(agg["cam_h"] if len(aggs) == 1 else
+                         [round(c, 3) for c in agg["cam_h"]]),
+                  fusion_s=agg["fusion_s"],
+                  per_session=[{"rec": a["rec"], "sid": a["sid"], "pose_src": a["pose_src"],
+                                "base": a["base"], "n_kf": a["n_kf"], "fallback": a["pose_fallback"]}
+                               for a in aggs],
                   transitions=st, baseline_all_rings=m_b, rmax3_rings=m_3, fused_rings=m_f)
+
+    if args.write_prior:
+        bases = {a["base"] for a in aggs}
+        if None in bases or len(bases) != 1:
+            raise SystemExit(f"[fail] 会话位姿表坐标系根不一致（{sorted(str(b) for b in bases)}）："
+                             "先验必须落在**同一棵树**里；先跑 tools/xsession_align.py --world-tree")
+        base_sid = str(bases.pop())
+        scales = {sid: session_world_scale(world_dir, sid) for sid in sids}
+        if any(v is None for v in scales.values()):
+            raise SystemExit(f"[fail] 会话 session.json 缺 world_scale（{scales}）：不能固化先验（尺度不明）")
+        if max(scales.values()) - min(scales.values()) > 1e-6:
+            raise SystemExit(f"[fail] 会话 world_scale 不一致（{scales}）：换过 avatar，先验不能混尺度")
+        ws = float(min(scales.values()))
+        # 存储布局：行 = y、列 = x（labels_f 是行 = x、列 = y）⇒ 转置；origin = 最小格下标 × 分辨率。
+        npz_path = write_prior(
+            world_dir, labels_f.T, (x0 * RES, y0 * RES), RES, world_scale=ws, base_sid=base_sid,
+            meta={"tool": "research/tools/offline_fusion.py", "pose_mode": mode,
+                  "sessions": [{"sid": a["sid"], "rec": a["rec"], "n_kf": a["n_kf"],
+                                "pose_src": a["pose_src"], "pose_fallback": a["pose_fallback"]}
+                               for a in aggs],
+                  "transitions": st, "fused_rings": m_f, "cam_h": [round(a["cam_h"], 3) for a in aggs],
+                  "extent_m": {"x": [x0 * RES, (x0 + H) * RES], "y": [y0 * RES, (y0 + W) * RES]}})
+        result["prior"] = str(npz_path)
+
     (out_dir / f"metrics_{tag}.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, indent=2))
