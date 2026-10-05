@@ -17,6 +17,10 @@
     <out>/osc.jsonl、hmd_frames.jsonl、run.json
                                     离线路线（recorder/run_motion.py）的遥测格式，
                                     供 research/tools/stereo_seq_ground_truth.py 做 OSC+HMD 航位推算
+    <out>/avatar_params.jsonl       速度之外的 avatar 参数（含 **EyeHeightAsMeters** / ScaleFactor），
+                                    只记变化。**这是「世界米 ↔ 追踪米」的外部真值**：
+                                    VRChat 报的眼高就是世界米，除以 HMD 在追踪系里的高度即得世界尺度
+                                    （见 ``Docs/漂移形态诊断（2026-10-05）.md`` §十）。
 
 内参与基线
 ----------
@@ -116,7 +120,7 @@ Viewer.ViewpointF: 500.0
 """
 
 
-def _write_telemetry(out: Path, started: float, osc_samples, hmd_samples) -> int:
+def _write_telemetry(out: Path, started: float, osc_samples, osc_params, hmd_samples) -> int:
     """按 recorder/run_motion.py 的格式写遥测，让 OscPath / HmdYaw 直接读。
 
     run_motion 的时间轴是 ``t - obs_start_monotonic``；这里两者都用 perf_counter，
@@ -128,6 +132,12 @@ def _write_telemetry(out: Path, started: float, osc_samples, hmd_samples) -> int
         for t, axis, value in osc_samples:
             addr = _OSC_PREFIX + _VELOCITY_NAMES[int(axis)]
             f.write(json.dumps({"t": t, "addr": addr, "args": [value]}) + "\n")
+    # 速度之外的全部 avatar 参数（含 EyeHeightAsMeters / ScaleFactor）。只记**变化**。
+    # 这是「世界米 ↔ 追踪米」的外部真值：VRChat 报的眼高就是世界米，
+    # 除以 HMD 在追踪系里的高度即得世界尺度（见 Docs/漂移形态诊断（2026-10-05）.md §十）。
+    with (out / "avatar_params.jsonl").open("w", encoding="utf-8") as f:
+        for t, name, value in osc_params:
+            f.write(json.dumps({"t": t, "name": name, "value": value}) + "\n")
     written = 0
     with (out / "hmd_frames.jsonl").open("w", encoding="utf-8") as f:
         for t, m in hmd_samples:
@@ -297,7 +307,8 @@ def main() -> int:
         # OSC 用 perf_counter 绝对时刻，这里换到与图像同一个零点（秒）。
         osc_arr[:, 0] -= started
     np.save(out / "osc.npy", osc_arr)
-    hmd_count = _write_telemetry(out, started, [] if osc is None else osc.samples, hmd_samples)
+    hmd_count = _write_telemetry(out, started, [] if osc is None else osc.samples,
+                                 [] if osc is None else osc.params, hmd_samples)
     hmd_t = np.array([t for t, _ in hmd_samples]) - started
     hmd_gap = float(np.max(np.diff(hmd_t))) if len(hmd_t) > 1 else None
     (out / "meta.json").write_text(json.dumps({

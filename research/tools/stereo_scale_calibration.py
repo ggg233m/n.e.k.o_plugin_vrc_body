@@ -76,7 +76,15 @@ _OSC_PREFIX = "/avatar/parameters/"
 # ---------------------------------------------------------------------------
 
 class OscRecorder:
-    """在独立线程里收 OSC，只记录速度三轴，时间戳用 perf_counter。"""
+    """在独立线程里收 OSC：速度三轴进 ``samples``，**其余 avatar 参数**进 ``params``。
+
+    🔑 为什么要把所有参数一起收（2026-10-05）：VRChat 的标准参数里有 ``EyeHeightAsMeters``
+    （模型眼高，**米**）与 ``ScaleFactor`` / ``ScaleFactorInverse``——它们给出「世界米 ↔ 追踪米」
+    这个比值的外部真值，而那双目链与 OSC 链**各自都自证不了自己的绝对米制**
+    （见 `Docs/漂移形态诊断（2026-10-05）.md` §十）。原先只收速度三轴，等于每次录制都把
+    这份真值丢掉了。
+    ``params`` 只记**变化**（同名同值不重复记），否则 Voice/Viseme 这类高频参数会把文件撑爆。
+    """
 
     def __init__(self, host: str, port: int) -> None:
         from neko_anyadance_body.osc import decode_osc_packet
@@ -92,6 +100,8 @@ class OscRecorder:
             ) from exc
         self._sock.settimeout(0.2)
         self.samples: list[tuple[float, int, float]] = []
+        self.params: list[tuple[float, str, float]] = []   # 非速度参数（含 EyeHeightAsMeters）
+        self._param_last: dict[str, float] = {}
         self.packets = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -115,13 +125,16 @@ class OscRecorder:
                 if not address.startswith(_OSC_PREFIX) or not arguments:
                     continue
                 name = address[len(_OSC_PREFIX):]
-                if name not in _VELOCITY_NAMES:
-                    continue
                 value = arguments[0]
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     continue
-                if math.isfinite(float(value)):
+                if not math.isfinite(float(value)):
+                    continue
+                if name in _VELOCITY_NAMES:
                     self.samples.append((received, _VELOCITY_NAMES.index(name), float(value)))
+                elif self._param_last.get(name) != float(value):
+                    self._param_last[name] = float(value)
+                    self.params.append((received, name, float(value)))
 
     def close(self) -> None:
         self._stop.set()
