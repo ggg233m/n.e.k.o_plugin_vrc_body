@@ -321,7 +321,7 @@
 | 跨会话**检索**（世界级索引 + 验证） | ✅ **已上线且默认开** | `backend/nav_xsession.py:57` `enabled: bool = True`；`nav_online.py:34` import、`:866` 关键帧分支调用、`:1058` 进 `status()["xsession"]` |
 | 确认约束质量 | ✅ 6 → **529 条**（10-06 收盘：live 单场 111 + 录制重放补 277；早前 252 的抽检 16/16 零误检） | `跨会话地点检索接线P0（2026-10-02）.md:36`；live 见 `ROADMAP.md` P0 §洞 2、§洞 4 |
 | 会话末**采纳**（gauge + 弹性位姿图） | ✅ **已接线自动跑**（⚠️ **2026-10-05 live 抓到"从未真正跑过"**：`stop()` 先清 `_mem` ⇒ 线程恒报 `memory_gone`；已修 + 回归测试 `test_stop_hands_sid_to_align_thread_body`） | `P0.3b会话末自动采纳（2026-10-03）.md:5-6`；live 记录见 `ROADMAP.md` P0 §洞 2 |
-| 采纳结果**被下游消费** | ✅ **2026-10-05 已接（索引 / 再对齐）** —— `nav_xsession.session_pose_table` merged 优先、换表令索引缓存失效（`SCHEMA=2`）；**离线融合 / 固化档**侧仍未接 | `P0.3b…:22`、`:55-56`；实现见 `tests/test_nav_xsession.py::TestMergedConsumption` |
+| 采纳结果**被下游消费** | ✅ **2026-10-05 已接（索引 / 再对齐）** —— `nav_xsession.session_pose_table` merged 优先、换表令索引缓存失效（`SCHEMA=2`）；**离线融合侧 2026-10-06 已接**（`research/tools/offline_fusion.py`，A/B 结论：融合默认 `--pose rigid`）；**prior/ 固化产出与在线消费仍未接** | `P0.3b…:22`、`:55-56`；实现见 `tests/test_nav_xsession.py::TestMergedConsumption`；融合见 `Docs/离线多视角融合v1-假障碍清除` 更新段 |
 | 全链 live 实测 | ✅ **2026-10-06 跑通**（两场）：确认 111 → 采纳 99 锚（gauge R_dev 0.22°、holdout 中位 **0.283 m**）→ `merged_...npz` 落盘 → 索引消费（`tables`：044153 / 001523 = `merged`）。⚠️ 世界身份不落盘，重启后必重设 | `ROADMAP.md` P0 §洞 2；`plugin.toml` world_model 注释 |
 | 多会话并树（spanning tree） | ✅ **2026-10-06 闭环成一棵树**：根因是 tracker 的**绝对 6° yaw 门吞真重合**（回放：真匹配成簇在 signed −6…−15°、内点中位 ~210）；`yaw_consensus`（默认开：θ=会话对带符号中位数、±6° 窗、20° 硬顶）修复后重放补约束（252→529）并树——4 场同系，holdout 中位 **0.169 / 0.27 m**，025013 零新约束 | `ROADMAP.md` P0 §洞 4；`tests/test_nav_xsession.py::TestYawConsensusGate` + `TestWorldTree` |
 
