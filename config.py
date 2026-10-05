@@ -353,9 +353,19 @@ class NavmeshMemoryConfig:
 class NavmeshConfig:
     """在线建图导航（/worldmodel/navmesh）的配置面。
 
-    ``world_scale`` 是唯一真值源：世界米 = 追踪米 × s，随 avatar 变（现用 avatar 实测 0.755）。
+    ``world_scale`` 是唯一真值源：世界米 = 追踪米 × s（追踪米即地图单位，= 双目按
+    ``expected_baseline_m`` 算出的深度单位）。**它随 avatar / 身高变**：
+
+    * 基准（2026-10-05 实测）：缩放盘 **1.26 m** / 玩家 **1.5 m** 时 **0.755**，
+      由房间里的实物竖尺锚定到 **±5%**（`research/tools/room_ruler.py`；
+      证据见 `Docs/漂移形态诊断（2026-10-05）.md` §10.8/§10.10）。
+    * **换身高按比例改**：``s = 0.755 × (本场眼高 ÷ 1.26)``（例：眼高设 1.6 ⇒ **0.96**）。
+      不改就是按同样的比例错——DR 链会与几何链差那么多。
+    * 只改这里的配置值：`MapperConfig` / `LoopConfig` 里的同名值是占位，会被它覆盖。
+
     ``expected_baseline_m`` 是启动自检的期望双目基线：0.126 只有自编 AnyaDance 驱动才有，
     SteamVR 注册回发行版会静默回到 0.063（深度噪声翻倍、跨会话记忆混用）。0 表示不检查。
+    **改这个不改 ``world_scale``**（它同时进分子分母，约掉）。
     ``online`` / ``mapper`` / ``loop`` 只存用户显式写了的覆盖项，其余沿用 backend 默认。
     """
 
