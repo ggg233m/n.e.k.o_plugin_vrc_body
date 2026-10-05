@@ -237,6 +237,9 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "osc_zoh_max_s": (float, 0.0, 30.0),
     "osc_zoh_fade_s": (float, 0.0, 30.0),
     "stereo_period_s": (float, 0.02, 2.0),
+    # 双目采集宽度下限（像素）：720 = 现役（mip2 720×405 / fx 202.5），1440 / 2880 = mip1 / 全分辨率。
+    # 深度尺度不随它变；SGBM 视差范围按 fx 自动缩放（nav_mapping.disparity_range_px）。
+    "capture_width": (int, 360, 2880),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
     "kf_turn_deg": (float, 1.0, 180.0),

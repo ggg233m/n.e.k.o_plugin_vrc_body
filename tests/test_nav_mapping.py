@@ -8,8 +8,8 @@ import numpy as np
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.nav_grid import FREE, OCC, UNK
-from neko_anyadance_body.backend.nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, frontiers,
-                                                     stereo_points)
+from neko_anyadance_body.backend.nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
+                                                     frontiers, make_sgbm, stereo_points)
 
 CAM_H = 1.73
 
@@ -508,6 +508,21 @@ class StereoPointsTests(unittest.TestCase):
         self.assertAlmostEqual(float(z), 100.0 * 0.1 / d, delta=0.05)
         # 光学 x 右 → base −y：像素右半边的点 y 为负。
         self.assertLess(float(np.median(pts[pts[:, 1] < 0, 1])), 0)
+
+
+class DisparityRangeTests(unittest.TestCase):
+    """视差范围按 fx 缩放：默认 720×405 逐位不变，高分辨率近场不被裁。"""
+
+    def test_scales_with_fx(self) -> None:
+        self.assertEqual(disparity_range_px(202.5), 64)
+        # 实测 fx 带浮点尾差（getProjectionRaw 推导），不能因尾差跳档。
+        self.assertEqual(disparity_range_px(202.49999849125743), 64)
+        self.assertEqual(disparity_range_px(405.0), 128)
+        self.assertEqual(disparity_range_px(810.0), 256)
+
+    def test_make_sgbm_default_unchanged(self) -> None:
+        self.assertEqual(make_sgbm().getNumDisparities(), 64)
+        self.assertEqual(make_sgbm(disparity_range_px(810.0)).getNumDisparities(), 256)
 
 
 class CoverageCountsTests(unittest.TestCase):

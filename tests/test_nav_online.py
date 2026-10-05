@@ -550,6 +550,31 @@ class ThreadsTest(unittest.TestCase):
             self.assertEqual(len(poses["ids"]), info["keyframes"])
             self.assertIsNone(store.active_status())
 
+    def test_stop_hands_sid_to_align_thread_body(self) -> None:
+        """stop() 顺序回归：``_end_memory`` 先把 ``_mem`` 清掉，采纳线程体必须收到 stop 捕获的 sid。
+
+        2026-10-05 live 实测指纹：``xsession_align == {"ok": false, "reason": "memory_gone"}``
+        ——采纳**从未真正跑过**（旧测试直接调线程体，绕开了真实 stop 顺序）。
+        这里用 spy 替线程体、断言实参（无时序依赖）：sid 必须非空、world_dir 必须是 tracker 的目录。
+        """
+        import types as _types
+        seen: dict = {}
+        wd = Path("wrld_probe_dir")                  # 只作实参比对，不碰盘
+        h = Harness(armed=False)
+        # 模拟"内存会话还活着"：不接 memory store（少一层集成面，测的就是 stop 的顺序约定：
+        # stop 必须在 _end_memory 清掉 _mem 之前把 sid 抓下来）。
+        h.nav._mem = _types.SimpleNamespace(session_id="SID_PROBE")
+        h.nav._xs = _types.SimpleNamespace(
+            world_dir=wd, write_back=lambda *a, **k: {"written": True},
+            status=lambda: {"active": True, "reason": "ok"})
+        with mock.patch.object(h.nav, "_align_xsession",
+                               side_effect=lambda sid, world_dir: seen.update(sid=sid, wd=world_dir)):
+            h.nav.stop()
+        if h.nav._align_thread is not None:
+            h.nav._align_thread.join(timeout=5.0)
+        self.assertEqual(seen.get("sid"), "SID_PROBE", f"线程体没拿到 sid（memory_gone 的根因）：{seen}")
+        self.assertEqual(seen.get("wd"), wd)
+
     def test_unknown_world_runs_without_memory(self) -> None:
         from neko_anyadance_body.backend.nav_memory import NavMemoryStore
         with tempfile.TemporaryDirectory() as tmp:
@@ -798,11 +823,9 @@ class XSessionAlignTest(unittest.TestCase):
             nav = OnlineNavigator.__new__(OnlineNavigator)
             nav._state_lock = threading.Lock()
             nav._errors = []
-            nav._mem = types.SimpleNamespace(session_id="NEW")
-            nav._xs = types.SimpleNamespace(world_dir=wdir)
             nav._align_out = None
             nav.cfg = OnlineNavConfig(xsession=XSessionConfig(align_min_constraints=8))
-            nav._align_xsession()                     # 直接调线程体
+            nav._align_xsession("NEW", wdir)          # 直接调线程体（sid/world_dir 由 stop 捕获后传入）
             out = nav._align_out
             self.assertIsNotNone(out)
             self.assertTrue(out["ok"], out)

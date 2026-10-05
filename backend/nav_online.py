@@ -32,7 +32,8 @@ from .nav_grid import FREE, OCC, UNK
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
 from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto
-from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, make_sgbm, stereo_disparity, stereo_points
+from .nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
+                          make_sgbm, stereo_disparity, stereo_points)
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -62,6 +63,10 @@ class OnlineNavConfig:
     # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
     stereo_period_s: float = 0.1
+    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级 ⇒ 720（默认）
+    # = mip2 720×405 / fx 202.5（现役行为）、1440 = mip1 / fx 405、2880 = 全分辨率 / fx 810。
+    # 深度尺度不随它变（fx 与视差同比例变）；SGBM 视差范围按 fx 自动缩放（见 make_sgbm 调用点）。
+    capture_width: int = 720
     control_hz: float = 10.0
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
     kf_dist_m: float = 0.4           # 世界米；< 条带深度，快走也首尾相接
@@ -533,7 +538,7 @@ class OnlineNavigator:
     def __init__(self, *, motion_history: Callable[[], Sequence[dict[str, Any]]],
                  send_move: Callable[[float, int], Any], send_turn: Callable[[float], Any],
                  stop_motion: Callable[[], Any], drive_block_reason: Callable[[], str | None],
-                 sensors_factory: Callable[[], Any] = OpenVRSensors,
+                 sensors_factory: Callable[[], Any] | None = None,
                  cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
                  record_root: Path | None = None, memory: NavMemoryStore | None = None,
                  world_identity: Callable[[], dict[str, Any]] | None = None) -> None:
@@ -550,7 +555,10 @@ class OnlineNavigator:
         self._send_turn = send_turn
         self._stop_motion = stop_motion
         self._drive_block_reason = drive_block_reason
-        self._sensors_factory = sensors_factory
+        # 默认工厂吃 ``cfg.capture_width``（720 = 现役 mip2；1440 / 2880 = 高分辨率录制实验）。
+        # 测试注入的假传感器不受影响。
+        self._sensors_factory = sensors_factory or (
+            lambda: OpenVRSensors(target_width=self.cfg.capture_width))
         self._clock = clock
         self._state_lock = threading.Lock()
         self._nav_lock = threading.RLock()
@@ -652,8 +660,12 @@ class OnlineNavigator:
             self.session.cancel()
         if self.recorder is not None:
             self.recorder.close(None if self.loops is None else self.loops.poses())
+        # 采纳线程要的 session_id **只有这里还取得到**：_end_memory 会把 _mem 置 None。
+        # （2026-10-05 live 实测：线程里再读 self._mem 恒为 None ⇒ xsession_align 永远报
+        # memory_gone，采纳从未真正跑过——旧测试直接调线程体，绕开了这个顺序。）
+        mem = self._mem
         self._end_memory()
-        self._end_xsession()
+        self._end_xsession(None if mem is None else str(mem.session_id))
         return self.status()
 
     # ---- 跨会话地点检索（P0）----
@@ -675,8 +687,12 @@ class OnlineNavigator:
             self._xs, self._xs_reason = None, f"init_error:{type(exc).__name__}"
             self._fail("xsession", exc)
 
-    def _end_xsession(self) -> None:
-        """会话末把本会话并入世界索引。在 _end_memory 之后调用（特征已落盘、线程已 join）。"""
+    def _end_xsession(self, mem_sid: str | None = None) -> None:
+        """会话末把本会话并入世界索引。在 ``_end_memory`` 之后调用（特征已落盘、线程已 join）。
+
+        ``mem_sid`` 由 ``stop()`` 在 **_end_memory 之前**捕获后传入——到这一步内存会话
+        对象已被释放（``self._mem is None``），线程里再去读只会拿到 None。
+        """
         xs = self._xs
         if xs is None:
             return
@@ -686,23 +702,25 @@ class OnlineNavigator:
             self._fail("xsession_end", exc)
             wb = {}
         # P0.3b：写回成功后后台自动采纳（对齐进历史世界系；对齐失败不拖垮 stop）。
-        if wb.get("written"):
-            self._align_out = None
-            try:
-                self._align_thread = threading.Thread(
-                    target=self._align_xsession, name="navmesh-xsession-align", daemon=True)
-                self._align_thread.start()
-            except Exception as exc:              # noqa: BLE001
-                self._fail("xsession_align", exc)
+        if not wb.get("written"):
+            return
+        self._align_out = None
+        if mem_sid is None:
+            self._align_out = {"ok": False, "reason": "memory_gone"}
+            return
+        try:
+            # world_dir 也在此刻捕获：线程跑到一半用户重开一场时 _xs 会被换掉。
+            self._align_thread = threading.Thread(
+                target=self._align_xsession, args=(mem_sid, xs.world_dir),
+                name="navmesh-xsession-align", daemon=True)
+            self._align_thread.start()
+        except Exception as exc:                  # noqa: BLE001
+            self._fail("xsession_align", exc)
 
-    def _align_xsession(self) -> None:
+    def _align_xsession(self, mem_sid: str, world_dir: Path) -> None:
         """后台采纳线程体：挑约束最多的旧会话对齐，结果进 status()["xsession_align"]。"""
         try:
-            mem = self._mem
-            if mem is None:
-                self._align_out = {"ok": False, "reason": "memory_gone"}
-                return
-            out = align_into_auto(self._xs.world_dir, mem.session_id, self.cfg.xsession)
+            out = align_into_auto(world_dir, mem_sid, self.cfg.xsession)
         except Exception as exc:                  # noqa: BLE001 - 采纳只是锦上添花
             self._fail("xsession_align", exc)
             out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
@@ -858,7 +876,9 @@ class OnlineNavigator:
                             pair = sensors.read_stereo()
                         if pair is not None:
                             if matcher is None:
-                                matcher = make_sgbm()
+                                # 视差范围随 fx 缩放：换采集宽度（fx 202.5→405→810）时不缩
+                                # 会把近场裁掉；默认 720 下仍是 64，行为逐位不变。
+                                matcher = make_sgbm(disparity_range_px(sensors.fx))
                             disp = stereo_disparity(pair[0], pair[1], matcher)
                             # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
                             pts = stereo_points(pair[0], pair[1], fx=sensors.fx, cx=sensors.cx, cy=sensors.cy,

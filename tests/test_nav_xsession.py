@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -12,7 +13,9 @@ from neko_anyadance_body.backend.nav_bow import BowVocabulary
 from neko_anyadance_body.backend.nav_loop import M_OPT, KeyframeFeatures, LoopConfig
 from neko_anyadance_body.backend.nav_xsession import (BowIndex, XSessionConfig, XSessionTracker,
                                                       align_into, align_into_auto,
-                                                      build_index, estimate_gauge, load_index)
+                                                      align_world_tree, build_index,
+                                                      estimate_gauge, load_index,
+                                                      session_pose_table)
 
 K = np.array([[200.0, 0.0, 160.0], [0.0, 200.0, 120.0], [0.0, 0.0, 1.0]])
 SIZE = (320, 240)
@@ -426,6 +429,255 @@ class TestAlignInto(unittest.TestCase):
         out = align_into(self.wdir, "NEW", "OLD")
         self.assertFalse(out["ok"])
         self.assertEqual(out["reason"], "no_constraints")
+
+
+class TestMergedConsumption(XSessionTestBase):
+    """P0 收尾：已采纳的 merged 表被**下游消费**（索引读它；换表让缓存失效）。"""
+
+    def _write_merged(self, sid: str, base: str, dx: float, ids_override=None) -> Path:
+        xdir = self.wdir / "xsession"
+        xdir.mkdir(parents=True, exist_ok=True)
+        with np.load(self.wdir / "sessions" / sid / "poses.npz") as z:
+            ids = np.asarray(z["ids"], np.int64)
+            T = np.asarray(z["T_map"], np.float64)
+            dist = np.asarray(z["dist_m"], np.float64)
+        T = T.copy()
+        T[:, 0, 3] += dx
+        p = xdir / f"merged_{sid}_into_{base}.npz"
+        np.savez_compressed(p, ids=np.asarray(ids if ids_override is None else ids_override),
+                            T_map=T, dist_m=np.asarray(dist, np.float64), base_sid=base)
+        return p
+
+    @staticmethod
+    def _xy_of(idx, sid: str) -> np.ndarray:
+        rows = [i for i, s in enumerate(idx.sids) if s == sid]
+        return np.asarray([idx.xy[i] for i in rows], np.float64)
+
+    def test_index_prefers_merged_and_invalidates_cache(self) -> None:
+        idx0, _ = build_index(self.cfg, self.wdir, exclude_sid=None)
+        self.assertTrue(np.allclose(self._xy_of(idx0, "B"), 0.0, atol=1e-6))
+        self._write_merged("B", "A", dx=0.3)
+        idx1, info = load_index(self.cfg, self.wdir, exclude_sid=None)
+        self.assertEqual(info.get("source"), "rebuild", "换了表必须让索引缓存失效")
+        self.assertTrue(np.allclose(self._xy_of(idx1, "B")[:, 0], 0.3, atol=1e-6))
+        self.assertEqual(info["tables"]["B"], "merged", "info 要如实报实际用到的表")
+
+    def test_bad_merged_falls_back_to_raw(self) -> None:
+        self._write_merged("B", "A", dx=0.3, ids_override=[98, 99])
+        idx, info = build_index(self.cfg, self.wdir, exclude_sid=None)
+        self.assertTrue(np.allclose(self._xy_of(idx, "B"), 0.0, atol=1e-6),
+                        "ids 对不上必须退回原表（宁可旧坐标，不要错误坐标）")
+        self.assertEqual(info["tables"]["B"], "raw")
+
+
+class TestAlignBaseComposition(unittest.TestCase):
+    """旧会话自己已被采纳时：再对齐按 ``base_sid`` **链式往上传**（C→B、B→A ⇒ C 落 A 系）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.wdir = Path(self._tmp.name) / "wrld_x-abc"
+        self.p_old, self.p_new_true, _ = build_align_fixture(self.wdir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_align_reads_merged_old_and_propagates_base(self) -> None:
+        delta = 1.0                                   # OLD 早已被采纳进 BASE：整体平移 1 m
+        with np.load(self.wdir / "sessions" / "OLD" / "poses.npz") as z:
+            ids = np.asarray(z["ids"], np.int64)
+            T = np.asarray(z["T_map"], np.float64)
+            dist = np.asarray(z["dist_m"], np.float64)
+        T = T.copy()
+        T[:, 0, 3] += delta
+        np.savez_compressed(self.wdir / "xsession" / "merged_OLD_into_BASE.npz",
+                            ids=ids, T_map=T, dist_m=dist, base_sid="BASE")
+        out = align_into(self.wdir, "NEW", "OLD", tail_m=8.0)
+        self.assertTrue(out["ok"], out)
+        with np.load(Path(out["merged"])) as z:
+            self.assertEqual(str(z["base_sid"]), "BASE", "最终基准要往上传，而不是停在中间会话")
+            T_out = np.asarray(z["T_map"], np.float64)
+        # NEW 对齐到「OLD 被平移后的系」⇒ 尾帧应接近 真值 + δ
+        err = np.linalg.norm(T_out[-1][:2, 3] - (self.p_new_true[-1][:2] + delta))
+        self.assertLess(float(err), 3.0, "merged 基准没被消费：尾帧没跟着平移")
+
+
+class TestIndexGainAfterAdoption(unittest.TestCase):
+    """端到端收益（合成夹具带真值）：采纳后**索引里** NEW 的坐标被拉回真值。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.wdir = Path(self._tmp.name) / "wrld_x-abc"
+        self.p_old, self.p_new_true, _ = build_align_fixture(self.wdir)
+        self.vpath = Path(self._tmp.name) / "vocab.npz"
+        make_vocab(self.vpath)
+        self.cfg = XSessionConfig(vocab=str(self.vpath), min_session_kf=2)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _new_xy(idx) -> np.ndarray:
+        rows = [i for i, s in enumerate(idx.sids) if s == "NEW"]
+        order = np.argsort([idx.kfs[i] for i in rows])
+        return np.asarray([idx.xy[rows[j]] for j in order], np.float64)
+
+    def test_tail_error_drops_after_adoption(self) -> None:
+        idx0, _ = build_index(self.cfg, self.wdir, exclude_sid=None)
+        err0 = np.linalg.norm(self._new_xy(idx0)[20:] - self.p_new_true[20:, :2], axis=1).mean()
+        out = align_into(self.wdir, "NEW", "OLD", tail_m=8.0)
+        self.assertTrue(out["ok"], out)
+        idx1, info = build_index(self.cfg, self.wdir, exclude_sid=None)
+        err1 = np.linalg.norm(self._new_xy(idx1)[20:] - self.p_new_true[20:, :2], axis=1).mean()
+        self.assertLess(err1, 0.6 * err0, f"索引尾部误差 {err0:.2f} → {err1:.2f}")
+        self.assertEqual(info["tables"]["NEW"], "merged")
+
+
+def _chain_fixture(wdir: Path, *, rows_b: list[int] | None = None,
+                   rows_c: list[int] | None = None) -> dict[str, Any]:
+    """三段同一条走廊的会话链 A ← B ← C（视觉=真值 ⇒ t_ab=0/R_ab=I）。
+
+    B 的存档系比 A 差一个 gauge（R_ba/t_ba）、C 又比 B 差一个：align_into(B,A) 与
+    align_into(C,B) 应把它俩**先后**收回 A 系（链式）。真值轨迹 p_a 供几何断言。
+    """
+    n = 30
+    R_ba, t_ba = _rz(3.0), np.array([0.4, 0.2, 0.01])
+    R_cb, t_cb = _rz(-2.5), np.array([-0.3, 0.1, 0.02])
+    p_a = np.column_stack([0.5 * np.arange(n), np.zeros(n), np.zeros(n)])
+    p_b = (p_a - t_ba) @ R_ba
+    p_c = (p_b - t_cb) @ R_cb
+    R_a = np.stack([np.eye(3)] * n)
+    R_b = np.stack([R_ba.T] * n)
+    R_c = np.stack([R_cb.T @ R_ba.T] * n)
+    rng = np.random.default_rng(11)
+    des = {k: rng.integers(1, 255, (n, 4, 32), dtype=np.uint8) for k in "abc"}
+    for sid, (p, R, dk) in {"A": (p_a, R_a, "a"), "B": (p_b, R_b, "b"),
+                            "C": (p_c, R_c, "c")}.items():
+        kfs = [(r, np.zeros((1, 3), np.float32), np.zeros((1, 2), np.float32), des[dk][r])
+               for r in range(n)]
+        write_session(wdir, sid, kfs, [_t4(R[r], p[r]) for r in range(n)],
+                      [0.5 * r for r in range(n)])
+    cons = ([{"new_sid": "B", "new_kf": r, "old_sid": "A", "old_kf": r, "inliers": 100,
+              "R_ab": np.eye(3).tolist(), "t_ab": [0, 0, 0]}
+             for r in (rows_b if rows_b is not None else range(n))]
+            + [{"new_sid": "C", "new_kf": r, "old_sid": "B", "old_kf": r, "inliers": 100,
+                "R_ab": np.eye(3).tolist(), "t_ab": [0, 0, 0]}
+               for r in (rows_c if rows_c is not None else range(n))])
+    (wdir / "xsession").mkdir(parents=True, exist_ok=True)
+    (wdir / "xsession" / "constraints.jsonl").write_text(
+        "\n".join(json.dumps(c) for c in cons) + "\n", encoding="utf-8")
+    return {"p_a": p_a}
+
+
+class TestWorldTree(unittest.TestCase):
+    """P0 §洞4：世界树 pass —— 合成链 A←B←C：链式采纳进 A 系、幂等、门槛与干跑。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.wdir = Path(self._tmp.name) / "wrld_x-abc"
+        # tail-m=8 让 30 帧 ×0.5 m 的会话有尾段可留出（质量闸要留出锚 ≥2）
+        self.cfg = XSessionConfig(min_session_kf=2, align_tail_m=8.0, align_holdout_frac=0.5)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_chain_aligns_into_one_gauge_and_is_idempotent(self) -> None:
+        fx = _chain_fixture(self.wdir)
+        out = align_world_tree(self.wdir, self.cfg, write=True)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(len(out["components"]), 1, "三个会话一条链 ⇒ 一个分量")
+        comp = out["components"][0]
+        self.assertEqual(comp["root"], "A")
+        self.assertEqual(comp["coverage"], "3/3")
+        self.assertEqual([o["status"] for o in comp["ops"]], ["aligned", "aligned"])
+        self.assertEqual([(o["sid"], o["parent"]) for o in comp["ops"]],
+                         [("B", "A"), ("C", "B")])
+        # 链式上传：C 的基准应是 A（中间会话 B 只当跳板）而不是 B
+        tab = session_pose_table(self.wdir, "C")
+        self.assertEqual(tab["source"], "merged")
+        self.assertEqual(tab["base_sid"], "A")
+        with np.load(self.wdir / "xsession" / "merged_C_into_B.npz") as z:
+            T_c = np.asarray(z["T_map"], np.float64)
+        err = np.linalg.norm(T_c[-1][:2, 3] - fx["p_a"][-1][:2])
+        self.assertLess(float(err), 0.5, "C 必须被收回 A 系的走廊上")
+        self.assertTrue((self.wdir / "xsession" / "world_tree.json").is_file())
+        # 幂等：第二遍全走 already，不重算不重写
+        out2 = align_world_tree(self.wdir, self.cfg, write=True)
+        st2 = [o["status"] for c in out2["components"] for o in c["ops"]]
+        self.assertTrue(st2 and all(s == "already" for s in st2), st2)
+
+    def test_below_threshold_stays_apart_until_bridge_min(self) -> None:
+        # C→B 只 7 条 < 8：默认门槛下 C 自成分量；门槛降到 5 才被桥进来
+        _chain_fixture(self.wdir, rows_c=[4, 8, 12, 18, 22, 26, 28])
+        out = align_world_tree(self.wdir, self.cfg, write=True)
+        self.assertEqual(sorted(c["root"] for c in out["components"]), ["A", "C"])
+        comp_c = next(c for c in out["components"] if c["root"] == "C")
+        self.assertFalse(comp_c["bridge"]["meets_min"])
+        self.assertEqual(comp_c["bridge"]["count"], 7)
+        self.assertFalse((self.wdir / "xsession" / "merged_C_into_B.npz").exists())
+        out2 = align_world_tree(self.wdir, self.cfg, bridge_min=5, write=True)
+        comp = out2["components"][0]
+        self.assertEqual((comp["root"], comp["coverage"]), ("A", "3/3"))
+        # 第一遍已把 B 采纳进 A ⇒ 这里 B 是 already，只有 C 是新桥
+        self.assertEqual({o["sid"]: o["status"] for o in comp["ops"]},
+                         {"B": "already", "C": "aligned"})
+        self.assertTrue((self.wdir / "xsession" / "merged_C_into_B.npz").exists())
+
+    def test_dry_run_writes_no_merged(self) -> None:
+        _chain_fixture(self.wdir)
+        out = align_world_tree(self.wdir, self.cfg, write=False)
+        st = [o["status"] for c in out["components"] for o in c["ops"]]
+        # B 能预演（父=A 已在系）；C 的父 B 在干跑里没真落位 ⇒ 只给计划不预演
+        self.assertEqual(st, ["would_align", "planned"])
+        self.assertFalse((self.wdir / "xsession" / "merged_B_into_A.npz").exists())
+        self.assertFalse((self.wdir / "xsession" / "merged_C_into_B.npz").exists())
+
+
+class TestYawConsensusGate(XSessionTestBase):
+    """2026-10-06：绝对 6° yaw 门实测吞真重合（wrld_home，见 nav_xsession docstring）⇒
+    ``yaw_consensus`` 改用"相对该会话对带符号 yaw 残差中位数"的窗；硬顶仍拦大偏置。"""
+
+    @staticmethod
+    def _cfg(vpath: Path, **kw: Any) -> XSessionConfig:
+        return XSessionConfig(vocab=str(vpath), query_top=4, verify_max=2, min_session_kf=2,
+                              loop=LoopConfig(min_inliers=50, max_offset_m=6.0,
+                                              yaw_tol_deg=6.0, min_coverage=0.12), **kw)
+
+    def _feed(self, tr: XSessionTracker, rot_deg: float, n: int = 12) -> None:
+        v = view_of(self.W1, self.des1, np.array([0.15, 0.0, 0.0]))
+        feat = feat_from(*v)
+        R = _rz(rot_deg)
+        for k in range(n):
+            tr.on_keyframe(k, feat, 10.0 + 2.0 * k, R, False)   # 路程 2 m/帧：绕开 reconfirm 门
+
+    def test_offset_9deg_absolute_rejects_consensus_admits(self) -> None:
+        tr = self.tr = XSessionTracker(self._cfg(self.vpath, yaw_consensus=False), self.wdir, "C")
+        self.assertTrue(tr.wait_ready(30.0) and tr.ready)
+        self._feed(tr, 9.0)
+        st = tr.status()
+        self.assertEqual(st["confirmed"], 0, "9° > 绝对门 6°：旧判据全拒")
+        self.assertGreaterEqual(st["rejects"].get("rotation_mismatch", 0), 4)
+        tr.join(30.0)
+        tr2 = self.tr = XSessionTracker(self._cfg(self.vpath, yaw_consensus=True,
+                                                  yaw_consensus_min=4), self.wdir, "C2")
+        self.assertTrue(tr2.wait_ready(30.0) and tr2.ready)
+        self._feed(tr2, 9.0)
+        self.assertGreaterEqual(tr2.status()["confirmed"], 1, "池稳到 +9° 后应放行")
+        tr2.join(30.0)
+        recs = [json.loads(l) for l in
+                (self.wdir / "xsession" / "constraints.jsonl").read_text(encoding="utf-8")
+                .strip().splitlines() if l.strip()]
+        self.assertEqual([r["new_sid"] for r in recs], ["C2"] * len(recs))
+        self.assertTrue(any(r["rot_err_deg"] > 6.0 for r in recs),
+                        "共识门要能放行 >6° 的真匹配（rot_err 留痕应超过绝对门）")
+
+    def test_hard_cap_still_blocks_large_offset(self) -> None:
+        cfg = self._cfg(self.vpath, yaw_consensus=True, yaw_consensus_min=4, yaw_cap_deg=20.0)
+        tr = self.tr = XSessionTracker(cfg, self.wdir, "C3")
+        self.assertTrue(tr.wait_ready(30.0) and tr.ready)
+        self._feed(tr, 40.0)
+        st = tr.status()
+        self.assertEqual(st["confirmed"], 0, "40° 超硬顶：共识窗再宽也不放")
+        self.assertGreaterEqual(st["rejects"].get("rotation_mismatch", 0), 4)
 
 
 if __name__ == "__main__":

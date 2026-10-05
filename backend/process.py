@@ -86,6 +86,12 @@ StandaloneConfigStore = webui_module.StandaloneConfigStore
 UI_DIRECTORY = webui_module.UI_DIRECTORY
 deep_merge = webui_module.deep_merge
 load_settings_file = webui_module.load_settings_file
+# 图层白名单必须**模块级**取：脚本模式（python backend/process.py）下本文件是 __main__、
+# 没有父包，函数里的 ``from .nav_online import ...`` 会 ImportError 且只炸那一个端点
+# （2026-10-05 实况：/worldmodel/navmesh 空回复 ⇒ navmesh 页面全空）。这里沿用文件顶部
+# 既有的 importlib + PACKAGE_NAME 模式，两种启动方式都成立。
+nav_online_module = importlib.import_module(f"{PACKAGE_NAME}.backend.nav_online")  # noqa: E402
+_GRID_LAYERS = nav_online_module._GRID_LAYERS
 
 
 def _json_safe(value: Any) -> Any:
@@ -242,7 +248,6 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             # 一个手输的 ?layer=xxx 不该把整个状态轮询打断。真正的校验在
             # OnlineNavigator.grid_view 里，它对未知图层仍会抛。
             layer = str(q.get("layer", ["tristate"])[0])
-            from .nav_online import _GRID_LAYERS
             if layer not in _GRID_LAYERS:
                 layer = "tristate"
             self._json(200, self.server.service.navmesh_status(

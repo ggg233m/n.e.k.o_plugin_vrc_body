@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -229,6 +232,42 @@ class StandaloneHttpUiTests(unittest.TestCase):
                             ("/ui/coverage.css", "text/css")):
             with urlopen(self.base + path, timeout=2.0) as resp:
                 self.assertTrue(resp.headers["Content-Type"].startswith(ctype), path)
+
+
+class UiAssetSyntaxTests(unittest.TestCase):
+    """standalone_ui 的 JS 必须能解析。
+
+    一个字符串里未转义的 ASCII 引号就让整份脚本不执行——页面看着正常，但所有按钮
+    都没反应、状态永远停在 "—"（2026-10-05 实况：navmesh.js 的 LAYER_NOTE 里
+    写了 ``分不出"障碍还是楼板"``）。node 可用时逐个跑 ``node --check``，否则跳过。
+    """
+
+    def test_js_files_parse(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node 不在 PATH，跳过 JS 语法校验")
+        ui = Path(__file__).resolve().parents[1] / "backend" / "standalone_ui"
+        for js in sorted(ui.glob("*.js")):
+            proc = subprocess.run([node, "--check", str(js)],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0,
+                             f"{js.name} 语法错误：{proc.stderr.strip()[:300]}")
+
+
+class ScriptModeImportTests(unittest.TestCase):
+    """process.py 必须同时支持「宿主包导入」与「脚本直跑」（``python backend/process.py``）。
+
+    函数里的相对导入在包导入时正常、脚本直跑时抛 ``ImportError`` —— 而且只炸那一个
+    HTTP 端点（2026-10-05 实况：``/worldmodel/navmesh`` 空回复 ⇒ navmesh 页面全空）。
+    用 AST 钉住：整份文件不允许出现相对导入；跨模块引用一律走模块级 importlib + PACKAGE_NAME。
+    """
+
+    def test_no_relative_imports_in_process_module(self) -> None:
+        src = Path(__file__).resolve().parents[1] / "backend" / "process.py"
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        bad = [node.lineno for node in ast.walk(tree)
+               if isinstance(node, ast.ImportFrom) and node.level > 0]
+        self.assertEqual(bad, [], f"process.py 出现相对导入（脚本直跑会 ImportError）：行 {bad}")
 
 
 if __name__ == "__main__":

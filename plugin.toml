@@ -183,6 +183,9 @@ persist_players = false
 
 # W1 世界身份：只做「当前在哪个世界」+ 子系统启停骨架。world_key 只能靠用户
 # 手动输入——VRChat 的 OSC / OSCQuery 拿不到世界标识，日志解析也刻意不做。默认关闭。
+# ⚠️ **身份只存在运行期**（不落盘、重启即丢）：每次重启后端后都要重新
+# POST /worldmodel/world {"world_key": "..."}，否则 navmesh 记忆分区整场判 world_unknown
+# （2026-10-06 实测踩过：重启拿修复 → 忘重设 → 那一场没进记忆）。
 # persist 门控后续阶段才落盘的记忆分区（本期尚无记忆可写）。
 # 在线建图导航不读这里，走 /worldmodel/navmesh（镜像双目 + 航位推算 + 回环）。
 [world_model]

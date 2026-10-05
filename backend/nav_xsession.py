@@ -15,6 +15,11 @@
 * **跨会话专用的门**：``min_path_m`` 与漂移半径**不可用**（两个会话各自一个 gauge，路程与
   位置都不可比）；但 **HMD yaw 一致性门可用**（旋转与平移 gauge 无关；前提 = play space
   没被重置，重置过的话 yaw_jump 检测会留痕）+ ``max_offset_m`` 可用（相对量）。
+  ⚠️ **2026-10-06 修正**：wrld_home 实测下这道**绝对 6° 门吞掉大量真重合**——001523 对
+  10-01 库的真匹配成簇在 signed −6…−15°（内点中位 ~210，与被采纳的同档），绝对门只留下
+  10 条、共识门（``yaw_consensus=True``）下 116 条。判据改为"相对该会话对带符号 yaw 残差
+  中位数"的窗（``yaw_cap_deg`` 仍是硬顶：play space 重置 / 坏会话照拦）。
+  当日已落地（默认开）并完成真世界并树：holdout 中位 0.169 / 0.27 m，见 ROADMAP P0 §洞 4。
 * **隔离（v1 范围）**：确认的跨会话对**只写约束 jsonl，不碰位姿图**。把当前会话"采纳"进
   历史世界系需要世界系变换层（est/mapper/DR 全链换系），那是 P0.1 的活——v1 宁可只报告
   也不伪造修正。
@@ -46,9 +51,11 @@ except ImportError:                                          # pragma: no cover 
     from nav_loop import KeyframeFeatures, LoopConfig, relative_pose, rotation_angle_deg  # type: ignore[no-redef]
 
 __all__ = ["XSessionConfig", "XSessionIndex", "XSessionTracker", "estimate_gauge",
-           "align_into", "align_into_auto"]
+           "align_into", "align_into_auto", "align_world_tree", "session_pose_table"]
 
-SCHEMA = 1
+# 2 = 会话表标记进入索引 manifest（merged / raw）：会话被采纳后**换了一张表**，
+#     旧缓存必须失效重算，否则索引会继续供旧坐标（2026-10-05，P0 收尾）。
+SCHEMA = 2
 _INCLUDE_STATUS = {"complete", "complete_with_errors", "interrupted"}
 
 
@@ -66,6 +73,12 @@ class XSessionConfig:
     align_tail_m: float = 100.0           # 留出验证的"尾段"定义（路程阈值）
     align_holdout_frac: float = 0.3       # 尾段锚按 new_kf 分组留出的比例（A/B 铁律）
     align_elastic: float = 0.15           # 里程边弹性：σ = 0.05 + elastic·step（m）；0=刚性（拉不动漂移）
+    # 跨会话 yaw 判据（2026-10-06，见模块 docstring 的"修正"段）。yaw_consensus=True 时：
+    # θ = 该 (new, old) 对"已过几何验证候选"的带符号 yaw 残差中位数（进池即收样，不需要先确认），
+    # 判 |signed − θ| ≤ loop.yaw_tol_deg；池 < yaw_consensus_min 时退回绝对门。
+    yaw_consensus: bool = True            # 2026-10-06 离线闭环验证通过后默认开（ROADMAP P0 §洞 4）
+    yaw_consensus_min: int = 8            # 共识起步样本数（用中位数，抗假匹配混样）
+    yaw_cap_deg: float = 20.0             # 硬顶：总旋转角超它一律拒（与共识窗无关）
     loop: LoopConfig = field(default_factory=LoopConfig)  # 只消费 ratio/min_inliers/reproj_px/
     #                                                       min_coverage/yaw_tol_deg/max_offset_m
 
@@ -81,6 +94,75 @@ def _vocab_path(raw: str) -> Path | None:
 
 def _sha1(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def _merged_table_path(world_dir: Path, sid: str) -> Path | None:
+    """该会话**最新**的已采纳表（``xsession/merged_<sid>_into_*.npz``）；没有则 None。
+
+    多个 merged 取 mtime 最新（同一会话可能被先后采纳进不同基准）。
+    """
+    try:
+        cands = sorted((Path(world_dir) / "xsession").glob(f"merged_{sid}_into_*.npz"),
+                       key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    except OSError:
+        return None
+    return cands[0] if cands else None
+
+
+def _table_marker(world_dir: Path, sid: str) -> str:
+    """索引缓存的有效性标记：这个会话**现在该用哪张表**（原表 / 哪个 merged + 其 mtime）。
+
+    会话被采纳后表换了、坐标就变了——没有这个标记，缓存的 ``index.npz`` 会继续
+    供旧坐标，消费等于没接。
+    """
+    mp = _merged_table_path(world_dir, sid)
+    if mp is None:
+        return "raw"
+    try:
+        return f"merged:{mp.name}:{mp.stat().st_mtime_ns}"
+    except OSError:                                  # pragma: no cover - 竞态删除
+        return f"merged:{mp.name}"
+
+
+def session_pose_table(world_dir: Path, sid: str) -> dict[str, Any] | None:
+    """会话位姿表：**优先已采纳的 merged 表**，否则回退原表 ``sessions/<sid>/poses.npz``。
+
+    merged 是会话末采纳的产物（P0.3b，在 ``xsession/`` 下与原表并存、**不覆盖原表**——
+    v1 铁律）。下游（世界索引 / 再次对齐）从这里读到它，采纳的收益才真正进入链路：
+
+    * 索引里该会话的 xy/R 换成**基准会话系**，后续会话的约束引用的是修正后的历史；
+    * 再次对齐时按 ``base_sid`` 继续往上传（链式：C→B、B→A ⇒ C 落在 A 系）。
+
+    ids 对不上 / 文件坏 ⇒ 退回原表（宁可旧坐标，不要错误坐标）。返回 dict：
+    ``ids / T_map / dist_m / has_feat / source("raw"|"merged") / base_sid``。
+    """
+    sdir = Path(world_dir) / "sessions" / sid
+    try:
+        with np.load(sdir / "poses.npz") as z:
+            ids = np.asarray(z["ids"], np.int64)
+            raw = {"ids": ids,
+                   "T_map": np.asarray(z["T_map"], np.float64),
+                   "dist_m": np.asarray(z["dist_m"], np.float64),
+                   "has_feat": (np.asarray(z["has_feat"], bool) if "has_feat" in z.files
+                                else np.ones(len(ids), bool)),
+                   "source": "raw", "base_sid": None}
+    except (OSError, KeyError, ValueError):
+        return None
+    mp = _merged_table_path(world_dir, sid)
+    if mp is None:
+        return raw
+    try:
+        with np.load(mp) as z:
+            m_ids = np.asarray(z["ids"], np.int64)
+            T_map = np.asarray(z["T_map"], np.float64)
+            dist_m = np.asarray(z["dist_m"], np.float64)
+            base = str(z["base_sid"]) if "base_sid" in z.files else None
+    except (OSError, KeyError, ValueError):
+        return raw
+    if len(m_ids) != len(ids) or not np.array_equal(m_ids, ids):
+        return raw
+    return {"ids": ids, "T_map": T_map, "dist_m": dist_m, "has_feat": raw["has_feat"],
+            "source": "merged", "base_sid": base}
 
 
 class XSessionIndex:
@@ -160,20 +242,21 @@ def _scan_sessions(world_dir: Path, min_kf: int) -> list[dict[str, Any]]:
         n_feat = int(meta.get("features") or 0)
         if n_feat < min_kf or not (sdir / "poses.npz").is_file() or not (sdir / "kf").is_dir():
             continue
-        out.append({"sid": sdir.name, "dir": sdir, "features": n_feat})
+        out.append({"sid": sdir.name, "dir": sdir, "features": n_feat,
+                    "table": _table_marker(world_dir, sdir.name)})
     return out
 
 
-def _load_session_docs(sdir: Path, vocab: BowVocabulary) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """一个会话 → (kf ids, xy, R, dist, words, indptr)。任何缺口返回 None（该会话跳过）。"""
-    try:
-        with np.load(sdir / "poses.npz") as z:
-            ids = np.asarray(z["ids"], np.int64)
-            T_map = np.asarray(z["T_map"], np.float64)
-            dist = np.asarray(z["dist_m"], np.float64)
-            has_feat = np.asarray(z["has_feat"], bool)
-    except (OSError, KeyError, ValueError):
+def _load_session_docs(sdir: Path, vocab: BowVocabulary) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str] | None:
+    """一个会话 → (kf ids, xy, R, dist, words, indptr, 表来源)。任何缺口返回 None（该会话跳过）。
+
+    位姿走 ``session_pose_table``：**已采纳的会话读 merged 表**（采纳收益由此进入索引）；
+    末位 ``"raw"|"merged"`` 是**实际用到的**表来源，供 ``build_index`` 的 info 如实报告。
+    """
+    tab = session_pose_table(sdir.parent.parent, sdir.name)
+    if tab is None:
         return None
+    ids, T_map, dist, has_feat = tab["ids"], tab["T_map"], tab["dist_m"], tab["has_feat"]
     kfs, xys, Rs, dists, wparts = [], [], [], [], []
     for row, k in enumerate(ids):
         if not has_feat[row]:
@@ -196,12 +279,12 @@ def _load_session_docs(sdir: Path, vocab: BowVocabulary) -> tuple[list[int], np.
     counts = np.array([len(w) for w in wparts], np.int64)
     indptr = np.concatenate([[0], np.cumsum(counts)])
     return (kfs, np.asarray(xys, np.float32), np.asarray(Rs, np.float32),
-            np.asarray(dists, np.float32), words, indptr)
+            np.asarray(dists, np.float32), words, indptr, str(tab["source"]))
 
 
 def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -> tuple[XSessionIndex | None, dict[str, Any]]:
     """扫世界目录重建索引（也是写回后刷新同一入口）。永不抛——失败返回 (None, info)。"""
-    info: dict[str, Any] = {"sessions": 0, "docs": 0, "skipped": []}
+    info: dict[str, Any] = {"sessions": 0, "docs": 0, "skipped": [], "tables": {}}
     vpath = _vocab_path(cfg.vocab)
     if vpath is None:
         info["reason"] = "vocab_missing"
@@ -229,7 +312,8 @@ def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -
         if got is None:
             info["skipped"].append(s["sid"])
             continue
-        kfs, xy, R, dist, words, indptr = got
+        kfs, xy, R, dist, words, indptr, source = got
+        info["tables"][s["sid"]] = source
         sids_all += [s["sid"]] * len(kfs)
         kfs_all += kfs
         xy_all.append(xy)
@@ -246,7 +330,8 @@ def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -
         return None, info
     manifest = {"schema": SCHEMA, "built_wall": time.time(), "vocab_sha1": info["vocab_sha1"],
                 "min_session_kf": cfg.min_session_kf,
-                "sessions": [{"sid": s["sid"], "features": s["features"]} for s in kept]}
+                "sessions": [{"sid": s["sid"], "features": s["features"],
+                              "table": s.get("table", "raw")} for s in kept]}
     idx = XSessionIndex(vocab, world_dir, sids_all, kfs_all,
                         np.concatenate(xy_all) if xy_all else np.zeros((0, 2), np.float32),
                         np.concatenate(R_all) if R_all else np.zeros((0, 3, 3), np.float32),
@@ -316,8 +401,11 @@ def load_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) ->
         out = build_index(cfg, world_dir, exclude_sid)
         return out[0], {"source": "rebuild", **out[1]}
     have = {s["sid"]: s for s in _scan_sessions(world_dir, cfg.min_session_kf) if s["sid"] != exclude_sid}
-    want = {s["sid"]: int(s.get("features") or 0) for s in manifest.get("sessions", [])}
-    if have.keys() != want.keys() or any(have[k]["features"] != v for k, v in want.items()):
+    want = {s["sid"]: (int(s.get("features") or 0), s.get("table", "raw"))
+            for s in manifest.get("sessions", [])}
+    # 会话表标记也算有效性：会话被采纳后换了表（raw → merged），缓存必须重算。
+    if have.keys() != want.keys() or any(
+            (have[k]["features"], have[k].get("table", "raw")) != v for k, v in want.items()):
         out = build_index(cfg, world_dir, exclude_sid)
         return out[0], {"source": "rebuild", **out[1]}
     try:
@@ -507,25 +595,33 @@ def _elastic_merge(T: np.ndarray, dist: np.ndarray, anchors: list[dict[str, Any]
 
 def align_into(world_dir: Path, new_sid: str, old_sid: str, *, tail_m: float = 100.0,
                holdout_frac: float = 0.3, elastic: float = 0.15, seed: int = 7,
-               irls_rounds: int = 4, write: bool = True) -> dict[str, Any]:
+               irls_rounds: int = 4, write: bool = True,
+               min_constraints: int = 8) -> dict[str, Any]:
     """把新会话对齐进旧会话世界系（P0.1 gauge 初值 + P0.2 弹性位姿图），产物与原表并存。
 
+    ``min_constraints``：采纳门槛（默认 8，与 ``XSessionConfig.align_min_constraints`` 同源）——
+    **原始约束数**与**有效锚数**都少于此数就拒绝（世界树 pass 用它当桥门槛）。
     产物（write=True 时，均在世界 ``xsession/`` 下，**不碰 sessions/*/poses.npz 原表**）：
       * ``align_<new>_into_<old>.json``：gauge/优化/留出统计 + 逐锚内外点掩码；
       * ``merged_<new>_into_<old>.npz``：修正整表（ids/T_map/dist_m + base_sid/method）。
     返回 dict（ok/reason + 统计）；输入缺口返回 ok=False（不抛，供后台线程直接消费）。
     """
     world_dir = Path(world_dir)
+    # 新会话**必须**读原表：它可能已被对齐过，拿 merged 当输入会把同一修正叠第二次。
     try:
         with np.load(world_dir / "sessions" / new_sid / "poses.npz") as z:
             ids = np.asarray(z["ids"], np.int64)
             T = np.asarray(z["T_map"], np.float64)
             dist = np.asarray(z["dist_m"], np.float64)
-        with np.load(world_dir / "sessions" / old_sid / "poses.npz") as z:
-            T_old = {int(k): np.asarray(Tm, np.float64)
-                     for k, Tm in zip(np.asarray(z["ids"], np.int64), np.asarray(z["T_map"], np.float64))}
     except (OSError, KeyError, ValueError) as exc:
         return {"ok": False, "reason": f"poses_unreadable:{type(exc).__name__}"}
+    # 旧会话（基准）：优先已采纳的 merged 表 ⇒ 链式采纳（C→B、B→A）时 C 落在最终基准系，
+    # base_sid 随之往上传（写出的 merged 记录的是**最终**基准而不是中间会话）。
+    old_tab = session_pose_table(world_dir, old_sid)
+    if old_tab is None:
+        return {"ok": False, "reason": "poses_unreadable:OSError"}
+    T_old = {int(k): Tm for k, Tm in zip(old_tab["ids"], old_tab["T_map"])}
+    base_sid = old_tab.get("base_sid") or old_sid
     cpath = world_dir / "xsession" / "constraints.jsonl"
     if not cpath.is_file():
         return {"ok": False, "reason": "no_constraints"}
@@ -534,8 +630,9 @@ def align_into(world_dir: Path, new_sid: str, old_sid: str, *, tail_m: float = 1
     except (OSError, ValueError) as exc:
         return {"ok": False, "reason": f"constraints_unreadable:{type(exc).__name__}"}
     cons = [c for c in cons if c.get("new_sid") == new_sid and c.get("old_sid") == old_sid]
-    if len(cons) < 8:
-        return {"ok": False, "reason": "too_few_constraints", "n": len(cons)}
+    if len(cons) < int(min_constraints):
+        return {"ok": False, "reason": "too_few_constraints", "n": len(cons),
+                "threshold": int(min_constraints)}
 
     # 锚：约束 → 旧 map 系绝对观测（p_pred/yaw_pred）
     row_of = {int(k): r for r, k in enumerate(ids)}
@@ -554,8 +651,9 @@ def align_into(world_dir: Path, new_sid: str, old_sid: str, *, tail_m: float = 1
                         "ayaw": math.atan2(R_pred[1, 0], R_pred[0, 0]),
                         "w": float(c["inliers"]), "dist": float(dist[r])})
         sel.append(c)
-    if len(anchors) < 8:
-        return {"ok": False, "reason": "too_few_valid_anchors", "n": len(anchors)}
+    if len(anchors) < int(min_constraints):
+        return {"ok": False, "reason": "too_few_valid_anchors", "n": len(anchors),
+                "threshold": int(min_constraints)}
 
     # P0.1 gauge 初值
     R_old = np.array([T_old[c["old_kf"]][:3, :3] for c in sel])
@@ -599,11 +697,11 @@ def align_into(world_dir: Path, new_sid: str, old_sid: str, *, tail_m: float = 1
         xdir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(xdir / f"merged_{new_sid}_into_{old_sid}.npz",
                             ids=ids, T_map=T_out, dist_m=dist,
-                            base_sid=old_sid, method="anchored_pose_graph_v1")
+                            base_sid=base_sid, method="anchored_pose_graph_v1")
         thr = max(2.0 * (m["train_med"] or 1.0), 1.0)   # 内外点掩码（供证据加权参考）
         rec = {"wall": round(time.time(), 1), "method": "anchored_pose_graph_v1",
-               "new_sid": new_sid, "old_sid": old_sid, **{k: v for k, v in out.items()
-                                                          if k not in ("ok",)},
+               "new_sid": new_sid, "old_sid": old_sid, "base_sid": base_sid,
+               **{k: v for k, v in out.items() if k not in ("ok",)},
                "gauge_R_G": [[round(float(v), 5) for v in row] for row in g["R_G"]],
                # 掩码只对训练锚（len = train.n）；留出锚不参与优化故无残差
                "inlier_note": "per TRAIN anchor, len==train.n; holdout anchors excluded",
@@ -639,7 +737,346 @@ def align_into_auto(world_dir: Path, new_sid: str, cfg: XSessionConfig) -> dict[
                 "threshold": int(cfg.align_min_constraints)}
     return align_into(world_dir, new_sid, old_sid,
                       tail_m=cfg.align_tail_m, holdout_frac=cfg.align_holdout_frac,
-                      elastic=cfg.align_elastic)
+                      elastic=cfg.align_elastic,
+                      min_constraints=int(cfg.align_min_constraints))
+
+
+# ---- 世界树 pass（P0 §洞4：spanning tree —— 把多棵树并进同一坐标系）------------
+# 跨会话采纳（align_into）是**逐对**的：世界里会各自长成多棵"树"（每棵各一个 gauge），
+# 新会话落在哪棵取决于它看见了谁、看见多少。世界树 pass 补上"世界级"的那一步：
+# 按约束图把够格的桥**链式**采纳进同一坐标系，产出一棵指向根的树 + 一份诚实的报告
+#（分量 / 对外缺口 / 逐操作证据）。弱桥（低于 bridge_min 或过不了质量闸）**只报告不落盘**
+# ——v1 铁律：宁可只报告，也不伪造修正。
+
+_TREE_WRITE_GATE = {"min_holdout": 2, "holdout_med_max": 1.0}   # 落盘前质量闸（force 可关）
+
+
+def _effective_table_path(world_dir: Path, sid: str) -> Path | None:
+    """该会话**实际生效**的位姿表文件（口径与 ``session_pose_table`` 一致）：
+    合法 merged 就是它，否则原表；都没有返回 None。"""
+    raw = Path(world_dir) / "sessions" / sid / "poses.npz"
+    mp = _merged_table_path(world_dir, sid)
+    if mp is not None:
+        tab = session_pose_table(world_dir, sid)
+        if tab is not None and tab["source"] == "merged":
+            return mp
+    return raw if raw.is_file() else None
+
+
+def _chain_sids(world_dir: Path, sid: str, max_hops: int = 16) -> list[str] | None:
+    """"已采纳链"上的 sid 列表（含自己、以坐标系终点结尾）；过期/成环返回 None。
+
+    每一环都做**过期检查**：``merged_u`` 必须不早于 base 当前有效表——base 在 u 被采纳
+    之后又换过表的话，u 的坐标还停在 base 的旧系里，整条链作废（调用方必须重算 u）。
+    """
+    chain, cur = [sid], sid
+    seen = {sid}
+    for _ in range(max_hops):
+        tab = session_pose_table(world_dir, cur)
+        if tab is None:
+            return None
+        base = tab.get("base_sid")
+        if not base or str(base) == cur:
+            return chain
+        mp = _merged_table_path(world_dir, cur)
+        bp = _effective_table_path(world_dir, str(base))
+        if mp is None or bp is None:
+            return None
+        try:
+            if mp.stat().st_mtime_ns < bp.stat().st_mtime_ns:
+                return None
+        except OSError:                              # pragma: no cover - 竞态删除
+            return None
+        if str(base) in seen:
+            return None
+        seen.add(str(base))
+        chain.append(str(base))
+        cur = str(base)
+    return None
+
+
+def _constraint_edges(world_dir: Path) -> dict[tuple[str, str], int]:
+    """扫 ``xsession/constraints.jsonl`` → 有向边计数 {(new, old): 条数}。
+
+    方向即采纳方向：``new → old`` = "new 的帧看见了 old 的帧"，``align_into(new, old)`` 可用。
+    计数口径与 align_into 的门槛一致（它就是逐条拿去当锚的）。坏行跳过（报告件不拖垮谁）。
+    """
+    out: dict[tuple[str, str], int] = {}
+    try:
+        lines = (Path(world_dir) / "xsession" / "constraints.jsonl").read_text(
+            encoding="utf-8").strip().splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        try:
+            c = json.loads(ln)
+            k = (str(c["new_sid"]), str(c["old_sid"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _plan_tree(root: str, members: list[str], out_edges: dict[str, list[tuple[str, int]]],
+               kf_of: dict[str, int], chains: dict[str, list[str] | None]) -> dict[str, Any]:
+    """从 root 反向长出**指向 root 的树**（in-arborescence）。纯计算、不碰盘，选根与执行复用。
+
+    * 只走"能采纳"方向的有向边 u→v（u 的帧看见过 v），边权 = 约束条数；
+    * u 若已有新鲜**链**（u 被采纳进 b、边仍够格）⇒ 父 = b 并**等 b 先落位**：强链整段
+      跟着基走（99 条的那条不会被 7 条的弱桥顶掉）；基落不了位，u 一起不动（只报告）；
+    * 其余节点：到根距离（反向 BFS）近的先落位，父 = 已落位节点里边权最大者（树的最弱边
+      尽量大）；同层先放"被别的会话链指着的基"，平手取会话规模、sid 升序（确定性）。
+    """
+    rev: dict[str, list[str]] = {}
+    for u, lst in out_edges.items():
+        for v, _c in lst:
+            rev.setdefault(v, []).append(u)
+    dist = {root: 0}
+    dq = deque([root])
+    while dq:
+        v = dq.popleft()
+        for u in rev.get(v, []):
+            if u not in dist:
+                dist[u] = dist[v] + 1
+                dq.append(u)
+    mem = set(members)
+    bases = {ch[1] for ch in chains.values() if ch and len(ch) >= 2}
+    chain_base: dict[str, str] = {}
+    for u in members:
+        ch = chains.get(u) or []
+        if (len(ch) >= 2 and ch[1] != u and ch[1] in mem
+                and any(v == ch[1] for v, _c in out_edges.get(u, []))):
+            chain_base[u] = ch[1]
+
+    def key(u: str) -> tuple:
+        best = max((c for v, c in out_edges.get(u, []) if dist.get(v, 1 << 30) < dist.get(u, 1 << 30)),
+                   default=0)
+        return (dist.get(u, 1 << 30), 0 if u in bases else 1, -best, -kf_of.get(u, 0), u)
+
+    order: list[str] = [root]
+    parent: dict[str, tuple[str, int]] = {}
+    pending = sorted((s for s in members if s != root), key=key)
+    while pending:
+        rest, progressed = [], False
+        for u in pending:
+            b = chain_base.get(u)
+            if b is not None and b not in order:       # 链基还没落位：等它（链整段走）
+                rest.append(u)
+                continue
+            if b is not None:                          # 挂回自己的链基（不另投强父，保链完整）
+                parent[u] = (b, next(c for v, c in out_edges[u] if v == b))
+            else:
+                cand = [(c, v) for v, c in out_edges.get(u, []) if v in order]
+                if not cand:                           # 等更强的父落位（或最后判不可达）
+                    rest.append(u)
+                    continue
+                c, p = max(cand, key=lambda t: (t[0], t[1]))
+                parent[u] = (p, c)
+            order.append(u)
+            progressed = True
+        if not progressed:
+            break
+        pending = rest
+    used = [c for _p, c in parent.values()]
+    return {"root": root, "order": order, "parent": parent,
+            "unreachable": sorted(set(members) - set(order)),
+            "min_edge": min(used) if used else None, "total": sum(used)}
+
+
+def _best_edge_of(sid: str, edges: dict[tuple[str, str], int],
+                  bmin: int) -> dict[str, Any] | None:
+    """该会话最强的一条跨会话边（含弱边）：给 unreachable 一个诚实解释（差多少才够桥）。"""
+    best = None
+    for (u, v), c in sorted(edges.items()):
+        if sid not in (u, v):
+            continue
+        rec = ({"dir": "out", "peer": v, "count": c} if u == sid
+               else {"dir": "in", "peer": u, "count": c})
+        if best is None or c > best["count"]:
+            best = {**rec, "meets_min": c >= bmin}
+    return best
+
+
+def _component_bridge(members: list[str], edges: dict[tuple[str, str], int],
+                      bmin: int) -> dict[str, Any] | None:
+    """该分量对外最强的一条边 = **合树的缺口**（含低于门槛的弱边）：还差多少才够桥。"""
+    mem = set(members)
+    best = None
+    for (u, v), c in sorted(edges.items()):
+        if (u in mem) == (v in mem):
+            continue
+        if best is None or c > best["count"]:
+            best = {"new": u, "old": v, "count": c, "meets_min": c >= bmin}
+    return best
+
+
+def _tree_gate(out: dict[str, Any]) -> tuple[bool, str]:
+    """落盘质量闸：预览够格吗（留出锚 ≥2 且留出中位 ≤1 m）。不够 ⇒ 只报告不落盘。"""
+    ho = out.get("holdout") or {}
+    n, med = int(ho.get("n") or 0), ho.get("med_m")
+    if n < int(_TREE_WRITE_GATE["min_holdout"]):
+        return False, f"holdout_too_few:{n}"
+    if med is None or float(med) > float(_TREE_WRITE_GATE["holdout_med_max"]):
+        return False, f"holdout_med:{med}"
+    return True, "ok"
+
+
+def _brief_align(o: dict[str, Any]) -> dict[str, Any]:
+    """align_into 结果的精简证据（报告里每条操作留这些）。"""
+    return {"ok": bool(o.get("ok")), "reason": o.get("reason"),
+            "n_constraints": o.get("n_constraints"), "n_anchors": o.get("n_anchors"),
+            "gauge": o.get("gauge"), "train": o.get("train"),
+            "holdout": o.get("holdout"), "moved_m": o.get("moved_m")}
+
+
+def align_world_tree(world_dir: Path, cfg: XSessionConfig | None = None, *,
+                     bridge_min: int | None = None, root: str | None = None,
+                     write: bool = True, force: bool = False) -> dict[str, Any]:
+    """世界树 pass：把约束图里够格的桥**链式采纳**成"一个分量一个坐标系"（P0 §洞4）。
+
+    步骤：1) 建有向约束图（``new → old`` 可采纳方向，边权 = 确认条数）；
+    2) 弱连通分量（只认 ≥ ``bridge_min`` 的边；孤立会话自成分量）→ 逐候选根模拟，
+       取（覆盖率, 树瓶颈, 树总权, 会话规模，平手取 sid 最早）最大者为根 → 长出指向根的树；
+    3) 按树的次序逐个 ``align_into(子, 父)``：链新鲜且已在该系 ⇒ ``already`` 跳过；
+       父这轮没落位 ⇒ ``blocked_parent``；否则先**预演**（算不落盘）过质量闸，够格才真落盘
+       （``force=True`` 关闸；``write=False`` 只出计划+预演，不写任何 merged）。
+
+    报告落 ``<world>/xsession/world_tree.json``（分量/缺口/树边/逐操作证据）。不抛异常。
+    """
+    world_dir = Path(world_dir)
+    cfg = cfg or XSessionConfig()
+    bmin = int(cfg.align_min_constraints if bridge_min is None else bridge_min)
+    if not (world_dir / "xsession" / "constraints.jsonl").is_file():
+        return {"ok": False, "reason": "no_constraints"}
+    edges_all = _constraint_edges(world_dir)
+    feats = {s["sid"]: int(s["features"]) for s in _scan_sessions(world_dir, cfg.min_session_kf)}
+    if root is not None and root not in feats:
+        return {"ok": False, "reason": f"root_not_found:{root}"}
+    nodes = sorted(feats)
+    excluded = sorted({s for pair in edges_all for s in pair} - set(nodes))
+    out_edges: dict[str, list[tuple[str, int]]] = {}
+    for (u, v), c in edges_all.items():
+        if u in feats and v in feats and c >= bmin:
+            out_edges.setdefault(u, []).append((v, c))
+    adj: dict[str, set[str]] = {s: set() for s in nodes}
+    for u, lst in out_edges.items():
+        for v, _c in lst:
+            adj[u].add(v)
+            adj[v].add(u)
+    comps: list[list[str]] = []
+    seen: set[str] = set()
+    for s in nodes:
+        if s in seen:
+            continue
+        stack, comp = [s], []
+        seen.add(s)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in sorted(adj[u]):
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        comps.append(sorted(comp))
+    # 每个会话的"已采纳链"（新鲜性/成环由 _chain_sids 判；None = 过期，按无链处理）
+    chains: dict[str, list[str] | None] = {s: _chain_sids(world_dir, s) for s in nodes}
+
+    report: dict[str, Any] = {
+        "wall": round(time.time(), 1), "world": str(world_dir), "bridge_min": bmin,
+        "write": bool(write), "force": bool(force), "dry_run": not write,
+        "sessions": {s: feats[s] for s in nodes}, "excluded_sessions": excluded,
+        "edges": {f"{u}->{v}": c for (u, v), c in sorted(edges_all.items())},
+        "components": []}
+    for comp in comps:
+        cands = [root] if (root is not None and root in comp) else comp
+        best_sc: tuple | None = None
+        best_plan: dict[str, Any] | None = None
+        for r in cands:                              # cands 有序 ⇒ 平手时 sid 最早的赢
+            plan = _plan_tree(r, comp, out_edges, feats, chains)
+            sc = (len(plan["order"]), plan["min_edge"] or 0, plan["total"], feats.get(r, 0))
+            if best_sc is None or sc > best_sc:
+                best_sc, best_plan = sc, plan
+        assert best_plan is not None
+        root_sid = str(best_plan["root"])
+        ch = _chain_sids(world_dir, root_sid)
+        root_gauge = ch[-1] if ch else root_sid        # 根的"坐标系终点"
+        ops: list[dict[str, Any]] = []
+        ok_sids = {root_sid}                       # 执行后（干跑=计划里）应在根系的会话
+        previewable = {root_sid}                   # **此刻**真在根系的会话（预演只对它们成立）
+        for u in best_plan["order"][1:]:
+            p, cnt = best_plan["parent"][u]
+            op: dict[str, Any] = {"sid": u, "parent": p, "count": cnt}
+            chu = _chain_sids(world_dir, u)
+            if chu is not None and chu[-1] == root_gauge:
+                op["status"] = "already"              # 链新鲜且已在该系：不重复算
+                ok_sids.add(u)
+                previewable.add(u)
+                ops.append(op)
+                continue
+            if p not in ok_sids:
+                op["status"] = "blocked_parent"       # 父这轮没落位，链断在这里
+                ops.append(op)
+                continue
+            if p not in previewable:
+                op["status"] = "planned"              # 干跑里的链下游：父还没写，预演不成立
+                ok_sids.add(u)
+                ops.append(op)
+                continue
+            prev = align_into(world_dir, u, p, tail_m=cfg.align_tail_m,
+                              holdout_frac=cfg.align_holdout_frac, elastic=cfg.align_elastic,
+                              min_constraints=bmin, write=False)
+            op["preview"] = _brief_align(prev)
+            if not prev.get("ok"):
+                op["status"] = "align_failed"
+                ops.append(op)
+                continue
+            gate_ok, why = _tree_gate(prev)
+            if not write:
+                if gate_ok or force:
+                    op["status"] = "would_align"
+                    ok_sids.add(u)
+                else:
+                    op["status"] = "would_refuse"
+                op["gate"] = why
+            elif gate_ok or force:
+                real = align_into(world_dir, u, p, tail_m=cfg.align_tail_m,
+                                  holdout_frac=cfg.align_holdout_frac,
+                                  elastic=cfg.align_elastic, min_constraints=bmin, write=True)
+                op["status"] = "aligned" if real.get("ok") else "align_failed"
+                op["merged"] = real.get("merged")
+                if real.get("ok"):
+                    ok_sids.add(u)
+                    previewable.add(u)
+            else:
+                op["status"] = "refused_gate"
+                op["gate"] = why
+            ops.append(op)
+        report["components"].append({
+            "root": root_sid, "nodes": comp,
+            "coverage": f"{len(best_plan['order'])}/{len(comp)}",
+            "tree": [{"sid": u, "parent": best_plan["parent"][u][0],
+                      "count": best_plan["parent"][u][1]} for u in best_plan["order"][1:]],
+            "bridge": _component_bridge(comp, edges_all, bmin),
+            "unreachable": [{"sid": u, "best_edge": _best_edge_of(u, edges_all, bmin)}
+                            for u in best_plan["unreachable"]],
+            "ops": ops})
+    report["aligned"] = sum(1 for c in report["components"] for o in c["ops"]
+                            if o["status"] == "aligned")
+    report["skipped"] = sum(1 for c in report["components"] for o in c["ops"]
+                            if o["status"] == "already")
+    report["refused"] = sum(1 for c in report["components"] for o in c["ops"]
+                            if o["status"] in ("refused_gate", "would_refuse"))
+    xdir = world_dir / "xsession"
+    xdir.mkdir(parents=True, exist_ok=True)
+    jp = xdir / "world_tree.json"
+    tmp = jp.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(jp)                               # 原子写
+        report["report"] = str(jp)
+    except OSError:                                   # pragma: no cover - 报告写不出去不影响结论
+        report["report"] = None
+    return {"ok": True, **report}
 
 
 class XSessionTracker:
@@ -664,6 +1101,7 @@ class XSessionTracker:
         self._rejects: dict[str, int] = {}
         self._recent: deque = deque(maxlen=8)
         self._last_confirm_dist: dict[int, float] = {}
+        self._yaw_pool: dict[tuple[str, str], deque] = {}   # (new, old) → 带符号 yaw 残差样本
         self._query_ms: float | None = None
         self._written: dict[str, Any] = {"written": False}
         self._words: dict[int, np.ndarray] = {}       # k → des3d 的 word id（写回收集，建图线程写）
@@ -770,9 +1208,21 @@ class XSessionTracker:
             self._reject(why)
             return None
         # HMD 朝向不漂（跨会话也成立：旋转与平移 gauge 无关；play space 被重置会先被 yaw_jump 留痕）。
+        # 2026-10-06：绝对 6° 门实测吞真重合 ⇒ yaw_consensus 用"相对该会话对中位数"的窗（见 cfg 注释）。
         R_err = (np.asarray(R_old, np.float64) @ rel["R_ab"]).T @ R_map
         yaw_err = rotation_angle_deg(R_err)
-        if yaw_err > cfg.yaw_tol_deg:
+        signed = math.degrees(math.atan2(float(R_err[1, 0]), float(R_err[0, 0])))
+        theta = None
+        if self.cfg.yaw_consensus:
+            pool = self._yaw_pool.setdefault((self.sid, sid), deque(maxlen=256))
+            if len(pool) >= int(self.cfg.yaw_consensus_min):
+                theta = float(np.median(np.fromiter(pool, float)))
+            pool.append(signed)                       # 先收样：被拒的样本同样进池（中位数靠池收敛）
+        if yaw_err > float(self.cfg.yaw_cap_deg):
+            self._reject("rotation_mismatch")         # 硬顶：重置/坏会话（如 025013）照拦
+            return None
+        over = (yaw_err > cfg.yaw_tol_deg) if theta is None else (abs(signed - theta) > cfg.yaw_tol_deg)
+        if over:
             self._reject("rotation_mismatch")
             return None
         t_ab = rel["t_ab"]

@@ -334,8 +334,19 @@ def _ray_voxels(rxy: np.ndarray, h: np.ndarray, t: np.ndarray, cam_h: float, cfg
     return hits, miss
 
 
-def make_sgbm() -> Any:
-    return cv2.StereoSGBM_create(minDisparity=0, numDisparities=64, blockSize=5,
+def disparity_range_px(fx: float, *, base_fx: float = 202.5, base_px: int = 64) -> int:
+    """按 fx 缩放的视差搜索范围（取 16 的倍数）。
+
+    ``d = fx·B/Z`` ⇒ 同一深度下视差与 fx 成正比。换采集宽度（720→1440→2880，
+    fx 202.5→405→810）时范围不跟着缩放，近场会被裁掉：64@fx202.5 覆盖到 Z≈0.40 m，
+    仍用 64 的话边界退到 ≈0.80 / 1.60 m。默认参数下返回 64 —— 720×405 行为逐位不变。
+    见 `Docs/全分辨率验证录制SOP（2026-10-05）.md`。
+    """
+    return max(16, int(16 * round(base_px * float(fx) / base_fx / 16.0)))
+
+
+def make_sgbm(num_disparities: int = 64) -> Any:
+    return cv2.StereoSGBM_create(minDisparity=0, numDisparities=int(num_disparities), blockSize=5,
                                  P1=8 * 25, P2=32 * 25, uniquenessRatio=10,
                                  speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1,
                                  mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
