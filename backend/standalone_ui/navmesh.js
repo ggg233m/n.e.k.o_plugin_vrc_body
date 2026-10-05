@@ -205,14 +205,19 @@ function render(s, auto) {
   flag($("xsession"), `${xsHead}${recentText} · ${alText}`,
     (xs.errors || 0) > 0 ? "bad" : (xs.active === false ? "warn" : "ok"));
   // 世界先验注入（P0.3b）：ok 后面那串才是"真的补进去了几格"；被拒时的 state 是**闸门**报的
-  // 原因，所以数字（内点/残差/前后半差异）一律要显示出来 —— 只说一个 gauge_inlier_frac
-  // 等于没说，现场没法判断是位姿漂了还是阈值太紧。
+  // 原因，所以数字（核心条数/残差/核心跨度/前后半差异）一律要显示出来 —— 只说一个
+  // gauge_inlier_frac 等于没说，现场没法判断是位姿漂了还是阈值太紧（判据全在核心上，见
+  // backend/nav_prior.PriorConfig）。
   const pr = s.prior || {};
   const ap = pr.applied || {};
   const gp = pr.gauge || {};
   const sp = pr.split || {};
+  const co = pr.core || {};
+  // 核心跨度：核心横跨"命中区间"的里程占比（判据：≥ min_core_span_frac 才算全段成立）。
+  const spanText = co.span_frac == null ? "" : ` · 核心跨度 ${num(co.span_frac * 100, 0)}%`;
   const gaugeText = gp.n == null ? "" :
-    ` ｜ 内点 ${gp.n_inlier}/${gp.n} · 残差中位 ${num(gp.pos_med_m)} m / ${num(gp.rot_med_deg, 1)}°` +
+    ` ｜ 核心 ${co.n == null ? gp.n_inlier : co.n}/${gp.n} · 残差中位 ${num(gp.pos_med_m)} m / ${num(gp.rot_med_deg, 1)}°` +
+    spanText +
     (sp.m == null ? "" : ` · 前后半 ${num(sp.m)} m / ${num(sp.yaw_deg, 1)}°`);
   flag($("prior"), pr.enabled === false ? "已关闭 · " + (pr.state || "—")
     : (pr.state === "ok"
@@ -257,8 +262,9 @@ const PRIOR_WHY = {
   idle: "待首次栅格化", not_started: "待首次栅格化", disabled: "已关闭",
   no_xsession: "无跨会话（先设世界身份）", no_prior: "世界里还没有 prior/（先跑 offline_fusion.py --write-prior）",
   gauge_too_few: "约束还不够（会话早期正常）", gauge_degenerate: "约束退化，估不出 gauge",
-  gauge_few_inliers: "内点太少", gauge_inlier_frac: "位姿内部不一致（内点占比不够）",
+  gauge_few_inliers: "内点太少", gauge_inlier_frac: "位姿内部不一致（核心占比不够）",
   gauge_pos_residual: "残差太大（位姿与历史对不上）", gauge_rot_residual: "朝向残差太大",
+  gauge_core_local: "自洽的那几条只挤在一小段（整场撑不起一个 gauge）",
   gauge_unstable: "会话帧在漂移（前后半估的 gauge 对不上）",
   frame_mismatch: "旧会话表与先验不同坐标系", world_scale_mismatch: "世界尺度变了（换过 avatar？）",
 };

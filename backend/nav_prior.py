@@ -18,9 +18,11 @@
   一个假障碍守在走廊上会把自己困住（start 不在中心区 ⇒ 规划直接拒绝）；
 * 先验 FREE 会被 live 后续观测覆盖（同一规则的另一半）。
 
-**质量闸**（任一不过就不注入，``status()["prior"]`` 里如实报原因）：
-约束数 ≥ ``min_constraints``、内点 ≥ ``min_inlier``、内点占比 ≥ ``min_inlier_frac``、
-内点位置残差中位 ≤ ``max_pos_med_m``、旋转残差中位 ≤ ``max_rot_med_deg``。
+**质量闸**（任一不过就不注入，``status()["prior"]`` 里如实报原因）—— 一律只对 **IRLS 内点核心**
+（= 真正参与 gauge 的那批约束）说话：约束数 ≥ ``min_constraints``、核心 ≥ ``min_inlier``、
+核心占比 ≥ ``min_inlier_frac``、核心位置残差中位 ≤ ``max_pos_med_m``、旋转残差中位 ≤
+``max_rot_med_deg``、核心跨度 ≥ ``min_core_span_frac``（别只在命中区间的一小片成立）、
+前后半交叉验证 ≤ ``max_split_m`` / ``max_split_yaw_deg``。
 另外先验所在坐标系的根（``base_sid``）必须与约束引用的旧会话表**同根**
 （``XSessionTracker.table_base``）——**绝不混 gauge**，同源判据见
 ``Docs/P0.3b会话末自动采纳（2026-10-03）.md`` 与 ``Docs/离线多视角融合v1-假障碍清除``。
@@ -61,14 +63,26 @@ class PriorConfig:
     # 但这里更严一点：采纳错只是写错一张表，注入错是**当场**把障碍画到错的格上。
     min_constraints: int = 8      # 参与 gauge 的原始约束数下限
     min_inlier: int = 6           # IRLS 内点数下限
-    min_inlier_frac: float = 0.5  # 内点占比下限（防"约束多但半数外点"）
+    # 内点占比下限（防"约束多但全是外点"）。
+    # ⚠️ 2026-10-06 从 0.5 降到 0.2：**这条判据原来在否决好数据**。live 四场复现（052927/050848/
+    # 035644/001523）显示，一场会话的约束池天然是"一整场都自洽的核心 + 局部形变的散兵"（DR 漂移
+    # 2.8% × 路程，回环只修平移 ⇒ 地图局部扭曲 1–3 m），核心稳定在 8–59 条、残差中位 0.14–0.31 m，
+    # 而占比只有 0.23–0.36。旧门槛让散兵**否决**核心（035644 的 58/161 被拒，而同一批数据离线
+    # 采纳的留出中位是 0.326 m ⇒ 本来就该放行）。占比仍有意义——它挡的是"池子很大而核心极小"。
+    min_inlier_frac: float = 0.2
     max_pos_med_m: float = 0.5    # 内点位置残差（中位）上限
     max_rot_med_deg: float = 5.0  # 内点旋转残差（中位）上限
+    # 核心跨度：核心约束的 ``new_dist_m`` 跨度 / 全池跨度。核心若只挤在命中区间的一小段里，
+    # 说明这个 gauge 只在那一小片成立（会话帧局部扭曲），别拿去铺整张先验图。
+    min_core_span_frac: float = 0.5
     # 半样本交叉验证：两组子集各估一次 gauge，比它们把**同一批新帧**映射到哪儿。
     # 为什么不能只靠残差（2026-10-06 live 教训）：16 条约束就能拟合出一个**自洽但错**的刚体
     # 变换——池化残差 0.39 m / 1.8° 全过闸，而那个 gauge 的 yaw 是 2.4°，全场 161 条给的是
     # 8.6°（差 6°）。先验按它投影 ⇒ 现场看到"一张废了的地图"，约束攒多后闸门改判拒绝、
     # 地图自己恢复正常。两组独立估计对不上 = 这组数据还撑不起一个 gauge，一律不注入。
+    # ⚠️ 2026-10-06 起这道闸与上面的残差闸一样**只在核心上做**（外点本来就不参与拟合，让它们
+    # 再来一次否决是双重标准）；上面那条"核心要有跨度"接住了"只在局部自洽的核心"这个洞，
+    # 事故场（16 条时核心 = 全池 ⇒ 前后半 1.007 m/4.59°）照旧被拒 —— 有回归测试钉住。
     max_split_m: float = 0.6          # 两组 gauge 映射同一批新帧的位置差（中位）上限
     max_split_yaw_deg: float = 2.5    # 两组 gauge 的 yaw 差上限
 
@@ -313,6 +327,8 @@ class PriorConsumer:
         self._prior_tried = False
         self._gauge: dict[str, Any] | None = None
         self._split: dict[str, Any] | None = None     # 半样本交叉验证的差异统计
+        self._core: list[dict[str, Any]] = []         # 本次估计的内点核心（= 真参与 gauge 的约束）
+        self._core_span: float | None = None          # 核心在命中区间里覆盖的里程占比
         self._overlay: PriorOverlay | None = None
         self._lock = threading.Lock()
         self._st: dict[str, Any] = {"enabled": True, "state": "idle", "n_constraints": 0}
@@ -359,21 +375,25 @@ class PriorConsumer:
         prior = self._prior
         if prior is None:
             # 没有先验文件 / 尺度对不上 / 读坏：一格都不注入，但 gauge 照算（供现场核对）。
-            self._gauge = self._estimate(self._usable(None))
+            aligned = self._aligned(self._usable(None))
+            self._gauge = self._estimate(aligned)
+            self._set_core(aligned, self._gauge)
             self._overlay = None
             self._publish(self._prior_reason or "no_prior", self._gauge, None)
             return
         cons = self._usable(prior)
         # 池里有约束、但没一条与先验同根 ⇒ 坐标系对不上：如实报，不做任何估算（绝不混 gauge）。
         mismatch = self._table_base is not None and bool(self._cons) and not cons
-        g = None if mismatch else self._estimate(cons)
+        aligned = self._aligned(cons)
+        g = None if mismatch else self._estimate(aligned)
         self._gauge = g
         self._split = None
-        reason = "frame_mismatch" if mismatch else self._gate(g, len(cons))
+        core = self._set_core(aligned, g)
+        reason = "frame_mismatch" if mismatch else self._gate(g, aligned, core)
         # 半样本交叉验证：**总是算**（数字进 status，现场能看见"数据撑不撑得起 gauge"），
         # 但只在残差闸已放行时才让它定生死 —— 残差都不合格时原因要报更根本的那条。
         if not mismatch and g is not None and self._table_base is not None:
-            self._split, split_reason = self._cross_check(cons)
+            self._split, split_reason = self._cross_check(core)
             if not reason:
                 reason = split_reason
         self._overlay = None
@@ -407,18 +427,30 @@ class PriorConsumer:
                 out.append(c)
         return out
 
+    def _aligned(self, cons: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """只留"两侧位姿都查得到"的约束 —— ``_estimate`` / ``_cross_check`` / 核心掩码对齐用同一份，
+        三处各筛一遍的话 ``g["inlier"]`` 就和约束列表错位了。"""
+        out = []
+        for c in cons:
+            if self._pose_of(int(c["new_kf"])) is None:
+                continue
+            if self._pose_of_old is None or self._pose_of_old(
+                    str(c["old_sid"]), int(c["old_kf"])) is None:
+                continue
+            out.append(c)
+        return out
+
     def _estimate(self, cons: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """约束池 + 当前位姿 → gauge（``estimate_gauge``，口径与会话末采纳一致）。"""
+        """约束池 + 当前位姿 → gauge（``estimate_gauge``，口径与会话末采纳一致）。
+
+        ``cons`` 必须是 ``_aligned`` 过的那份（每条都能查到两侧位姿）。
+        """
         if len(cons) < 3:                                     # estimate_gauge 的硬下限
             return None
         R_old, p_old, R_ab, t_ab, R_new, p_new, w = [], [], [], [], [], [], []
         for c in cons:
             T_new = self._pose_of(int(c["new_kf"]))
-            got = None if self._pose_of_old is None else self._pose_of_old(
-                str(c["old_sid"]), int(c["old_kf"]))
-            if T_new is None or got is None:
-                continue
-            R_o, xy_o = got
+            R_o, xy_o = self._pose_of_old(str(c["old_sid"]), int(c["old_kf"]))
             R_old.append(np.asarray(R_o, np.float64))
             # ⚠️ z 一律置 0：索引只存 xy，先验也是纯 xy 图；掺半个 3D 只会让 t_G 的 z
             # 分量去吸收"混合口径"，对 xy 面映射是纯污染（本模块只消费 R_G/t_G 的 xy 块）。
@@ -434,25 +466,60 @@ class PriorConsumer:
         return estimate_gauge(np.array(R_old), np.array(p_old), np.array(R_ab), np.array(t_ab),
                               np.array(R_new), np.array(p_new), np.array(w))
 
-    def _gate(self, g: dict[str, Any] | None, n_cons: int) -> str:
-        """质量闸：返回空串 = 放行，否则是拒绝原因（进 status）。"""
+    def _set_core(self, aligned: list[dict[str, Any]], g: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """把这次估计的**内点核心**（= 真正参与 gauge 的那批约束）记下来给闸门/status 用。"""
+        if g is None:
+            self._core, self._core_span = [], None
+            return self._core
+        self._core = [c for c, k in zip(aligned, np.asarray(g["inlier"], bool).tolist()) if k]
+        self._core_span = self._core_span_frac(aligned, self._core)
+        return self._core
+
+    @staticmethod
+    def _core_span_frac(pool: list[dict[str, Any]], core: list[dict[str, Any]]) -> float | None:
+        """核心在"命中区间"里覆盖的里程占比（核心 ``new_dist_m`` 跨度 / 全池跨度）。
+
+        ``new_dist_m`` 缺失（老的 jsonl / 测试用假约束）⇒ None = 这条闸不适用（不猜）。
+        """
+        try:
+            all_d = [float(c["new_dist_m"]) for c in pool]
+            core_d = [float(c["new_dist_m"]) for c in core]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if len(all_d) < 3 or len(core_d) < 2:
+            return None
+        span = max(all_d) - min(all_d)
+        if span <= 1e-6:
+            return None
+        return (max(core_d) - min(core_d)) / span
+
+    def _gate(self, g: dict[str, Any] | None, pool: list[dict[str, Any]],
+              core: list[dict[str, Any]]) -> str:
+        """质量闸：返回空串 = 放行，否则是拒绝原因（进 status）。
+
+        残差（``pos_med``/``rot_med``）本来就只统计内点；占比、跨度、前后半也一律只谈核心——
+        外点已经被 IRLS 剔掉，不该再否决一次（见 ``PriorConfig.min_inlier_frac`` 的说明）。
+        """
         c = self.cfg
-        if n_cons < int(c.min_constraints):
+        n = len(pool)
+        if n < int(c.min_constraints):
             return "gauge_too_few"
         if g is None:
             return "gauge_degenerate"
         if g["n_inlier"] < int(c.min_inlier):
             return "gauge_few_inliers"
-        if g["n_inlier"] < float(c.min_inlier_frac) * max(int(g["n"]), 1):
+        if g["n_inlier"] < float(c.min_inlier_frac) * max(n, 1):
             return "gauge_inlier_frac"
         if g["pos_med"] > float(c.max_pos_med_m):
             return "gauge_pos_residual"
         if g["rot_med"] > float(c.max_rot_med_deg):
             return "gauge_rot_residual"
+        if self._core_span is not None and self._core_span < float(c.min_core_span_frac):
+            return "gauge_core_local"
         return ""
 
-    def _cross_check(self, cons: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
-        """前后半交叉验证：``(两组差异统计 | None, 拒绝原因)``。
+    def _cross_check(self, core: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+        """前后半交叉验证（**只在内点核心上做**）：``(两组差异统计 | None, 拒绝原因)``。
 
         **按时间前后切**（不是交错取），比较两半各估出的 gauge 把同一批新帧映射到哪儿：
         位置差中位 ≤ ``max_split_m``、yaw 差 ≤ ``max_split_yaw_deg`` 才放行。
@@ -462,12 +529,15 @@ class PriorConsumer:
         里的两组子集**都偏同样的 6°**、交错对比照样一致（实测 split 0.375 m / 2.3°，放行），
         于是先验按错 6° 的变换画了满屏废图；而前后两半一比就差 6°，立刻露馅。
         ⇒ 这条闸测的是"**gauge 跟时间有关**"，正是漂移/形变的指纹。
+
+        事故场在只喂 16 条时核心 = 全池，这道闸照旧拦下（split 1.007 m / 4.59°）；核心被外点
+        稀释的场（052927）则不再被"外点自己造成的漂移"误杀 —— 那是两种不同的病。
         """
-        half = len(cons) // 2
-        ga, gb = self._estimate(cons[:half]), self._estimate(cons[half:])
+        half = len(core) // 2
+        ga, gb = self._estimate(core[:half]), self._estimate(core[half:])
         if ga is None or gb is None:
             return None, "gauge_unstable"
-        xy = self._new_xy(cons)
+        xy = self._new_xy(core)
         if xy is None or len(xy) < 3:
             return None, "gauge_unstable"
         pa = xy @ np.asarray(ga["R_G"], np.float64)[:2, :2].T + np.asarray(ga["t_G"], np.float64)[:2]
@@ -507,6 +577,9 @@ class PriorConsumer:
                 "rot_med_deg": round(float(g["rot_med"]), 2),
                 # R_dev 只是 |gauge 的 yaw|（两场会话共享 SteamVR 锚时 ≈0），信息量用，不是闸
                 "r_dev_deg": round(float(g["R_dev_deg"]), 2)},
+            # 内点核心（真正参与 gauge 的那批约束）：条数 + 覆盖命中区间的里程占比
+            "core": {"n": len(self._core),
+                     "span_frac": (None if self._core_span is None else round(self._core_span, 3))},
             # 半样本差异（两组子集各估一份 gauge 差多远）：池化残差好看但这里大 = 数据撑不起 gauge
             "split": (None if self._split is None else
                       {"m": self._split.get("split_m"), "yaw_deg": self._split.get("split_yaw_deg"),

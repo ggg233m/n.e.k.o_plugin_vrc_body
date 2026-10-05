@@ -362,6 +362,43 @@ class TestPriorConsumer(unittest.TestCase):
         self.assertLess(st["split"]["m"], 0.05, st["split"])
         self.assertLess(st["split"]["yaw_deg"], 0.5, st["split"])
 
+    # ---- 核心 vs 散兵（2026-10-06 live 052927 的形状）----
+    def test_gate_speaks_only_about_the_core(self) -> None:
+        """闸门口径回归：占比 / 跨度只谈**内点核心**，外点不参与否决。
+
+        live 052927：池 31 条、核心 8 条（残差 0.345 m / 2.56°、核心横跨 50 m 里 49.9 m、
+        前后半 0.39 m / 1.96°）—— 旧口径被"8/31 = 0.26 < 0.5"卡死，地图永远恢复不了。
+        散兵（会话帧局部形变）已经被 IRLS 剔掉，不该再否决一次。
+        """
+        self.write_sample()
+        c = self.consumer({}, {})
+        g = {"n": 31, "n_inlier": 8, "pos_med": 0.345, "rot_med": 2.56}
+        wide = [{"new_dist_m": float(i) * 1.6} for i in range(31)]      # 命中区间 0–48 m
+        core = [wide[i] for i in (0, 1, 2, 3, 28, 29, 30)]             # 核心横跨整段
+        c._core_span = c._core_span_frac(wide, core)
+        self.assertAlmostEqual(c._core_span, 1.0, places=3)
+        self.assertEqual(c._gate(g, wide, core), "", "核心占比 0.26 也要放行")
+        # 核心只挤在命中区间的一小段 ⇒ gauge 只在那儿成立
+        local = [wide[0], wide[1], wide[2]]
+        c._core_span = c._core_span_frac(wide, local)
+        self.assertLess(c._core_span, 0.5)
+        self.assertEqual(c._gate(g, wide, local), "gauge_core_local")
+        # 池子很大而核心极小 ⇒ 占比闸仍在（防"上千条里挑出 8 条"）
+        g_big = {"n": 200, "n_inlier": 8, "pos_med": 0.2, "rot_med": 1.0}
+        c._core_span = 0.9
+        self.assertEqual(c._gate(g_big, [{"new_dist_m": float(i)} for i in range(200)],
+                                 [{"new_dist_m": float(i)} for i in range(8)]), "gauge_inlier_frac")
+
+    def test_record_without_new_dist_skips_the_span_gate(self) -> None:
+        """老 jsonl / 假约束没有 ``new_dist_m`` ⇒ 这条闸不适用（不猜，不误杀）。"""
+        self.write_sample()
+        recs, pn, po = synth(12)
+        c = self.consumer(pn, po)
+        c.add_constraints(recs)
+        self.assertIsNotNone(c.overlay())
+        self.assertEqual(c.status()["state"], "ok")
+        self.assertIsNone(c.status()["core"]["span_frac"])
+
     def test_frame_root_mismatch_refused(self) -> None:
         self.write_sample(base_sid="ROOT")
         recs, pn, po = synth(12)

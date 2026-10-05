@@ -312,9 +312,12 @@ NAVMESH_PRIOR_KEYS: dict[str, tuple[type, float, float]] = {
     "enabled": (bool, 0, 1),
     "min_constraints": (int, 3, 100000),      # 参与 gauge 的原始约束数下限（3 = estimate_gauge 硬下限）
     "min_inlier": (int, 3, 100000),           # IRLS 内点数下限
-    "min_inlier_frac": (float, 0.0, 1.0),     # 内点占比下限
+    "min_inlier_frac": (float, 0.0, 1.0),     # 核心占比下限（2026-10-06 由 0.5 调到 0.2，见 nav_prior）
     "max_pos_med_m": (float, 0.0, 10.0),      # 内点位置残差（中位）上限
     "max_rot_med_deg": (float, 0.0, 180.0),   # 内点旋转残差（中位）上限
+    # 核心跨度（见 backend/nav_prior._core_span_frac）：核心若只挤在命中区间的一小段，
+    # 说明 gauge 只在那一小片成立（会话帧局部形变），别拿去铺整张先验图。
+    "min_core_span_frac": (float, 0.0, 1.0),
     # 前后半交叉验证（见 backend/nav_prior._cross_check）：池化残差好看但前后半各估的 gauge
     # 对不上 = 会话帧在漂移（2026-10-06 live 就因为这条缺失注入了错 6° 的先验）。
     "max_split_m": (float, 0.0, 20.0),

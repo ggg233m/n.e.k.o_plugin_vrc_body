@@ -217,10 +217,16 @@ range_m = 5.0
 # 融合而来）的**在线消费**闸门：会话中攒够跨会话约束后在线估 gauge，够格才把先验叠进在线栅格
 # （live 证据优先，只补 unknown）。这里写的是"要不要信这张先验"：过不了闸就一格都不注入，
 # 原因进 status()["prior"]。键名见 config.py 的 NAVMESH_PRIOR_KEYS。
+# 闸门一律只对**IRLS 内点核心**说话：外点（会话帧局部形变那一批）已经被剔掉，不该再否决一次。
+# min_inlier_frac 因此是 0.2 而不是 0.5 —— 实测一场会话的核心占比只有 0.23–0.36，旧值把
+# "整场自洽的核心"直接卡死（2026-10-06，见 backend/nav_prior.PriorConfig 的说明）。
+# min_core_span_frac 挡的是另一种病：核心只挤在命中区间的一小段 ⇒ gauge 只在那儿成立。
 [navmesh.prior]
 enabled = true
 min_constraints = 8
 max_pos_med_m = 0.5
+min_inlier_frac = 0.2
+min_core_span_frac = 0.5
 
 # 按世界分区的关键帧记忆（位姿整表 + 地图侧 ORB 特征 + 彩色缩略图，不存点云），
 # 在 <state_dir>/navmesh_memory/。世界身份未设置时不写。管理页：/navmesh/memory。
