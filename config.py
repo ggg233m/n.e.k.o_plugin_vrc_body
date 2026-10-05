@@ -322,6 +322,17 @@ NAVMESH_PRIOR_KEYS: dict[str, tuple[type, float, float]] = {
     # 对不上 = 会话帧在漂移（2026-10-06 live 就因为这条缺失注入了错 6° 的先验）。
     "max_split_m": (float, 0.0, 20.0),
     "max_split_yaw_deg": (float, 0.0, 180.0),
+    # 分片降级档（2026-10-06 新增）：全局刚体对不上整张图时，改按米级分片各自估 gauge、各自过闸，
+    # 只对得上那几片才注入。见 backend/nav_prior.py 的 tiles_* 字段与 _tiles_fallback。
+    "tiles_enabled": (bool, 0, 1),
+    "tile_size_m": (float, 1.0, 100.0),
+    "tile_neighbor_m": (float, 1.0, 200.0),
+    "tile_min_constraints": (int, 3, 100000),
+    "tile_min_inlier": (int, 3, 100000),
+    "tile_split_min": (int, 4, 100000),
+    # 先验只注障碍、不注 free（2026-10-06 默认 False）：free 是上千关键帧在漂移位姿下
+    # 累积扫出来的，约束 gauge 合格不代表 free 不糊（渲染实证呈放射状星芒）。见 nav_prior。
+    "inject_free": (bool, 0, 1),
 }
 
 NavmeshOverrides = tuple[tuple[str, "float | int | bool"], ...]

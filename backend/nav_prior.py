@@ -86,6 +86,33 @@ class PriorConfig:
     max_split_m: float = 0.6          # 两组 gauge 映射同一批新帧的位置差（中位）上限
     max_split_yaw_deg: float = 2.5    # 两组 gauge 的 yaw 差上限
 
+    # ---- 分片（tile）降级档（2026-10-06 新增）----
+    # 为什么要有这一档：全局 gauge 是**一个刚体管整张图**，会话帧只要有一片局部形变
+    # （DR 漂移 + 回环只修平移 ⇒ 地图局部扭曲 1–3 m），整张先验就被否决 —— 明明对准的
+    # 那大半张图跟着一起丢。判据没错，错在**粒度**：该问的不是"整张图能不能用一个刚体
+    # 对上"，而是"**哪几片**能对上"。⇒ 全局闸拒了之后，改用分片 gauge 兜底：每片只用
+    # 它自己附近的约束估 gauge、自己过闸，**过闸的那几片才注入**；没过闸的片保持 unknown。
+    # ⚠️ 它是**降级档不是替代档**：全局闸放行时不动（那说明整图一致，分片只会引入片间
+    # 数值抖动）；全局拒了才启用。宁可少画，不画错（035644 那张废图的代价守着这条）。
+    tiles_enabled: bool = True
+    tile_size_m: float = 8.0          # 分片边长（会话帧追踪米）；片内先验格用该片的 gauge
+    # 每片估 gauge 时用**半径**内的约束（> tile_size_m 保证相邻片的约束集高度重叠 ⇒
+    # 片与片的 gauge 连续变化，不会在片界上把地图撕开）。
+    tile_neighbor_m: float = 12.0
+    tile_min_constraints: int = 6     # 片内（含邻域）约束数下限，不够 ⇒ 该片不注入
+    tile_min_inlier: int = 4          # 片内 IRLS 内点下限
+    tile_split_min: int = 8           # 片内约束 ≥ 这个数才补做前后半交叉验证
+
+    # ---- free 注入开关（2026-10-06 新增）----
+    # 为什么默认改 False：free 是**上千关键帧在各自漂移位姿下累积扫出来**的，先验渲染实证
+    # （.tmp/_render_prior.py，3 场 1497 kf）free 呈放射状星芒、轨迹跨度 27–42 m（实际房间
+    # 量级 ~15 m）——约束 gauge 残差合格（0.355 m）**不代表 free 不糊**：闸门量的是约束
+    # 一致性，量不了"free 累积漂移"。注入糊 free = 往 unknown 区铺假可走 ⇒ 污染 frontier。
+    # OCC 不受此影响：融合档验证过（已知内障碍 31→11~13、各场 OCC 落先验 OCC 85–98%），
+    # 且 apply_into 已有 walked 走廊保护。⇒ 先验注入**默认只注障碍**，free 等离线把
+    # free 质量（多场一致性阈值 / 更好位姿）修好再开。
+    inject_free: bool = False
+
 
 @dataclass
 class PriorMap:
@@ -299,6 +326,57 @@ def project_prior(prior: PriorMap, R2: np.ndarray, t2: np.ndarray,
                         corners=corners, stat=dict(stat or {}))
 
 
+def project_prior_tiles(prior: PriorMap, tiles: dict[tuple[int, int], dict[str, Any]],
+                        assign_R2: np.ndarray, assign_t2: np.ndarray,
+                        *, tile_size_m: float,
+                        stat: dict[str, Any] | None = None) -> PriorOverlay:
+    """**分片**投影：每片先验格用**它自己那一片**的 gauge（全局闸拒了之后的降级档）。
+
+    * ``tiles``：``{(i, j): {"R2": (2,2), "t2": (2,)}}``，i/j 是会话帧 ``tile_size_m`` 网格下标；
+    * ``assign_R2/t2``：**归属判定**用的变换（取全局 gauge）——只用来决定"这一格归哪一片"，
+      分片是米级尺度，归属判定对 gauge 的亚米级误差不敏感；真正画图用该片自己的 gauge；
+    * 没落在任何过闸片里的格**直接丢掉**（保持 unknown），绝不拿别的片的 gauge 顶替。
+
+    返回的是**一份** ``PriorOverlay``（各片投影完再拼）⇒ ``apply_into`` / 图层 / 测试全不用改。
+    """
+    lab = prior.labels
+    nz = np.argwhere(lab != L_UNK)
+    if not len(nz) or not tiles:
+        empty = np.zeros((0, 2), np.float64)
+        return PriorOverlay(labels=np.zeros(0, np.uint8), xy_session=empty,
+                            corners=empty, stat=dict(stat or {}))
+    rows, cols = nz[:, 0], nz[:, 1]
+    P = np.column_stack([prior.origin_xy[0] + (cols + 0.5) * prior.res_m,
+                         prior.origin_xy[1] + (rows + 0.5) * prior.res_m])
+    aR = np.asarray(assign_R2, np.float64).reshape(2, 2)
+    at = np.asarray(assign_t2, np.float64).reshape(2)
+    sess_assign = (P - at) @ aR                            # 粗投影：只用于决定归属哪一片
+    size = float(tile_size_m)
+    ij = np.floor(sess_assign / size).astype(np.int64) if size > 0 else np.zeros_like(
+        sess_assign, dtype=np.int64)
+    sess = np.empty_like(P)
+    used = np.zeros(len(P), bool)
+    for (ti, tj), tg in tiles.items():
+        m = (ij[:, 0] == int(ti)) & (ij[:, 1] == int(tj))
+        if not m.any():
+            continue
+        sess[m] = (P[m] - np.asarray(tg["t2"], np.float64).reshape(2)) @ np.asarray(
+            tg["R2"], np.float64).reshape(2, 2)
+        used[m] = True
+    if not used.any():
+        empty = np.zeros((0, 2), np.float64)
+        return PriorOverlay(labels=np.zeros(0, np.uint8), xy_session=empty,
+                            corners=empty, stat=dict(stat or {}))
+    x0 = prior.origin_xy[0] + float(cols.min()) * prior.res_m
+    x1 = prior.origin_xy[0] + (float(cols.max()) + 1.0) * prior.res_m
+    y0 = prior.origin_xy[1] + float(rows.min()) * prior.res_m
+    y1 = prior.origin_xy[1] + (float(rows.max()) + 1.0) * prior.res_m
+    box = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)
+    keep = np.flatnonzero(used)
+    return PriorOverlay(labels=lab[rows, cols].astype(np.uint8)[keep], xy_session=sess[keep],
+                        corners=(box - at) @ aR, stat=dict(stat or {}))
+
+
 class PriorConsumer:
     """在线先验消费（**只允许建图线程**调 ``add_constraints`` / ``note_map_moved`` / ``overlay``）。
 
@@ -329,6 +407,7 @@ class PriorConsumer:
         self._split: dict[str, Any] | None = None     # 半样本交叉验证的差异统计
         self._core: list[dict[str, Any]] = []         # 本次估计的内点核心（= 真参与 gauge 的约束）
         self._core_span: float | None = None          # 核心在命中区间里覆盖的里程占比
+        self._tiles: dict[str, Any] = {}              # 分片降级档摘要（片数 / 过闸数 / 拒绝原因计数）
         self._overlay: PriorOverlay | None = None
         self._lock = threading.Lock()
         self._st: dict[str, Any] = {"enabled": True, "state": "idle", "n_constraints": 0}
@@ -398,15 +477,62 @@ class PriorConsumer:
                 reason = split_reason
         self._overlay = None
         if reason:
+            # 降级档：全局一个刚体对不上整张图时，改问"哪几片对得上"（见 _tiles_fallback）。
+            # ⚠️ 坐标系不同根（mismatch）时不许走这条路 —— 那是"混 gauge"，不是"局部不准"。
+            if not mismatch and self._tiles_fallback(prior, aligned, g):
+                return
             self._publish(reason, g, prior)
             return
+        self._tiles = {}
         r2 = np.asarray(g["R_G"], np.float64)[:2, :2]
         t2 = np.asarray(g["t_G"], np.float64)[:2]
         stat = {"base_sid": prior.base_sid, "built_wall": prior.meta.get("built_wall"),
                 "path": str(prior.path), "cells_free": int((prior.labels == L_FREE).sum()),
                 "cells_occ": int((prior.labels == L_OCC).sum())}
-        self._overlay = project_prior(prior, r2, t2, stat=stat)
+        self._overlay = self._maybe_strip_free(project_prior(prior, r2, t2, stat=stat))
         self._publish("ok", g, prior)
+
+    def _tiles_fallback(self, prior: PriorMap, aligned: list[dict[str, Any]],
+                        g: dict[str, Any]) -> bool:
+        """全局闸拒了 ⇒ 改问"哪几片能对上"。过闸的那几片才注入，其余保持 unknown。
+
+        返回 True = 已按分片注入（调用方直接 return）。**一格都过不了闸就返回 False**，
+        交给调用方按原样报全局的拒绝原因 —— 分片是降级档，不是"总能画点什么"的借口。
+        """
+        self._tiles = {}
+        if not self.cfg.tiles_enabled or g is None:
+            return False
+        if len(aligned) < int(self.cfg.tile_min_constraints):
+            return False
+        xy = self._new_xy(aligned)
+        if xy is None or len(xy) != len(aligned):
+            return False
+        tiles, why = self._tile_gauges(aligned, xy)
+        self._tiles = {"size_m": float(self.cfg.tile_size_m), "n": len(tiles) + sum(why.values()),
+                       "ok": len(tiles), "rejects": why}
+        if not tiles:
+            return False
+        r2 = np.asarray(g["R_G"], np.float64)[:2, :2]
+        t2 = np.asarray(g["t_G"], np.float64)[:2]
+        stat = {"base_sid": prior.base_sid, "built_wall": prior.meta.get("built_wall"),
+                "path": str(prior.path), "cells_free": int((prior.labels == L_FREE).sum()),
+                "cells_occ": int((prior.labels == L_OCC).sum()),
+                "tiles": dict(self._tiles)}
+        self._overlay = self._maybe_strip_free(
+            project_prior_tiles(prior, tiles, r2, t2,
+                                tile_size_m=float(self.cfg.tile_size_m), stat=stat))
+        self._publish("ok_tiles", g, prior)
+        return True
+
+    def _maybe_strip_free(self, ovl: PriorOverlay | None) -> PriorOverlay | None:
+        """``inject_free=False``（默认）⇒ 先验只注障碍，FREE 格降为 unknown（不画）。"""
+        if ovl is None or self.cfg.inject_free:
+            return ovl
+        drop = ovl.labels == L_FREE
+        if drop.any():
+            ovl.labels[drop] = L_UNK
+            ovl.stat["free_dropped"] = int(drop.sum())
+        return ovl
 
     def _usable(self, prior: PriorMap | None) -> list[dict[str, Any]]:
         """只留"旧会话表坐标系根 == 先验坐标系根"的约束——绝不混 gauge。
@@ -550,6 +676,56 @@ class PriorConsumer:
             return st, "gauge_unstable"
         return st, ""
 
+    def _tile_gauges(self, aligned: list[dict[str, Any]], xy: np.ndarray
+                     ) -> tuple[dict[tuple[int, int], dict[str, Any]], dict[str, int]]:
+        """**分片**估 gauge：每片只用自己附近的约束，各自过闸。返回 ``(过闸片, 拒绝原因计数)``。
+
+        只在**全局闸已拒**时调用（降级档）。片心 = 约束所在片；每片取半径
+        ``tile_neighbor_m`` 内的约束（半径 > 片边长 ⇒ 相邻片的约束集高度重叠 ⇒ 片间 gauge
+        连续，不会在片界上把地图撕开）。
+
+        片级闸只留"这一片撑不撑得起一个刚体"的三条（内点数 / 位置残差 / 旋转残差），
+        **不做核心跨度**（局部本来就是局部）；约束够多时补做前后半交叉验证
+        （会话帧随时间长转那种病在片内一样能被抓到）。
+        """
+        c = self.cfg
+        size = float(c.tile_size_m)
+        rad = float(c.tile_neighbor_m)
+        out: dict[tuple[int, int], dict[str, Any]] = {}
+        why: dict[str, int] = {}
+        if size <= 0 or rad <= 0 or len(aligned) < 3:
+            return out, why
+        ij = np.floor(xy / size).astype(np.int64)
+        for key in sorted({(int(a), int(b)) for a, b in ij.tolist()}):
+            cx, cy = (key[0] + 0.5) * size, (key[1] + 0.5) * size
+            sel = (np.abs(xy[:, 0] - cx) <= rad) & (np.abs(xy[:, 1] - cy) <= rad)
+            sub = [cc for cc, k in zip(aligned, sel.tolist()) if k]
+            if len(sub) < int(c.tile_min_constraints):
+                why["few"] = why.get("few", 0) + 1
+                continue
+            g = self._estimate(sub)
+            if g is None:
+                why["degenerate"] = why.get("degenerate", 0) + 1
+                continue
+            if g["n_inlier"] < int(c.tile_min_inlier):
+                why["few_inliers"] = why.get("few_inliers", 0) + 1
+                continue
+            if g["pos_med"] > float(c.max_pos_med_m):
+                why["pos_residual"] = why.get("pos_residual", 0) + 1
+                continue
+            if g["rot_med"] > float(c.max_rot_med_deg):
+                why["rot_residual"] = why.get("rot_residual", 0) + 1
+                continue
+            if len(sub) >= int(c.tile_split_min):
+                core = [cc for cc, k in zip(sub, np.asarray(g["inlier"], bool).tolist()) if k]
+                _, sreason = self._cross_check(core)
+                if sreason:
+                    why["unstable"] = why.get("unstable", 0) + 1
+                    continue
+            out[key] = {"R2": np.asarray(g["R_G"], np.float64)[:2, :2],
+                        "t2": np.asarray(g["t_G"], np.float64)[:2]}
+        return out, why
+
     @staticmethod
     def _yaw_deg(g: dict[str, Any]) -> float:
         R = np.asarray(g["R_G"], np.float64)
@@ -584,6 +760,11 @@ class PriorConsumer:
             "split": (None if self._split is None else
                       {"m": self._split.get("split_m"), "yaw_deg": self._split.get("split_yaw_deg"),
                        "n": self._split.get("n_split")}),
+            # 分片降级档（全局拒了才用）：片数 / 过闸片数 / 各片被拒的原因计数
+            "tiles": dict(self._tiles),
+            # inject_free=False 时被剥掉的 free 格数（现场要能看见"free 没注"这件事）
+            "free_dropped": (None if self._overlay is None
+                             else int(self._overlay.stat.get("free_dropped", 0))),
             "prior": None if prior is None else {
                 "base_sid": prior.base_sid, "path": str(prior.path),
                 "built_wall": prior.meta.get("built_wall"),
@@ -599,7 +780,7 @@ class PriorConsumer:
             st = dict(self._st)
         # apply_into 每次栅格化都会重写，status 拿最近一份（读多写一，值都是不可变小对象）。
         ovl = self._overlay
-        if ovl is not None and st.get("state") == "ok":
+        if ovl is not None and st.get("state") in ("ok", "ok_tiles"):
             st["applied"] = dict(ovl.stat.get("applied") or {})
         return st
 

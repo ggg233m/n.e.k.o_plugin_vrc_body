@@ -219,11 +219,21 @@ function render(s, auto) {
     ` ｜ 核心 ${co.n == null ? gp.n_inlier : co.n}/${gp.n} · 残差中位 ${num(gp.pos_med_m)} m / ${num(gp.rot_med_deg, 1)}°` +
     spanText +
     (sp.m == null ? "" : ` · 前后半 ${num(sp.m)} m / ${num(sp.yaw_deg, 1)}°`);
+  // `ok_tiles` = 全局一个刚体对不上整张图、降级成**按片注入**（只有过闸的那几片画进来）。
+  // 文案必须说清是分片，否则"补了多少格"会被当成整张图都对上了。
+  const tl = pr.tiles || {};
+  const tileText = pr.state === "ok_tiles"
+    ? `分片 ${tl.ok ?? 0}/${tl.n ?? 0} 片过闸 · ` : "";
+  const priorOk = pr.state === "ok" || pr.state === "ok_tiles";
+  // inject_free=false（默认）：free 被剥掉、只注障碍 —— 文案要能看出"free 没注"是有意为之。
+  const freeText = (pr.free_dropped ?? 0) > 0
+    ? `只注障碍 ${ap.applied_occ ?? 0}${ap.blocked_walked ? " · 挡走廊 " + ap.blocked_walked : ""}（free 已扣 ${pr.free_dropped}）`
+    : `补 free ${ap.applied_free ?? 0} / 障碍 ${ap.applied_occ ?? 0}${ap.blocked_walked ? " · 挡走廊 " + ap.blocked_walked : ""}`;
   flag($("prior"), pr.enabled === false ? "已关闭 · " + (pr.state || "—")
-    : (pr.state === "ok"
-        ? `补 free ${ap.applied_free ?? 0} / 障碍 ${ap.applied_occ ?? 0}${ap.blocked_walked ? " · 挡走廊 " + ap.blocked_walked : ""}${gaugeText}`
+    : (priorOk
+        ? tileText + freeText + gaugeText
         : `${PRIOR_WHY[pr.state] || pr.state || "—"}${gaugeText}`),
-    pr.state === "ok" ? "ok" : (pr.enabled === false || PRIOR_SOFT.includes(pr.state) ? "warn" : "bad"));
+    priorOk ? "ok" : (pr.enabled === false || PRIOR_SOFT.includes(pr.state) ? "warn" : "bad"));
   const near = s.near_obstacle || {};
   flag($("near"), near.stop ? `停（${near.points} 点）` : `无（${near.points ?? 0} 点）`, near.stop ? "bad" : "ok");
   if (auto) {

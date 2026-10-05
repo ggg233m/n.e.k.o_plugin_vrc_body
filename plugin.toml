@@ -221,6 +221,16 @@ range_m = 5.0
 # min_inlier_frac 因此是 0.2 而不是 0.5 —— 实测一场会话的核心占比只有 0.23–0.36，旧值把
 # "整场自洽的核心"直接卡死（2026-10-06，见 backend/nav_prior.PriorConfig 的说明）。
 # min_core_span_frac 挡的是另一种病：核心只挤在命中区间的一小段 ⇒ gauge 只在那儿成立。
+# **分片降级档**（2026-10-06，tiles_enabled 默认开）：全局一个刚体对不上整张图时，不再整张
+# 否决，改按 tile_size_m 的米级网格分片、每片只用自己附近的约束估 gauge 并各自过闸 ——
+# **过闸的那几片才注入**，没过闸的片保持 unknown。判据没变（残差/内点/前后半），变的只是
+# 粒度：全局闸放行时分片不介入（那说明整图一致）。键：tiles_enabled / tile_size_m /
+# tile_neighbor_m / tile_min_constraints / tile_min_inlier / tile_split_min。
+#
+# inject_free（默认 false，2026-10-06）：先验**只注障碍、不注 free**。free 是上千关键帧在
+# 各自漂移位姿下累积扫出来的——约束 gauge 残差合格不代表 free 不糊（渲染实证呈放射状星芒、
+# 轨迹被漂移吹大 3 倍+），注入糊 free = 往 unknown 区铺假可走。等离线把 free 质量修好
+# （多场一致性阈值 / 更好位姿）再改 true。
 [navmesh.prior]
 enabled = true
 min_constraints = 8

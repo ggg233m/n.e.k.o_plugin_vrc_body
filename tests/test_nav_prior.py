@@ -223,11 +223,15 @@ T_TRUE = np.array([1.5, -0.7])
 
 
 def synth(n: int, *, noise: float = 0.0, seed: int = 3, theta: float = THETA,
-          t_true: np.ndarray = T_TRUE):
+          t_true: np.ndarray = T_TRUE, center: tuple[float, float] = (0.0, 0.0), k0: int = 0):
     """构造与真值 gauge 一致的约束集（noise=0 ⇒ ``estimate_gauge`` 应逐位恢复）。
 
     ``theta``：该批约束的真值 yaw（弧度）。**同一场会话里前后两半给不同的 theta 就是在模拟
     "会话帧随时间长转"** —— 2026-10-06 live 那场就是这么坏掉的（见 ``_cross_check``）。
+
+    ``center``：这批约束的新帧 xy 中心（会话帧）—— 分片测试靠它把两批约束放到空间两端，
+    模拟"这一片对准了、那一片没对准"的局部形变。
+    ``k0``：new/old 关键帧编号起点 —— 多批合并时避免编号撞车。
 
     返回 (recs, poses_new, poses_old)：new 位姿在会话帧、old 位姿在"旧会话表所在系"
     （即先验所在世界系）。
@@ -239,16 +243,16 @@ def synth(n: int, *, noise: float = 0.0, seed: int = 3, theta: float = THETA,
     poses_old: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
     recs = []
     for i in range(n):
-        p_n = np.array([rng.uniform(-3, 3), rng.uniform(-3, 3)])
+        p_n = np.asarray(center, np.float64) + np.array([rng.uniform(-3, 3), rng.uniform(-3, 3)])
         r_n = yaw(rng.uniform(-180, 180))
         p_o = np.array([rng.uniform(-3, 3), rng.uniform(-3, 3)])
         r_o = yaw(rng.uniform(-180, 180))
         p_pred = r2 @ p_n + np.asarray(t_true) + np.array([noise * (1 if i % 2 else -1), 0.0])
         T = np.eye(4)
         T[:3, :3], T[:2, 3] = r_n, p_n
-        poses_new[i] = T
-        poses_old[("OLD", i)] = (r_o, p_o)
-        recs.append({"new_sid": "NEW", "new_kf": i, "old_sid": "OLD", "old_kf": i,
+        poses_new[k0 + i] = T
+        poses_old[("OLD", k0 + i)] = (r_o, p_o)
+        recs.append({"new_sid": "NEW", "new_kf": k0 + i, "old_sid": "OLD", "old_kf": k0 + i,
                      "inliers": 40,
                      "t_ab": (r_o.T @ np.array([p_pred[0], p_pred[1], 0.0])
                               - r_o.T @ np.array([p_o[0], p_o[1], 0.0])).tolist(),
@@ -269,9 +273,9 @@ class TestPriorConsumer(unittest.TestCase):
                     world_scale=world_scale, base_sid=base_sid)
 
     def consumer(self, poses_new, poses_old, *, bases: dict | None = None,
-                 world_scale: float = 0.755) -> PriorConsumer:
+                 world_scale: float = 0.755, inject_free: bool = False) -> PriorConsumer:
         return PriorConsumer(
-            PriorConfig(), self.wdir, world_scale=world_scale,
+            PriorConfig(inject_free=inject_free), self.wdir, world_scale=world_scale,
             pose_of=lambda k: poses_new.get(int(k)),
             pose_of_old=lambda sid, kf: poses_old.get((str(sid), int(kf))),
             table_base=lambda sid: (bases or {}).get(str(sid), "ROOT"))
@@ -303,7 +307,7 @@ class TestPriorConsumer(unittest.TestCase):
     def test_ok_projects_with_recovered_gauge(self) -> None:
         self.write_sample()
         recs, pn, po = synth(12)
-        c = self.consumer(pn, po)
+        c = self.consumer(pn, po, inject_free=True)
         c.add_constraints(recs)
         ovl = c.overlay()
         self.assertIsNotNone(ovl)
@@ -463,6 +467,152 @@ class TestSessionHook(unittest.TestCase):
         res = s.compute({"state": "localized", "xy": (0.0, 0.0)}, s.snapshot())
         self.assertNotIn("prior", res["info"])
         self.assertFalse((res["ng"].grid == OCC).any())
+
+
+# 分片降级档（2026-10-06）：全局一个刚体对不上整张图时，改按片各自估 gauge。
+# A 片中心取 (−4,−4)：先验非 UNK 格投影后正好落在它里面（会话帧 ≈ (−2.5…−1.4, −0.3…0.8)）；
+# B 片放在 20 m 外，真值 gauge 差 1.5 m ⇒ 全局拟合出来的刚体两边都不贴。
+CLUSTER_A = (-4.0, -4.0)
+CLUSTER_B = (12.0, 12.0)
+T_B = T_TRUE + np.array([1.5, 0.0])
+
+
+def two_clusters(n: int = 8, n_b: int | None = None, noise: float = 0.0):
+    """两片各自自洽、彼此不一致的约束集（模拟会话帧的局部形变）。"""
+    nb = n if n_b is None else n_b
+    ra, pna, poa = synth(n, center=CLUSTER_A, t_true=T_TRUE, k0=0, noise=noise)
+    rb, pnb, pob = synth(nb, center=CLUSTER_B, t_true=T_B, k0=n, noise=noise)
+    return ra + rb, {**pna, **pnb}, {**poa, **pob}
+
+
+class TestPriorTiles(unittest.TestCase):
+    """分片降级档：过闸的片才注入，没过闸的片保持 unknown（宁可少画，不画错）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.wdir = Path(self._tmp.name) / "wrld_x"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def write_sample(self) -> None:
+        write_prior(self.wdir, sample_prior().labels, (-2.0, -2.0), 0.1,
+                    world_scale=0.755, base_sid="ROOT")
+
+    def consumer(self, poses_new, poses_old, *, cfg: PriorConfig | None = None,
+                 bases: dict | None = None) -> PriorConsumer:
+        return PriorConsumer(
+            cfg or PriorConfig(), self.wdir, world_scale=0.755,
+            pose_of=lambda k: poses_new.get(int(k)),
+            pose_of_old=lambda sid, kf: poses_old.get((str(sid), int(kf))),
+            table_base=lambda sid: (bases or {}).get(str(sid), "ROOT"))
+
+    def test_local_warp_is_rescued_tile_by_tile(self) -> None:
+        """**这条是分片档存在的理由**：整图刚体对不上 ⇒ 全局拒，但对得上的那片照注。"""
+        self.write_sample()
+        recs, pn, po = two_clusters()
+        c = self.consumer(pn, po, cfg=PriorConfig(inject_free=True))
+        c.add_constraints(recs)
+        ovl = c.overlay()
+        self.assertIsNotNone(ovl)
+        st = c.status()
+        self.assertEqual(st["state"], "ok_tiles")
+        self.assertGreaterEqual(st["tiles"]["ok"], 1)
+        # 全局 gauge 该报什么还报什么（现场要能看见"整图对不上"这个事实）
+        self.assertIsNotNone(st["gauge"])
+        assert ovl is not None
+        # 落在 A 片的格用 **A 的真值** gauge 投影（不是全局那个折中的刚体）
+        self.assertTrue(np.allclose(ovl.xy_session, np.array(
+            [[-2.45, -0.25], [-2.35, -0.25], [-2.45, -0.15], [-2.35, -0.15]]), atol=1e-6))
+        ng = make_grid(shape=(60, 60), origin=(-4.0, -4.0))
+        info = ovl.apply_into(ng)
+        self.assertEqual(info["applied_free"], 4)
+        # 障碍格落在**没过闸**的那片 ⇒ 一个都不画（不是拿邻片的 gauge 顶替）
+        self.assertEqual(info["applied_occ"], 0)
+
+    def test_default_injects_occ_only(self) -> None:
+        """inject_free 默认 False：free 一格不注（先验 free 已实证是漂移糊图），障碍照注。
+
+        这是**保守侧**：free 错了污染 frontier（把没探过的地方标成可走），障碍错了
+        只是少条近道 —— 两者错误代价不对称。
+        """
+        self.write_sample()
+        recs, pn, po = synth(12)
+        c = self.consumer(pn, po)               # 默认配置（inject_free=False）
+        c.add_constraints(recs)
+        ovl = c.overlay()
+        self.assertIsNotNone(ovl)
+        assert ovl is not None
+        self.assertEqual(c.status()["state"], "ok")
+        # overlay 里 FREE 已被剥掉：一格 FREE 都不剩，free_dropped 记了账
+        self.assertFalse((ovl.labels == 1).any())
+        self.assertGreaterEqual(ovl.stat.get("free_dropped", 0), 4)
+        ng = make_grid(shape=(60, 60), origin=(-4.0, -4.0))
+        info = ovl.apply_into(ng)
+        self.assertEqual(info["applied_free"], 0)
+        self.assertEqual(info["applied_occ"], 1)
+
+    def test_tiles_off_keeps_the_global_refusal(self) -> None:
+        """反向对照组：关掉分片就是原来的行为 —— 一格都不注入。"""
+        self.write_sample()
+        recs, pn, po = two_clusters()
+        c = self.consumer(pn, po, cfg=PriorConfig(tiles_enabled=False))
+        c.add_constraints(recs)
+        self.assertIsNone(c.overlay())
+        self.assertEqual(c.status()["state"], "gauge_pos_residual")
+        self.assertEqual(c.status()["tiles"], {})
+
+    def test_every_tile_failing_reports_the_global_reason(self) -> None:
+        """每片自己就散（noise 2 m）⇒ 分片也救不了，且报的是**全局**那条原因。"""
+        self.write_sample()
+        recs, pn, po = two_clusters(noise=2.0)
+        c = self.consumer(pn, po)
+        c.add_constraints(recs)
+        self.assertIsNone(c.overlay())
+        st = c.status()
+        self.assertEqual(st["state"], "gauge_pos_residual")
+        self.assertEqual(st["tiles"]["ok"], 0)
+        self.assertGreaterEqual(st["tiles"]["rejects"].get("pos_residual", 0), 1)
+
+    def test_tile_with_too_few_constraints_is_skipped(self) -> None:
+        """约束不够的片自己不注入（rejects.few），不影响别的片。
+
+        ⚠️ 两片数据里再塞一小撮"另一片"（two_clusters n_b=2）是测不到这条的：那一小撮会被
+        全局 IRLS 当外点剔掉、全局闸照样过关（这本来就是对的 —— 少数外点不该否决核心，
+        见 ``min_inlier_frac`` 从 0.5 降到 0.2 那次），于是根本走不到分片档。
+        ⇒ 这里把分片边长调小（2 m）制造出**边缘片**：它们的邻域里约束不够，自己不注入。
+        """
+        self.write_sample()
+        recs, pn, po = two_clusters()
+        c = self.consumer(pn, po, cfg=PriorConfig(tile_size_m=2.0, tile_neighbor_m=3.0))
+        c.add_constraints(recs)
+        ovl = c.overlay()
+        self.assertIsNotNone(ovl)
+        st = c.status()
+        self.assertEqual(st["state"], "ok_tiles")
+        self.assertGreaterEqual(st["tiles"]["ok"], 1)
+        self.assertGreaterEqual(st["tiles"]["rejects"].get("few", 0), 1)
+
+    def test_root_mismatch_never_falls_back_to_tiles(self) -> None:
+        """坐标系不同根 = 混 gauge，不是"局部不准" ⇒ 分片档不许出手。"""
+        self.write_sample()
+        recs, pn, po = two_clusters()
+        c = self.consumer(pn, po, bases={"OLD": "OTHER"})
+        c.add_constraints(recs)
+        self.assertIsNone(c.overlay())
+        self.assertEqual(c.status()["state"], "frame_mismatch")
+        self.assertEqual(c.status()["tiles"], {})
+
+    def test_global_ok_does_not_use_tiles(self) -> None:
+        """全局闸过关时不动 —— 整图一致，分片只会引入片间数值抖动。"""
+        self.write_sample()
+        recs, pn, po = synth(12)
+        c = self.consumer(pn, po)
+        c.add_constraints(recs)
+        self.assertIsNotNone(c.overlay())
+        st = c.status()
+        self.assertEqual(st["state"], "ok")
+        self.assertEqual(st["tiles"], {})
 
 
 if __name__ == "__main__":
