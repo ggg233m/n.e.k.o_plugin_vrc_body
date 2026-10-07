@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -44,7 +45,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.nav_mapping import MapperConfig, _ground_correction   # noqa: E402
+from backend.nav_grid import FREE, OCC                                # noqa: E402
+from backend.nav_mapping import (MapperConfig, _ground_correction, _ground_model,  # noqa: E402
+                                 _ray_voxels, assemble_labels, label_cells, majority3)
 from backend.nav_prior import write_prior                          # noqa: E402
 from backend.nav_xsession import session_pose_table                # noqa: E402
 
@@ -54,6 +57,8 @@ NEAR_M, MID_M = 1.5, 3.0
 MIN_PTS = C.min_pts
 RINGS = (1.5, 2.5, 3.0)
 KOFF = 1 << 20
+# 射线体素在打包键里占的位数：iz ∈ [0, _ray_z())。见 ``ray_z()``。
+RAY_ZBITS = 6
 
 
 def load_events(rec: Path) -> list[dict]:
@@ -204,9 +209,25 @@ def estimate_cam_h(kf_npz, events, alive_check) -> float:
     return float(cands[order][np.searchsorted(cw, cw[-1] / 2)])
 
 
-def kf_rows(k, pts, T, cam_h):
-    """单关键帧 → 每格每带计数行：(cu, rows[6] = g0,g1,g2, o0,o1,o2)。"""
+def ray_z() -> int:
+    """障碍高度带 (ground_tol, obst_top) 的层数。与 ``KeyframeGridMapper._ray_z`` 同一算式，
+    但**不复制那个数**：直接问 cfg，改 ``ray_z_m`` 时两边一起动。"""
+    return int(math.ceil((C.obst_top_m - C.ground_tol_m) / C.ray_z_m))
+
+
+def kf_rows(k, pts, T, cam_h, *, ray_clear=False):
+    """单关键帧 → ``(cu, rows[6])``，``ray_clear=True`` 时 → ``(cu, rows, (hit, mis))``。
+
+    ``rows`` 六列 = ``g0,g1,g2,o0,o1,o2``（地面/障碍 × 近/中/远带）。
+    ``hit``/``mis`` 是**该关键帧的射线体素**（``K×3`` 的 ``(ix, iy, iz)``，地图系格下标），
+    语义与 ``KeyframeGridMapper._ray_hit/_ray_mis`` 逐位一致——同一个 ``_ray_voxels`` 算出来的。
+    """
     R, t = T[:3, :3], T[:2, 3]
+    # 与在线 mapper **同一道距离门**（``nav_mapping.py:472``，在 ``add_keyframe`` 里）。
+    # 在线其实过了两层：采集时 ``stereo_points(max_range_m=range_m)`` 卡的是**光学深度 z**，
+    # 入图时这里卡的是**水平半径**。npz 里存的是过了第一层的点（044153 实测 r 到 10.11 m），
+    # 所以这一层在离线是**真缺**：044153 有 20.8% 的点 r > 5.0，会被这道门丢掉。
+    pts = pts[np.hypot(pts[:, 0], pts[:, 1]) <= C.range_m]
     # 局部系体素化（与 mapper 同参：xy 5cm / z 2cm），计数聚合
     vkey = (np.floor(pts[:, 0] / C.vox_xy_m).astype(np.int64) * (1 << 42)
             + np.floor(pts[:, 1] / C.vox_xy_m).astype(np.int64) * (1 << 21)
@@ -230,6 +251,20 @@ def kf_rows(k, pts, T, cam_h):
     sel = g | o
     if sel.sum() < 20:
         return None
+    # 射线清除要用**全量**点（含高带）的高度，所以在 ``sel`` 过滤之前算。
+    # 与在线 ``_sync_ray`` 走的是同一个 ``_ray_voxels``：那是唯一实现，绝不在这里重写一份
+    # （在线那份的稠密去重、10 cm 端点去重都是量过代价调出来的，抄一遍必然漂移）。
+    # ``under`` 与在线同义：关键帧正下方地面修正量，用来定"相机离地多高"。
+    ray = None
+    if ray_clear:
+        corr, under = _ground_model(h_raw, w, rxy, C.ground_offset_max_m,
+                                    C.ground_offset_min_range_m, C.ground_plane_max_deg,
+                                    C.ground_plane_band_m)
+        hit, mis = _ray_voxels(rxy, h_raw - corr, t, cam_h - under, C)
+        Z = ray_z()
+        hit = hit[(hit[:, 2] >= 0) & (hit[:, 2] < Z)]
+        mis = mis[(mis[:, 2] >= 0) & (mis[:, 2] < Z)]
+        ray = (hit, mis)
     rxy, w, g, o = rxy[sel], w[sel], g[sel], o[sel]
     d = np.hypot(rxy[:, 0], rxy[:, 1])
     band = np.where(d < NEAR_M, 0, np.where(d < MID_M, 1, 2)).astype(np.int64)
@@ -244,12 +279,17 @@ def kf_rows(k, pts, T, cam_h):
             m = cls_mask & (band == b)
             if m.any():
                 rows[:, base + b] = np.bincount(cinv[m], weights=w[m], minlength=len(cu))
+    if ray_clear:
+        return cu, rows, ray
     return cu, rows
 
 
-def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str) -> dict:
+def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str, *,
+              ray_clear: bool | None = None) -> dict:
+    """``ray_clear``：None = 用 ``MapperConfig`` 的当前值（与在线同一开关）；可显式覆盖做 A/B。"""
     events = load_events(rec)
     kf_npz, pose, src, n_fb, base = load_poses(rec, events, mode, world_dir, sid)
+    rc = C.ray_clear if ray_clear is None else bool(ray_clear)
     # refresh 语义（replay 同款）：kf k 事件带 refresh ⇒ 上一帧 k-1 的点让出（不计入终态）。
     alive = []
     prev = None
@@ -269,13 +309,16 @@ def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str) -> dict:
 
     t0 = time.perf_counter()
     rows_all = []
+    rays: list[tuple[np.ndarray, np.ndarray]] = []
     traj = []
     for k in alive:
         z = kf_npz(k)
         T = pose(k)
-        r = kf_rows(k, z["pts"], T, cam_h)
+        r = kf_rows(k, z["pts"], T, cam_h, ray_clear=rc)
         if r is not None:
-            rows_all.append(r)
+            rows_all.append(r[:2])
+            if rc:
+                rays.append(r[2])
         traj.append(T[:2, 3])
     for e in events:
         if e.get("kind") == "trail":
@@ -297,10 +340,105 @@ def aggregate(rec: Path, mode: str, world_dir: Path | None, sid: str) -> dict:
         S[:, j] = np.bincount(inv, weights=(vals[:, j] > 0).astype(float), minlength=len(uk))
     ix = (uk >> 22) - KOFF
     iy = (uk & (4 * KOFF - 1)) - KOFF
+    hit = mis = None
+    if rc:
+        hk, hn, mk, mn = ray_keys(rays)
+    else:
+        hk = hn = mk = mn = None
     return dict(cam_h=cam_h, cam_h_est_s=round(n_est, 1), fusion_s=round(dt, 1),
                 n_kf=len(alive), n_refresh=n_refresh, pose_src=src, pose_fallback=n_fb,
-                base=base, rec=rec.name, sid=sid,
-                ix=ix, iy=iy, G=G, S=S, traj=np.asarray(traj))
+                base=base, rec=rec.name, sid=sid, ray_clear=rc,
+                ix=ix, iy=iy, G=G, S=S, traj=np.asarray(traj),
+                ray_hit_key=hk, ray_hit_n=hn, ray_mis_key=mk, ray_mis_n=mn)
+
+
+def ray_zbits() -> int:
+    """射线层号在打包键里占的位数。按 ``ray_z()`` 现算，不写死。"""
+    return max(1, (ray_z() - 1).bit_length())
+
+
+def ray_keys(rays: list[tuple[np.ndarray, np.ndarray]]):
+    """各帧射线体素 → 打包键 ``(格键 << zbits) | iz`` 的 (打中/看穿) 去重计数。
+
+    格键与 ``G`` 的格键**同一坐标系**（都是 ``(ix+KOFF)*4KOFF + (iy+KOFF)``），所以跨场合并
+    只是「拼起来再 unique」，与 ``merge_aggs`` 处理 G/S 完全同一个套路。
+    层号进键 ⇒ ``ray_veto`` 才能按**层**做 ``any``（在线正是逐层判的，见那里的说明）。
+    """
+    if not rays:
+        z = np.zeros(0, np.int64)
+        return z, z, z, z
+
+    def pack(arrs):
+        if not arrs:
+            return np.zeros(0, np.int64), np.zeros(0, np.float64)
+        a = np.concatenate(arrs)
+        u, c = np.unique(a, return_counts=True)
+        return u, c.astype(np.float64)
+
+    hk, hn = pack([((h[:, 0] + KOFF) * (4 * KOFF) + (h[:, 1] + KOFF)) << ray_zbits() | h[:, 2]
+                   for h, _m in rays if len(h)])
+    mk, mn = pack([((m[:, 0] + KOFF) * (4 * KOFF) + (m[:, 1] + KOFF)) << ray_zbits() | m[:, 2]
+                   for _h, m in rays if len(m)])
+    return hk, hn, mk, mn
+
+
+def ray_veto(agg: dict, *, beta: float | None = None,
+             walk_w: float | None = None) -> np.ndarray:
+    """本聚合的射线清除判据 → 长度 = ``G`` 的布尔数组，``True`` = 该格被看穿清掉。
+
+    判据与在线 ``KeyframeGridMapper._ray_veto`` **逐字同源**：
+    ``veto = ~((hit > 0) & (mis < beta · hit)).any(层)``
+    —— 即"没有任何一层满足 看穿 < beta×打中"。
+
+    ⚠️ **必须逐层 ``any``，不能先把层加起来**。反例（每层各 1 打中、看穿 5/0）：
+    逐层看第 2 层满足条件 ⇒ 不清除；先求和得 hit=2/mis=5 ⇒ 5 ≥ 2 ⇒ 误判成清除。
+    这是"看起来只是省一次循环"的静默错误，所以层号进了打包键。
+
+    另加身体走过的中心线每格 ``ray_walk_w`` 次看穿（在线 ``ray_walk_w``，默认 3.0，**所有层**都加，
+    与在线把一维线广播进 ``(Z, n)`` 的写法一致）：走过就是活的通行证据。
+    """
+    c = MapperConfig()
+    beta = c.ray_beta if beta is None else float(beta)
+    walk_w = c.ray_walk_w if walk_w is None else float(walk_w)
+    n = len(agg["ix"])
+    if not n:
+        return np.zeros(0, bool)
+    zb = ray_zbits()
+    zmask = (1 << zb) - 1
+    cell = (agg["ix"] + KOFF) * (4 * KOFF) + (agg["iy"] + KOFF)
+    order = np.argsort(cell, kind="stable")
+    cs = cell[order]
+
+    def spread(keys, counts, z: int) -> np.ndarray:
+        out = np.zeros(n, np.float64)
+        if keys is None or not len(keys):
+            return out
+        sel = (keys & zmask) == z
+        if not sel.any():
+            return out
+        k = keys[sel] >> zb
+        pos = np.searchsorted(cs, k)
+        ok = (pos < n) & (cs[np.minimum(pos, n - 1)] == k)
+        np.add.at(out, order[pos[ok]], counts[sel][ok])
+        return out
+
+    # 走过的格（每层都 +walk_w 次看穿）。
+    wl = np.zeros(n, np.float64)
+    if walk_w:
+        tr = np.asarray(agg["traj"], np.float64)
+        if len(tr):
+            tcell = ((np.floor(tr[:, 0] / RES).astype(np.int64) + KOFF) * (4 * KOFF)
+                     + (np.floor(tr[:, 1] / RES).astype(np.int64) + KOFF))
+            pos = np.searchsorted(cs, tcell)
+            ok = (pos < n) & (cs[np.minimum(pos, n - 1)] == tcell)
+            wl[order[pos[ok]]] = walk_w
+
+    cond_any = np.zeros(n, bool)
+    for z in range(ray_z()):
+        hz = spread(agg.get("ray_hit_key"), agg.get("ray_hit_n"), z)
+        mz = spread(agg.get("ray_mis_key"), agg.get("ray_mis_n"), z) + wl
+        cond_any |= (hz > 0) & (mz < beta * hz)
+    return ~cond_any
 
 
 def merge_aggs(aggs: list[dict]) -> dict:
@@ -321,6 +459,24 @@ def merge_aggs(aggs: list[dict]) -> dict:
         S[:, j] = np.bincount(inv, weights=sup[:, j], minlength=len(uk))
     ix = (uk >> 22) - KOFF
     iy = (uk & (4 * KOFF - 1)) - KOFF
+    # 射线票与 G/S 同一套路合并（键已含层号，直接拼起来 unique）。
+    hk, hn, mk, mn = ray_keys([])
+    rhk, rhn, rmk, rmn = [], [], [], []
+    for a in aggs:
+        if a.get("ray_hit_key") is not None and len(a["ray_hit_key"]):
+            rhk.append(a["ray_hit_key"]); rhn.append(a["ray_hit_n"])
+        if a.get("ray_mis_key") is not None and len(a["ray_mis_key"]):
+            rmk.append(a["ray_mis_key"]); rmn.append(a["ray_mis_n"])
+    if rhk:
+        allk = np.concatenate(rhk)
+        allv = np.concatenate(rhn)
+        u, inv = np.unique(allk, return_inverse=True)
+        hk = u; hn = np.bincount(inv, allv, minlength=len(u))
+    if rmk:
+        allk = np.concatenate(rmk)
+        allv = np.concatenate(rmn)
+        u, inv = np.unique(allk, return_inverse=True)
+        mk = u; mn = np.bincount(inv, allv, minlength=len(u))
     return dict(ix=ix, iy=iy, G=G, S=S,
                 traj=np.concatenate([a["traj"] for a in aggs]),
                 n_kf=sum(a["n_kf"] for a in aggs),
@@ -328,6 +484,8 @@ def merge_aggs(aggs: list[dict]) -> dict:
                 pose_fallback=sum(a["pose_fallback"] for a in aggs),
                 cam_h=[a["cam_h"] for a in aggs],
                 fusion_s=round(sum(a["fusion_s"] for a in aggs), 1),
+                ray_clear=all(a.get("ray_clear", False) for a in aggs),
+                ray_hit_key=hk, ray_hit_n=hn, ray_mis_key=mk, ray_mis_n=mn,
                 per=aggs)
 
 
@@ -357,33 +515,72 @@ def dense(agg):
 
 
 def majority(occ):
-    return (cv2.filter2D(occ.astype(np.uint8), -1, np.ones((3, 3), np.float32)) >= 3)
+    """**已废弃**：改调 ``backend.nav_mapping.majority3``（唯一实现，带 BORDER_CONSTANT）。
+    保留这个名字只为兼容可能的外部引用；它的旧实现少了 ``BORDER_CONSTANT``，
+    图外沿会镜像回填、白送 3×3 支撑。"""
+    return majority3(occ)
 
 
-def classify(gband, oband, sband):
+def classify(gband, oband, sband, veto=None):
+    """三态判定 → ``(occ_baseline, labels_fused, occ_b3, stats)``。
+
+    **规则本体走 ``backend.nav_mapping.label_cells``**（唯一实现），本函数只负责：
+    把分带计数铺成 ``label_cells`` 要的入参、按**在线同款**算出 ``base_occ``、再算 stats。
+
+    ⚠️ 2026-10-08 前的版本是自己重写的一份规则，**漏了两处门**：
+      * ``base_occ`` 前置门（``(n_o > min_pts) & (n_o ≥ ratio·n_g)`` + 3×3 多数）——
+        离线直接 ``majority(near_ok | mid_ok)``，等于近带票单条即定罪，绕过三道密度门；
+      * ``solo`` 单帧例外（票 ≥q_solo_pts 且远带占比 ≤q_far_tol）——离线没有，
+        中距真障碍被 q_mid_kf≥2 卡掉。
+    044153 实测：只在线有 580 格、只离线有 1229 格、IoU 0.662。现在两边同一份。
+
+    ``veto``：射线清除掩码（``(H,W)`` bool，True = 该格被看穿）。接法见下面注释。
+    """
+    # 射线清除：在线 ``rasterize`` 是先把 ``n_o`` 清零、**再**算 ``base_occ`` 与走 ``_by_quality``
+    # （``nav_mapping.py:1087-1091``），所以被看穿的格连候选都不是。离线要等价，
+    # 就必须在**算 base_occ 之前**把障碍票清零——只清 ``oband`` 的分带票不够，
+    # 因为 ``base_occ`` 用的是 ``O = oband.sum()``。
+    if veto is not None:
+        oband = np.where(veto[:, :, None], 0.0, oband)
     G = gband.sum(axis=2)
     O = oband.sum(axis=2)
     o_near, o_mid, o_far = oband[:, :, 0], oband[:, :, 1], oband[:, :, 2]
     g_near, g_mid = gband[:, :, 0], gband[:, :, 1]
     sup_o_mid = sband[:, :, 4]
 
-    occ_b = majority((O >= MIN_PTS) & (O >= C.occ_ground_ratio * G))
+    # 与在线 ``rasterize`` 逐字同源的两步（在线用的是累加器整块，这里用的是分带求和，等价）。
+    occ_b = majority3((O >= MIN_PTS) & (O >= C.occ_ground_ratio * G))
+    # 规则本体：与在线同一份（含 base_occ 前置门与 solo 单帧例外）。
+    occ_f, restored, rejected = label_cells(C, occ_b, G, O, o_near, o_mid, g_near, sup_o_mid)
 
-    # RangeMax 复刻（run5-7 口径）：只用近+中距观测建图，远场票全部丢弃
+    # RangeMax 复刻（run5-7 口径）：只用近+中距观测建图，远场票全部丢弃。**离线专有**，
+    # 不接进在线（它是历史对照口径，不是生产规则）。
     G_nm = gband[:, :, :2].sum(axis=2)
     O_nm = oband[:, :, :2].sum(axis=2)
-    occ_b3 = majority((O_nm >= MIN_PTS) & (O_nm >= C.occ_ground_ratio * G_nm))
-
-    near_ok = o_near >= MIN_PTS  # 近距确认：1.5 m 内假障碍 0.06%（run5-7），近看票本身即决定性
-    # 中距半可靠：除多帧确认外，仍须过地面压制（障碍票 ≥ 30% 地面票），防止纯地面格被倾斜点翻成障碍
-    mid_ok = (o_mid >= MIN_PTS) & (sup_o_mid >= 2) & (O >= C.occ_ground_ratio * G)
-    occ_f = majority(near_ok | mid_ok)
+    occ_b3 = majority3((O_nm >= MIN_PTS) & (O_nm >= C.occ_ground_ratio * G_nm))
 
     g_evid = (g_near + g_mid) >= MIN_PTS
-    free_f = (G > 0.5) & ~occ_f
-    labels_f = np.zeros(occ_f.shape, np.uint8)  # 0 unk 1 free 2 occ
-    labels_f[free_f] = 1
-    labels_f[occ_f] = 2
+    # 三态装配走 ``backend.nav_mapping.assemble_labels``（唯一实现）——**含在线的第 ⑦ 步**
+    # （``rejected & ~restored ⇒ UNK``）。改动前离线只有第 ④ 步，FREE 是在线的超集：
+    # 044153 上多出 7,106 格（占其 FREE 的 10.3%，其中 4,409 格**只有远带**地面票）。
+    # 这一步不是"收紧口径"，是补回在线本来就有的诚实降级。
+    #
+    # ⚠️ **编码转换**：``assemble_labels`` 返回 ``nav_grid`` 编码（FREE 178 / OCC 0 / UNK 89），
+    # 而本工具与 ``write_prior`` 用的是 **先验编码**（0 UNK / 1 FREE / 2 OCC）。
+    # 两套编码里 UNK 与 OCC 的数值正好交叉，**直接混用不会报错**，只会把障碍写成可走。
+    # 转换只在这一处做。
+    _g = assemble_labels(C, occ_f, restored, rejected, G)
+    labels_f = np.full(_g.shape, 0, np.uint8)          # 0 = UNK
+    labels_f[_g == FREE] = 1                            # 1 = FREE
+    labels_f[_g == OCC] = 2                             # 2 = OCC
+
+    # ⚠️ 与在线**仍有一处故意不同**（保留，不修）：在线第 ④ 步的门是 ``n_g > 0.5``，
+    # 即**任何**地面观测（含远带）都算；这与"unknown 永不当 free"的红线精神有张力——
+    # 远带 δz 一个视差像素就值米级（C31）。实测（.tmp/free_gate.py，三场融合先验）：
+    # 只有远带地面票的 FREE 占 37.6%，收紧到"近+中距 ≥min_pts"会掉 38.3%。
+    # **但那次测量不支持"收紧才对"**：那些格离轨迹中位仅 0.89 m、票中位 11 张，
+    # 很可能是走过的地面本身。⇒ 保持原行为，判据留给有真值的那天。
+    free_f = labels_f == 1
 
     base_occ_mask = occ_b
     cleared_free = base_occ_mask & (labels_f == 1)
@@ -464,6 +661,10 @@ def main() -> None:
                     help="把融合结果固化为**世界先验** <world>/prior/prior.npz+json（原子写）。"
                          "强制 rigid 口径（弹性形变会拉坏多视一致性，见 ROADMAP 2026-10-06 A/B）")
     ap.add_argument("--out", default=None, help="输出目录（默认 .tmp/offline_fusion）")
+    ap.add_argument("--ray-clear", dest="ray_clear", action="store_true", default=None,
+                    help="开射线清除（默认跟随 MapperConfig.ray_clear=True，与在线同一开关）")
+    ap.add_argument("--no-ray-clear", dest="ray_clear", action="store_false",
+                    help="关射线清除（A/B 对照用：量它到底改了多少格）")
     args = ap.parse_args()
 
     recs = [ROOT / "navmesh_recordings" / r for r in args.rec]
@@ -494,10 +695,20 @@ def main() -> None:
     out_dir = Path(args.out) if args.out else (ROOT / ".tmp" / "offline_fusion")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    aggs = [aggregate(rec, mode, world_dir, sid) for rec, sid in zip(recs, sids)]
+    aggs = [aggregate(rec, mode, world_dir, sid, ray_clear=args.ray_clear)
+            for rec, sid in zip(recs, sids)]
     agg = aggs[0] if len(aggs) == 1 else merge_aggs(aggs)
     x0, y0, gband, oband, sband = dense(agg)
-    occ_b, labels_f, occ_b3, st = classify(gband, oband, sband)
+    # 射线清除：把"被看穿"的格掩码对齐到 G 的稀疏键，再铺成 (H,W)。
+    veto = None
+    if agg.get("ray_clear"):
+        sparse = ray_veto(agg)
+        veto = np.zeros((H, W), bool)
+        veto.flat[((agg["ix"] - x0) * W + (agg["iy"] - y0))] = sparse
+    occ_b, labels_f, occ_b3, st = classify(gband, oband, sband, veto)
+    st["ray_clear"] = bool(agg.get("ray_clear"))
+    if veto is not None:
+        st["ray_cleared_cells"] = int((veto & (oband.sum(axis=2) > 0)).sum())
     H, W = occ_b.shape
 
     G = gband.sum(axis=2)

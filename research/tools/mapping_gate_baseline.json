@@ -1,16 +1,16 @@
 {
   "20260929_045615": {
     "R1.5": {
-      "free_pct": 42.745,
-      "known_obstacle_pct": 22.875
+      "free_pct": 69.653,
+      "known_obstacle_pct": 20.219
     },
     "R2.5": {
-      "free_pct": 43.202,
-      "known_obstacle_pct": 22.252
+      "free_pct": 64.554,
+      "known_obstacle_pct": 20.755
     },
     "R3.0": {
-      "free_pct": 42.644,
-      "known_obstacle_pct": 22.413
+      "free_pct": 61.108,
+      "known_obstacle_pct": 20.574
     },
     "astar_probes": [
       {
@@ -61,10 +61,17 @@
       "recorded_not_in_dataclass": [],
       "started": "2026-09-29 04:56"
     },
-    "corridor_blockers": 5902,
+    "corridor_blockers": 8502,
     "free_cells": 69895,
     "grid_sha256": "3abfd9531bd4590376ea658d7e59078b25e3d57bfbc7f9c74d1e127e8a185e2d",
     "occ_cells": 18093,
+    "occ_shape": {
+      "boundary_frac_pct": 43.1,
+      "cells": 18093,
+      "components": 320,
+      "in_blocks": 16760,
+      "thickness_p50_m": 0.28
+    },
     "origin_xy_m": [
       -31.1,
       -30.1
@@ -75,10 +82,10 @@
     },
     "resolution_m": 0.1,
     "sensors": {
-      "baseline_m": 0.12600000202655792,
+      "baseline_m": 0.126,
       "cx": 360.0,
       "cy": 202.5,
-      "fx": 202.49999849125743,
+      "fx": 202.5,
       "size": [
         720,
         405
@@ -93,16 +100,16 @@
   },
   "20261001_044120": {
     "R1.5": {
-      "free_pct": 68.018,
-      "known_obstacle_pct": 0.0
+      "free_pct": 66.7,
+      "known_obstacle_pct": 0.395
     },
     "R2.5": {
-      "free_pct": 65.464,
-      "known_obstacle_pct": 0.848
+      "free_pct": 64.205,
+      "known_obstacle_pct": 0.662
     },
     "R3.0": {
-      "free_pct": 62.349,
-      "known_obstacle_pct": 0.802
+      "free_pct": 61.354,
+      "known_obstacle_pct": 1.161
     },
     "astar_probes": [
       {
@@ -161,10 +168,17 @@
       "recorded_not_in_dataclass": [],
       "started": "2026-10-01 04:41"
     },
-    "corridor_blockers": 0,
+    "corridor_blockers": 3,
     "free_cells": 6059,
     "grid_sha256": "bad7be4f494dac760254dbb0ada27f98227009b217e3167bdccde645ff1b55a8",
     "occ_cells": 48,
+    "occ_shape": {
+      "boundary_frac_pct": 76.67,
+      "cells": 48,
+      "components": 6,
+      "in_blocks": 30,
+      "thickness_p50_m": 0.2
+    },
     "origin_xy_m": [
       -11.2,
       -10.5
@@ -175,10 +189,10 @@
     },
     "resolution_m": 0.1,
     "sensors": {
-      "baseline_m": 0.12600000202655792,
+      "baseline_m": 0.126,
       "cx": 360.0,
       "cy": 202.5,
-      "fx": 202.49999849125743,
+      "fx": 202.5,
       "size": [
         720,
         405
@@ -193,16 +207,16 @@
   },
   "20261001_044153": {
     "R1.5": {
-      "free_pct": 55.48,
-      "known_obstacle_pct": 5.517
+      "free_pct": 85.35,
+      "known_obstacle_pct": 7.794
     },
     "R2.5": {
-      "free_pct": 53.867,
-      "known_obstacle_pct": 5.949
+      "free_pct": 80.133,
+      "known_obstacle_pct": 7.784
     },
     "R3.0": {
-      "free_pct": 52.563,
-      "known_obstacle_pct": 6.286
+      "free_pct": 77.367,
+      "known_obstacle_pct": 7.252
     },
     "astar_probes": [
       {
@@ -265,10 +279,17 @@
       "recorded_not_in_dataclass": [],
       "started": "2026-10-01 04:41"
     },
-    "corridor_blockers": 505,
+    "corridor_blockers": 1120,
     "free_cells": 61660,
     "grid_sha256": "6317b070b61ffb1b49f244799029be329080c3503d7a1022aa4b6784e8d2757d",
     "occ_cells": 4122,
+    "occ_shape": {
+      "boundary_frac_pct": 50.17,
+      "cells": 4122,
+      "components": 117,
+      "in_blocks": 3743,
+      "thickness_p50_m": 0.2
+    },
     "origin_xy_m": [
       -17.9,
       -33.0
@@ -279,10 +300,10 @@
     },
     "resolution_m": 0.1,
     "sensors": {
-      "baseline_m": 0.12600000202655792,
+      "baseline_m": 0.126,
       "cx": 360.0,
       "cy": 202.5,
-      "fx": 202.49999849125743,
+      "fx": 202.5,
       "size": [
         720,
         405
