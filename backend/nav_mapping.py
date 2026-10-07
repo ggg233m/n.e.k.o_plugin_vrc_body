@@ -388,6 +388,104 @@ _ACC_SLOTS: tuple[tuple[int, str], ...] = (
 _ACC_NAMES: tuple[str, ...] = tuple(name for _slot, name in _ACC_SLOTS)
 
 
+def label_cells(cfg: "MapperConfig", base_occ: np.ndarray, n_g: np.ndarray, n_o: np.ndarray,
+                o_n: np.ndarray, o_m: np.ndarray, g_n: np.ndarray, o_mk: np.ndarray
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """把"扁平计数判为障碍"的格按**观测距离**复核一遍。返回 (障碍, 降级回空地, 降级但无近距证据)。
+
+    这是**唯一实现**：在线走 ``KeyframeGridMapper._by_quality``（薄壳），离线走
+    ``research/tools/offline_fusion.classify``。抽出来的理由不是洁癖——2026-10-08 核查发现
+    离线那一版是自己重写的一份，**漏了本函数的两处门**（``base_occ`` 前置门与 ``solo`` 单帧例外），
+    在 044153 上量出"只在线有 580 格 / 只离线有 1229 格"、IoU 0.662。重写一份规则就等于
+    埋一个必然漂移的分叉。
+
+    为什么必须分层：视差深度误差 δz = z²/(fx·b)·δd，面板口径 fx 202.5 / 基线 0.126 下
+    1 像素 ≈ z²/25.5 m（1.5 m→9 cm、3 m→35 cm、5 m→98 cm），而障碍高度带 (0.3, 2.0) 有
+    1.7 m 宽。所以 1.5 m 以外"真地面被抖进障碍带"是必然的：min_pts、3×3 多数、
+    occ_ground_ratio 都只压密度，补不回那一层根本不存在的信息。这就是"走过的空地中间
+    冒出孤岛障碍"的物理来源（Docs/RTAB-Map双目评估（2026-09-26）.md:128 同一个结论）。
+
+    规则（口径取自 Docs/离线多视角融合v1-假障碍清除（2026-10-02）.md，该录制障碍占比
+    31.4%→13.3%；与 ``ray_clear`` 机理正交，可叠加）：
+      * 近带 <q_near_m：误差还在带边沿内，单帧即定案；**故意不带**地面压制条件，
+        否则 occ_ground_ratio 会把真细障碍（桌腿、栏杆）一起误杀；
+      * 中带 q_near~q_mid：默认须 ≥q_mid_kf 个关键帧一致 + 地面压制，压住量化倾斜与单帧鬼影；
+        但"只被一个关键帧看到"也是常态（刚走近就看见了），所以留了一条**单帧例外**：
+        票够多（≥q_solo_pts）且远带票占比 ≤q_far_tol 时单帧即定案——近/中距的票本来就可信，
+        远带票才是噪声来源，票里没有远带成分就没必要等第二个关键帧；
+      * 远带 >q_mid：没有定案权。纯远场票的格降级——**近距**在同一格见过地面 ⇒ FREE，
+        否则 ⇒ UNK（诚实降级，不伪造 free：见 nav_grid 的"unknown 永不当 free"）。
+
+    ⚠️ ``base_occ`` 前置门不可省：``near``/``mid``/``solo`` 是**加分项**不是**定案项**，
+    最终障碍 = ``base_occ & (near|mid|solo|near_only)``。少了 ``& base_occ`` 就变成
+    "近带票单条即定罪"，绕过 min_pts / 3×3 / occ_ground_ratio 三道密度门
+    （离线版原来正是这个错，044153 上多出 1229 个障碍格）。
+
+    与离线那一版的一处收紧（**保留**）：降级判回 FREE 只认**近距**地面证据，不用中距。中距地面自己
+    就是被抖出来的，拿它当"这格是地板"的证据，等于用噪声治噪声——实测会把只被一个关键帧
+    看到的中距真墙判成 free（可走 ⇒ 规划直接穿墙）。近距地面才够格推翻一张障碍票。
+    """
+    if not cfg.q_tiers:
+        z = np.zeros(base_occ.shape, bool)
+        return base_occ, z, z
+    c = cfg
+    hi = c.min_pts - 0.5
+    near = o_n > hi
+    mid = (o_m > hi) & (o_mk >= c.q_mid_kf - 0.5) & (n_o >= c.occ_ground_ratio * n_g)
+    # 单帧例外：票密集且不含远带成分 ⇒ 近/中距证据本身就够定案，不等第二个关键帧。
+    far = np.maximum(n_o - o_n - o_m, 0.0)
+    solo = (o_m > hi) & (n_o >= c.q_solo_pts) & (far <= c.q_far_tol * np.maximum(n_o, 1.0))
+    # ``q_near_pts`` 把文档里那句"近带**故意不带**地面压制"真正接上。历史上它是死代码：
+    # ``rasterize`` 的 base 规则先做了 (n_o > min_pts) & (n_o ≥ ratio·n_g)，而
+    # ``occ = (base_occ > 0) & (...)`` 只能给已有障碍加分，救不回被地面压制杀掉的格。
+    # 后果实测（tools/near_band_check.py，044153）：201 格票数是门槛 8 倍、99.5% 判成可走，
+    # 而它们的形状（n_g 中位 130 / n_o 中位 26）正是文档点名要保护的细障碍——桌腿、栏杆、矮墙。
+    # 0 = 关闭，此时 near_only 恒 False，**与改动前逐格相同**（见 tests 的 no-op 断言）。
+    if c.q_near_pts > 0:
+        near_pts = min(c.q_near_pts, c.min_pts) - 0.5
+        near_only = (o_n > near_pts) & (n_o > near_pts)
+    else:
+        near_only = np.zeros_like(near)
+    # base_occ > 0 而不是 base_occ：base_occ 是 uint8，& 出来的还是 uint8，而
+    # (a) numpy 把 uint8 数组当**整数下标**不是布尔掩码——g[那个数组] 会去写第 0 行、第 1 行，
+    #     一格都改不到还不报错；(b) uint8 上做 ~ 是按位取反（0→254），不是逻辑非。
+    # 三个返回值一律真 bool，调用方拿它当掩码用才对。
+    ok_rule = near | mid | solo | near_only
+    occ = ((base_occ > 0) & ok_rule) | near_only
+    rejected = (base_occ > 0) & ~ok_rule
+    return occ, rejected & (g_n > 0.5), rejected
+
+
+def assemble_labels(cfg: "MapperConfig", occ: np.ndarray, restored: np.ndarray,
+                    rejected: np.ndarray, n_g: np.ndarray) -> np.ndarray:
+    """复核后的 (障碍, 判回空地, 降级无近距证据) + 地面票 → **三态栅格**（``nav_grid`` 编码）。
+
+    这是**唯一实现**：在线 ``rasterize`` 与离线 ``offline_fusion.classify`` 共用。
+    抽出来的理由同上（见 ``label_cells``）：离线那一版只做了第 ④ 步，**漏了第 ⑦ 步**，
+    044153 上 FREE 多出 7,106 格（占其 FREE 的 10.3%）。
+
+    四步的顺序有讲究：
+      ④ 有地面观测且非障碍 ⇒ FREE。**这一行是宽口径的**，它会顺手把降级格也填成 free；
+      ⑤ ``restored``（远场票被否证、而近距在同一格见过地面）⇒ FREE（与④重复，语义自解释）；
+      ⑥ 障碍 ⇒ OCC；
+      ⑦ ``rejected & ~restored`` ⇒ 压回 UNK。**少了这一行，降级就等于清障，整个质量分层白做**——
+        没有可信证据说它是地板，就不许当 free（``nav_grid`` 的红线"unknown 永不当 free"）。
+    """
+    g = np.full(occ.shape, UNK, np.uint8)
+    g[(n_g > 0.5) & (occ == 0)] = FREE
+    g[restored] = FREE
+    g[occ == 1] = OCC
+    g[rejected & ~restored] = UNK
+    return g
+
+
+def majority3(x: np.ndarray) -> np.ndarray:
+    """3×3 多数（≥3 格）。``BORDER_CONSTANT``：默认的 reflect 会把图外沿的障碍格镜像回填，
+    边缘一圈白送 3×3 支撑。在线与离线共用这一个，避免"两处各写一遍滤波边界"。"""
+    return (cv2.filter2D(x.astype(np.uint8), -1, np.ones((3, 3), np.float32),
+                         borderType=cv2.BORDER_CONSTANT) >= 3)
+
+
 class KeyframeGridMapper:
     def __init__(self, cfg: MapperConfig | None = None) -> None:
         self.cfg = cfg or MapperConfig()
@@ -1086,75 +1184,22 @@ class KeyframeGridMapper:
         # 扁平口径（历史规则）：只数格内总票数，看不见"这些票是几米外打的"。
         occ = ((n_o > c.min_pts - 0.5) & (n_o >= c.occ_ground_ratio * n_g)).astype(np.uint8)
         # BORDER_CONSTANT：默认的 reflect 会把图外沿的障碍格镜像回填，边缘一圈白送 3×3 支撑。
-        occ = ((cv2.filter2D(occ, -1, np.ones((3, 3), np.float32), borderType=cv2.BORDER_CONSTANT) >= 3)
-               .astype(np.uint8))
+        occ = majority3(occ).astype(np.uint8)
         occ, restored, rejected = self._by_quality(occ, n_g, n_o, o_n, o_m, g_n, o_mk)
-        g = np.full((h, w), UNK, np.uint8)
-        g[(n_g > 0.5) & (occ == 0)] = FREE
-        g[restored] = FREE       # 远场票被否证、而近距在同一格见过地面 ⇒ 判回空地
-        g[occ == 1] = OCC
-        # 上面那行"有地面观测且非障碍 ⇒ free"会把**所有**被降级的格顺手填成 free，包括那些
-        # 根本没有近距地面证据的。必须显式压回 unknown：没有可信证据说它是地板，就不许当 free
-        # （nav_grid 的红线"unknown 永不当 free"）。少了这一行，降级就等于清障，白做。
-        g[rejected & ~restored] = UNK
+        g = assemble_labels(c, occ, restored, rejected, n_g)
         self._last_grid = (h, w)
         return NavGrid(g[::-1].copy(), GridMeta(c.res_m, (float(lo[0]), float(lo[1])), c.world_scale))
 
     def _by_quality(self, base_occ: np.ndarray, n_g: np.ndarray, n_o: np.ndarray,
                     o_n: np.ndarray, o_m: np.ndarray, g_n: np.ndarray, o_mk: np.ndarray
                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """把"扁平计数判为障碍"的格按**观测距离**复核一遍。返回 (障碍, 降级回空地, 降级但无近距证据)。
+        """薄壳：规则本体在模块级 ``label_cells``（离线 ``offline_fusion`` 也走那一份）。
 
-        为什么必须分层：视差深度误差 δz = z²/(fx·b)·δd，面板口径 fx 202.5 / 基线 0.126 下
-        1 像素 ≈ z²/25.5 m（1.5 m→9 cm、3 m→35 cm、5 m→98 cm），而障碍高度带 (0.3, 2.0) 有
-        1.7 m 宽。所以 1.5 m 以外"真地面被抖进障碍带"是必然的：min_pts、3×3 多数、
-        occ_ground_ratio 都只压密度，补不回那一层根本不存在的信息。这就是"走过的空地中间
-        冒出孤岛障碍"的物理来源（Docs/RTAB-Map双目评估（2026-09-26）.md:128 同一个结论）。
-
-        规则（口径取自 Docs/离线多视角融合v1-假障碍清除（2026-10-02）.md，该录制障碍占比
-        31.4%→13.3%；与 ``ray_clear`` 机理正交，可叠加）：
-          * 近带 <q_near_m：误差还在带边沿内，单帧即定案；**故意不带**地面压制条件，
-            否则 occ_ground_ratio 会把真细障碍（桌腿、栏杆）一起误杀；
-          * 中带 q_near~q_mid：默认须 ≥q_mid_kf 个关键帧一致 + 地面压制，压住量化倾斜与单帧鬼影；
-            但"只被一个关键帧看到"也是常态（刚走近就看见了），所以留了一条**单帧例外**：
-            票够多（≥q_solo_pts）且远带票占比 ≤q_far_tol 时单帧即定案——近/中距的票本来就可信，
-            远带票才是噪声来源，票里没有远带成分就没必要等第二个关键帧；
-          * 远带 >q_mid：没有定案权。纯远场票的格降级——**近距**在同一格见过地面 ⇒ FREE，
-            否则 ⇒ UNK（诚实降级，不伪造 free：见 nav_grid 的"unknown 永不当 free"）。
-
-        与离线那一版的一处收紧：降级判回 FREE 只认**近距**地面证据，不用中距。中距地面自己
-        就是被抖出来的，拿它当"这格是地板"的证据，等于用噪声治噪声——实测会把只被一个关键帧
-        看到的中距真墙判成 free（可走 ⇒ 规划直接穿墙）。近距地面才够格推翻一张障碍票。
+        保留这个方法名，是因为 ``tools/`` 下三个探针（``nav_audit`` / ``low_ceiling_nav`` /
+        ``near_band_check``）用**继承覆写**它来截取入参出参——那是它们看生产路径的唯一窗口。
+        规则本体一旦在这里和离线各写一份，就会漂移；实测过（见 ``label_cells`` 的 docstring）。
         """
-        if not self.cfg.q_tiers:
-            z = np.zeros(base_occ.shape, bool)
-            return base_occ, z, z
-        c = self.cfg
-        hi = c.min_pts - 0.5
-        near = o_n > hi
-        mid = (o_m > hi) & (o_mk >= c.q_mid_kf - 0.5) & (n_o >= c.occ_ground_ratio * n_g)
-        # 单帧例外：票密集且不含远带成分 ⇒ 近/中距证据本身就够定案，不等第二个关键帧。
-        far = np.maximum(n_o - o_n - o_m, 0.0)
-        solo = (o_m > hi) & (n_o >= c.q_solo_pts) & (far <= c.q_far_tol * np.maximum(n_o, 1.0))
-        # ``q_near_pts`` 把文档里那句"近带**故意不带**地面压制"真正接上。历史上它是死代码：
-        # ``rasterize`` 的 base 规则先做了 (n_o > min_pts) & (n_o ≥ ratio·n_g)，而
-        # ``occ = (base_occ > 0) & (...)`` 只能给已有障碍加分，救不回被地面压制杀掉的格。
-        # 后果实测（tools/near_band_check.py，044153）：201 格票数是门槛 8 倍、99.5% 判成可走，
-        # 而它们的形状（n_g 中位 130 / n_o 中位 26）正是文档点名要保护的细障碍——桌腿、栏杆、矮墙。
-        # 0 = 关闭，此时 near_only 恒 False，**与改动前逐格相同**（见 tests 的 no-op 断言）。
-        if c.q_near_pts > 0:
-            near_pts = min(c.q_near_pts, c.min_pts) - 0.5
-            near_only = (o_n > near_pts) & (n_o > near_pts)
-        else:
-            near_only = np.zeros_like(near)
-        # base_occ > 0 而不是 base_occ：base_occ 是 uint8，& 出来的还是 uint8，而
-        # (a) numpy 把 uint8 数组当**整数下标**不是布尔掩码——g[那个数组] 会去写第 0 行、第 1 行，
-        #     一格都改不到还不报错；(b) uint8 上做 ~ 是按位取反（0→254），不是逻辑非。
-        # 三个返回值一律真 bool，调用方拿它当掩码用才对。
-        ok_rule = near | mid | solo | near_only
-        occ = ((base_occ > 0) & ok_rule) | near_only
-        rejected = (base_occ > 0) & ~ok_rule
-        return occ, rejected & (g_n > 0.5), rejected
+        return label_cells(self.cfg, base_occ, n_g, n_o, o_n, o_m, g_n, o_mk)
 
     def coverage_counts(self) -> dict[str, Any] | None:
         """覆盖伴生网格的只读快照（**仅建图线程可调**，HTTP 侧消费下游快照）。

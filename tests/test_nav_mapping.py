@@ -8,8 +8,9 @@ import numpy as np
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.nav_grid import FREE, OCC, UNK
-from neko_anyadance_body.backend.nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
-                                                     frontiers, make_sgbm, stereo_points)
+from neko_anyadance_body.backend.nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, assemble_labels,
+                                                     disparity_range_px, frontiers, label_cells, majority3,
+                                                     make_sgbm, stereo_points)
 
 CAM_H = 1.73
 
@@ -972,6 +973,100 @@ class HeightBandTests(unittest.TestCase):
         m._acc_sb_h[:] = 12345.0                    # 人为破坏矩
         m.rasterize()
         np.testing.assert_array_equal(a, m.rasterize().grid)
+
+
+class SharedRuleTests(unittest.TestCase):
+    """``label_cells`` / ``assemble_labels`` 是**唯一实现**（离线 ``offline_fusion`` 也走这一份）。
+
+    2026-10-08 体检发现离线自己重写了一份，**漏了 ``base_occ`` 前置门与第 ⑦ 步诚实降级**
+    （044153 上只离线多 1,229 个障碍格、FREE 多 10.3%）。这些测试钉住"规则只有一份且行为固定"。
+    """
+
+    def test_thin_shell_matches_shared_rule(self) -> None:
+        """``KeyframeGridMapper._by_quality`` 必须与模块级 ``label_cells`` 逐位一致。
+
+        留方法名是因为 ``tools/`` 下三个探针用继承覆写它截取入参；但**规则本体只有一份**。
+        """
+        rng = np.random.default_rng(7)
+        c = MapperConfig()
+        shape = (9, 11)
+        base = (rng.random(shape) < 0.5).astype(np.uint8)
+        n_g = rng.integers(0, 200, shape).astype(float)
+        n_o = rng.integers(0, 60, shape).astype(float)
+        o_n = rng.integers(0, 30, shape).astype(float)
+        o_m = rng.integers(0, 30, shape).astype(float)
+        g_n = rng.integers(0, 50, shape).astype(float)
+        o_mk = rng.integers(0, 5, shape).astype(float)
+        m = KeyframeGridMapper(c)
+        got = m._by_quality(base, n_g, n_o, o_n, o_m, g_n, o_mk)
+        want = label_cells(c, base, n_g, n_o, o_n, o_m, g_n, o_mk)
+        for a, b in zip(got, want):
+            np.testing.assert_array_equal(a, b)
+
+    def test_base_occ_is_a_precondition_not_a_bonus(self) -> None:
+        """``near`` 票再多，过不了 ``base_occ`` 也不得成障碍。
+
+        这是离线漏掉的那道门：少了它就等于"近带票单条即定罪"，绕过 min_pts / 3×3 /
+        ``occ_ground_ratio`` 三道密度门。
+        """
+        c = MapperConfig()
+        shape = (1, 1)
+        # 近带票爆表（100 张），但 base_occ = 0（扁平规则没判它）
+        occ, restored, rejected = label_cells(
+            c, np.zeros(shape, np.uint8), np.full(shape, 130.0), np.full(shape, 100.0),
+            np.full(shape, 100.0), np.zeros(shape), np.full(shape, 130.0), np.zeros(shape))
+        self.assertFalse(bool(occ.any()), "base_occ=0 时不得判障碍（前置门失效）")
+        self.assertFalse(bool(rejected.any()), "没进候选就不算 rejected")
+        # 同一批票，base_occ = 1 ⇒ 必须判障碍（证明上一行不是因为票不够）
+        occ2, _r, _j = label_cells(
+            c, np.ones(shape, np.uint8), np.full(shape, 130.0), np.full(shape, 100.0),
+            np.full(shape, 100.0), np.zeros(shape), np.full(shape, 130.0), np.zeros(shape))
+        self.assertTrue(bool(occ2.all()))
+
+    def test_assemble_labels_downgrade_is_not_free(self) -> None:
+        """第 ⑦ 步：``rejected & ~restored`` ⇒ UNK，不许被第 ④ 步顺手填成 FREE。
+
+        ``nav_mapping`` 原注释："少了这一行，降级就等于清障，白做"——离线那份正是少了它。
+        """
+        c = MapperConfig()
+        shape = (1, 2)
+        n_g = np.full(shape, 10.0)
+        occ = np.zeros(shape, bool)
+        rejected = np.array([[True, True]])
+        restored = np.array([[True, False]])       # 第 0 格有近距证据，第 1 格没有
+        g = assemble_labels(c, occ, restored, rejected, n_g)
+        self.assertEqual(int(g[0, 0]), FREE, "restored ⇒ 判回空地")
+        self.assertEqual(int(g[0, 1]), UNK, "rejected 且无近距证据 ⇒ 必须压回 unknown")
+        # 分辨率：若第 ⑦ 步失效，第 1 格会变成 FREE
+        self.assertNotEqual(int(g[0, 1]), FREE)
+
+    def test_prior_encoding_is_converted_not_reused(self) -> None:
+        """``nav_grid`` 编码(178/0/89) 与**先验**编码(0/1/2) 里 UNK 与 OCC **数值交叉**。
+
+        ``OCC == 0 == L_UNK`` ⇒ 直接把 ``nav_grid`` 值当先验标签**不报错**，
+        只会把**全部障碍静默写成未知**。这条测试证明那个陷阱真实存在，且转换是对的。
+        """
+        from neko_anyadance_body.backend.nav_prior import L_FREE, L_OCC, L_UNK
+        self.assertEqual((FREE, OCC, UNK), (178, 0, 89))
+        self.assertEqual((L_UNK, L_FREE, L_OCC), (0, 1, 2))
+        self.assertEqual(OCC, L_UNK, "交叉点移动了，转换代码要重看")
+        g = np.array([[FREE, OCC], [UNK, FREE]], np.uint8)
+        lab = np.full(g.shape, L_UNK, np.uint8)          # 与 offline_fusion.classify 同款三行
+        lab[g == FREE] = L_FREE
+        lab[g == OCC] = L_OCC
+        np.testing.assert_array_equal(lab, np.array([[L_FREE, L_OCC], [L_UNK, L_FREE]], np.uint8))
+        # 分辨力：不转换必须与正确结果不同，且一个障碍都认不出
+        self.assertFalse(np.array_equal(g, lab))
+        self.assertEqual(int((g == L_OCC).sum()), 0)
+
+    def test_majority3_uses_constant_border(self) -> None:
+        """``majority3`` 必须用 BORDER_CONSTANT：默认 reflect 会把图外沿镜像回填，
+        边缘一圈白送 3×3 支撑（本仓已踩过）。"""
+        x = np.zeros((3, 3), np.uint8)
+        x[0, 0] = 1                                       # 角上一格
+        self.assertFalse(bool(majority3(x).any()), "角上单格不得因镜像回填凑够 3×3")
+        x2 = np.ones((3, 3), np.uint8)
+        self.assertTrue(bool(majority3(x2).all()))
 
 
 if __name__ == "__main__":
