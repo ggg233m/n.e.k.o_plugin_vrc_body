@@ -31,5 +31,11 @@ navmesh_memory/
 
 tools/*.png
 
+# 点云查看器生成的根目录 HTML（4–8 MB，纯产物，可随时重跑 pointcloud_view.py 再生）
+/world_*.html
+# 文档内嵌图（PNG）。**生成脚本随文档一起入库，图本身不入库** ——
+# 需要看图就跑该文档「复现」一节里对应的脚本（例：mff_supply_map.py → Docs/assets/mff-supply-*.png）。
+Docs/assets/
+
 # 文献调研抓取的论文全文/HTML 缓存（~4 MB 原始素材；结论已提炼进 research/*.md）
 /_research/
