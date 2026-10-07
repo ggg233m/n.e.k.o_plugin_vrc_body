@@ -647,6 +647,30 @@ def session_world_scale(world_dir: Path, sid: str) -> float | None:
     return ws if ws > 0.0 and np.isfinite(ws) else None
 
 
+def veto_grid(agg: dict, x0: int, y0: int, shape: tuple[int, int],
+              **kw) -> np.ndarray | None:
+    """射线清除 → ``(H, W)`` 稠密掩码（``True`` = 该格被看穿）。没开射线清除返回 ``None``。
+
+    抽成独立函数有两个理由，都不是洁癖：
+      * ``main`` 里这段原来内联在 ``dense()`` 之后、``H, W`` 赋值**之前**，
+        踩过一次 `UnboundLocalError`（而当时的 A/B 脚本直接调 ``aggregate``/``classify``，
+        绕过了 `main` ⇒ **测试全绿但命令行根本跑不起来**）。取成显式入参就没有这个顺序依赖。
+      * 它有一处容易写错的对齐（稀疏键 → 稠密 ``flat``），值得单独测。
+    """
+    if not agg.get("ray_clear"):
+        return None
+    sparse = ray_veto(agg, **kw)
+    H, W = shape
+    out = np.zeros((H, W), bool)
+    flat = (agg["ix"] - x0) * W + (agg["iy"] - y0)
+    if len(flat):
+        if flat.min() < 0 or flat.max() >= H * W:
+            raise ValueError(f"射线票的格越出稠密图幅（flat ∈ [{flat.min()}, {flat.max()}]，"
+                             f"容量 {H * W}）：x0/y0/shape 与 agg 不是同一套坐标系")
+        out.flat[flat] = sparse
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rec", nargs="+", help="录制目录名（navmesh_recordings/ 下）；给多个 = 多场融合成同一张图")
@@ -699,17 +723,12 @@ def main() -> None:
             for rec, sid in zip(recs, sids)]
     agg = aggs[0] if len(aggs) == 1 else merge_aggs(aggs)
     x0, y0, gband, oband, sband = dense(agg)
-    # 射线清除：把"被看穿"的格掩码对齐到 G 的稀疏键，再铺成 (H,W)。
-    veto = None
-    if agg.get("ray_clear"):
-        sparse = ray_veto(agg)
-        veto = np.zeros((H, W), bool)
-        veto.flat[((agg["ix"] - x0) * W + (agg["iy"] - y0))] = sparse
+    H, W = gband.shape[:2]
+    veto = veto_grid(agg, x0, y0, (H, W))
     occ_b, labels_f, occ_b3, st = classify(gband, oband, sband, veto)
     st["ray_clear"] = bool(agg.get("ray_clear"))
     if veto is not None:
         st["ray_cleared_cells"] = int((veto & (oband.sum(axis=2) > 0)).sum())
-    H, W = occ_b.shape
 
     G = gband.sum(axis=2)
     free_b = (G > 0.5) & ~occ_b
