@@ -27,6 +27,9 @@ sys.path.insert(0, str(ROOT))
 from backend.nav_grid import FREE, OCC, UNK          # noqa: E402
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "research" / "tools"))
+from trail_geom import trail_mask                    # noqa: E402
+
 STEPS = (1, 2, 5, 10, 25, 50, 100, 200, 0)          # 0 = 全部
 REC = "20261001_044153"
 
@@ -68,17 +71,12 @@ def floor_polluted(ng, s: float) -> tuple[int, int]:
 
 
 def corridor_blockers(ng, trail: list[np.ndarray], half_m: float = 0.5) -> int:
-    """走廊上还有几个障碍格（与 tools/q_tier_ab.py 同口径）。"""
-    import cv2
-    H, W = ng.grid.shape
-    m = np.zeros((H, W), np.uint8)
-    ox, oy = ng.meta.origin_xy_m
-    r = ng.meta.resolution_m
-    for p in trail:
-        cx, cy = int((p[0] - ox) / r), int((p[1] - oy) / r)
-        if 0 <= cx < H and 0 <= cy < W:
-            cv2.circle(m, (cy, cx), max(1, int(round(half_m / r))), 1, -1)
-    return int(((m > 0) & (ng.grid == OCC)).sum())
+    """走廊上还有几个障碍格（与 tools/q_tier_ab.py 同口径）。
+
+    ⚠️ 2026-10-08：本函数原来是**转置**的（``cv2.circle(m, (cx, cy))`` 而 ``cx`` 其实是行号），
+    量的是一片镜像区域。实现已迁到 ``trail_geom.trail_mask``（唯一实现）。
+    """
+    return int((trail_mask(ng, trail, half_m) & (ng.grid == OCC)).sum())
 
 
 def pose_ab(rec: Path, frames) -> None:

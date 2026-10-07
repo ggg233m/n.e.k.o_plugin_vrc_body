@@ -59,6 +59,9 @@ if str(ROOT) not in sys.path:
 from backend.nav_grid import FREE, OCC, UNK, NavGrid          # noqa: E402
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # research/tools/
+from trail_geom import trail_cells, trail_mask                    # noqa: E402
+
 BASELINE = Path(__file__).parent / "mapping_gate_baseline.json"
 RECS = ("20260929_045615", "20261001_044120", "20261001_044153")
 RINGS = (1.5, 2.5, 3.0)
@@ -139,24 +142,15 @@ def replay(rec: Path, cfg: MapperConfig):
 
 
 def _trail_mask(ng: NavGrid, trail: list[np.ndarray], radius_m: float) -> np.ndarray:
-    """轨迹附近的格。单位口径与 ``q_tier_ab.ring_masks`` 一致：这里吃的是**未乘
-    ``world_scale``** 的原始 T_map 平面坐标，``origin_xy_m`` 也是同一口径。
+    """轨迹附近的格。**实现已迁到 ``trail_geom.trail_mask``**（唯一实现，不许再各推一遍）。
 
-    ⚠️ **变量名故意不叫 cx/cy**：``q_tier_ab`` 里那两个名字与 OpenCV 惯例相反
-    （``cx`` 其实是行号），照抄那个名字再写 ``cv2.circle(m, (cx, cy))`` 会把
-    x/y 弄反——而且**不会报错**，只会让掩码落到镜像位置，走廊数从 505 变成 779。
-    这里用 ``r_idx`` / ``c_idx`` 让调用点自解释。
+    ⚠️ 2026-10-08 修掉一个一直量错地方的 bug：本函数以前写的是
+    ``cv2.circle(m, (int((p[1]-oy)/r), int((p[0]-ox)/r)))`` —— 把 x 当成了行、又漏掉
+    ``NavGrid`` 的上下翻转（行轴是 y 且自下而上，见 ``nav_grid.to_cell``）。
+    后果不是报错，是**数了一片镜像区域**：044153 上与正确掩码的 IoU = 0.090，
+    落在掩码里的障碍格 505 → 899。下面这几行保留成薄壳，只为让调用点不改名。
     """
-    H, W = ng.grid.shape
-    m = np.zeros((H, W), np.uint8)
-    ox, oy = ng.meta.origin_xy_m
-    rpx = int(radius_m / ng.meta.resolution_m)
-    for p in trail:
-        r_idx = int((p[0] - ox) / ng.meta.resolution_m)
-        c_idx = int((p[1] - oy) / ng.meta.resolution_m)
-        if 0 <= r_idx < H and 0 <= c_idx < W:
-            cv2.circle(m, (c_idx, r_idx), rpx, 1, -1)   # OpenCV: (x=col, y=row)
-    return m > 0
+    return trail_mask(ng, trail, radius_m)
 
 
 def astar_probes(ng: NavGrid, trail: list[np.ndarray]) -> list[dict]:
@@ -201,6 +195,77 @@ def astar_probes(ng: NavGrid, trail: list[np.ndarray]) -> list[dict]:
     return out
 
 
+def occ_shape(occ: np.ndarray, res_m: float, min_cells: int = 20) -> dict:
+    """障碍的**形状**：边界格占比 + 局部厚度中位。回答"墙有没有变胖"。
+
+    为什么门需要这一项：``corridor_blockers``、环比例、``build()`` 量的都是**多少格**，
+    对"障碍被抹厚"几乎不敏感——墙从 2 格胖到 6 格时，只要它仍然堵在路上，格数变化会被
+    "清掉了一些孤岛"抵消掉，指标看起来还可能变好。而墙厚是**能不能贴着走**的直接物理量。
+
+    两个量的分工（合成对照见 ``_shape_selftest``）：
+      * ``boundary_frac_pct``：4 邻域有缺失的格占比。薄墙/环 → ~100%；实心块 → 很低。
+      * ``thickness_p50_m``：``2 × 中位(距离变换)``。薄墙 → 就是它自己的厚度；实心块 → 直径量级。
+
+    ⚠️ 只用**≥min_cells 格的连通块**：碎屑（单帧量化打出的几个格）本身就是"全边界、厚度 0"，
+    会把统计拉向"薄"，正好抵消掉我们要抓的"变胖"。**别用 PCA 伸长率代替**：房间四壁是一个
+    闭环，主轴长宽比 ≈1，与实心块无法区分（本仓踩过，见 C 记录）。
+
+    ⚠️ 该项对**分割阈值**敏感：``occ`` 必须是三态栅格里的 GiST OCC，不是原始票数图。
+    """
+    out = {"cells": int(occ.sum()), "components": 0, "in_blocks": 0,
+           "boundary_frac_pct": 0.0, "thickness_p50_m": 0.0}
+    if not out["cells"]:
+        return out
+    n, cc = cv2.connectedComponents(occ.astype(np.uint8), connectivity=8)
+    out["components"] = int(n - 1)
+    sizes = np.bincount(cc.ravel())
+    keep = np.zeros_like(occ, bool)
+    for i in np.flatnonzero(sizes >= min_cells):
+        if i != 0:
+            keep |= (cc == i)
+    out["in_blocks"] = int(keep.sum())
+    if not keep.any():
+        return out
+    k4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], np.uint8)
+    nb = cv2.filter2D(keep.astype(np.uint8), -1, k4, borderType=cv2.BORDER_CONSTANT)
+    out["boundary_frac_pct"] = round(100.0 * float((keep & (nb < 5)).sum()) / float(keep.sum()), 2)
+    dt = cv2.distanceTransform(keep.astype(np.uint8), cv2.DIST_L2, 5)
+    out["thickness_p50_m"] = round(2.0 * float(np.median(dt[keep])) * float(res_m), 4)
+    return out
+
+
+def _shape_selftest() -> None:
+    """合成对照自检：**必须**能把薄墙/环与实心块分开，否则这个指标没有分辨力。
+
+    本仓已有一次"自检的两个分支算同一个表达式"的教训——那种自检比没有还糟。所以这里
+    断言的是**两组数字必须分开**，而不是"跑完不报错"。
+    """
+    wall = np.zeros((300, 300), bool)
+    wall[150:152, 30:270] = True                       # 16 m 长、0.2 m 厚
+    ring = np.zeros((300, 300), bool)
+    ring[50:250, 50:52] = ring[50:250, 248:250] = True
+    ring[50:52, 50:250] = ring[248:250, 50:250] = True  # 20×20 m 房间的四壁
+    rr, cc_ = np.ogrid[:300, :300]
+    disc = ((rr - 150) ** 2 + (cc_ - 150) ** 2) <= 45 ** 2
+    w, r_, d = (occ_shape(m, 0.1) for m in (wall, ring, disc))
+    assert abs(w["thickness_p50_m"] - 0.20) < 0.02, w
+    assert abs(r_["thickness_p50_m"] - 0.20) < 0.02, r_
+    assert w["boundary_frac_pct"] > 95.0 and r_["boundary_frac_pct"] > 95.0, (w, r_)
+    assert d["thickness_p50_m"] > 2.0, d                # 实心盘直径 9 m，中位厚度 ~2.6 m
+    assert d["boundary_frac_pct"] < 15.0, d
+    # 分辨力：薄墙与实心块在两个量上都必须分开（同一个数就不是分辨力）
+    assert w["thickness_p50_m"] < 0.5 < d["thickness_p50_m"]
+    assert d["boundary_frac_pct"] < 50.0 < w["boundary_frac_pct"]
+    # 碎屑不能主导：加一堆 1 格孤点，结论必须不变
+    noisy = wall.copy()
+    noisy[10, 10] = noisy[20, 20] = noisy[30, 30] = True
+    assert abs(occ_shape(noisy, 0.1)["thickness_p50_m"] - 0.20) < 0.02
+    print("occ_shape self-test: PASS  "
+          f"(wall {w['boundary_frac_pct']}%/{w['thickness_p50_m']}m, "
+          f"ring {r_['boundary_frac_pct']}%/{r_['thickness_p50_m']}m, "
+          f"disc {d['boundary_frac_pct']}%/{d['thickness_p50_m']}m)")
+
+
 def measure(ng: NavGrid, trail: list[np.ndarray], mapper: KeyframeGridMapper) -> dict:
     g = ng.grid
     occ, free = g == OCC, g == FREE
@@ -221,6 +286,7 @@ def measure(ng: NavGrid, trail: list[np.ndarray], mapper: KeyframeGridMapper) ->
     build = ng.build(radius_m=0.25, walked=mapper.walked())
     out["build"] = {k: build[k] for k in sorted(build)}
     out["corridor_blockers"] = int((_trail_mask(ng, trail, 0.5) & occ).sum())
+    out["occ_shape"] = occ_shape(occ, ng.meta.resolution_m)
     for R in RINGS:
         ring = _trail_mask(ng, trail, R)
         n_o, n_f, n_all = int((occ & ring).sum()), int((free & ring).sum()), int(ring.sum())
@@ -413,7 +479,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dump-grid", type=Path, default=None, help="把栅格落盘到该目录")
     ap.add_argument("--why", action="store_true",
                     help="只跑走廊障碍拆解：剩余堵路的里面真结构 vs 量化倾斜")
+    ap.add_argument("--selftest", action="store_true",
+                    help="只跑合成对照自检（形状指标必须有分辨力，否则门会给出假绿）")
     args = ap.parse_args(argv)
+
+    if args.selftest:
+        _shape_selftest()
+        return 0
 
     recs = args.recs or list(RECS)
 

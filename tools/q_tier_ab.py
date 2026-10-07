@@ -35,6 +35,9 @@ sys.path.insert(0, str(ROOT))
 from backend.nav_grid import FREE, OCC, UNK                       # noqa: E402
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig   # noqa: E402
 
+sys.path.insert(0, str(ROOT / "research" / "tools"))
+from trail_geom import trail_mask                                 # noqa: E402
+
 RINGS = (1.5, 2.5, 3.0)
 RECS = ("20260929_045615", "20261001_044120", "20261001_044153")
 
@@ -116,17 +119,15 @@ def measure(ng, trail: list[np.ndarray], base: np.ndarray | None,
     out["corridor_blockers"] = corridor_blockers(ng, trail)
 
 
-def ring_masks(shape: tuple[int, int], meta, trail: list[np.ndarray], radius_m: float):
-    H, W = shape
-    m = np.zeros((H, W), np.uint8)
-    ox, oy = meta.origin_xy_m
-    rpx = int(radius_m / meta.resolution_m)
-    for p in trail:
-        cx = int((p[0] - ox) / meta.resolution_m)
-        cy = int((p[1] - oy) / meta.resolution_m)
-        if 0 <= cx < H and 0 <= cy < W:
-            cv2.circle(m, (cy, cx), rpx, 1, -1)
-    return m > 0
+def ring_masks(ng, trail: list[np.ndarray], radius_m: float):
+    """轨迹半径 ``radius_m`` 环内的格。**实现已迁到 ``trail_geom.trail_mask``**（唯一实现）。
+
+    ⚠️ 2026-10-08：本函数原来是转置的（把 x 当行、漏掉 NavGrid 的上下翻转），与
+    ``mapping_gate._trail_mask``、``precision_probe.corridor_blockers`` 是同一个错误。
+    签名从 ``(shape, meta, trail, R)`` 改成 ``(ng, trail, R)``：算对朝向需要 ``to_cell``，
+    而 ``shape`` + ``meta`` 拆开传正是让"自己再推一遍坐标"变得顺手的形状。
+    """
+    return trail_mask(ng, trail, radius_m)
 
 
 def near_ground_mask(ng, trail: list[np.ndarray], band_m: float = 0.6) -> np.ndarray:
@@ -134,19 +135,10 @@ def near_ground_mask(ng, trail: list[np.ndarray], band_m: float = 0.6) -> np.nda
 
     用来给"判回 FREE"的格做抽检：落在走廊里的降级几乎必然是真假障碍修正，
     落在没人走过的角落里的降级则没有外部证据支撑。
+
+    实现见 ``trail_geom.trail_mask``（2026-10-08 起唯一实现）。
     """
-    H, W = ng.grid.shape
-    m = np.zeros((H, W), np.uint8)
-    ox, oy = ng.meta.origin_xy_m
-    r = ng.meta.resolution_m
-    thick = max(1, int(round(2 * band_m / r)))
-    for p in trail:
-        cx = int((p[0] - ox) / r)
-        cy = int((p[1] - oy) / r)
-        if 0 <= cx < H and 0 <= cy < W:
-            cv2.circle(m, (cy, cx), int(band_m / r), 1, -1)
-    del thick
-    return m > 0
+    return trail_mask(ng, trail, band_m)
 
 
 def corridor_blockers(ng, trail: list[np.ndarray], half_m: float = 0.5) -> int:
@@ -172,7 +164,7 @@ def measure(ng, trail: list[np.ndarray], base: np.ndarray | None,
     out["regions"] = build["regions"]
     out["corridor_blockers"] = corridor_blockers(ng, trail)
     for R in RINGS:
-        ring = ring_masks(g.shape, ng.meta, trail, R)
+        ring = ring_masks(ng, trail, R)
         n_o, n_f = int((occ & ring).sum()), int((free & ring).sum())
         n_all = int(ring.sum())
         out[f"R{R}"] = {"known_obstacle_pct": round(100.0 * n_o / max(n_o + n_f, 1), 2),
