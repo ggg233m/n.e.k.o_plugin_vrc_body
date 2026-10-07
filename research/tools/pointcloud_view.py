@@ -257,7 +257,15 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
         # 投到地图上就是**从相机位置向外发散的尖刺**（俯视图里最扎眼的那一圈）。
         # 它们不是几何，是噪声；mapper 早就把它们挡在门外了，导出必须一致。
         if range_m is not None:
-            rng_ok = np.isfinite(p).all(axis=1) & (np.linalg.norm(p, axis=1) <= float(range_m))
+            # ⚠️ 口径必须是**水平半径**，与 mapper 逐字一致（`nav_mapping.py:472`
+            # `np.hypot(p[:,0], p[:,1]) <= range_m`）。
+            # 2026-10-08 修正：这里原来是 `np.linalg.norm(p, axis=1)`（**三维范数**），
+            # 而 base 系里地板点在 z ≈ −cam_h(−1.76 m) ⇒ 三维范数把远处的**地面**
+            # 算长了，水平 4.68–5.00 m 的地板点被误丢。
+            # 实测（044153，采样 40 帧）：水平口径留 79.95%、三维口径留 73.20%，
+            # **少留 8.44% 的应留点**，被误丢点的水平半径 p50 = 4.75 m（正是远处地板）。
+            # 这与在线/离线那次"同一个口径写了两遍"是同一类错，故把两个口径都写进注释。
+            rng_ok = np.isfinite(p).all(axis=1) & (np.hypot(p[:, 0], p[:, 1]) <= float(range_m))
             n_far_drop += int(len(p) - rng_ok.sum())
             p = p[rng_ok]
             if len(p) == 0:
