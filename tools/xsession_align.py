@@ -14,7 +14,7 @@
     python tools/xsession_align.py --world wrld_home-7cf435ea --world-tree --bridge-min 5
 
 方法与两个已付学费的坑见 ``backend/nav_xsession.align_into`` docstring 与
-``Docs/P0.2跨会话位姿图合并v1（2026-10-03）.md``；世界树的选根/次序/质量闸见
+``Docs/archive/P0.2跨会话位姿图合并v1（2026-10-03）.md``；世界树的选根/次序/质量闸见
 ``backend/nav_xsession.align_world_tree``。
 """
 from __future__ import annotations

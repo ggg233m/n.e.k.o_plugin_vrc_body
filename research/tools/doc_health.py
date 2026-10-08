@@ -36,8 +36,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
-# 扫描范围：Docs/ 全部 + 根目录 + backend 的说明文档
-DOC_GLOBS = ["Docs/*.md", "*.md", "backend/*.md", "research/**/*.md"]
+# 扫描范围：Docs/ 全部（含 archive/ 子目录！）+ 根目录 + backend 的说明文档
+# ⚠️ 2026-10-08：原来写的是 "Docs/*.md"，**不递归** —— 一旦把文档移进
+# Docs/archive/，那些文件就**静默脱离门禁**。分层改造时必须同步改成 **。
+DOC_GLOBS = ["Docs/**/*.md", "*.md", "backend/*.md", "research/**/*.md"]
 
 # vendored / 构建目录不参与"文件是否存在"的索引
 SKIP_DIR_PARTS = {".venv", ".git", "__pycache__", "deps", "build-ninja", ".buildtmp",
@@ -50,7 +52,7 @@ KNOWN_MD_ISSUES = {
     # 第 3 行只有 3 个 `**`（奇数），导致全文件 167 个 `**` 失衡。
     # 两种改法都说得通（只强调"永远" / 加粗整个分句），按仓库"不猜"惯例留给作者定。
     # 见 Docs/文档勘误与过时清单（2026-09-29）.md §7.8
-    "Docs/丢跟踪根因-图优化撕碎地图几何（2026-09-23）.md": "bold_parity: 待作者选改法（勘误 §7.8）",
+    "Docs/archive/丢跟踪根因-图优化撕碎地图几何（2026-09-23）.md": "bold_parity: 待作者选改法（勘误 §7.8）",
 }
 
 
@@ -187,6 +189,53 @@ def check_refs(files: list[Path], index: dict[str, list[str]]) -> dict:
     }
 
 
+def check_facts() -> list[str]:
+    """C 类：FACTS.md 里引用的 `文档名:行号` 必须真实存在。
+
+    这是**文档维护规矩第 2 条**（"改结论必须改源头"）的机器化：
+    真值单源一旦指向不存在的行，就等于把读者送进空指针。
+    """
+    facts = REPO / "Docs" / "FACTS.md"
+    if not facts.exists():
+        return ["Docs/FACTS.md 不存在 —— 真值单源缺失"]
+    text = facts.read_text(encoding="utf-8", errors="replace")
+    bad: list[str] = []
+    # 形如 `xxx.md:123` 或 `xxx.md:12-34`
+    for m in re.finditer(r"`([^`]+\.md):(\d+)(?:-(\d+))?`", text):
+        name, a, b = m.group(1), int(m.group(2)), m.group(3)
+        cand = [REPO / name, REPO / "Docs" / name, REPO / "Docs" / "archive" / name]
+        hit = next((c for c in cand if c.exists()), None)
+        if hit is None:
+            bad.append(f"FACTS.md 引用的文档不存在: {name}")
+            continue
+        n = len(hit.read_text(encoding="utf-8", errors="replace").splitlines())
+        hi = int(b) if b else a
+        if a > n or hi > n:
+            bad.append(f"FACTS.md 行号越界: {name}:{a}{'-'+b if b else ''} (该文件共 {n} 行)")
+    return bad
+
+
+def check_index_coverage() -> list[str]:
+    """D 类：Docs/ 实际文档集合 vs README 索引登记项，做差集。
+
+    ⚠️ **这就是 README §五 规矩 8 自己写了、但一直没实现的那道门。**
+    2026-09-30 → 10-04 新增 11 份文档、一份都没进索引，而门禁一条告警都没触发 ——
+    因为旧门禁只查 markdown 结构，**语义陈旧完全不在检查范围**。
+    """
+    readme = REPO / "Docs" / "README.md"
+    if not readme.exists():
+        return []
+    text = readme.read_text(encoding="utf-8", errors="replace")
+    registered = set(re.findall(r"^\| `(?:archive/)?([^`]+\.md)` \|", text, re.M))
+
+    actual = {p.name for p in (REPO / "Docs").glob("*.md")}
+    actual |= {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
+    actual.discard("README.md")  # 索引自身不必登记
+
+    missing = sorted(actual - registered)
+    return [f"文档未登记进 README §三 索引: Docs/{n}" for n in missing]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__ or "")
     ap.add_argument("--refs", action="store_true", help="额外跑引用存在性检查（软报告）")
@@ -225,6 +274,28 @@ def main() -> int:
             print("        - %s" % a)
 
     report: dict = {"files_scanned": len(files), "markdown": md_results}
+
+    # C 类：FACTS.md 证据可追溯性（硬门禁 —— 真值单源不许指向空处）
+    facts_bad = check_facts()
+    report["facts"] = facts_bad
+    print()
+    print("[C] FACTS.md 证据可追溯性 —— 硬门禁")
+    if not facts_bad:
+        print("    全部可追溯")
+    for b in facts_bad:
+        print("    ** %s" % b)
+    hard_fail += len(facts_bad)
+
+    # D 类：文档索引覆盖差集（硬门禁 —— 规矩 8 的机器化）
+    cov_bad = check_index_coverage()
+    report["index_coverage"] = cov_bad
+    print()
+    print("[D] 文档索引覆盖 —— 硬门禁（README §五 规矩 8）")
+    if not cov_bad:
+        print("    实有集合与索引登记项一致")
+    for b in cov_bad:
+        print("    ** %s" % b)
+    hard_fail += len(cov_bad)
 
     if args.refs:
         refs = check_refs(files, index)

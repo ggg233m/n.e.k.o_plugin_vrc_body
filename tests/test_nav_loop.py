@@ -174,7 +174,7 @@ class LoopCloserTest(unittest.TestCase):
 
     def test_status_reports_loop_freshness(self) -> None:
         # 健康度：全程 0 回环时 = 从起点累计，单调增长 —— 这就是"尾部长期 0 回环"的报警器
-        # （此前只能事后翻录制才发现，见 Docs/停顿后地图错位-根因诊断（2026-10-01）.md §七.3）。
+        # （此前只能事后翻录制才发现，见 Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md §七.3）。
         lc = LoopCloser(LoopConfig())
         pts = square_loop()
         walk(lc, pts, 0.05, lambda a, b: (None, "few_matches"))
@@ -208,7 +208,7 @@ class LoopCloserTest(unittest.TestCase):
 class BowCandidateTest(unittest.TestCase):
     """外观（词袋）候选的接线：默认关、缺词汇树不致命、候选必须过 min_path_m。
 
-    对应 `Docs/停顿后地图错位-根因诊断（2026-10-01）.md` §10 的两条硬要求：
+    对应 `Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md` §10 的两条硬要求：
       ① `_verify` 不查 `min_path_m`，所以外观候选必须**自己过**；
       ② 必须**先过门再截断**，否则长时间停顿时名额被重复帧占满。
     """

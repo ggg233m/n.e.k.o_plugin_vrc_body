@@ -143,7 +143,7 @@
 
 | 目录 / 文件 | 结论 |
 |---|---|
-| `ORB_SLAM3/`、`deps/`（Pangolin/glew/libepoxy）、`orbslam3_run*`、`run_mono_tum.sh`、`analyze_orbslam3.py` | **单目**：走—停全败，直接喂录像不可行。**双目**（2026-09-26）已重新评估：几何与尺度成立，但**因 GPLv3 + 30 Hz 做不到而不采用**，只做参照 → `Docs/ORB-SLAM3双目参照评估（2026-09-26）.md` |
+| `ORB_SLAM3/`、`deps/`（Pangolin/glew/libepoxy）、`orbslam3_run*`、`run_mono_tum.sh`、`analyze_orbslam3.py` | **单目**：走—停全败，直接喂录像不可行。**双目**（2026-09-26）已重新评估：几何与尺度成立，但**因 GPLv3 + 30 Hz 做不到而不采用**，只做参照 → `Docs/archive/ORB-SLAM3双目参照评估（2026-09-26）.md` |
 | `depth_scale/*`（`vio_new`、`osc_odometry`、`pose_graph_opt`、`loop_closure_check`、`metric_scale`、`umeyama_check`、`batch_scale`、`overlap_new`…） | VO 闭合误差 12–14% ❌，不用它替代 OSC 里程 |
 | `sfm_ba/`、`triangulation/triangulate_check.py` | 增量几何已止损：单帧墙 0.0098 m → 融合 0.071 m，瓶颈在**跨帧位姿** |
 | `loop_probe/`、`learned_probe/` | 学习描述子替 BoW、全局指纹：**判别力不足** |

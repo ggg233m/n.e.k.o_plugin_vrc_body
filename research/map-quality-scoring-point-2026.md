@@ -28,7 +28,7 @@
    OSC 回传的位置与速度就是结果的度量。**这是本项目相对学术界最占便宜的一点。**
 
 3. **绝对不能自己给自己打分。** 仓库已经踩过一次：
-   `Docs/停顿后地图错位-根因诊断（2026-10-01）.md` §505 记录了"自己给自己打分 → 结论反转"。
+   `Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md` §505 记录了"自己给自己打分 → 结论反转"。
    → 因此打分函数**必须带一个独立的参照物**（反事实臂 / OSC 真值 / 人工 golden 集），
    且**参照物不得由被评系统产生**。
 
@@ -123,7 +123,7 @@
 > **后者才是避障与局部规划真正依赖的东西**，"even when global accuracy may be compromised"。
 
 > ⚠️ 现有系统已经有一个"看起来像分数"的东西，注意别混用：
-> `Docs/2.5D建图主验收报告.md` 的 `all_route_costs_uncertain_are_explicit` 显示
+> `Docs/archive/2.5D建图主验收报告.md` 的 `all_route_costs_uncertain_are_explicit` 显示
 > **20/20 条路线边的代价都是"不确定"**。那是**校核项**（诚实的标志），不是分数。
 > 它恰好说明：**当前的地图基本没有代价信息**——这正是第 2 层要补的洞。
 
@@ -228,7 +228,7 @@ SoftS = max(0, 1 − d_t/d_0) · d_0 / max(d_0, d_traveled)
 同一起点、同一目标、同一控制律，比 `S`。差值就是学习部分的净收益。
 
 > ✅ **A 臂必须先固化并冻结**（golden 回放 + 固定阈值），否则每轮都在动基线，
-> 差值不可比——这正是 `Docs/停顿后地图错位-根因诊断（2026-10-01）.md` §505
+> 差值不可比——这正是 `Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md` §505
 > 记的那个错误的同构版本（那次是"配置挑中自己拽到一起的帧"）。
 >
 > ⚠️ 附加一条铁律：**A 臂的结果不能被用来调 B 臂的阈值**。
@@ -785,8 +785,8 @@ A 臂（规则分类器）**作为基线冻结**，永远不参与再训练。
 - [`research/terrain-classification-training-2026.md`](terrain-classification-training-2026.md) —— 地形分类原始方案
 - [`research/traversability-perception-lit-2026.md`](traversability-perception-lit-2026.md) —— 可通行性感知文献综述（完整证据底座）
 - [`Docs/开放世界具身智能体-项目计划.md`](../Docs/开放世界具身智能体-项目计划.md) §1.3 / §10.2 / §11.1 / §11.3 / §19.2
-- [`Docs/2.5D建图主验收报告.md`](../Docs/2.5D建图主验收报告.md) —— `all_route_costs_uncertain` 20/20
-- [`Docs/停顿后地图错位-根因诊断（2026-10-01）.md`](../Docs/停顿后地图错位-根因诊断（2026-10-01）.md) —— "自己给自己打分"的反例
+- [`Docs/archive/2.5D建图主验收报告.md`](../Docs/archive/2.5D建图主验收报告.md) —— `all_route_costs_uncertain` 20/20
+- [`Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md`](../Docs/archive/停顿后地图错位-根因诊断（2026-10-01）.md) —— "自己给自己打分"的反例
 
 **外部**
 - ViNL（ICRA 2023，零标签自监督可通行性 costmap）— https://arxiv.org/abs/2210.14791 ｜ https://github.com/SimarKareer/ViNL

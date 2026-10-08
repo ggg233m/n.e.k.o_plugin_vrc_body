@@ -5,7 +5,7 @@ r"""用 RTAB-Map 回环当"同一地点"证据，量 OSC+HMD 航位推算的**�
     python research/tools/dr_loop_drift.py .slam_probe/stereo_seq/run5_ipd126 .tmp/rtabmap_run5_ipd126/f2m_lite_r1/rtabmap.db --yaw-sign +1
 
 **来历**：原脚本是 `.tmp/dr_drift/dr_loop_drift.py`（2026-09-27 实验），
-`Docs/双目序列run5-7结论汇总（2026-09-27）.md` §3 记「脚本写了但**输出没有留在 `.tmp/`**
+`Docs/archive/双目序列run5-7结论汇总（2026-09-27）.md` §3 记「脚本写了但**输出没有留在 `.tmp/`**
 ⇒ 结论无产物，需重跑」，§7.4 又把它列为待补实验。本次（2026-10-05）把它搬进仓库
 并修好两处漂移：① 依赖 `stereo_seq_ground_truth` 的路径假设还停在旧的 `tools/`
 （该文件已迁到 `research/tools/`）；② 输出路径原来靠 `parents[3]` 反推、随 db 布局脆断。
