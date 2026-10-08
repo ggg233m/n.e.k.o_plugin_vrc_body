@@ -354,7 +354,7 @@ debug_command(command="body_vrchat_input", arguments={action="use", side="right"
 ```
 
 ⚠️ **`body_enable` / `body_disable` / `body_reset` agent 调不到** —— 它们是 `panel_command`
-（`agent_auto=false`），需用户在调试面板点击。参见 [Docs/README.md](Docs/README.md) §三 **C8 / C17**。
+（`agent_auto=false`），需用户在调试面板点击。参见 [Docs/CONFLICTS.md](Docs/CONFLICTS.md) **C8 / C17**。
 
 角度是插件定义的语义手臂角度，不是真实肩关节测量值。肩膀位置由 HMD 和身体配置估算，肩肘最终由 VRChat IK 求解。
 

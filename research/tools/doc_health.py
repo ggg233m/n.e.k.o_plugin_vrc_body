@@ -221,6 +221,142 @@ def check_archive_paths(files: list[Path]) -> list[str]:
     return sorted(set(bad))
 
 
+def _has_section(text: str, sec: str) -> bool:
+    """目标文本里是否存在小节 `sec`。
+
+    `sec` 可能是：
+      * 中文章号 ``四``      -> 匹配 ``## 四、`` / ``## 四 `` / ``### 四、``
+      * 阿拉伯全号 ``17.8``  -> 匹配 ``### 17.8``
+      * 带条目的 ``四.0``    -> 回退到父号 ``四``（作者常写 ``§四.0`` 指"§四 的第 0 条"）
+
+    判据刻意放宽到"**前缀命中**"并**逐级回退父号**：写 ``§3`` 时目标里有 ``### 3.1``
+    也算指得中（作者常以父号概称整组）。
+    这是有意的**假阴性优先**取向 —— 见本函数调用处的说明。
+
+    ⚠️ 回退**不是**可有可无的宽松：第一版没有它，``§四.0``（目标真身是
+    ``## 四、已知陷阱`` 下的第 0 条）被报成失效，而它其实指得中。
+    """
+    def match(s: str) -> bool:
+        if re.fullmatch(r"[\d.]+", s):
+            # 阿拉伯号：`17.8` 精确命中；`(?![\d])` 保证 `3` 不误吞 `31`
+            return re.search(r"^#{2,4}\s*" + re.escape(s) + r"(?![\d])", text, re.M) is not None
+        return re.search(
+            r"^#{2,4}\s*" + re.escape(s) + r"\s*[、.．:：\s]", text, re.M) is not None
+
+    if match(sec):
+        return True
+    # 逐级回退：`四.0` -> `四`；`17.8.1` -> `17.8` -> `17`
+    s = sec
+    while "." in s:
+        s = s.rsplit(".", 1)[0]
+        if match(s):
+            return True
+    return False
+
+
+def check_section_pointers() -> list[str]:
+    """F 类：**跨文档小节号指针**是否还指得中。
+
+    2026-10-08 拆分踩到的坑，必须机器化才不再复发：
+    `Docs/README.md` 的 §四（文档状态总表）与 §三（冲突登记表）在分层改造中
+    被搬走/重编号，全仓 **32 处**指针（`Docs/README.md` §三 **C18** 一类）
+    当场变成空指针 —— 而 A/C/D/E 四道门**一条都没拦住**：
+      * D 类只比"文件名集合"，指针内容不在它的视野；
+      * A 类只查 markdown 结构（`**` 配平、括号）；
+      * E 类只查 `Docs/` 前缀路径。
+    判据：形如 `` `xxx.md` §N `` 的引用，目标文件里必须真有该小节标题。
+    对 `Docs/README.md` 额外要求 **§号连续**（不许缺号，缺号说明有指针会指空）。
+
+    ⚠️ **取向是"假阴性优先"**：只报**明确指不中**的，宁可漏报也不误报。
+    第一版把 `§3.1`/`§17.8-4` 一律当小节号整串匹配，一次报了 38 条、
+    其中绝大多数是子小节号导致的误报（实测逐条核过）。误报的门会被绕过。
+
+    ⚠️ **② 有个已知盲区，必须说清**：它查"该小节**在不在**"，查不出
+    "**同一个号换了含义**"。本次事故正是后者 —— 拆分后 `§三` 仍在（改成了
+    文档地图），旧指针 `Docs/README.md` §三 **C18** 因此**照样通过**。
+    真正抓到本次回归的是 ①（`§四` 被抽走 ⇒ 一/二/三/**五** 断档）
+    与 ③（冲突条目**必须**落在 `CONFLICTS.md`）。②只防"号被删"。
+
+    豁免 `Docs/archive/`：历史层合法地指向**当时**的文档结构
+    （如 `verification_report.md` 记 `README §四 4.2` 是当时的实况），
+    与本仓"历史报告不回改"的规矩一致 —— 同 E 类豁免 ②。
+    """
+    cn = "一二三四五六七八九十"
+    readme = REPO / "Docs" / "README.md"
+    bad: list[str] = []
+
+    # ① README 自身的小节号必须连续（缺 §四 就是本次事故的直接特征）
+    if readme.exists():
+        heads = readme.read_text(encoding="utf-8", errors="replace").splitlines()
+        seen = [cn.index(m.group(1)) + 1 for l in heads if l.startswith("## ")
+                if (m := re.match(r"## ([" + cn + r"])[、.]", l))]
+        if seen and seen != list(range(1, len(seen) + 1)):
+            bad.append(
+                "Docs/README.md 小节号不连续：实际「%s」应为「%s」—— "
+                "缺号说明有跨文件指针会指空（2026-10-08 §四 事故）"
+                % ("".join(cn[i - 1] for i in seen), "".join(cn[i - 1] for i in range(1, len(seen) + 1)))
+            )
+
+    # ③ 冲突条目指针必须落在 CONFLICTS.md（本次事故的**直接**判据）
+    #    形如 `Docs/README.md` §三 **C18** / `Docs/README.md` **C9**
+    #
+    #    ⚠️ 中间**只允许** 空白 + 可选 `§N`：第一版写成 `[^\n`]{0,12}?`（任意 12 字符），
+    #    把 ROADMAP.md 里 `Docs/多帧融合…md` / **C29** 这种"**并列两个引用**"误当成
+    #    "把 C29 指向多帧融合"——实测踩到。并列与指针在文本上必须分开。
+    #
+    #    ⚠️ 必须容忍 **markdown 链接形态** ``[`x.md`](x.md) §三 **C18**`` ——
+    #    本仓库把反引号文件名再包一层链接是常见写法（ROADMAP.md 三处如此），
+    #    只认裸反引号的版本会**漏检真实的指针回归**（变异测试实测漏掉）。
+    #    链接尾巴是 ``](url)`` 而**不是** ``(url)`` —— 那个 ``]`` 必须一起吃掉，
+    #    第一版漏了它，于是整条正则对链接形态静默失配（变异测试第二次实测漏掉）。
+    c_pat = re.compile(
+        r"`([^`\n]+?\.md)`(?:\]\([^)\n]*\))?\s*(?:§[" + cn + r"\d][\d.]*)?\s*"
+        r"\*\*(C\d+(?:\s*[～~/、]\s*C?\d+)*)\*\*"
+    )
+    for p in doc_files():
+        rel = p.relative_to(REPO).as_posix()
+        if rel.startswith("Docs/archive/"):
+            continue  # 历史层豁免（它记的是当时的登记位置）
+        for m in c_pat.finditer(text := p.read_text(encoding="utf-8", errors="replace")):
+            target, cid = m.group(1), m.group(2)
+            if target.split("/")[-1] == "CONFLICTS.md":
+                continue
+            bad.append(
+                f"{rel} 把冲突条目 `{cid}` 指向了 {target} —— "
+                f"冲突登记表已独立为 Docs/CONFLICTS.md"
+            )
+
+    # ② 全仓跨文件小节指针必须指得中
+    #    形如 `x.md` §三 / `x.md` §三、 / `x.md` §17.8 / [`x.md`](x.md) §三
+    pat = re.compile(r"`([^`\n]+?\.md)`(?:\]\([^)\n]*\))?\s*§([" + cn + r"\d][\d.]*)")
+    for p in doc_files():
+        rel = p.relative_to(REPO).as_posix()
+        if rel.startswith("Docs/archive/"):
+            continue  # 历史层豁免（同 E 类豁免 ②）
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for m in pat.finditer(text):
+            target, sec = m.group(1), m.group(2).rstrip(".")
+            # 自身引用（`本文 §二` / 同文件内）不查：改号时会一起改
+            if target.split("/")[-1] == p.name:
+                continue
+            cands = [p.parent / target, REPO / "Docs" / target,
+                     REPO / "Docs" / "archive" / target, REPO / target]
+            tgt = next((c for c in cands if c.is_file()), None)
+            if tgt is None:
+                # ⚠️ 只报"**带目录前缀**的路径"（`Docs/x.md`）或索引自身。
+                # 裸文件名（`audit/REPORT.md`、`REPORT.md`、`vrchat-cache-…md`）**不报**：
+                # 仓库里同名报告有 7 份 `REPORT.md`，且外部调研稿可能只存在于
+                # 会话工作区而异机器不可得 —— 对它们做"不存在"的断定必然是误报
+                # （第一版就此误报过 `audit/REPORT.md` §2.4，实测踩到）。
+                if target.startswith(("Docs/", "backend/", "research/")):
+                    bad.append(f"{rel} 引用了不存在的文档: {target} §{sec}")
+                continue
+            t = tgt.read_text(encoding="utf-8", errors="replace")
+            if not _has_section(t, sec):
+                bad.append(f"{rel} 的指针失效: `{target}` §{sec} —— 目标文件没有该小节")
+    return sorted(set(bad))
+
+
 def check_facts() -> list[str]:
     """C 类：FACTS.md 里引用的 `文档名:行号` 必须真实存在。
 
@@ -339,6 +475,17 @@ def main() -> int:
     for b in arch_bad:
         print("    ** %s" % b)
     hard_fail += len(arch_bad)
+
+    # F 类：跨文档小节指针（硬门禁 —— 2026-10-08 拆分事故的机器化）
+    sec_bad = check_section_pointers()
+    report["section_pointers"] = sec_bad
+    print()
+    print("[F] 跨文档小节指针 —— 硬门禁（`x.md` §N 必须在目标里指得中）")
+    if not sec_bad:
+        print("    全部指得中")
+    for b in sec_bad:
+        print("    ** %s" % b)
+    hard_fail += len(sec_bad)
 
     if args.refs:
         refs = check_refs(files, index)

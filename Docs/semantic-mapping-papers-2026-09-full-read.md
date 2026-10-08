@@ -2,7 +2,7 @@
 
 > **状态**：外部调研（**全文精读**，不是搜索片段）；快照日期 **2026-09-30**。
 > 这不是"当前实现"的描述；任何与代码不符处**以代码为准**（见 `Docs/README.md` §一）。
-> 已登记于 `Docs/README.md` §四（📑）。文中所有数字均来自实读原文，未读到的标 **NOT FOUND**。
+> 已登记于 `Docs/README.md` §三（📑）。文中所有数字均来自实读原文，未读到的标 **NOT FOUND**。
 
 Scope: papers 1–5 of the brief, read in FULL from arXiv HTML, not snippets.
 All page/section references are to the fetched full text. Anything I could not find is marked **NOT FOUND**.

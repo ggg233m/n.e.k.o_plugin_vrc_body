@@ -33,7 +33,7 @@
 | 产物 | `topo_map` / `nav_map.json` / `world_model.json` / 2.5D 障碍层 | 三态栅格（free/obstacle/unknown）+ navmesh |
 | 接线 | **离线跑，人工触发**（入口 `map_from_capture.py`） | **已接进后端**：`service.py` 构造 `OnlineNavigator`，11 处调用 |
 | HTTP | 无 | `GET /worldmodel/navmesh`、`POST /worldmodel/navmesh/{start,stop,goto,explore,cancel}` |
-| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话检索 ✅ / 采纳下游消费 ❌**（2026-10-04 更正，见 `Docs/README.md` §三 **C18**） |
+| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话检索 ✅ / 采纳下游消费 ❌**（2026-10-04 更正，见 `Docs/CONFLICTS.md` **C18**） |
 
 **两条路线各有坐标系与尺度、没有绑定** —— 这是当前最大的结构洞。
 详见 [`Docs/自动到达能力差距清单.md`](自动到达能力差距清单.md)（2026-09-30 已重写）。
@@ -103,7 +103,7 @@
 | **持久空间记忆**（新北极星里的那个） | `ROADMAP.md` 北极星；`Docs/业界世界模型方案落地评估（2026-09-29）.md` |
 
 ⇒ **说"世界身份"或"地点记忆"，不要写"世界模型"**。这条**已经在文档里造成过实际混淆**
-（见 `Docs/README.md` §三 C7 / C15）。
+（见 `Docs/CONFLICTS.md` **C7 / C15**）。
 
 ---
 
