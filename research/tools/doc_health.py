@@ -189,6 +189,38 @@ def check_refs(files: list[Path], index: dict[str, list[str]]) -> dict:
     }
 
 
+def check_archive_paths(files: list[Path]) -> list[str]:
+    """E 类：指向已归档文档、但漏写 `archive/` 前缀的**路径引用**。
+
+    分层改造后最容易漏的一类：文件在 `Docs/archive/`，而别处仍写 `Docs/xxx.md`。
+    纯文本搜索看不出来（裸文件名到处都是，包括索引表本身），
+    所以判据必须收紧到**带 `Docs/` 前缀的路径**。
+
+    两条豁免（都是误报源，实测踩过）：
+      ① `Docs/README.md` —— 索引自身仍在现役层，与 `archive/README.md` 同名不同物；
+      ② **归档件之间互引** —— 历史层内部引用旧路径是**合法的**
+         （本仓规矩：历史报告不回改，只在其内部自洽即可）。
+    """
+    arch = {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
+    bad: list[str] = []
+    for p in files:
+        rel = p.relative_to(REPO).as_posix()
+        if rel.startswith("Docs/archive/"):
+            continue  # 豁免 ②
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"Docs/([^`\s\)\]、，]*?\.md)", text):
+            name = m.group(1)
+            if name.startswith("archive/") or name not in arch:
+                continue
+            if name == "README.md":
+                continue  # 豁免 ①
+            bad.append(f"{rel} 引用了 Docs/{name}，但该文件已在 Docs/archive/{name}")
+    return sorted(set(bad))
+
+
 def check_facts() -> list[str]:
     """C 类：FACTS.md 里引用的 `文档名:行号` 必须真实存在。
 
@@ -296,6 +328,17 @@ def main() -> int:
     for b in cov_bad:
         print("    ** %s" % b)
     hard_fail += len(cov_bad)
+
+    # E 类：归档路径前缀（硬门禁 —— 分层改造后最容易漏的一类）
+    arch_bad = check_archive_paths(files)
+    report["archive_paths"] = arch_bad
+    print()
+    print("[E] 归档路径前缀 —— 硬门禁（Docs/xxx.md 应写成 Docs/archive/xxx.md）")
+    if not arch_bad:
+        print("    全部正确")
+    for b in arch_bad:
+        print("    ** %s" % b)
+    hard_fail += len(arch_bad)
 
     if args.refs:
         refs = check_refs(files, index)
