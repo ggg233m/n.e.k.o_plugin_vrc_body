@@ -6,25 +6,25 @@
       "unk_cells": 140454,
       "walkable_center_m2": 377.9,
       "regions": 124,
-      "corridor_blockers": 8832,
+      "corridor_blockers": 5396,
       "R1.5": {
-        "known_obstacle_pct": 22.48,
-        "free_pct": 54.63,
-        "unknown_pct": 29.53
+        "known_obstacle_pct": 14.18,
+        "free_pct": 82.36,
+        "unknown_pct": 4.03
       },
       "R2.5": {
-        "known_obstacle_pct": 20.82,
-        "free_pct": 55.33,
-        "unknown_pct": 30.12
+        "known_obstacle_pct": 16.72,
+        "free_pct": 78.25,
+        "unknown_pct": 6.04
       },
       "R3.0": {
-        "known_obstacle_pct": 20.45,
-        "free_pct": 55.19,
-        "unknown_pct": 30.61
+        "known_obstacle_pct": 17.96,
+        "free_pct": 75.97,
+        "unknown_pct": 7.4
       },
       "n_kf": 3014,
       "n_refresh": 0,
-      "replay_s": 13.9
+      "replay_s": 14.7
     },
     "on": {
       "occ_cells": 9692,
@@ -32,26 +32,26 @@
       "unk_cells": 154550,
       "walkable_center_m2": 382.8,
       "regions": 139,
-      "corridor_blockers": 3618,
+      "corridor_blockers": 3695,
       "R1.5": {
-        "known_obstacle_pct": 11.3,
-        "free_pct": 54.73,
-        "unknown_pct": 38.3
+        "known_obstacle_pct": 9.55,
+        "free_pct": 82.52,
+        "unknown_pct": 8.77
       },
       "R2.5": {
-        "known_obstacle_pct": 10.47,
-        "free_pct": 55.43,
-        "unknown_pct": 38.09
+        "known_obstacle_pct": 10.28,
+        "free_pct": 78.37,
+        "unknown_pct": 12.65
       },
       "R3.0": {
-        "known_obstacle_pct": 10.12,
-        "free_pct": 55.29,
-        "unknown_pct": 38.48
+        "known_obstacle_pct": 10.03,
+        "free_pct": 76.09,
+        "unknown_pct": 15.43
       },
       "from_occ_to_free": 14227,
       "from_occ_to_unk": 14096,
-      "freed_on_corridor": 5214,
-      "freed_off_corridor": 9013,
+      "freed_on_corridor": 1905,
+      "freed_off_corridor": 12322,
       "comp_big": 55,
       "comp_big_cells": 22363,
       "comp_big_kept_frac": 0.401,
@@ -60,7 +60,7 @@
       "comp_small_kept_frac": 0.467,
       "n_kf": 3014,
       "n_refresh": 0,
-      "replay_s": 14.3
+      "replay_s": 14.9
     },
     "on_mid": {
       "occ_cells": 9692,
@@ -68,26 +68,26 @@
       "unk_cells": 149128,
       "walkable_center_m2": 402.8,
       "regions": 138,
-      "corridor_blockers": 3618,
+      "corridor_blockers": 3695,
       "R1.5": {
-        "known_obstacle_pct": 10.56,
-        "free_pct": 59.06,
-        "unknown_pct": 33.97
+        "known_obstacle_pct": 9.17,
+        "free_pct": 86.32,
+        "unknown_pct": 4.97
       },
       "R2.5": {
-        "known_obstacle_pct": 9.85,
-        "free_pct": 59.32,
-        "unknown_pct": 34.2
+        "known_obstacle_pct": 9.77,
+        "free_pct": 82.94,
+        "unknown_pct": 8.08
       },
       "R3.0": {
-        "known_obstacle_pct": 9.54,
-        "free_pct": 59.05,
-        "unknown_pct": 34.72
+        "known_obstacle_pct": 9.5,
+        "free_pct": 80.81,
+        "unknown_pct": 10.71
       },
       "from_occ_to_free": 14227,
       "from_occ_to_unk": 8674,
-      "freed_on_corridor": 5214,
-      "freed_off_corridor": 9013,
+      "freed_on_corridor": 1905,
+      "freed_off_corridor": 12322,
       "comp_big": 55,
       "comp_big_cells": 22363,
       "comp_big_kept_frac": 0.401,
@@ -96,7 +96,7 @@
       "comp_small_kept_frac": 0.467,
       "n_kf": 3014,
       "n_refresh": 0,
-      "replay_s": 15.7
+      "replay_s": 16.9
     }
   },
   "20261001_044120": {
@@ -106,25 +106,25 @@
       "unk_cells": 10199,
       "walkable_center_m2": 12.9,
       "regions": 13,
-      "corridor_blockers": 38,
+      "corridor_blockers": 5,
       "R1.5": {
-        "known_obstacle_pct": 4.61,
-        "free_pct": 68.02,
-        "unknown_pct": 28.7
+        "known_obstacle_pct": 0.59,
+        "free_pct": 66.73,
+        "unknown_pct": 32.87
       },
       "R2.5": {
-        "known_obstacle_pct": 4.65,
-        "free_pct": 65.46,
-        "unknown_pct": 31.34
+        "known_obstacle_pct": 1.76,
+        "free_pct": 64.3,
+        "unknown_pct": 34.55
       },
       "R3.0": {
-        "known_obstacle_pct": 4.5,
-        "free_pct": 62.37,
-        "unknown_pct": 34.69
+        "known_obstacle_pct": 4.77,
+        "free_pct": 61.43,
+        "unknown_pct": 35.49
       },
       "n_kf": 11,
       "n_refresh": 2,
-      "replay_s": 0.5
+      "replay_s": 0.1
     },
     "on": {
       "occ_cells": 48,
@@ -132,26 +132,26 @@
       "unk_cells": 10710,
       "walkable_center_m2": 12.9,
       "regions": 13,
-      "corridor_blockers": 0,
+      "corridor_blockers": 3,
       "R1.5": {
-        "known_obstacle_pct": 0.0,
-        "free_pct": 68.02,
-        "unknown_pct": 31.98
+        "known_obstacle_pct": 0.39,
+        "free_pct": 66.73,
+        "unknown_pct": 33.0
       },
       "R2.5": {
-        "known_obstacle_pct": 0.85,
-        "free_pct": 65.46,
-        "unknown_pct": 33.98
+        "known_obstacle_pct": 0.66,
+        "free_pct": 64.3,
+        "unknown_pct": 35.27
       },
       "R3.0": {
-        "known_obstacle_pct": 0.8,
-        "free_pct": 62.37,
-        "unknown_pct": 37.13
+        "known_obstacle_pct": 1.16,
+        "free_pct": 61.43,
+        "unknown_pct": 37.85
       },
       "from_occ_to_free": 511,
       "from_occ_to_unk": 511,
-      "freed_on_corridor": 38,
-      "freed_off_corridor": 473,
+      "freed_on_corridor": 2,
+      "freed_off_corridor": 509,
       "comp_big": 2,
       "comp_big_cells": 514,
       "comp_big_kept_frac": 0.078,
@@ -168,26 +168,26 @@
       "unk_cells": 10680,
       "walkable_center_m2": 13.0,
       "regions": 13,
-      "corridor_blockers": 0,
+      "corridor_blockers": 3,
       "R1.5": {
-        "known_obstacle_pct": 0.0,
-        "free_pct": 68.13,
-        "unknown_pct": 31.87
+        "known_obstacle_pct": 0.39,
+        "free_pct": 66.83,
+        "unknown_pct": 32.9
       },
       "R2.5": {
-        "known_obstacle_pct": 0.84,
-        "free_pct": 65.84,
-        "unknown_pct": 33.6
+        "known_obstacle_pct": 0.66,
+        "free_pct": 64.43,
+        "unknown_pct": 35.14
       },
       "R3.0": {
-        "known_obstacle_pct": 0.8,
-        "free_pct": 62.72,
-        "unknown_pct": 36.78
+        "known_obstacle_pct": 1.15,
+        "free_pct": 61.86,
+        "unknown_pct": 37.42
       },
       "from_occ_to_free": 511,
       "from_occ_to_unk": 481,
-      "freed_on_corridor": 38,
-      "freed_off_corridor": 473,
+      "freed_on_corridor": 2,
+      "freed_off_corridor": 509,
       "comp_big": 2,
       "comp_big_cells": 514,
       "comp_big_kept_frac": 0.078,
@@ -206,25 +206,25 @@
       "unk_cells": 87694,
       "walkable_center_m2": 234.8,
       "regions": 45,
-      "corridor_blockers": 2164,
+      "corridor_blockers": 1652,
       "R1.5": {
-        "known_obstacle_pct": 18.58,
-        "free_pct": 55.55,
-        "unknown_pct": 31.77
+        "known_obstacle_pct": 13.14,
+        "free_pct": 85.45,
+        "unknown_pct": 1.61
       },
       "R2.5": {
-        "known_obstacle_pct": 18.74,
-        "free_pct": 53.95,
-        "unknown_pct": 33.61
+        "known_obstacle_pct": 16.15,
+        "free_pct": 80.25,
+        "unknown_pct": 4.3
       },
       "R3.0": {
-        "known_obstacle_pct": 19.03,
-        "free_pct": 52.67,
-        "unknown_pct": 34.94
+        "known_obstacle_pct": 17.06,
+        "free_pct": 77.47,
+        "unknown_pct": 6.59
       },
       "n_kf": 391,
       "n_refresh": 6,
-      "replay_s": 1.9
+      "replay_s": 2.3
     },
     "on": {
       "occ_cells": 4080,
@@ -232,26 +232,26 @@
       "unk_cells": 97669,
       "walkable_center_m2": 235.6,
       "regions": 49,
-      "corridor_blockers": 502,
+      "corridor_blockers": 1104,
       "R1.5": {
-        "known_obstacle_pct": 5.47,
-        "free_pct": 55.55,
-        "unknown_pct": 41.24
+        "known_obstacle_pct": 7.7,
+        "free_pct": 85.5,
+        "unknown_pct": 7.36
       },
       "R2.5": {
-        "known_obstacle_pct": 5.86,
-        "free_pct": 53.95,
-        "unknown_pct": 42.69
+        "known_obstacle_pct": 7.71,
+        "free_pct": 80.28,
+        "unknown_pct": 13.01
       },
       "R3.0": {
-        "known_obstacle_pct": 6.18,
-        "free_pct": 52.68,
-        "unknown_pct": 43.85
+        "known_obstacle_pct": 7.17,
+        "free_pct": 77.51,
+        "unknown_pct": 16.51
       },
       "from_occ_to_free": 9998,
       "from_occ_to_unk": 9975,
-      "freed_on_corridor": 1662,
-      "freed_off_corridor": 8336,
+      "freed_on_corridor": 678,
+      "freed_off_corridor": 9320,
       "comp_big": 26,
       "comp_big_cells": 13476,
       "comp_big_kept_frac": 0.289,
@@ -260,7 +260,7 @@
       "comp_small_kept_frac": 0.309,
       "n_kf": 391,
       "n_refresh": 6,
-      "replay_s": 1.8
+      "replay_s": 2.0
     },
     "on_mid": {
       "occ_cells": 4080,
@@ -268,26 +268,26 @@
       "unk_cells": 94968,
       "walkable_center_m2": 246.1,
       "regions": 50,
-      "corridor_blockers": 502,
+      "corridor_blockers": 1104,
       "R1.5": {
-        "known_obstacle_pct": 5.23,
-        "free_pct": 58.22,
-        "unknown_pct": 38.57
+        "known_obstacle_pct": 7.37,
+        "free_pct": 89.7,
+        "unknown_pct": 3.17
       },
       "R2.5": {
-        "known_obstacle_pct": 5.61,
-        "free_pct": 56.54,
-        "unknown_pct": 40.1
+        "known_obstacle_pct": 7.35,
+        "free_pct": 84.52,
+        "unknown_pct": 8.78
       },
       "R3.0": {
-        "known_obstacle_pct": 5.91,
-        "free_pct": 55.22,
-        "unknown_pct": 41.31
+        "known_obstacle_pct": 6.85,
+        "free_pct": 81.46,
+        "unknown_pct": 12.55
       },
       "from_occ_to_free": 9998,
       "from_occ_to_unk": 7274,
-      "freed_on_corridor": 1662,
-      "freed_off_corridor": 8336,
+      "freed_on_corridor": 678,
+      "freed_off_corridor": 9320,
       "comp_big": 26,
       "comp_big_cells": 13476,
       "comp_big_kept_frac": 0.289,
@@ -296,7 +296,7 @@
       "comp_small_kept_frac": 0.309,
       "n_kf": 391,
       "n_refresh": 6,
-      "replay_s": 2.1
+      "replay_s": 2.5
     }
   }
 }
