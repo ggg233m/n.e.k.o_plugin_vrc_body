@@ -61,6 +61,7 @@ rg <关键词> Docs/archive/    # 只搜历史
 | 世界模型业界有什方案可用 | `Docs/业界世界模型方案落地评估（2026-09-29）.md` |
 | 某个文件/模块还在不在、旧路径去哪了 | `Docs/文档勘误与过时清单（2026-09-29）.md` |
 | 现在有深度吗？有 SLAM 吗？ | **见 [`CONFLICTS.md`](CONFLICTS.md) C2**（答案：本地避障是 2.5D 增量栅格，需双目深度可用且本地导航已启用；**无跨遮挡全局推理**） |
+| 离线 2.5D 流水线现在还有人用吗？ | **没有** —— [`CONFLICTS.md`](CONFLICTS.md) **C33**（架构位置仍在，当前用途为零） |
 | **建图 / SLAM 精度低，该怎么排查？** | ⚠️ **先看 [`CONFLICTS.md`](CONFLICTS.md) C21**。现役是**镜像双目**链路；`.slam_probe/` 里那批单目探针报告**结论已作废**，别拿它们的"根因"当现役瓶颈 |
 | 某个工具存不存在 | `tool_defs.py` / `__init__.py`（代码），不要信文档里的清单 |
 | 某个标定数值是多少 | 先在本文 §二 找到权威文档，再核对代码 |
@@ -83,7 +84,7 @@ rg <关键词> Docs/archive/    # 只搜历史
 | 相机内参 —— **SteamVR 镜像路径** | `openvr_mirror.projection_intrinsics()`（定义 `backend/openvr_mirror.py:289`；调用 `backend/nav_online.py:370`） | `getProjectionRaw`，2880×1620 经 mip 降到 720×405 ⇒ fx=202.5。⚠️ 原写的 `nav_online.py:280` 是错的，见 [`CONFLICTS.md`](CONFLICTS.md) **C20** |
 | 在线导航架构 | `backend/nav_online.py` + `nav_mapping.py` + `nav_loop.py` + `nav_grid.py` + `nav_follow.py` + **`nav_xsession.py`** + **`nav_memory.py`** + `nav_bow.py` | `nav_xsession` 是**跨会话 P0 的主体且默认开**（2026-10-02 起），前次修订漏登。`nav_follow` 由 `nav_mapping.py:882` 惰性 import |
 | 跨会话重定位现状 | 代码 `backend/nav_xsession.py` / `nav_online.py` / **`nav_prior.py`**；过程记录 `Docs/P0*（2026-10-02~03）` | ⚠️ 拆两行读，见 [`CONFLICTS.md`](CONFLICTS.md) **C18**（检索 ✅ / 采纳下游消费 ✅；**prior/ 注入在线 ✅ 但差 live 端到端**） |
-| 离线 2.5D 流水线 | `.slam_probe/offline_probe/recorder/` + `research/recorder/` | ⚠️ 编排器 `map_from_capture.py` 曾因迁移断裂，已修 |
+| 离线 2.5D 流水线 | `.slam_probe/offline_probe/recorder/` + `research/recorder/` | ⚠️ **2026-10-11 已存档隔离**：发行面/工具面**零消费者**（`backend/`、`tool_defs.py`、`__init__.py` 各 0 命中），最新 run 停在 `20260920-233456` ⇒ 见 [`CONFLICTS.md`](CONFLICTS.md) **C33** 与 `.slam_probe/offline_probe/ARCHIVED.md`。⚠️ **不要与 `research/tools/offline_fusion.py` 混淆**（那条用 SGBM 双目、产 `prior.npz`、在线默认消费，仍现役）。编排器 `map_from_capture.py` 曾因迁移断裂，已修 |
 | 航位推算公式 | `backend/pose_math.py` | **唯一实现**；`online_pose.py`/`pose_graph.py` 已删除 |
 | 米制标定配方（待执行） | `Docs/标定录制SOP（2026-09-24）.md` | 段 B 尚未录制；P4 依赖它。⚠️ **2026-10-05**：`.tmp/calib_anchor_dr.json` 存在但**非合规录制**（见 [`CONFLICTS.md`](CONFLICTS.md) **C22**） |
 | **建图的实测能力边界**（高度精度 / 地形可分辨性 / 尺度自洽） | `Docs/建图实测能力边界（2026-10-05）.md` | **2026-10-05 新增**。局部高度精度 1.7–2.1 cm 不随距离退化；**"深度链与 OSC 链差 5–13%" 对现役链是死问题**（见 [`CONFLICTS.md`](CONFLICTS.md) **C22**）。工具全在 `research/tools/` |

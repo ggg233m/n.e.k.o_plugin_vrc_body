@@ -57,7 +57,7 @@
 | 位姿 | 航位推算（`backend/pose_math.py`，唯一实现）+ 位姿图 | 20 Hz 航位推算 + ORB+PnP 回环（**只修平移，朝向来自 HMD**） |
 | 产物 | `topo_map` / `nav_map` / `world_model.json` / 2.5D 障碍层 | 三态栅格（free/obstacle/unknown）+ navmesh |
 | 接线 | 离线跑，人工触发 | **已接进后端**：`service.py` 构造 `OnlineNavigator`，调用 `status/grid_view/start/stop/goto/explore/cancel` |
-| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded` | 局部建图跑通；**跨会话检索 ✅ / 采纳下游消费 ❌**（2026-10-04 拆行，见下） |
+| 状态 | 主样本 `20260920-233456` 验收 **pass**（21 节点 / 20 边），manifest 为 `degraded`。⚠️ **2026-10-11 已存档隔离**：发行面/工具面**零消费者**、最新 run 停在 `20260920-233456` ⇒ [`CONFLICTS.md`](Docs/CONFLICTS.md) **C33**、`.slam_probe/offline_probe/ARCHIVED.md`。**pass 是历史事实，不是当前用途** | 局部建图跑通；**跨会话检索 ✅ / 采纳下游消费 ❌**（2026-10-04 拆行，见下） |
 
 **⚠️ 2026-10-04 状态更正（原句「局部建图跑通；跨会话重定位失败」已过期，拆两行读）**：
 
@@ -293,6 +293,11 @@ WGC 是**遗留**，决定全转双目。连带三件必须**一起**做，否�
 
 未迁移的那半条流水线（20+ 脚本）与全部录制素材只在 `.slam_probe/`，而它被 gitignore
 （`.gitignore:19`）。**这是结构性风险，不是整洁问题** —— full 无备份。
+
+⚠️ **2026-10-11 补**：该流水线已**存档隔离**（C33），但**隔离只加了标记、没有搬迁**。
+物理搬迁前必须先决定 **`offline_probe/recorder/runs/`（35 个 run、约 5.1 GB，含全部录制素材与深度缓存）
+是保留还是清掉** —— 它同时是 `estimate_video_offset.py` / `calib_hmd_anchor.py`（P4 米制锚点）的输入来源。
+⇒ **先纳入版本控制 / 备份，再谈搬迁**，否则搬完就没有回滚点。
 
 ## 明确不做
 
