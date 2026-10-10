@@ -557,10 +557,10 @@ class BackendService:
         view = self.navmesh.coverage_view()
         return view if view is not None else {"available": False, "reason": "no_map_yet"}
 
-    def navmesh_start(self, record: bool = False) -> dict[str, Any]:
+    def navmesh_start(self, record: bool = False, record_images: bool = False) -> dict[str, Any]:
         if not self._started:
             return {**self.navmesh.status(), "ok": False, "reason": "backend_not_started"}
-        return {**self.navmesh.start(record=record), "ok": True}
+        return {**self.navmesh.start(record=record, record_images=record_images), "ok": True}
 
     def navmesh_stop(self) -> dict[str, Any]:
         return {**self.navmesh.stop(), "ok": True}

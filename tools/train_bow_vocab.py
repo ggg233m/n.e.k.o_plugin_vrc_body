@@ -8,11 +8,11 @@
         --out models/bow_vocab.npz --branching 16 --depth 3
 
 输出到 `models/bow_vocab.npz`；`backend/nav_loop.py` 的 `LoopConfig.bow_vocab`
-默认指向这里，但 `bow_candidates` 默认 **0（关）**，要显式打开才有外观候选。
+默认指向这里；`bow_candidates` 2026-10-10 起默认 4（开）。
 
 ⚠️ **词汇树是世界相关的**：它把 ORB 描述子空间切成 4096 个词，切法由训练数据决定。
 跨路线（同世界）迁移实测只掉 0.5~4.6 pt 召回；**跨世界未测**，换世界请重训。
-这也是它不随包默认开启的原因之一。
+词汇树缺失时回环只是没有外观候选（`status()["bow_reason"]` = vocab_missing）。
 
 训练只用**前若干帧**的描述子（默认前一半），这样尾部帧可以用来做"没见过的地方"的
 召回测试，不会自己检自己。

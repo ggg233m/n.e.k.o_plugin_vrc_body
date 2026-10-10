@@ -72,6 +72,8 @@
         <button id="explore">探索</button>
         <button id="cancel">取消目标</button>
         <label class="muted"><input type="checkbox" id="record"> 录制本次会话</label>
+        <!-- 关键帧左右原图：离线重算视差 / 跨经过稠密对齐要用；720 下每关键帧约 +0.26 MB。 -->
+        <label class="muted" title="另存关键帧左右灰度原图（kf_img/），720 下每关键帧约 +0.26 MB"><input type="checkbox" id="recordImages" disabled> 含双目原图</label>
       </div>
       <p id="recInfo" class="muted"></p>
       <!-- 世界身份：跨会话检索 / 采纳 / 世界先验消费**全都**挂在它上面，没设就是整条链不启动。

@@ -237,9 +237,10 @@ class BowCandidateTest(unittest.TestCase):
         des = rng.integers(0, 256, (n, 32), dtype=np.uint8)
         return KeyframeFeatures(uv, des, P.astype(np.float32), des, K, (720, 405), HALF_B)
 
-    def test_off_by_default(self) -> None:
-        self.assertEqual(LoopConfig().bow_candidates, 0)
-        st = LoopCloser(LoopConfig()).status()
+    def test_on_by_default(self) -> None:
+        # 2026-10-10 起默认开（4 个外观候选）；0 仍是关闭。
+        self.assertEqual(LoopConfig().bow_candidates, 4)
+        st = LoopCloser(LoopConfig(bow_candidates=0)).status()
         self.assertFalse(st["bow_ready"])
         self.assertEqual(st["bow_reason"], "disabled")
 

@@ -107,7 +107,9 @@ $("gotoClear").onclick = () => {
   pending = null; $("gotoConfirm").disabled = true; $("gotoClear").disabled = true;
   $("clickInfo").textContent = "点击栅格选择目标。"; draw();
 };
-$("start").onclick = () => act("启动", "/worldmodel/navmesh/start", {record: $("record").checked});
+$("start").onclick = () => act("启动", "/worldmodel/navmesh/start",
+  {record: $("record").checked, record_images: $("record").checked && $("recordImages").checked});
+$("record").onchange = () => { $("recordImages").disabled = !$("record").checked; };
 $("stop").onclick = () => act("停止", "/worldmodel/navmesh/stop");
 $("explore").onclick = () => act("探索", "/worldmodel/navmesh/explore");
 $("cancel").onclick = () => act("取消目标", "/worldmodel/navmesh/cancel");
@@ -126,8 +128,9 @@ function render(s, auto) {
   $("state").className = `state ${running ? "running" : "stopped"}`;
   $("start").disabled = running; $("stop").disabled = !running; $("explore").disabled = !running;
   $("record").disabled = running;
+  $("recordImages").disabled = running || !$("record").checked;
   const rec = s.recording;
-  $("recInfo").textContent = rec ? `录制：${rec.keyframes} 关键帧 · ${rec.mb} MB${rec.stopped ? " · " + rec.stopped : ""} · ${rec.dir}` : "";
+  $("recInfo").textContent = rec ? `录制：${rec.keyframes} 关键帧${rec.images ? "（含原图）" : ""} · ${rec.mb} MB${rec.stopped ? " · " + rec.stopped : ""} · ${rec.dir}` : "";
   $("mode").textContent = s.mode || "—";
   const p = s.pose;
   $("pose").textContent = p ? `x ${num(p.xy_m[0])}  y ${num(p.xy_m[1])}  θ ${num(p.theta_rad * 180 / Math.PI, 0)}°  σ ${num(p.sigma_m)}` : "—";

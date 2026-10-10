@@ -12,6 +12,7 @@ from dataclasses import fields
 from pathlib import Path
 from unittest import mock
 
+import cv2
 import numpy as np
 
 from tests import _bootstrap  # noqa: F401
@@ -930,10 +931,11 @@ class ConfigSurfaceTest(unittest.TestCase):
 
 
 class RecorderTest(unittest.TestCase):
-    def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False) -> dict:
+    def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False,
+                    record_images: bool = False) -> dict:
         h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
-            h.nav.start(record=record)
+            h.nav.start(record=record, record_images=record_images)
             try:
                 deadline = time.monotonic() + 5.0
                 while time.monotonic() < deadline and h.nav.status()["keyframes"] < 3:
@@ -977,6 +979,26 @@ class RecorderTest(unittest.TestCase):
             self.assertEqual(len(osc_lines), 1)
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
+
+    def test_record_images_writes_keyframe_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self.run_session(Path(d), record=True, record_images=True)
+            out = Path(st["recording"]["dir"])
+            kfs = sorted(int(p.stem) for p in (out / "kf").glob("*.npz"))
+            self.assertGreaterEqual(len(kfs), 3)
+            for k in kfs:
+                for eye in "LR":
+                    img = cv2.imread(str(out / "kf_img" / f"{k:06d}_{eye}.png"), cv2.IMREAD_UNCHANGED)
+                    self.assertIsNotNone(img, f"{k}_{eye}")
+                    self.assertEqual(img.shape, (4, 4))
+            self.assertTrue(st["recording"]["images"])
+            self.assertTrue(json.loads((out / "meta.json").read_text(encoding="utf-8"))["record_images"])
+
+    def test_record_images_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self.run_session(Path(d), record=True)
+            self.assertFalse((Path(st["recording"]["dir"]) / "kf_img").exists())
+            self.assertFalse(st["recording"]["images"])
 
     def test_size_limit_stops_recording_not_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as d:

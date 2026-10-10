@@ -196,14 +196,18 @@ class SessionRecorder:
 
     目录内容：``meta.json``（配置、传感器）、``hmd.jsonl``（每个位姿周期的 HMD 旋转，base 系）、
     ``osc.jsonl``（新到的 OSC 速度样本）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
-    ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）。
+    ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
+    ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右灰度原图，采集分辨率）。
 
     感知线程只往内存缓冲里追加（``line``），所有磁盘写都在建图线程（``flush`` / ``keyframe``）里做。
     写失败或超出上限就停录并留痕，不影响导航。
     """
 
-    def __init__(self, root: Path, max_bytes: float, meta: dict[str, Any]) -> None:
+    def __init__(self, root: Path, max_bytes: float, meta: dict[str, Any], images: bool = False) -> None:
         self.dir = Path(root)
+        # 关键帧左右灰度原图另存 ``kf_img/<id>_{L,R}.png``（720 下每帧约 +0.26 MB）。
+        # 用途：离线重算视差 / 稠密重定位 / 跨经过对齐 —— kf/*.npz 只有体素点和稀疏 ORB，做不了这些。
+        self.images = bool(images)
         (self.dir / "kf").mkdir(parents=True, exist_ok=True)
         self.max_bytes = float(max_bytes)
         self.bytes = 0
@@ -217,7 +221,7 @@ class SessionRecorder:
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {"dir": str(self.dir), "keyframes": self.keyframes, "mb": round(self.bytes / 1e6, 1),
-                    "stopped": self.stopped}
+                    "stopped": self.stopped, "images": self.images}
 
     def line(self, name: str, obj: dict[str, Any]) -> None:
         text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=_json_default)
@@ -244,7 +248,7 @@ class SessionRecorder:
             self._check_size_locked()
 
     def keyframe(self, k: int, pts: np.ndarray, T_dr: np.ndarray, T_map: np.ndarray, dist_m: float,
-                 feat: Any) -> None:
+                 feat: Any, images: tuple[np.ndarray, np.ndarray] | None = None) -> None:
         arrays: dict[str, np.ndarray] = {"pts": np.asarray(pts, np.float32), "T_dr": np.asarray(T_dr, float),
                                          "T_map": np.asarray(T_map, float), "dist_m": np.array(float(dist_m))}
         if feat is not None:
@@ -258,6 +262,14 @@ class SessionRecorder:
                 np.savez(path, **arrays)   # 不压缩：点云压不了多少，还占建图线程
                 self.bytes += path.stat().st_size
                 self.keyframes += 1
+                if images is not None and self.images:
+                    # PNG 无损（视差要亚像素，JPEG 的块效应会直接变成深度偏置）；压缩级 1 求快。
+                    (self.dir / "kf_img").mkdir(exist_ok=True)
+                    for eye, img in zip("LR", images):
+                        ip = self.dir / "kf_img" / f"{int(k):06d}_{eye}.png"
+                        if not cv2.imwrite(str(ip), img, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+                            raise OSError(f"imwrite failed: {ip.name}")
+                        self.bytes += ip.stat().st_size
             except OSError as exc:
                 self._halt_locked(f"write_failed: {exc}")
             self._check_size_locked()
@@ -690,8 +702,9 @@ class OnlineNavigator:
     def running(self) -> bool:
         return any(t.is_alive() for t in self._threads)
 
-    def start(self, record: bool = False) -> dict[str, Any]:
-        """``record=True``：把这次会话的原始输入录到 ``record_root/<时间>/``（默认不录）。"""
+    def start(self, record: bool = False, record_images: bool = False) -> dict[str, Any]:
+        """``record=True``：把这次会话的原始输入录到 ``record_root/<时间>/``（默认不录）。
+        ``record_images=True``：录制时另存关键帧左右原图（只在 ``record`` 时生效）。"""
         if self.running:
             return self.status()
         self._stop.clear()
@@ -705,7 +718,9 @@ class OnlineNavigator:
                 try:
                     self.recorder = SessionRecorder(
                         self._record_root / time.strftime("%Y%m%d_%H%M%S"), self.cfg.record_max_mb * 1e6,
-                        {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at})
+                        {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at,
+                         "record_images": bool(record_images)},
+                        images=record_images)
                 except (OSError, TypeError) as exc:
                     self._fail("recorder", exc)
         self._mem_rows = {}
@@ -1021,8 +1036,10 @@ class OnlineNavigator:
                                     if mem is not None:
                                         src = left_rgb if left_rgb is not None else pair[0]
                                         thumb = make_thumbnail(src, mem.cfg.thumb_width)
+                                    imgs = (pair[0].copy(), pair[1].copy()) if (
+                                        self.recorder is not None and self.recorder.images) else None
                                     self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
-                                                                 kf_kind == "refresh", thumb)))
+                                                                 kf_kind == "refresh", thumb, imgs)))
                             if new_kf:
                                 self._map_event.set()
                 self._stop.wait(max(0.0, period - (self._clock() - tick)))
@@ -1057,7 +1074,7 @@ class OnlineNavigator:
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
                 for kind, item in pending:
                     if kind == "kf":
-                        k, pts, T, dist, feat, t_kf, refresh, thumb = item
+                        k, pts, T, dist, feat, t_kf, refresh, thumb, imgs = item
                         dirty = True
                         found = []
                         if self.loops is None:
@@ -1085,7 +1102,8 @@ class OnlineNavigator:
                                 self._fail("xsession", exc)
                                 self._xs = None
                         if rec is not None:
-                            rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat)
+                            rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat,
+                                         images=imgs)
                             rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
                                                 "refresh": refresh})
                         if self.loops is not None:

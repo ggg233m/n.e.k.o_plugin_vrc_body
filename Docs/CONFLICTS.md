@@ -290,7 +290,7 @@
 | 多会话并树（spanning tree） | ✅ **2026-10-06 闭环成一棵树**：根因是 tracker 的**绝对 6° yaw 门吞真重合**（回放：真匹配成簇在 signed −6…−15°、内点中位 ~210）；`yaw_consensus`（默认开：θ=会话对带符号中位数、±6° 窗、20° 硬顶）修复后重放补约束（252→529）并树——4 场同系，holdout 中位 **0.169 / 0.27 m**，025013 零新约束 | `ROADMAP.md` P0 §洞 4；`tests/test_nav_xsession.py::TestYawConsensusGate` + `TestWorldTree` |
 
 ⚠️ **两句必须一起读**：`ROADMAP.md:92` 原句的前半截「`_candidates()` 只按会话内路径距离取候选」
-**仍然为真**（`nav_loop.py:354`，且 `bow_candidates` 默认 0 见 `nav_loop.py:61`）——
+**仍然为真**（`nav_loop.py:357`，`bow_candidates` 原默认 0；**2026-10-10 起默认 4**，见 `nav_loop.py:64`）——
 **错的只是「没有全局检索入口」这个推论**。跨会话走的是 `nav_xsession` 这条**独立通路**，
 其确认对只 append 到 `constraints.jsonl`、**不回流在线位姿图**（`跨会话地点检索接线P0:18`「v1 铁律」）。
 ⚠️ 另外**首会话冷启动**：没有历史可对齐，第 2 个会话起才生效（`P0.3b…:48`）。
