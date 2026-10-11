@@ -1294,7 +1294,11 @@ class OnlineNavigator:
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),
             "stereo_age_s": None if stereo_at is None else round(now - stereo_at, 2),
-            "camera_height_m": round(cam_h, 3),
+            # cam_h 是**追踪米**（双目单位），而 status 的对外契约是导航系世界米（见模块
+            # docstring）。两个口径都给出、键名自带单位，避免"读到 1.7 就当成世界米"——
+            # 那正是 C9 六个 cam_h 值的来源（1.73 追踪米 ≡ 1.306 世界米）。
+            "camera_height_m": round(cam_h * self.cfg.world_scale, 3),
+            "camera_height_track_m": round(cam_h, 3),
             "near_obstacle": {"stop": near, "points": near_pts, "ahead_m": self.cfg.stop_ahead_m},
             "drive_block": self._drive_block,
             "last_step": dict(self._last_step),

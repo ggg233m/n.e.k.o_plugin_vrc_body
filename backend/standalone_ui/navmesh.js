@@ -149,7 +149,10 @@ function render(s, auto) {
   $("stereo").textContent = `${s.stereo_ms == null ? "—" : num(s.stereo_ms, 0) + " ms"} / ${s.stereo_age_s == null ? "—" : num(s.stereo_age_s, 1) + " s"}`;
   $("kf").textContent = `${s.keyframes ?? 0} / ${s.map_updates ?? 0}`;
   $("mapMs").textContent = s.map_update_ms == null ? "—" : `${num(s.map_update_ms, 0)} ms`;
-  $("camH").textContent = s.camera_height_m == null ? "—" : `${num(s.camera_height_m)} m`;
+  // 两个口径都显示：世界米（对外契约，可与房间里那把实物尺直接比）与追踪米（mapper 内部量，
+  // 就是事件日志里那个 1.7x）。只给一个数会让人把追踪米当世界米读——C9 的六个 cam_h 值就是这么来的。
+  $("camH").textContent = s.camera_height_m == null ? "—"
+    : `${num(s.camera_height_m)} m / ${num(s.camera_height_track_m)} m`;
   const lc = s.loop_closure;
   // 回环健康度：距上次回环多少关键帧 / 多少 OSC 路程。长期单涨 = 回环静默（尾部 0 回环）的现场证据。
   $("loops").textContent = lc

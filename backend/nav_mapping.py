@@ -7,8 +7,8 @@
   不会把旧位姿下的格子残留在图里；
 * 高度相对**观测它的那个关键帧**：h = z_map − z_node + cam_h，头部俯仰、轨迹 z
   漂移都不进入判定（RTAB-Map 自带栅格在 base 系判高，run6 上 3 m 处障碍 39%）；
-* 三态：free = 有地面点且非障碍；obstacle = 障碍点 ≥ min_pts 且 3×3 邻居支撑；
-  其余 unknown。不做射线追踪，free 只来自真正看见的地面，unknown 永不当 free。
+* 三态：free = 有地面点且非障碍；obstacle = 障碍点 ≥ min_pts 且 3×3 邻居支撑；其余 unknown。
+  **不做自由空间射线追踪**（free 只来自看见的地面）；unknown 永不当 free。``ray_clear`` 看穿否决只压 OCC→UNK。
 * **障碍判定按观测距离分层**（``q_tiers``，2026-10-05）：视差深度误差 δz = z²/(fx·b)·δd
   随距离平方增长，fx 202.5 / 基线 0.126 下 3 m 是 0.35 m、5 m 是 0.98 m，而障碍高度带
   (0.3, 2.0) 只有 1.7 m 宽——1.5 m 以外"真地面被抖进障碍带"是必然的，min_pts / 3×3 多数 /
@@ -496,11 +496,11 @@ class KeyframeGridMapper:
         self._trail: dict[int, list[tuple[np.ndarray, np.ndarray, float | None]]] = {}
         self._trail_arr: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.cam_h = self.cfg.cam_h_default
-        self._cam_h_at = 0            # 上次改 cam_h 时的关键帧数（cam_h_min_kf 限流用）
+        self._cam_h_at = 0            # 上次改 cam_h 时的关键帧数（_update_cam_h 的 len//8 限流用）
         # 缓存：_rot[k] = (R·p 的 xy, R·p 的 z = 相对关键帧的高度, 点数, 算它用的 R)；
         # 只改平移时高度不变，分类也不变。
-        # _base[k] = (ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far)；
-        # 近/远看按点到关键帧相机的水平距离分桶（相机在 base 系原点，与平移无关），整格平移照常复用。
+        # _base[k] = 21 元组：(ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far, o_near,
+        # o_mid, g_near_mid, o_mid_kf, 四高度带, 头顶矩 n/h/h2, 障碍带矩 h/h2)——下标见 _ACC_SLOTS 与 :743。
         self._rot: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._base: dict[int, tuple[Any, ...]] = {}
         self._hist: dict[int, np.ndarray] = {}
