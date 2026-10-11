@@ -243,6 +243,24 @@ class OscMotionFeedbackTests(unittest.TestCase):
         # 同一个样本在默认窗口下必须是可用的，否则就说明改过头了。
         self.assertTrue(self.bridge.motion_feedback()["available"])
 
+    def test_vertical_history_is_separate_from_horizontal(self) -> None:
+        # VelocityY / Grounded 单独成史：不能混进喂航位推算的水平速度历史。
+        self._feed("Grounded", True)
+        self.now[0] += 0.1
+        self._feed("VelocityY", 1.5)
+        self._feed("VelocityX", 0.0)          # 只来一轴：水平历史仍为空
+        vert = self.bridge.vertical_history()
+        self.assertEqual([v["source"] for v in vert], ["Grounded", "VelocityY"])
+        self.assertIsNone(vert[0]["velocity_y"])
+        self.assertEqual(vert[1]["velocity_y"], 1.5)
+        self.assertIs(vert[1]["grounded"], True)
+        self.assertAlmostEqual(vert[1]["timestamp"], 100.1)
+        self.assertEqual(self.bridge.motion_history(), [])
+        # 换 avatar 清空，和水平历史一致。
+        self.bridge._handle_message("/avatar/change", ("avtr_other",))
+        self.bridge._handle_message("/avatar/change", ("avtr_new",))
+        self.assertEqual(self.bridge.vertical_history(), [])
+
     def test_missing_builtins_report_unavailable_not_zero_speed(self) -> None:
         # 最重要的一条：avatar 没配这些参数时不能读成「速度为零」，否则导航器
         # 会把「读不到」当成「卡住了」，一armed 就立刻停车。

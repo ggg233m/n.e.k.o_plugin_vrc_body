@@ -63,7 +63,7 @@ def replay(rec: Path, cfg, pose_of: dict[int, np.ndarray]):
                 m.drop_points(k - 1)
             if k in m._pts:
                 m.drop_points(k)
-            m.add_keyframe(k, pts, T, e.get("osc"))
+            m.add_keyframe(k, pts, T, e.get("osc"), t_s=e.get("t"))
             trail.append(T[:2, 3])
         else:
             m.add_trail(k, T @ np.asarray(e["T_dr"], np.float64), e.get("osc"))

@@ -129,7 +129,7 @@ def replay(rec: Path, cfg: MapperConfig):
                 n_refresh += 1
             if k in m._pts:
                 m.drop_points(k)
-            m.add_keyframe(k, pts, T, e.get("osc"))
+            m.add_keyframe(k, pts, T, e.get("osc"), t_s=e.get("t"))
             trail.append(T[:2, 3])
         elif kind == "trail":
             k = int(e["k"])

@@ -136,6 +136,20 @@ class MapperConfig:
     # "走廊上还有几个障碍"几乎没差别（见 tools/q_tier_ab.json），差别只在图外那圈——所以
     # 默认取保守的那个，不伪造 free。
     q_free_m: float = 1.5
+    # 重访替换（repl）：一次**更晚的经过**（晚 ≥ repl_dt_s 秒）在某格近距（≤ repl_r_m）看到地面、
+    # 且这一帧在该格没有任何障碍点 ⇒ 更早关键帧落在该格的障碍体素作废（只作废障碍票，地面票不动）。
+    # 针对的是"障碍票只增不减"：跨经过错位时旧经过画下的墙没有机制清掉（假障碍的主因，见
+    # Docs 10-09 §十一）。作废记在体素上（关键帧局部系），回环挪位跟着关键帧走、不随之恢复；
+    # 射线缓存不重算（只依赖朝向），看穿/打中计数仍含被作废的体素。
+    # 离线原型 .tmp/revisit_replace.py 的 repl,10,2：路上障碍 −9~−25%、路外 −1~−12%。
+    repl_clear: bool = False
+    repl_dt_s: float = 10.0
+    repl_r_m: float = 2.0
+    # 抗漂移护栏（0 = 关）。margin：新帧在否决格周围这么多格内见过障碍就不否决——后一次经过的
+    # 位姿错位会把柱子的点挪到隔壁格，本格只剩柱脚地面，没有护栏就会把细柱、立牌清掉。
+    # max_w：旧帧在该格的障碍点权重 ≥ 它就不否决（实物票多、鬼影票少）。
+    repl_margin_cells: int = 0
+    repl_max_w: float = 0.0
     # 射线清除：相机到每个观测点的视线穿过的障碍高度体素记一次"看穿"。一个体素被看穿的关键帧数
     # ≥ ray_beta × 被打中的关键帧数，就不再算障碍。没有它，障碍只增不减：定位误差、回环挪位每次
     # 都在旁边再画一份墙，旧的那份没有任何机制清掉（21 min 实测 150 块障碍里 94 块是空地中间的孤岛）。
@@ -499,8 +513,8 @@ class KeyframeGridMapper:
         self._cam_h_at = 0            # 上次改 cam_h 时的关键帧数（_update_cam_h 的 len//8 限流用）
         # 缓存：_rot[k] = (R·p 的 xy, R·p 的 z = 相对关键帧的高度, 点数, 算它用的 R)；
         # 只改平移时高度不变，分类也不变。
-        # _base[k] = 21 元组：(ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far, o_near,
-        # o_mid, g_near_mid, o_mid_kf, 四高度带, 头顶矩 n/h/h2, 障碍带矩 h/h2)——下标见 _ACC_SLOTS 与 :743。
+        # _base[k] = 22 元组：(ix, iy, n_ground, n_obst, 算它用的 t_xy, cam_h, n_near, n_far, o_near,
+        # o_mid, g_near_mid, o_mid_kf, 四高度带, 头顶矩 n/h/h2, 障碍带矩 h/h2, 重访替换否决格)——下标见 _ACC_SLOTS 与 :743。
         self._rot: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._base: dict[int, tuple[Any, ...]] = {}
         self._hist: dict[int, np.ndarray] = {}
@@ -554,13 +568,21 @@ class KeyframeGridMapper:
         self._ray_hit: np.ndarray | None = None
         self._ray_mis: np.ndarray | None = None
         self.ray_cleared_cells = 0
+        # 重访替换：关键帧时间戳（秒，add_keyframe 的 t_s；没给的帧不参与）、被作废的障碍体素（False = 作废）、
+        # 已经拿去否决过旧帧的关键帧、_kf_base 顺手留下的障碍体素 (体素下标, ix, iy)（t0 下的格）。
+        self._t: dict[int, float] = {}
+        self._repl_keep: dict[int, np.ndarray] = {}
+        self._repl_seen: set[int] = set()
+        self._repl_vox: dict[int, tuple] = {}
+        self.repl_dropped_vox = 0
 
     def __len__(self) -> int:
         return len(self._pts)
 
     def add_keyframe(self, node_id: int, points_base: np.ndarray, pose_map_base: np.ndarray,
-                     osc_dist_m: float | None = None) -> None:
-        """``osc_dist_m``：该关键帧时刻的 OSC 累计路程（世界米）；给了才能门控走过的走廊。"""
+                     osc_dist_m: float | None = None, t_s: float | None = None) -> None:
+        """``osc_dist_m``：该关键帧时刻的 OSC 累计路程（世界米）；给了才能门控走过的走廊。
+        ``t_s``：关键帧时刻（秒，任意原点）；``repl_clear`` 只对给了时间的关键帧生效。"""
         k = int(node_id)
         if k in self._pts:
             # 与 LoopCloser.add_keyframe 同口径的廉价防御：重复 id 会静默覆盖点云与位姿。
@@ -575,6 +597,8 @@ class KeyframeGridMapper:
         self._ver += 1
         if osc_dist_m is not None:
             self._osc[k] = float(osc_dist_m)
+        if t_s is not None:
+            self._t[k] = float(t_s)
 
     def drop_points(self, node_id: int) -> None:
         """去掉关键帧的点云贡献，保留位姿、OSC 路程和挂在它上面的轨迹：目标锚点照样能 resolve，
@@ -583,6 +607,9 @@ class KeyframeGridMapper:
         if self._pts.pop(k, None) is None:
             return
         self._cnt.pop(k, None)
+        self._t.pop(k, None)
+        self._repl_keep.pop(k, None)
+        self._repl_seen.discard(k)
         # 把 cam_h 限流计数器夹回当前规模。背景（核查 issue #3-5 时实测澄清）：
         #   * 在线路径（nav_online.py:920-927）总是先 add_keyframe(k) 再 drop_points(k-1)，
         #     len(_pts) 单调不减，_cam_h_at <= len(_pts) 恒成立 ⇒ **线上不可达**，这里是 no-op；
@@ -600,6 +627,7 @@ class KeyframeGridMapper:
     def _drop_cache(self, k: int) -> None:
         self._rot.pop(k, None)
         self._base.pop(k, None)
+        self._repl_vox.pop(k, None)
         h = self._hist.pop(k, None)
         if h is not None:
             self._hist_sum -= h
@@ -672,7 +700,10 @@ class KeyframeGridMapper:
         h = h - np.float32(_ground_correction(h, cnt, rxy, c.ground_offset_max_m, c.ground_offset_min_range_m,
                                               c.ground_plane_max_deg, c.ground_plane_band_m))
         g = np.abs(h) <= c.ground_tol_m
-        o = (h > c.ground_tol_m) & (h < c.obst_top_m)
+        o_all = (h > c.ground_tol_m) & (h < c.obst_top_m)
+        # 重访替换作废的体素只去掉障碍票；sel 仍按未作废的口径取，没有作废时与改动前逐格相同。
+        keep = self._repl_keep.get(k) if c.repl_clear else None
+        o = o_all if keep is None else o_all & keep
         # 高度分带：把地面层判据之外的高度捡回来（-1 = 不属于任何带）。
         if c.hi_bands:
             hb = np.full(len(h), -1, np.int8)
@@ -682,10 +713,12 @@ class KeyframeGridMapper:
             hb[h >= c.hi_band_top_m] = 3
         else:
             hb = np.full(len(h), -2, np.int8)
-        sel = g | o | (hb >= 0)
+        sel = g | o_all | (hb >= 0)
         if not sel.any():
             z = np.zeros(0, np.int64)
-            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z)
+            out = (z, z, z, z, t, self.cam_h, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z, z)
+            if c.repl_clear:
+                self._repl_vox[k] = (z, z, z, t, self.cam_h)
             self._base[k] = out
             return out
         xy = rxy[sel].astype(np.float64) + t
@@ -706,6 +739,15 @@ class KeyframeGridMapper:
         # 覆盖伴生：点到相机（base 系原点）的水平距离分近/远两桶，复用同一 flat 与权重。
         # 口径仍是**地面层那两类点**（g|o），不带高带点——覆盖度显示层的语义不动。
         r = np.hypot(rxy[sel, 0], rxy[sel, 1])
+        if c.repl_clear:
+            # 本帧的否决格：近距（≤ repl_r_m）见过地面、且本帧（未作废口径）在该格没有障碍点。
+            gr = np.bincount(flat, w * (sg & (r <= c.repl_r_m)), minlength=size)
+            na = np.bincount(flat, w * o_all[sel], minlength=size)
+            rv = ((gr > 0) & (na == 0)).astype(np.float64)
+            # 自带 t0/cam_h：否决后就地删掉命中项，不必为取下标重算整个 base。
+            self._repl_vox[k] = (np.flatnonzero(sel)[so], ix[so], iy[so], t, self.cam_h)
+        else:
+            rv = np.zeros(size)
         go = sg | so
         near = r <= c.cov_near_m
         nn = np.bincount(flat, w * (go & near), minlength=size)
@@ -744,7 +786,7 @@ class KeyframeGridMapper:
                on[nz], om[nz], gn[nz], omk[nz],
                bands[0][nz], bands[1][nz], bands[2][nz], bands[3][nz],
                sbn[nz], sbh[nz], sbh2[nz],
-               obh[nz], obh2[nz])
+               obh[nz], obh2[nz], rv[nz])
         self._base[k] = out
         return out
 
@@ -1140,6 +1182,8 @@ class KeyframeGridMapper:
         for k in dirty:
             self._rotated(k)
         self._update_cam_h()
+        if c.repl_clear:
+            dirty |= self._repl_veto(dirty)
         self._sync_ray(self._sync_acc(dirty))
         veto = self._ray_veto(self.walked()) if self.cfg.ray_clear else None
         pts = []
@@ -1189,6 +1233,80 @@ class KeyframeGridMapper:
         g = assemble_labels(c, occ, restored, rejected, n_g)
         self._last_grid = (h, w)
         return NavGrid(g[::-1].copy(), GridMeta(c.res_m, (float(lo[0]), float(lo[1])), c.world_scale))
+
+    def _repl_veto(self, dirty: set[int]) -> set[int]:
+        """重访替换（见 ``MapperConfig.repl_clear``）：新关键帧按时间序各否决一次旧帧的障碍体素。
+
+        因果：只用新帧入图那一刻的位姿。返回被改了作废掩码的旧关键帧（要重算 base、重新入累加器）。"""
+        c = self.cfg
+        new = sorted((k for k in dirty if k in self._t and k not in self._repl_seen), key=lambda k: self._t[k])
+        if not new:
+            return set()
+        ids = np.array([k for k in self._pts if k in self._t], np.int64)
+        ts = np.array([self._t[k] for k in ids])
+        xy = np.array([self._pose[k][:2, 3] for k in ids]).reshape(-1, 2)
+        reach = c.range_m + c.repl_r_m + 2.0 * c.res_m
+        changed: set[int] = set()
+        for k in new:
+            self._repl_seen.add(k)
+            b = self._kf_base(k)
+            u = b[21] > 0.5
+            if not u.any():
+                continue
+            sx, sy = self._shift(k, b)
+            ux, uy = b[0][u] + sx, b[1][u] + sy
+            mg = int(c.repl_margin_cells)
+            bx, by = int(ux.min()) - mg, int(uy.min()) - mg
+            mask = np.zeros((int(ux.max()) - bx + 1 + mg, int(uy.max()) - by + 1 + mg), bool)
+            mask[ux - bx, uy - by] = True
+            if mg > 0:
+                # 新帧自己的障碍格膨胀 mg 格，从否决格里扣掉（新帧还没被否决过，b[3] 就是全量口径）。
+                ob = b[3] > 0
+                ox, oy = b[0][ob] + sx - bx, b[1][ob] + sy - by
+                inb = (ox >= 0) & (oy >= 0) & (ox < mask.shape[0]) & (oy < mask.shape[1])
+                om = np.zeros_like(mask)
+                om[ox[inb], oy[inb]] = True
+                om = cv2.dilate(om.astype(np.uint8), np.ones((2 * mg + 1, 2 * mg + 1), np.uint8)) > 0
+                mask &= ~om
+                if not mask.any():
+                    continue
+            near = (ts <= self._t[k] - c.repl_dt_s) & (np.hypot(*(xy - self._pose[k][:2, 3]).T) <= reach)
+            for j in ids[near]:
+                j = int(j)
+                vox = self._repl_vox.get(j)
+                if vox is None or vox[4] != self.cam_h:
+                    self._kf_base(j)
+                    vox = self._repl_vox[j]
+                vi, vx, vy, t0, _h = vox
+                if not len(vi):
+                    continue
+                d = (self._pose[j][:2, 3] - t0) / c.res_m
+                cx = vx + (int(round(float(d[0]))) - bx)
+                cy = vy + (int(round(float(d[1]))) - by)
+                inb = (cx >= 0) & (cy >= 0) & (cx < mask.shape[0]) & (cy < mask.shape[1])
+                hit = np.zeros(len(vi), bool)
+                hit[inb] = mask[cx[inb], cy[inb]]
+                if hit.any() and c.repl_max_w > 0:
+                    # 按格汇总旧帧在命中格的障碍点权重；票多的格当实物，不否决。
+                    hx, hy = cx[hit], cy[hit]
+                    key = hx * mask.shape[1] + hy
+                    uk, inv = np.unique(key, return_inverse=True)
+                    wsum = np.bincount(inv, self._cnt[j][vi[hit]].astype(np.float64))
+                    hit[np.flatnonzero(hit)[wsum[inv] >= c.repl_max_w]] = False
+                if not hit.any():
+                    continue
+                keep = self._repl_keep.get(j)
+                if keep is None:
+                    keep = self._repl_keep[j] = np.ones(len(self._pts[j]), bool)
+                keep[vi[hit]] = False
+                self.repl_dropped_vox += int(hit.sum())
+                # 只扔 base（同步累加器时按新掩码重算一次）；体素表就地删掉命中项，
+                # 与重算出来的逐项相同，同一轮里后面的新帧不必再重算 j。_rot 与射线缓存不动。
+                self._base.pop(j, None)
+                m = ~hit
+                self._repl_vox[j] = (vi[m], vx[m], vy[m], t0, _h)
+                changed.add(j)
+        return changed
 
     def _by_quality(self, base_occ: np.ndarray, n_g: np.ndarray, n_o: np.ndarray,
                     o_n: np.ndarray, o_m: np.ndarray, g_n: np.ndarray, o_mk: np.ndarray

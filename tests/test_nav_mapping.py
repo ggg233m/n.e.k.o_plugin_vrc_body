@@ -1069,5 +1069,107 @@ class SharedRuleTests(unittest.TestCase):
         self.assertTrue(bool(majority3(x2).all()))
 
 
+
+class RevisitReplaceTests(unittest.TestCase):
+    """重访替换：更晚的经过近距看到地面、本帧无障碍 ⇒ 旧经过在该格的障碍票作废；墙不受影响。"""
+
+    def setUp(self) -> None:
+        self.scene = world_scene()
+        # 第一次经过（t=0..2）三帧都看到 x∈[2, 2.3] 的假障碍；第二次经过（t=t2..）走近同一处只看到地面。
+        self.ghost = ghost_block(2.0, 2.3, 0.5, 1.0, 0.35, 1.2)
+
+    def build(self, repl: bool, t2: float = 30.0, shift: float = 0.0, **kw) -> KeyframeGridMapper:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=False, repl_clear=repl, **kw))
+        for i, x in enumerate((-0.5, 0.0, 0.5)):
+            T = pose(x, 0)
+            m.add_keyframe(i, observe(np.vstack([self.scene, self.ghost]), T), T, t_s=float(i))
+        m.rasterize()
+        for i, x in enumerate((0.5, 1.0)):
+            T = pose(x, 0)
+            m.add_keyframe(10 + i, observe(self.scene, T), T, t_s=t2 + i)
+        return m
+
+    def test_off_is_default_and_changes_nothing(self) -> None:
+        self.assertFalse(MapperConfig().repl_clear)
+        a = self.build(False).rasterize()
+        b = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=False))
+        for i, x in enumerate((-0.5, 0.0, 0.5)):
+            T = pose(x, 0)
+            b.add_keyframe(i, observe(np.vstack([self.scene, self.ghost]), T), T)
+        for i, x in enumerate((0.5, 1.0)):
+            T = pose(x, 0)
+            b.add_keyframe(10 + i, observe(self.scene, T), T)
+        np.testing.assert_array_equal(a.grid, b.rasterize().grid)
+        self.assertEqual(value_at(a, (2.15, 0.75)), OCC)
+
+    def test_later_pass_seeing_floor_clears_ghost_keeps_wall(self) -> None:
+        m = self.build(True)
+        ng = m.rasterize()
+        self.assertEqual(value_at(ng, (2.15, 0.75)), FREE)
+        self.assertGreater(m.repl_dropped_vox, 0)
+        # 墙每次经过都打中 ⇒ 本帧在墙格有障碍点 ⇒ 不否决。
+        for y in (-1.2, -0.8, -0.3, 0.1):
+            self.assertEqual(value_at(ng, (3.52, y)), OCC)
+
+    def test_same_pass_does_not_veto(self) -> None:
+        # 晚不到 repl_dt_s 的帧算同一次经过：鬼影照旧（与关掉时一致）。
+        ng = self.build(True, t2=5.0).rasterize()
+        self.assertEqual(value_at(ng, (2.15, 0.75)), OCC)
+        self.assertEqual(self.build(True, t2=5.0).repl_dropped_vox, 0)
+
+    def test_veto_follows_loop_shift_and_matches_fresh_build(self) -> None:
+        m = self.build(True)
+        m.rasterize()
+        moved = {k: m._pose[k] @ pose(0.3, -0.2) for k in m._pose}
+        m.update_poses(moved)
+        inc = m.rasterize()
+        # 同一套作废掩码、新位姿从零建：增量路径必须逐格一致。
+        f = KeyframeGridMapper(m.cfg)
+        for k in sorted(m._pts):
+            f.add_keyframe(k, m._pts[k], moved[k])
+            np.testing.assert_array_equal(f._pts[k], m._pts[k])     # 体素中心再体素化不换序，掩码才对得上
+            f._cnt[k] = m._cnt[k]
+        f._repl_keep = {k: v.copy() for k, v in m._repl_keep.items()}
+        f._repl_seen = set(m._pts)
+        np.testing.assert_array_equal(inc.grid, f.rasterize().grid)
+
+    def test_keyframes_without_time_are_ignored(self) -> None:
+        m = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=False, repl_clear=True))
+        for i, x in enumerate((-0.5, 0.0, 0.5)):
+            T = pose(x, 0)
+            m.add_keyframe(i, observe(np.vstack([self.scene, self.ghost]), T), T)
+        for i, x in enumerate((0.5, 1.0)):
+            T = pose(x, 0)
+            m.add_keyframe(10 + i, observe(self.scene, T), T)
+        self.assertEqual(value_at(m.rasterize(), (2.15, 0.75)), OCC)
+        self.assertEqual(m.repl_dropped_vox, 0)
+
+    def test_max_w_keeps_heavily_voted_cell(self) -> None:
+        # 旧帧在格里票多 ⇒ 当实物，不否决（细柱、立牌被漂移挪格时的护栏）。
+        m = self.build(True, repl_max_w=1.0)
+        self.assertEqual(value_at(m.rasterize(), (2.15, 0.75)), OCC)
+        self.assertEqual(m.repl_dropped_vox, 0)
+        self.assertEqual(MapperConfig().repl_max_w, 0.0)
+
+    def test_margin_spares_cells_next_to_new_obstacle(self) -> None:
+        # 第二次经过在鬼影旁 x≈2.45 看到一根柱子：margin 2 格内的旧票不否决，更远的照常清。
+        post = ghost_block(2.4, 2.5, 0.7, 0.8, 0.35, 1.2)
+
+        def run(mg: int):
+            m = KeyframeGridMapper(MapperConfig(res_m=0.10, ray_clear=False, repl_clear=True,
+                                                repl_margin_cells=mg))
+            for i, x in enumerate((-0.5, 0.0, 0.5)):
+                T = pose(x, 0)
+                m.add_keyframe(i, observe(np.vstack([self.scene, self.ghost]), T), T, t_s=float(i))
+            m.rasterize()
+            for i, x in enumerate((0.5, 1.0)):
+                T = pose(x, 0)
+                m.add_keyframe(10 + i, observe(np.vstack([self.scene, post]), T), T, t_s=30.0 + i)
+            return m.rasterize()
+        a, b = run(0), run(2)
+        self.assertNotEqual(value_at(a, (2.25, 0.75)), OCC)
+        self.assertEqual(value_at(b, (2.25, 0.75)), OCC)
+        self.assertNotEqual(value_at(b, (2.05, 0.75)), OCC)
+
 if __name__ == "__main__":
     unittest.main()

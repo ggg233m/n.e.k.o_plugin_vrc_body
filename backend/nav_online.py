@@ -195,7 +195,7 @@ class SessionRecorder:
     """默认不开。把一次在线会话的原始输入落盘，离线能按同样顺序重放建图/回环（长时间场景复现）。
 
     目录内容：``meta.json``（配置、传感器）、``hmd.jsonl``（每个位姿周期的 HMD 旋转，base 系）、
-    ``osc.jsonl``（新到的 OSC 速度样本）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
+    ``osc.jsonl``（新到的 OSC 速度样本）、``vert.jsonl``（OSC VelocityY / Grounded）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
     ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右灰度原图，采集分辨率）。
 
@@ -612,6 +612,7 @@ class OnlineNavigator:
 
     外部依赖全是注入的可调用对象，测试可以用假的：
     * ``motion_history()`` → OSC 速度样本（``timestamp`` 与 ``clock`` 同一单调时钟）；
+    * ``vertical_history()``（可选）→ OSC VelocityY / Grounded 样本，同一时钟；只进录制；
     * ``send_move(forward, duration_ms)`` / ``send_turn(correction_deg)``（正数 = 左转 CCW）；
     * ``stop_motion()``；``drive_block_reason()`` → None 可驾驶，否则为不能动的原因。
     """
@@ -622,7 +623,8 @@ class OnlineNavigator:
                  sensors_factory: Callable[[], Any] | None = None,
                  cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
                  record_root: Path | None = None, memory: NavMemoryStore | None = None,
-                 world_identity: Callable[[], dict[str, Any]] | None = None) -> None:
+                 world_identity: Callable[[], dict[str, Any]] | None = None,
+                 vertical_history: Callable[[], Sequence[dict[str, Any]]] | None = None) -> None:
         self.cfg = cfg or OnlineNavConfig()
         # 持久记忆（按世界分区）。world_identity() → {"world_key", ...}；key 为空时本次会话不写记忆。
         self.memory = memory
@@ -632,6 +634,8 @@ class OnlineNavigator:
         self._record_root = None if record_root is None else Path(record_root)
         self.recorder: SessionRecorder | None = None
         self._motion_history = motion_history
+        # VelocityY / Grounded：目前只录不用（多层/竖直漂移的离线评估数据）。
+        self._vertical_history = vertical_history or (lambda: ())
         self._send_move = send_move
         self._send_turn = send_turn
         self._stop_motion = stop_motion
@@ -942,6 +946,7 @@ class OnlineNavigator:
             rec.line("events", {"kind": "sensors", "t": self._clock(), "info": info, "fx": sensors.fx,
                                 "cx": sensors.cx, "cy": sensors.cy, "baseline_m": sensors.baseline_m})
         osc_seen = -math.inf
+        vert_seen = -math.inf
         matcher = None
         orb = None
         kf_id = -1
@@ -964,6 +969,12 @@ class OnlineNavigator:
                             if ts > osc_seen:
                                 osc_seen = ts
                                 rec.line("osc", {"t": ts, "vx": o.get("velocity_x"), "vz": o.get("velocity_z")})
+                        for o in self._vertical_history():
+                            ts = float(o.get("timestamp", -math.inf))
+                            if ts > vert_seen:
+                                vert_seen = ts
+                                rec.line("vert", {"t": ts, "src": o.get("source"), "vy": o.get("velocity_y"),
+                                                  "g": o.get("grounded")})
                         rec.line("hmd", {"t": tick, "R": np.round(r_ob, 6)})
                     T = self.dr.update(tick, r_ob, hist)
                     yaw_now = math.atan2(T[1, 0], T[0, 0])
@@ -1078,11 +1089,11 @@ class OnlineNavigator:
                         dirty = True
                         found = []
                         if self.loops is None:
-                            self.mapper.add_keyframe(k, pts, T, osc_dist_m=dist)
+                            self.mapper.add_keyframe(k, pts, T, osc_dist_m=dist, t_s=t_kf)
                         else:
                             found = self.loops.add_keyframe(k, T, dist, feat)
                             # 关键帧按修正后的位姿入图；回环后所有关键帧整体换位姿。
-                            self.mapper.add_keyframe(k, pts, self.loops.pose(k), osc_dist_m=dist)
+                            self.mapper.add_keyframe(k, pts, self.loops.pose(k), osc_dist_m=dist, t_s=t_kf)
                         if refresh:
                             # 原地补帧：上一帧的点云让给这帧；它的位姿、轨迹、回环节点都留着。
                             self.mapper.drop_points(k - 1)

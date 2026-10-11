@@ -457,6 +457,7 @@ class BackendService:
         # 在线增量 navmesh：显式 start 才开 OpenVR 会话，默认不占 SteamVR。
         self.navmesh = OnlineNavigator(
             motion_history=self._navmesh_motion_history,
+            vertical_history=self._navmesh_vertical_history,
             send_move=lambda forward, ms: self.set_locomotion(forward, 0.0, ms),
             send_turn=self._navigator_send_turn,
             stop_motion=self.stop_movement,
@@ -530,6 +531,11 @@ class BackendService:
     def _navmesh_motion_history(self) -> list[dict[str, Any]]:
         osc = self.osc
         return [] if osc is None else osc.motion_history(limit=64)
+
+    def _navmesh_vertical_history(self) -> list[dict[str, Any]]:
+        osc = self.osc
+        fn = None if osc is None else getattr(osc, "vertical_history", None)
+        return [] if fn is None else fn(limit=64)
 
     def _navmesh_drive_block(self) -> str | None:
         """None = 可以驾驶；否则是不能动的原因。与自主目标互斥。"""

@@ -286,7 +286,11 @@ class Harness:
             send_turn=lambda d: self.turns.append(d),
             stop_motion=self._stop,
             drive_block_reason=lambda: None if self.armed else "autonomy_not_armed",
-            sensors_factory=lambda: self.sensors, cfg=cfg, record_root=record_root)
+            sensors_factory=lambda: self.sensors, cfg=cfg, record_root=record_root,
+            vertical_history=lambda: [{"timestamp": 1.0, "source": "Grounded", "velocity_y": None,
+                                       "grounded": True},
+                                      {"timestamp": 2.0, "source": "VelocityY", "velocity_y": 0.4,
+                                       "grounded": False}])
 
     def _motion(self) -> list[dict]:
         # 时间戳必须和 navigator 同一个 monotonic 时钟且**新鲜**：真实回传是变化驱动的，
@@ -977,6 +981,10 @@ class RecorderTest(unittest.TestCase):
             # 假 OSC 历史每拍都一样：同一时间戳只记一次。
             osc_lines = (out / "osc.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(osc_lines), 1)
+            # VelocityY / Grounded 也落盘（多层/竖直漂移评估用），同样按时间戳去重。
+            vert = [json.loads(x) for x in (out / "vert.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(vert, [{"t": 1.0, "src": "Grounded", "vy": None, "g": True},
+                                    {"t": 2.0, "src": "VelocityY", "vy": 0.4, "g": False}])
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
 

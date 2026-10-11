@@ -282,6 +282,9 @@ class VrchatOscBridge:
         self._parameters: OrderedDict[str, dict[str, Any]] = OrderedDict()
         # 速度必须按接收时刻保存，不能只读取最后一个参数再与较早的 WGC 帧配对。
         self._motion_history: deque[dict[str, float]] = deque(maxlen=512)
+        # 竖直通道（VelocityY / Grounded）单独存：水平速度历史喂航位推算和视觉对齐，口径不能混。
+        # 用途是录制与离线评估楼层/竖直位移；两者同样是变化驱动、无心跳。
+        self._vertical_history: deque[dict[str, Any]] = deque(maxlen=512)
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
         self._held_inputs: set[tuple[str, str]] = set()
@@ -789,6 +792,7 @@ class VrchatOscBridge:
                 if avatar_id != self._avatar_id:
                     self._parameters.clear()
                     self._motion_history.clear()
+                    self._vertical_history.clear()
                 self._avatar_id = avatar_id
                 self._avatar_changed_at_unix = now_wall
             return
@@ -808,6 +812,15 @@ class VrchatOscBridge:
                 self._parameters[name] = record
                 while len(self._parameters) > self.config.parameter_cache_size:
                     self._parameters.popitem(last=False)
+                if name in {"VelocityY", "Grounded"}:
+                    vy = _numeric((self._parameters.get("VelocityY") or {}).get("value"))
+                    g = (self._parameters.get("Grounded") or {}).get("value")
+                    self._vertical_history.append({
+                        "timestamp": now_mono,
+                        "source": name,
+                        "velocity_y": vy,
+                        "grounded": g if isinstance(g, bool) else None,
+                    })
                 if name in {"VelocityX", "VelocityZ"}:
                     x = _numeric((self._parameters.get("VelocityX") or {}).get("value"))
                     z = _numeric((self._parameters.get("VelocityZ") or {}).get("value"))
@@ -1085,6 +1098,16 @@ class VrchatOscBridge:
             size = 512
         with self._lock:
             return [dict(item) for item in list(self._motion_history)[-size:]]
+
+    def vertical_history(self, *, limit: int = 512) -> list[dict[str, Any]]:
+        """VelocityY / Grounded 的接收样本（单调时钟）。每条是收到其中一个参数那一刻两者的最新值，
+        ``source`` 标明这条是谁触发的。"""
+        try:
+            size = max(1, min(512, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            size = 512
+        with self._lock:
+            return [dict(item) for item in list(self._vertical_history)[-size:]]
 
     def awareness(self) -> dict[str, Any]:
         with self._lock:
