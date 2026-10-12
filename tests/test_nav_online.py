@@ -63,8 +63,10 @@ class DeadReckonerTest(unittest.TestCase):
         self.assertAlmostEqual(T[0, 3] * S, 0.8 * 2.0 * 1.1, places=6)   # 积分和超前都按 0.8 缩
         self.assertAlmostEqual(dr.dist_m, 1.6, places=6)
 
-    def test_speed_scale_default_is_identity(self) -> None:
-        self.assertEqual(OnlineNavConfig().osc_speed_scale, 1.0)
+    def test_speed_scale_default_is_085(self) -> None:
+        self.assertEqual(OnlineNavConfig().osc_speed_scale, 0.85)
+
+    def test_speed_scale_1_is_identity(self) -> None:
         r = hmd_to_base_rotation(np.eye(3))
         a, b = DeadReckoner(S, osc_lag_s=0.1), DeadReckoner(S, osc_lag_s=0.1, speed_scale=1.0)
         for dr in (a, b):

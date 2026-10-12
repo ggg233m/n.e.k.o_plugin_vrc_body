@@ -129,11 +129,20 @@ def main() -> int:
     ap.add_argument("--dr-sigma", type=float, default=0.15, help="DR 帧间平移噪声 σ（追踪米/步）")
     ap.add_argument("--max-corr", type=float, default=0.8, help="视觉与 DR 差超过此值的约束丢弃")
     ap.add_argument("--guided", action="store_true", help="DR 预测引导匹配")
+    ap.add_argument("--k-osc", type=float, default=1.0, help="DR 帧间平移先乘此系数（同 osc_speed_scale）")
     ap.add_argument("--out", default="vo_poses.npz")
     a = ap.parse_args()
     rec = REC_ROOT / a.rec
     F = load(rec)
     ids = sorted(F)
+    if a.k_osc != 1.0:             # 按系数重放 DR 轨迹（旋转不变，只缩帧间平移）
+        p0, acc = F[ids[0]]["T"][:3, 3].copy(), F[ids[0]]["T"][:3, 3].copy()
+        for k in ids:
+            raw = F[k]["T"][:3, 3].copy()
+            acc = acc + (raw - p0) * a.k_osc
+            p0 = raw
+            F[k]["T"] = F[k]["T"].copy()
+            F[k]["T"][:3, 3] = acc
     idx = {k: i for i, k in enumerate(ids)}
     rng = np.random.default_rng(0)
 
