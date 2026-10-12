@@ -54,6 +54,10 @@ class OnlineNavConfig:
     expected_baseline_m: float = 0.126
     baseline_tol_m: float = 0.01
     osc_lag_s: float = 0.18          # OSC 速度比画面晚到约 0.18 s（run5/run6 局部窗口回放扫描最优 0.175–0.2）
+    # OSC VelocityX/Z 乘这个系数再积分。VelocityZ 报的比镜头实际移动多 ~15–25%：run8_ruler 尺子
+    # 拟合 1.16–1.25 倍，5 场录制相邻关键帧迎面墙 ICP 视觉/DR 前向比 0.82–0.87 且与速度无关
+    # （双目 world_scale 在尺子上实测 0.757，是对的）。1.0 = 旧行为。
+    osc_speed_scale: float = 1.0
     # 非零速度的 ZOH 外推上限：VelocityX/Z 无心跳，静默只在短时间内等于"速度没变"
     # （实测需要外推非零速度的空档全部 ≤ 2.03 s）。静默超过 osc_zoh_max_s 后在 osc_zoh_fade_s
     # 内线性淡出到 0，避免丢掉"停下"那个 0 包时把最后一个速度永远积分下去（静止漂移 + 路程虚涨）。
@@ -350,8 +354,9 @@ class DeadReckoner:
     """
 
     def __init__(self, world_scale: float, osc_lag_s: float = 0.18, *,
-                 zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0) -> None:
+                 zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0, speed_scale: float = 1.0) -> None:
         self.s = float(world_scale)
+        self.k = float(speed_scale)     # OSC 速度 → 实际速度 的系数（见 OnlineNavConfig.osc_speed_scale）
         self.lag = float(osc_lag_s)
         self.zoh_max = max(0.0, float(zoh_max_s))
         self.zoh_fade = max(0.0, float(zoh_fade_s))
@@ -394,7 +399,7 @@ class DeadReckoner:
             if self._v_at is not None and math.hypot(vx, vz) > 0.05:
                 self.max_legit_gap_s = max(self.max_legit_gap_s, ts - self._v_at)
             self._advance(min(max(ts, self._t), target), fwd, right)
-            self._v = (float(vx), float(vz))
+            self._v = (float(vx) * self.k, float(vz) * self.k)
             self._v_at = ts
             self._last_ts = ts
             self.samples += 1
@@ -657,7 +662,8 @@ class OnlineNavigator:
         self.mapper = KeyframeGridMapper(c.mapper)
         self.session = NavSession(self.mapper, radius_m=c.radius_m, request_update=self._request_map_update)
         self.dr = DeadReckoner(c.world_scale, c.osc_lag_s,
-                               zoh_max_s=c.osc_zoh_max_s, zoh_fade_s=c.osc_zoh_fade_s)
+                               zoh_max_s=c.osc_zoh_max_s, zoh_fade_s=c.osc_zoh_fade_s,
+                               speed_scale=c.osc_speed_scale)
         self.loops = LoopCloser(c.loop) if c.loop_closure else None
         self._offset = np.zeros(2)          # 回环修正量（追踪米），加在原始航位推算上
         self._last_loop: dict[str, Any] | None = None

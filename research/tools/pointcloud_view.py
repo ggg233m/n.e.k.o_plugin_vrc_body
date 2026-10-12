@@ -213,9 +213,15 @@ def pose_table_rigid(world_dir: Path, sid: str) -> tuple[dict, str]:
 
 def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                  z_min: float, z_max: float, every: int, pose_mode: str = "rigid",
-                 range_m: float | None = None):
+                 range_m: float | None = None, pose_npz: str | None = None):
     """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, 统计)。"""
-    if pose_mode == "merged":
+    if pose_npz:
+        # 诊断用：直接取录制目录里的位姿表（ids, T），不走世界树 ⇒ 只适合单场看
+        pp = ROOT / "navmesh_recordings" / rec / f"{pose_npz}.npz"
+        with np.load(pp) as z:
+            pose_of = {int(k): np.asarray(T, np.float64) for k, T in zip(z["ids"], z["T"])}
+        pose_src = f"npz({pose_npz})"
+    elif pose_mode == "merged":
         tab = session_pose_table(world_dir, sid)
         if tab is None:
             raise SystemExit(f"[fail] 会话 {sid} 没有位姿表（没并树？先跑 tools/xsession_align.py --world-tree）")
@@ -436,7 +442,8 @@ function draw(){
   let xx=cyw, xy=syw, xz=0;
   let yx=zz*xy-zy*xz, yy=zx*xz-zz*xx, yz=zy*xx-zx*xy;   // = (−z)×x
   l=Math.hypot(yx,yy,yz)||1; yx/=l;yy/=l;yz/=l;
-  xx=yy*zz-yz*zy; xy=yz*zx-yx*zz; xz=yx*zy-yy*zx;
+  // 右 = 上 × 后 = z × y（z 是视线）。⚠️ 别写成 y×z：那是反号，整张图左右镜像（det=−1，2026-10-12 实测翻车）。
+  xx=zy*yz-zz*yy; xy=zz*yx-zx*yz; xz=zx*yy-zy*yx;
   const V=new Float32Array([xx,yx,-zx,0, xy,yy,-zy,0, xz,yz,-zz,0,
      -(xx*ex+xy*ey+xz*ez), -(yx*ex+yy*ey+yz*ez), (zx*ex+zy*ey+zz*ez), 1]);
   const Pm=persp(0.9,ar,0.05,dist*8+50);
@@ -459,7 +466,8 @@ cv.addEventListener('mousedown',e=>{drag=e.button===2?2:1;lx=e.clientX;ly=e.clie
 addEventListener('mouseup',()=>drag=0);
 cv.addEventListener('contextmenu',e=>e.preventDefault());
 addEventListener('mousemove',e=>{ if(!drag)return; const dx=e.clientX-lx,dy=e.clientY-ly;lx=e.clientX;ly=e.clientY;
-  if(drag===1){ yaw+=dx*0.006; pitch=Math.max(-0.35,Math.min(1.50,pitch+dy*0.006)); }
+  if(drag===1){ yaw-=dx*0.006;   // 右拖 ⇒ 场景跟手右转（相机绕 z 向左）
+    pitch=Math.max(-0.35,Math.min(1.50,pitch+dy*0.006)); }
   else { const s=dist*0.0016; cx-=Math.cos(yaw)*dx*s+Math.sin(yaw)*dy*s; cy-=Math.sin(yaw)*dx*s-Math.cos(yaw)*dy*s; } });
 cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.6,dist*(1+Math.sign(e.deltaY)*0.12));},{passive:false});
 // ⚠️ 勿用 bS/bH：那是上面的 WebGL buffer 名，重复声明会让整段脚本 SyntaxError（全黑）
@@ -532,6 +540,8 @@ def main() -> None:
     ap.add_argument("--range-m", type=float, default=5.0,
                     help="相机距离上限（米），与 mapper.range_m 同口径；默认 5.0。"
                          "双目深度误差按 z² 增长，远带点会变成放射状尖刺。给 0 表示不过滤（仅诊断用）")
+    ap.add_argument("--pose-npz", default=None,
+                    help="诊断：用 navmesh_recordings/<rec>/<名字>.npz（ids,T）当位姿，不走世界树（只适合单场）")
     ap.add_argument("--max-pts", type=int, default=1_200_000, help="点数上限，超了自动加粗体素")
     ap.add_argument("--color-by", choices=("session", "time"), default="session",
                     help="着色：session=按场次（看跨场对齐）；time=按本场累积路程（看漂移展开，"
@@ -579,7 +589,8 @@ def main() -> None:
         pts, s, tt, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
                                       float(args.z_min), float(args.z_max), max(1, int(args.every)),
                                       pose_mode=str(args.pose),
-                                      range_m=(None if float(args.range_m) <= 0 else float(args.range_m)))
+                                      range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
+                                      pose_npz=args.pose_npz)
         # 着色通道：按时间 = 本场累积路程进度 0..254；按会话 = 场索引（shader 取调色板）
         col = (tt * 254.0).astype(np.float32) if by_time else np.full(len(pts), float(i), np.float32)
         allp.append(pts)

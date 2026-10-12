@@ -55,6 +55,22 @@ class DeadReckonerTest(unittest.TestCase):
         self.assertAlmostEqual(dr.dist_m, 1.0, places=6)      # 路程不含超前量
         self.assertEqual(dr.samples, 1)                     # 重复样本不重复计
 
+    def test_speed_scale_scales_position_lead_and_distance(self) -> None:
+        r = hmd_to_base_rotation(np.eye(3))
+        dr = DeadReckoner(S, osc_lag_s=0.1, speed_scale=0.8)
+        dr.update(0.0, r, [osc(0.0, 0.0, 2.0)])
+        T = dr.update(1.0, r, [])
+        self.assertAlmostEqual(T[0, 3] * S, 0.8 * 2.0 * 1.1, places=6)   # 积分和超前都按 0.8 缩
+        self.assertAlmostEqual(dr.dist_m, 1.6, places=6)
+
+    def test_speed_scale_default_is_identity(self) -> None:
+        self.assertEqual(OnlineNavConfig().osc_speed_scale, 1.0)
+        r = hmd_to_base_rotation(np.eye(3))
+        a, b = DeadReckoner(S, osc_lag_s=0.1), DeadReckoner(S, osc_lag_s=0.1, speed_scale=1.0)
+        for dr in (a, b):
+            dr.update(0.0, r, [osc(0.0, 0.5, 1.0)])
+        np.testing.assert_array_equal(a.update(1.0, r, []), b.update(1.0, r, []))
+
     def test_lag_compensation_survives_late_samples(self) -> None:
         # 旧实现把积分终点推到 now+lag，迟到样本又从 now+lag 起生效，两者抵消：换 lag 输出不变。
         r = hmd_to_base_rotation(np.eye(3))
