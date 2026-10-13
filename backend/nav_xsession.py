@@ -230,8 +230,19 @@ class XSessionIndex:
         return xyz, des3d
 
 
-def _scan_sessions(world_dir: Path, min_kf: int) -> list[dict[str, Any]]:
-    """列出一个世界里可入索引的会话：状态合法、特征数达标、poses/kf 都在。"""
+def _same_scale(meta: dict[str, Any], world_scale: float | None) -> bool:
+    """会话的 world_scale 与当前一致（旧会话没记 ⇒ 当作一致）。头像缩放会让双目单位跟着缩放，
+    不同缩放的会话之间 xyz/位姿差一个倍数，混进同一索引会把尺度误差当成位移。"""
+    if world_scale is None or meta.get("world_scale") is None:
+        return True
+    try:
+        return abs(float(meta["world_scale"]) - float(world_scale)) <= 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _scan_sessions(world_dir: Path, min_kf: int, world_scale: float | None = None) -> list[dict[str, Any]]:
+    """列出一个世界里可入索引的会话：状态合法、特征数达标、poses/kf 都在、world_scale 相同。"""
     out = []
     sroot = world_dir / "sessions"
     if not sroot.is_dir():
@@ -244,7 +255,7 @@ def _scan_sessions(world_dir: Path, min_kf: int) -> list[dict[str, Any]]:
             meta = json.loads((sdir / "session.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if meta.get("status") not in _INCLUDE_STATUS:
+        if meta.get("status") not in _INCLUDE_STATUS or not _same_scale(meta, world_scale):
             continue
         n_feat = int(meta.get("features") or 0)
         if n_feat < min_kf or not (sdir / "poses.npz").is_file() or not (sdir / "kf").is_dir():
@@ -289,7 +300,8 @@ def _load_session_docs(sdir: Path, vocab: BowVocabulary) -> tuple[list[int], np.
             np.asarray(dists, np.float32), words, indptr, str(tab["source"]))
 
 
-def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -> tuple[XSessionIndex | None, dict[str, Any]]:
+def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None,
+                world_scale: float | None = None) -> tuple[XSessionIndex | None, dict[str, Any]]:
     """扫世界目录重建索引（也是写回后刷新同一入口）。永不抛——失败返回 (None, info)。"""
     info: dict[str, Any] = {"sessions": 0, "docs": 0, "skipped": [], "tables": {}}
     vpath = _vocab_path(cfg.vocab)
@@ -302,7 +314,7 @@ def build_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -
         info["reason"] = "vocab_load_error"
         return None, info
     info["vocab_sha1"] = _sha1(vpath)
-    sessions = [s for s in _scan_sessions(world_dir, cfg.min_session_kf) if s["sid"] != exclude_sid]
+    sessions = [s for s in _scan_sessions(world_dir, cfg.min_session_kf, world_scale) if s["sid"] != exclude_sid]
     # 文档上限：优先保留最新会话（sid 即时间戳）。
     kept: list[dict[str, Any]] = []
     docs = 0
@@ -392,7 +404,8 @@ class _NpzWriter:
             self.path.unlink(missing_ok=True)
 
 
-def load_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) -> tuple[XSessionIndex | None, dict[str, Any]]:
+def load_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None,
+               world_scale: float | None = None) -> tuple[XSessionIndex | None, dict[str, Any]]:
     """优先读缓存；manifest（会话集/特征数/词汇树 sha）对不上或缓存坏 → 重建。"""
     info: dict[str, Any] = {"source": "cache"}
     vpath = _vocab_path(cfg.vocab)
@@ -402,18 +415,18 @@ def load_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) ->
         vocab = BowVocabulary.load(str(vpath))
         manifest = json.loads((world_dir / "xsession" / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        out = build_index(cfg, world_dir, exclude_sid)
+        out = build_index(cfg, world_dir, exclude_sid, world_scale)
         return out[0], {"source": "rebuild", **out[1]}
     if int(manifest.get("schema", 0)) != SCHEMA or manifest.get("vocab_sha1") != _sha1(vpath):
-        out = build_index(cfg, world_dir, exclude_sid)
+        out = build_index(cfg, world_dir, exclude_sid, world_scale)
         return out[0], {"source": "rebuild", **out[1]}
-    have = {s["sid"]: s for s in _scan_sessions(world_dir, cfg.min_session_kf) if s["sid"] != exclude_sid}
+    have = {s["sid"]: s for s in _scan_sessions(world_dir, cfg.min_session_kf, world_scale) if s["sid"] != exclude_sid}
     want = {s["sid"]: (int(s.get("features") or 0), s.get("table", "raw"))
             for s in manifest.get("sessions", [])}
     # 会话表标记也算有效性：会话被采纳后换了表（raw → merged），缓存必须重算。
     if have.keys() != want.keys() or any(
             (have[k]["features"], have[k].get("table", "raw")) != v for k, v in want.items()):
-        out = build_index(cfg, world_dir, exclude_sid)
+        out = build_index(cfg, world_dir, exclude_sid, world_scale)
         return out[0], {"source": "rebuild", **out[1]}
     try:
         with np.load(world_dir / "xsession" / "index.npz") as z:
@@ -429,7 +442,7 @@ def load_index(cfg: XSessionConfig, world_dir: Path, exclude_sid: str | None) ->
             raise ValueError("index_corrupt")
         idx = XSessionIndex(vocab, world_dir, sids, kfs, xy, R, dist, words, indptr, dirs, manifest)
     except (OSError, KeyError, ValueError):
-        out = build_index(cfg, world_dir, exclude_sid)
+        out = build_index(cfg, world_dir, exclude_sid, world_scale)
         return out[0], {"source": "rebuild", **out[1]}
     info["sessions"] = len(set(sids))
     info["docs"] = len(kfs)
@@ -1094,8 +1107,9 @@ class XSessionTracker:
     """
 
     def __init__(self, cfg: XSessionConfig, world_dir: Path, sid: str,
-                 session_dir: Path | None = None) -> None:
+                 session_dir: Path | None = None, world_scale: float | None = None) -> None:
         self.cfg = cfg
+        self.world_scale = world_scale                # 只索引同 world_scale 的历史会话（None = 不筛）
         self.world_dir = Path(world_dir)
         self.sid = str(sid)
         self.session_dir = Path(session_dir) if session_dir is not None else None
@@ -1134,7 +1148,7 @@ class XSessionTracker:
     # ---- 装载（后台线程）----
     def _load_bg(self) -> None:
         try:
-            idx, info = load_index(self.cfg, self.world_dir, exclude_sid=self.sid)
+            idx, info = load_index(self.cfg, self.world_dir, exclude_sid=self.sid, world_scale=self.world_scale)
             with self._lock:
                 self._index, self._info = idx, info
                 self._reason = "ok" if idx is not None else str(info.get("reason", "no_sessions"))
@@ -1323,7 +1337,7 @@ class XSessionTracker:
             if self._thread is not None:
                 self._thread.join(timeout=60.0)       # 装载完成再写，避免与后台重建竞争
             if self._index is None:                   # 首个会话 / 装载失败：重建一次（含本会话）
-                idx, binfo = build_index(self.cfg, self.world_dir, exclude_sid=None)
+                idx, binfo = build_index(self.cfg, self.world_dir, exclude_sid=None, world_scale=self.world_scale)
                 with self._lock:
                     self._index, self._info = idx, binfo
                 if idx is None:

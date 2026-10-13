@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
+import os
 import socket
 import struct
+import tempfile
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
@@ -291,6 +294,33 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.bridge._handle_message("/avatar/change", ("avtr_b",))
         self.assertEqual(self.bridge.param_history()[-1]["name"], "avatar_change")
         self.assertNotIn("ScaleFactor", self.bridge.avatar_scale_snapshot())
+
+    def test_scale_snapshot_falls_back_to_oscquery(self) -> None:
+        # 缩放没改过 ⇒ 缓存里没眼高；query=True 时现问 OSCQuery，问到就补上并标来源。
+        with mock.patch.object(osc_module, "vrchat_oscquery_port", return_value=9123), \
+                mock.patch.object(osc_module, "oscquery_value", return_value=1.2577) as get:
+            self.assertNotIn("/avatar/eyeheight", self.bridge.avatar_scale_snapshot())   # 默认不问
+            get.assert_not_called()
+            snap = self.bridge.avatar_scale_snapshot(query=True)
+            get.assert_called_once_with(9123, "/avatar/eyeheight")
+            self.assertEqual((snap["/avatar/eyeheight"], snap["eyeheight_via"]), (1.2577, "oscquery"))
+            self.bridge._handle_message("/avatar/eyeheight", (1.4,))   # 缓存有了就不再问
+            snap = self.bridge.avatar_scale_snapshot(query=True)
+            self.assertEqual(get.call_count, 1)
+            self.assertNotIn("eyeheight_via", snap)
+        with mock.patch.object(osc_module, "vrchat_oscquery_port", return_value=None):
+            self.bridge._avatar_values.clear()
+            self.assertNotIn("/avatar/eyeheight", self.bridge.avatar_scale_snapshot(query=True))
+
+    def test_oscquery_port_from_latest_log(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            old, new = Path(d) / "output_log_1.txt", Path(d) / "output_log_2.txt"
+            old.write_bytes(b"Advertising Service VRChat-Client-1 of type OSCQuery on 11111\n")
+            new.write_bytes(b"x\nAdvertising Service VRChat-Client-2 of type OSCQuery on 22222\n"
+                            b"Advertising Service VRChat-Client-2 of type OSCQuery on 33333\n")
+            os.utime(old, (1, 1))
+            self.assertEqual(osc_module.vrchat_oscquery_port(str(Path(d) / "output_log_*.txt")), 33333)
+            self.assertIsNone(osc_module.vrchat_oscquery_port(str(Path(d) / "nothing_*.txt")))
 
     def test_missing_builtins_report_unavailable_not_zero_speed(self) -> None:
         # 最重要的一条：avatar 没配这些参数时不能读成「速度为零」，否则导航器

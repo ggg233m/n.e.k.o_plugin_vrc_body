@@ -547,7 +547,8 @@ class BackendService:
     def _navmesh_avatar_snapshot(self) -> dict[str, Any]:
         osc = self.osc
         fn = None if osc is None else getattr(osc, "avatar_scale_snapshot", None)
-        return {} if fn is None else fn()
+        # query=True：缓存没收到眼高时现问 VRChat OSCQuery —— world_scale 要按它换算。
+        return {} if fn is None else fn(query=True)
 
     def _navmesh_drive_block(self) -> str | None:
         """None = 可以驾驶；否则是不能动的原因。与自主目标互斥。"""

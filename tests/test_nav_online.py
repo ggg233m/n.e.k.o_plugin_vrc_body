@@ -387,7 +387,7 @@ class FakeSensors:
 
 class Harness:
     def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None,
-                 frozen_osc: bool = False) -> None:
+                 frozen_osc: bool = False, avatar: dict | None = None) -> None:
         self.armed = armed
         self.vz = vz
         self.frozen_osc = frozen_osc
@@ -412,7 +412,8 @@ class Harness:
             param_history=lambda: [{"seq": 1, "timestamp": 1.0, "name": "ScaleFactor", "value": 1.1131},
                                    {"seq": 2, "timestamp": 1.0, "name": "/avatar/eyeheight", "value": 1.4},
                                    {"seq": 3, "timestamp": 1.5, "name": "Upright", "value": 0.98}],
-            avatar_snapshot=lambda: {"avatar_id": "avtr_x", "/avatar/eyeheight": 1.4})
+            # 默认不带眼高：world_scale 不随头像缩放（= S），其余用例的世界米断言才成立。
+            avatar_snapshot=lambda: dict(avatar or {"avatar_id": "avtr_x"}))
 
     def _motion(self) -> list[dict]:
         # 时间戳必须和 navigator 同一个 monotonic 时钟且**新鲜**：真实回传是变化驱动的，
@@ -906,7 +907,7 @@ class ThreadsTest(unittest.TestCase):
         from neko_anyadance_body.backend.nav_prior import PriorConsumer
 
         class FakeTracker:
-            def __init__(self, cfg, world_dir, sid, session_dir=None):
+            def __init__(self, cfg, world_dir, sid, session_dir=None, world_scale=None):
                 self.world_dir = Path(world_dir)
                 self.seen: list[int] = []
 
@@ -1006,6 +1007,86 @@ class ThreadsTest(unittest.TestCase):
 
 
 class ConfigSurfaceTest(unittest.TestCase):
+    def test_avatar_scale_factor(self) -> None:
+        ref = 1.2577
+        self.assertEqual(nav_online.avatar_scale_factor({}, ref), (1.0, "none"))
+        self.assertEqual(nav_online.avatar_scale_factor({"/avatar/eyeheight": 1.4}, 0.0), (1.0, "disabled"))
+        f, src = nav_online.avatar_scale_factor({"EyeHeightAsMeters": 1.4, "/avatar/eyeheight": 2.0,
+                                                 "ScaleFactor": 3.0}, ref)
+        self.assertEqual(src, "EyeHeightAsMeters")
+        self.assertAlmostEqual(f, 1.4 / ref)
+        self.assertEqual(nav_online.avatar_scale_factor({"ScaleFactor": 1.1131}, ref), (1.1131, "ScaleFactor"))
+        # 坏值（非数、0、离谱倍数）跳过，落到下一个来源或不缩放。
+        self.assertEqual(nav_online.avatar_scale_factor({"EyeHeightAsMeters": 0.0, "ScaleFactor": "x"}, ref),
+                         (1.0, "none"))
+        self.assertEqual(nav_online.avatar_scale_factor({"/avatar/eyeheight": float("nan"), "ScaleFactor": 2.0},
+                                                        ref), (2.0, "ScaleFactor"))
+
+    def test_avatar_scale_applied_once_per_start(self) -> None:
+        snap = {"/avatar/eyeheight": 1.4}
+        nav = Harness(armed=False, avatar=snap).nav
+        nav._avatar_snapshot = lambda: dict(snap)
+        base = nav.cfg.world_scale
+        f = 1.4 / 1.2577
+        for _ in range(2):                       # 重开会话不叠乘
+            nav._apply_avatar_scale(dict(snap))
+            self.assertAlmostEqual(nav.cfg.world_scale, base * f)
+            self.assertAlmostEqual(nav.cfg.mapper.world_scale, base * f)
+            self.assertAlmostEqual(nav.cfg.loop.world_scale, base * f)
+        self.assertEqual(nav.cfg.osc_speed_scale, OnlineNavConfig().osc_speed_scale)   # DR 的 k 不动
+        self.assertFalse(nav._read_avatar_scale()["changed"])
+        snap["/avatar/eyeheight"] = 1.2577       # 会话中改回默认：报 changed，读数本身不改已用的尺度
+        self.assertTrue(nav._read_avatar_scale()["changed"])
+        snap["/avatar/eyeheight"] = 1.4 * 1.008  # 1% 以内不算变
+        self.assertFalse(nav._read_avatar_scale()["changed"])
+        self.assertAlmostEqual(nav.cfg.world_scale, base * f)
+        nav._apply_avatar_scale({})              # 收不到眼高 ⇒ 回到配置原值
+        self.assertEqual(nav.cfg.world_scale, base)
+        nav.cfg = OnlineNavConfig(world_scale=0.9, avatar_ref_eye_height_m=0.0)   # 外部换 cfg 以新值为准；0 = 关
+        nav._apply_avatar_scale(dict(snap))
+        self.assertEqual(nav.cfg.world_scale, 0.9)
+
+    def test_rescale_waits_for_settle_then_restarts(self) -> None:
+        """会话中缩放偏离 >1%：读数稳住 2 s 才重开（拖动手势是连续变的），重开后 world_scale 跟新眼高。"""
+        snap = {"/avatar/eyeheight": 1.4}
+        nav = Harness(armed=False, avatar=snap).nav
+        nav._avatar_snapshot = lambda: dict(snap)
+        nav._apply_avatar_scale(dict(snap))
+        calls: list[dict] = []
+        with mock.patch.object(nav_online.threading, "Thread") as T:
+            T.side_effect = lambda target, args, **kw: mock.Mock(start=lambda: calls.append(args[0]))
+            nav._watch_avatar_scale(0.0)
+            snap["/avatar/eyeheight"] = 1.30         # 拖动中
+            nav._watch_avatar_scale(1.0)
+            snap["/avatar/eyeheight"] = 1.2577
+            nav._watch_avatar_scale(2.0)
+            nav._watch_avatar_scale(3.0)
+            self.assertEqual(calls, [])            # 1.2577 才看到 1 s
+            self.assertTrue(nav.status()["avatar_scale"]["changed"])
+            nav._watch_avatar_scale(4.0)
+            self.assertEqual(len(calls), 1)
+            nav._watch_avatar_scale(5.0)           # 重开进行中不再触发
+            self.assertEqual(len(calls), 1)
+        nav._rescaling = False
+        # 真跑一次重开：stop+start，记录一条，world_scale 回到 S × 1.0。
+        with mock.patch.object(type(nav), "running", new_callable=mock.PropertyMock, return_value=True),                 mock.patch.object(nav, "stop") as stop,                 mock.patch.object(nav, "start", side_effect=lambda **kw: nav._apply_avatar_scale(dict(snap))) as start:
+            nav._start_args = {"record": True, "record_images": False}
+            nav._rescale_restart(calls[0])
+        stop.assert_called_once()
+        start.assert_called_once_with(record=True, record_images=False)
+        r = nav._rescales[-1]
+        self.assertAlmostEqual(r["from_factor"], 1.4 / 1.2577, places=4)
+        self.assertEqual((r["to_factor"], r["world_scale"]), (1.0, S))
+        self.assertFalse(nav._rescaling)
+
+    def test_rescale_skipped_if_user_stopped(self) -> None:
+        nav = Harness(armed=False).nav
+        nav._stop.set()
+        with mock.patch.object(type(nav), "running", new_callable=mock.PropertyMock, return_value=True),                 mock.patch.object(nav, "start") as start:
+            nav._rescale_restart({"factor": 1.0})
+        start.assert_not_called()
+        self.assertEqual(nav._rescales, [])
+
     def test_world_scale_single_source(self) -> None:
         c = OnlineNavConfig(world_scale=0.9)
         self.assertEqual((c.mapper.world_scale, c.loop.world_scale), (0.9, 0.9))
@@ -1058,8 +1139,8 @@ class ConfigSurfaceTest(unittest.TestCase):
 
 class RecorderTest(unittest.TestCase):
     def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False,
-                    record_images: bool = False) -> dict:
-        h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc)
+                    record_images: bool = False, avatar: dict | None = None) -> dict:
+        h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc, avatar=avatar)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
             h.nav.start(record=record, record_images=record_images)
             try:
@@ -1078,7 +1159,8 @@ class RecorderTest(unittest.TestCase):
 
     def test_recording_has_everything_needed_to_replay(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            st = self.run_session(Path(d), record=True, frozen_osc=True)
+            st = self.run_session(Path(d), record=True, frozen_osc=True,
+                                  avatar={"avatar_id": "avtr_x", "/avatar/eyeheight": 1.4})
             rec = st["recording"]
             self.assertEqual(rec["stopped"], "closed")
             out = Path(rec["dir"])
@@ -1112,6 +1194,15 @@ class RecorderTest(unittest.TestCase):
                                       {"t": 1.0, "n": "/avatar/eyeheight", "v": 1.4},
                                       {"t": 1.5, "n": "Upright", "v": 0.98}])
             self.assertEqual(meta["avatar"], {"avatar_id": "avtr_x", "/avatar/eyeheight": 1.4})
+            # 眼高 1.4 ⇒ world_scale 按 1.4/1.2577 放大，配置里的 S 原样留作基准。
+            f = 1.4 / 1.2577
+            self.assertEqual(meta["avatar_scale"]["source"], "/avatar/eyeheight")
+            self.assertAlmostEqual(meta["avatar_scale"]["factor"], f, places=4)
+            self.assertAlmostEqual(meta["avatar_scale"]["base_world_scale"], S)
+            self.assertAlmostEqual(meta["config"]["world_scale"], S * f)
+            self.assertAlmostEqual(meta["config"]["mapper"]["world_scale"], S * f)
+            self.assertAlmostEqual(st["world_scale"], S * f)
+            self.assertFalse(st["avatar_scale"]["changed"])
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
 

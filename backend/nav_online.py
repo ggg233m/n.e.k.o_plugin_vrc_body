@@ -49,6 +49,11 @@ class OnlineNavConfig:
     # 世界米 = 追踪米 × world_scale（随 avatar 变）。唯一真值源：__post_init__ 把它推给 mapper / loop，
     # 两边各写一份时以这里为准（改 mapper.world_scale 不会生效，别在那边改）。
     world_scale: float = 0.755
+    # world_scale 跟随头像缩放：开会话时把 world_scale 乘 本场眼高 ÷ 这个参考眼高（0.755 标定时的眼高）。
+    # 2026-10-14 同世界同路线 A/B（默认 1.2577 vs 1.40）：OSC 世界速度不随缩放、双目 IPD 随缩放 ⇒
+    # 只有双目单位→米这一侧要乘；DR 的 k 不动。眼高取 EyeHeightAsMeters → /avatar/eyeheight →
+    # ScaleFactor（最后这个只对标定用的 avatar 成立）；都没收到就按 1 不改。0 = 关闭（固定 world_scale）。
+    avatar_ref_eye_height_m: float = 1.2577
     # 启动自检：实测双目基线与期望差超过 tol 就报 baseline_mismatch（不停机：深度按实测基线算，几何仍对，
     # 只是噪声变了；但跨会话记忆不能混用）。0.126 = 自编驱动；发行版驱动是 0.063。0 表示不检查。
     expected_baseline_m: float = 0.126
@@ -155,6 +160,26 @@ def check_baseline(measured_m: float, cfg: OnlineNavConfig) -> dict[str, Any]:
     ok = math.isfinite(measured_m) and abs(float(measured_m) - exp) <= cfg.baseline_tol_m
     return {"ok": bool(ok), "measured_m": round(float(measured_m), 4), "expected_m": exp,
             "tol_m": cfg.baseline_tol_m}
+
+
+_SCALE_RANGE = (0.2, 5.0)      # 超出这个倍数的缩放读数当作坏值，不用
+_RESCALE_TOL = 0.01            # 会话中缩放偏离开头读数超过 1% ⇒ 地图作废、重开会话
+_RESCALE_SETTLE_S = 2.0        # 新读数要稳住（±0.5%）这么久才重开：拖动缩放手势是连续变的
+_RESCALE_CHECK_S = 1.0
+
+
+def avatar_scale_factor(snapshot: dict[str, Any], ref_eye_m: float) -> tuple[float, str]:
+    """头像缩放倍数（相对 world_scale 标定时的眼高）及来源。拿不到 / 关闭时返回 ``(1.0, 原因)``。"""
+    if not ref_eye_m or ref_eye_m <= 0:
+        return 1.0, "disabled"
+    for key, div in (("EyeHeightAsMeters", ref_eye_m), ("/avatar/eyeheight", ref_eye_m), ("ScaleFactor", 1.0)):
+        try:
+            v = float(snapshot.get(key))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v) and _SCALE_RANGE[0] <= v / div <= _SCALE_RANGE[1]:
+            return v / div, key
+    return 1.0, "none"
 
 
 class KeyframePolicy:
@@ -719,6 +744,16 @@ class OnlineNavigator:
                  param_history: Callable[[], Sequence[dict[str, Any]]] | None = None,
                  avatar_snapshot: Callable[[], dict[str, Any]] | None = None) -> None:
         self.cfg = cfg or OnlineNavConfig()
+        # start() 把 cfg 换成按头像缩放修正过的那份（_cfg_eff）；_cfg_user 留着配置原值，重启不会叠乘。
+        # 外部直接赋值 self.cfg（测试）时以新值为准。
+        self._cfg_user = self._cfg_eff = self.cfg
+        self._avatar_scale: dict[str, Any] | None = None
+        self._start_args: dict[str, Any] = {}
+        self._life_lock = threading.RLock()           # start/stop 与缩放重开互斥
+        self._rescales: list[dict[str, Any]] = []     # 会话中缩放触发的重开（跨重开保留，status 里看）
+        self._rescaling = False
+        self._scale_pending: tuple[float, float] | None = None   # (首次看到的时刻, 读数)：等它稳住
+        self._scale_view: dict[str, Any] | None = None           # 缩放线程最近一次读数
         # 持久记忆（按世界分区）。world_identity() → {"world_key", ...}；key 为空时本次会话不写记忆。
         self.memory = memory
         self._world_identity = world_identity
@@ -807,9 +842,19 @@ class OnlineNavigator:
     def start(self, record: bool = False, record_images: bool = False) -> dict[str, Any]:
         """``record=True``：把这次会话的原始输入录到 ``record_root/<时间>/``（默认不录）。
         ``record_images=True``：录制时另存关键帧左右原图（只在 ``record`` 时生效）。"""
+        with self._life_lock:
+            return self._start(record, record_images)
+
+    def _start(self, record: bool, record_images: bool) -> dict[str, Any]:
         if self.running:
             return self.status()
         self._stop.clear()
+        self._start_args = {"record": bool(record), "record_images": bool(record_images)}
+        try:
+            avatar = dict(self._avatar_snapshot() or {})
+        except Exception as exc:  # noqa: BLE001 - 快照拿不到不能挡住导航/录制，按不缩放走
+            avatar = {"error": f"{type(exc).__name__}: {exc}"}
+        self._apply_avatar_scale(avatar)
         self._reset()
         self._started_at = self._clock()
         self.recorder = None
@@ -818,14 +863,11 @@ class OnlineNavigator:
                 self._fail("recorder", RuntimeError("record_root_not_configured"))
             else:
                 try:
-                    try:
-                        avatar = dict(self._avatar_snapshot() or {})
-                    except Exception as exc:  # 快照只是附带信息，拿不到不能挡住录制
-                        avatar = {"error": f"{type(exc).__name__}: {exc}"}
                     self.recorder = SessionRecorder(
                         self._record_root / time.strftime("%Y%m%d_%H%M%S"), self.cfg.record_max_mb * 1e6,
                         {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at,
-                         "record_images": bool(record_images), "avatar": avatar},
+                         "record_images": bool(record_images), "avatar": avatar,
+                         "avatar_scale": self._avatar_scale},
                         images=record_images)
                 except (OSError, TypeError) as exc:
                     self._fail("recorder", exc)
@@ -836,12 +878,89 @@ class OnlineNavigator:
         self._threads = [threading.Thread(target=fn, name=f"navmesh-{name}", daemon=True)
                          for name, fn in (("perception", self._perception_loop),
                                           ("mapping", self._mapping_loop),
-                                          ("control", self._control_loop))]
+                                          ("control", self._control_loop),
+                                          ("scale", self._scale_loop))]
         for t in self._threads:
             t.start()
         return self.status()
 
+    def _apply_avatar_scale(self, avatar: dict[str, Any]) -> None:
+        """会话开头定一次 world_scale。中途缩放改不了已建的图 ⇒ ``_watch_avatar_scale`` 重开会话。"""
+        user = self._cfg_user if self.cfg is self._cfg_eff else self.cfg
+        factor, source = avatar_scale_factor(avatar, user.avatar_ref_eye_height_m)
+        eff = user if factor == 1.0 else replace(user, world_scale=user.world_scale * factor)
+        self._cfg_user, self._cfg_eff, self.cfg = user, eff, eff
+        self._scale_view = self._scale_pending = None
+        self._avatar_scale = {"factor": round(factor, 4), "source": source,
+                              "base_world_scale": user.world_scale, "world_scale": eff.world_scale}
+
+    def _avatar_scale_status(self) -> dict[str, Any] | None:
+        """status() 用：只读缩放线程最近一次的结果（快照可能走 HTTP，不在 status 路径上现取）。"""
+        if self._avatar_scale is None:
+            return None
+        return {**(self._scale_view or self._avatar_scale), "restarts": list(self._rescales[-5:])}
+
+    def _read_avatar_scale(self) -> dict[str, Any] | None:
+        info = self._avatar_scale
+        if info is None or info["source"] == "disabled":
+            return info
+        try:
+            now, src = avatar_scale_factor(dict(self._avatar_snapshot() or {}), self.cfg.avatar_ref_eye_height_m)
+        except Exception:  # noqa: BLE001 - 只是状态读数
+            return info
+        # 会话中改了缩放：地图仍按开头的 world_scale，DR 与几何从此差 now/factor 倍，要重开会话。
+        changed = src != "none" and abs(now / info["factor"] - 1.0) > _RESCALE_TOL
+        return {**info, "current_factor": round(now, 4), "current_source": src, "changed": changed}
+
+    def _scale_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._watch_avatar_scale(self._clock())
+            except Exception as exc:  # noqa: BLE001 - 缩放监视坏了导航照常
+                self._fail("avatar_scale", exc)
+            self._stop.wait(_RESCALE_CHECK_S)
+
+    def _watch_avatar_scale(self, tick: float) -> None:
+        """缩放线程每秒查一次；偏离开头读数 >1% 且稳住 2 s ⇒ 另起线程 stop()+start() 重开。
+
+        不能在本线程里直接 stop()（它要 join 本线程）。重开后旧会话照常收尾
+        （录制关闭、记忆落盘 complete），新会话按新眼高定 world_scale。"""
+        if self._rescaling:
+            return
+        st = self._scale_view = self._read_avatar_scale()
+        if not st or not st.get("changed"):
+            self._scale_pending = None
+            return
+        cur, p = float(st["current_factor"]), self._scale_pending
+        if p is None or abs(cur / p[1] - 1.0) > 0.005:
+            self._scale_pending = (tick, cur)
+            return
+        if tick - p[0] >= _RESCALE_SETTLE_S:
+            self._rescaling = True
+            threading.Thread(target=self._rescale_restart, args=(st,), name="navmesh-rescale", daemon=True).start()
+
+    def _rescale_restart(self, st: dict[str, Any]) -> None:
+        try:
+            with self._life_lock:
+                if self._stop.is_set() or not self.running:      # 期间用户已经停了：不替他开
+                    return
+                args = dict(self._start_args)
+                self.stop()
+                self.start(**args)
+                self._rescales = (self._rescales + [{
+                    "wall": round(time.time(), 1), "from_factor": st["factor"],
+                    "to_factor": (self._avatar_scale or {}).get("factor"),
+                    "world_scale": self.cfg.world_scale}])[-20:]
+        except Exception as exc:  # noqa: BLE001 - 重开失败要留痕
+            self._fail("avatar_rescale", exc)
+        finally:
+            self._rescaling = False
+
     def stop(self, timeout_s: float = 2.0) -> dict[str, Any]:
+        with self._life_lock:
+            return self._stop_session(timeout_s)
+
+    def _stop_session(self, timeout_s: float) -> dict[str, Any]:
         self._stop.set()
         self._map_event.set()
         for t in self._threads:
@@ -873,7 +992,8 @@ class OnlineNavigator:
             return
         try:
             wdir = mem.dir.parent.parent          # <root>/<world>/sessions/<sid> → <root>/<world>
-            self._xs = XSessionTracker(self.cfg.xsession, wdir, mem.session_id, session_dir=mem.dir)
+            self._xs = XSessionTracker(self.cfg.xsession, wdir, mem.session_id, session_dir=mem.dir,
+                                       world_scale=self.cfg.world_scale)
             self._xs_reason = ""
         except Exception as exc:                  # noqa: BLE001 - 检索坏了导航照常
             self._xs, self._xs_reason = None, f"init_error:{type(exc).__name__}"
@@ -1436,6 +1556,7 @@ class OnlineNavigator:
             "sensors": info,
             "baseline_check": baseline_check,
             "world_scale": self.cfg.world_scale,
+            "avatar_scale": self._avatar_scale_status(),
             "errors": errors,
             "uptime_s": None if self._started_at is None else round(now - self._started_at, 1),
             "recording": None if self.recorder is None else self.recorder.status(),

@@ -235,6 +235,8 @@ class WorldModelConfig:
 NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "osc_lag_s": (float, 0.0, 1.0),
     "osc_speed_scale": (float, 0.5, 1.5),
+    # world_scale 标定时的眼高（米）；开会话时 world_scale × 本场眼高 ÷ 它。0 = 关闭。
+    "avatar_ref_eye_height_m": (float, 0.0, 5.0),
     "osc_zoh_max_s": (float, 0.0, 30.0),
     "osc_zoh_fade_s": (float, 0.0, 30.0),
     "stereo_period_s": (float, 0.02, 2.0),
@@ -402,8 +404,10 @@ class NavmeshConfig:
     * 基准（2026-10-05 实测）：缩放盘 **1.26 m** / 玩家 **1.5 m** 时 **0.755**，
       由房间里的实物竖尺锚定到 **±5%**（`research/tools/room_ruler.py`；
       证据见 `Docs/漂移形态诊断（2026-10-05）.md` §10.8/§10.10）。
-    * **换身高按比例改**：``s = 0.755 × (本场眼高 ÷ 1.26)``（例：眼高设 1.6 ⇒ **0.96**）。
-      不改就是按同样的比例错——DR 链会与几何链差那么多。
+    * **换身高按比例变**：``s = 0.755 × (本场眼高 ÷ 1.2577)``（例：眼高设 1.6 ⇒ **0.96**）。
+      在线会话开头自动乘（``avatar_ref_eye_height_m``，眼高取自 OSC 缓存，缓存没有就现问
+      OSCQuery；都拿不到就不乘），这里只写标定 avatar 的基准值。会话中途缩放偏离 >1% 且稳住 2 s
+      ⇒ 自动重开会话（旧图按旧尺度建，不能续用），记在 status.avatar_scale.restarts。
     * 只改这里的配置值：`MapperConfig` / `LoopConfig` 里的同名值是占位，会被它覆盖。
 
     ``expected_baseline_m`` 是启动自检的期望双目基线：0.126 只有自编 AnyaDance 驱动才有，

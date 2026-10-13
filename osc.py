@@ -6,14 +6,19 @@ from collections import OrderedDict
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import glob
 import heapq
 import itertools
+import json
 import math
+import os
+import re
 import socket
 import struct
 import threading
 import time
 from typing import Any, Callable, Iterable
+import urllib.request
 
 from .config import VrchatOscConfig
 
@@ -260,6 +265,49 @@ class _ScheduledInput:
     # 只用 action 存按钮名，side 留空。两者的 OSC 载荷类型不同（浮点 vs 整数），
     # 必须在分派时就分开，不能让调用方误把一种当另一种发出去。
     kind: str = field(compare=False, default="input")
+
+
+_OSCQUERY_LOG_GLOB = os.path.join("%USERPROFILE%", "AppData", "LocalLow", "VRChat", "VRChat", "output_log_*.txt")
+_OSCQUERY_PORT_RE = re.compile(rb"Advertising Service \S+ of type OSCQuery on (\d+)")
+_OSCQUERY_PORT_TTL_S = 30.0
+_oscquery_port_cache: tuple[float, int | None] = (-math.inf, None)
+# 不走系统代理：127.0.0.1 也会被 HTTP(S)_PROXY 劫走。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def vrchat_oscquery_port(log_glob: str | None = None) -> int | None:
+    """VRChat 自己的 OSCQuery HTTP 端口（每次启动随机）：最新 output_log 里最后一条广播。
+
+    只读日志里这一行端口号，不解析别的。30 s 缓存，失败返回 None。"""
+    global _oscquery_port_cache
+    now = time.monotonic()
+    if log_glob is None and now - _oscquery_port_cache[0] < _OSCQUERY_PORT_TTL_S:
+        return _oscquery_port_cache[1]
+    port = None
+    try:
+        logs = glob.glob(os.path.expandvars(log_glob or _OSCQUERY_LOG_GLOB))
+        if logs:
+            with open(max(logs, key=os.path.getmtime), "rb") as fh:
+                found = _OSCQUERY_PORT_RE.findall(fh.read())
+            port = int(found[-1]) if found else None
+    except (OSError, ValueError):
+        port = None
+    if log_glob is None:
+        _oscquery_port_cache = (now, port)
+    return port
+
+
+def oscquery_value(port: int, address: str, timeout_s: float = 0.3) -> Any:
+    """GET VRChat OSCQuery 节点的 VALUE（列表取首元素）。拿不到返回 None。"""
+    try:
+        with _LOCAL_OPENER.open(f"http://127.0.0.1:{int(port)}{address}", timeout=timeout_s) as resp:
+            body = json.loads(resp.read(65536).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+    value = body.get("VALUE") if isinstance(body, dict) else None
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value
 
 
 class VrchatOscBridge:
@@ -1147,10 +1195,12 @@ class VrchatOscBridge:
         with self._lock:
             return [dict(item) for item in list(self._param_history)[-size:]]
 
-    def avatar_scale_snapshot(self) -> dict[str, Any]:
+    def avatar_scale_snapshot(self, query: bool = False) -> dict[str, Any]:
         """录制开始时的缓存值：缩放参数变化驱动、不改就不重发，只靠 param_history 会缺开头。
 
-        只含已经收到过的键；``None`` 不代表 0。"""
+        只含已经收到过的键；``None`` 不代表 0。``query=True`` 且缓存里没有眼高时，
+        向 VRChat 的 OSCQuery 直接 GET ``/avatar/eyeheight``（插件刚启动、没改过缩放时缓存是空的），
+        取到就写进 ``/avatar/eyeheight`` 并标 ``eyeheight_via = "oscquery"``。"""
         with self._lock:
             out: dict[str, Any] = {"avatar_id": self._avatar_id}
             for name in RECORDED_AVATAR_PARAMETERS:
@@ -1161,7 +1211,13 @@ class VrchatOscBridge:
                 rec = self._avatar_values.get(address)
                 if rec is not None:
                     out[address] = rec.get("value")
-            return out
+        if query and out.get("EyeHeightAsMeters") is None and out.get("/avatar/eyeheight") is None:
+            port = vrchat_oscquery_port()
+            value = None if port is None else _numeric(oscquery_value(port, "/avatar/eyeheight"))
+            if value is not None:
+                out["/avatar/eyeheight"] = value
+                out["eyeheight_via"] = "oscquery"
+        return out
 
     def awareness(self) -> dict[str, Any]:
         with self._lock:

@@ -193,7 +193,9 @@ enabled = false
 persist = true
 
 # 在线建图导航（/worldmodel/navmesh）。world_scale 是唯一真值源：世界米 = 追踪米 × s，
-# 随 avatar 变（现用 avatar 实测 0.755），换 avatar 须重标。expected_baseline_m 是启动自检：
+# 这里写标定 avatar 默认眼高下的值（0.755）；会话开头按眼高（OSC 缓存或 OSCQuery）自动 × 眼高/1.2577，
+# 会话中改缩放 >1% 会自动重开会话；
+# 换别的 avatar 仍须重标。expected_baseline_m 是启动自检：
 # 0.126 只有自编 AnyaDance 驱动才有，发行版驱动是 0.063，不符时 status.errors 报 baseline_mismatch；
 # 0 表示不检查。其余参数默认沿用代码里的实测值，要覆盖就在本节或 [navmesh.mapper] /
 # [navmesh.loop] / [navmesh.prior] 写同名键（可写的键见 config.py 的 NAVMESH_*_KEYS，

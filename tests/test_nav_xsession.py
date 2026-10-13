@@ -156,6 +156,19 @@ class TestIndexBuildLoad(XSessionTestBase):
         self.assertNotIn("tiny", idx.sessions())
 
 
+    def test_index_skips_other_world_scale(self) -> None:
+        """头像缩放改了 world_scale 的会话不进同一索引（双目单位差一个倍数）；没记的旧会话照收。"""
+        meta = json.loads((self.wdir / "sessions" / "B" / "session.json").read_text(encoding="utf-8"))
+        (self.wdir / "sessions" / "B" / "session.json").write_text(
+            json.dumps({**meta, "world_scale": 0.84}), encoding="utf-8")
+        idx, _ = build_index(self.cfg, self.wdir, exclude_sid=None, world_scale=0.755)
+        self.assertEqual(sorted(idx.sessions()), ["A"])
+        idx, _ = build_index(self.cfg, self.wdir, exclude_sid=None, world_scale=0.84)
+        self.assertEqual(sorted(idx.sessions()), ["A", "B"])
+        idx, _ = build_index(self.cfg, self.wdir, exclude_sid=None)
+        self.assertEqual(sorted(idx.sessions()), ["A", "B"])
+
+
 class TestBowAddWords(unittest.TestCase):
     def test_add_words_matches_add(self) -> None:
         rng = np.random.default_rng(3)
