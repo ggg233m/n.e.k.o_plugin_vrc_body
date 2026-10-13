@@ -261,6 +261,37 @@ class OscMotionFeedbackTests(unittest.TestCase):
         self.bridge._handle_message("/avatar/change", ("avtr_new",))
         self.assertEqual(self.bridge.vertical_history(), [])
 
+    def test_param_history_records_motion_and_scale_raw(self) -> None:
+        # 录制用的原始参数流：运动 + 缩放 + /avatar/eyeheight；无关参数不进；seq 严格递增。
+        self.bridge._handle_message("/avatar/change", ("avtr_a",))
+        self._feed("Upright", 0.97)
+        self._feed("VelocityMagnitude", 2.5)
+        self._feed("AngularY", -544.0)
+        self._feed("SomeCustomParam", 1)
+        self.now[0] += 0.1
+        self._feed("ScaleFactor", 1.1131)
+        self.bridge._handle_message("/avatar/eyeheight", (1.40,))
+        self._feed("Grounded", True)
+        hist = self.bridge.param_history()
+        self.assertEqual([h["name"] for h in hist],
+                         ["avatar_change", "Upright", "VelocityMagnitude", "AngularY", "ScaleFactor",
+                          "/avatar/eyeheight", "Grounded"])
+        self.assertEqual([h["seq"] for h in hist], sorted({h["seq"] for h in hist}))
+        self.assertEqual(hist[0]["value"], "avtr_a")
+        self.assertAlmostEqual(hist[-2]["timestamp"], 100.1)
+        self.assertEqual(self.bridge.param_history(limit=2), hist[-2:])
+        snap = self.bridge.avatar_scale_snapshot()
+        self.assertEqual(snap["avatar_id"], "avtr_a")
+        self.assertEqual(snap["ScaleFactor"], 1.1131)
+        self.assertEqual(snap["/avatar/eyeheight"], 1.40)
+        self.assertIs(snap["Grounded"], True)
+        self.assertNotIn("EyeHeightAsMeters", snap)       # 没收到就没有键，不是 0
+        self.assertNotIn("SomeCustomParam", snap)
+        # 换 avatar 不清原始流（只追加一条切换记录）；参数缓存照旧清空。
+        self.bridge._handle_message("/avatar/change", ("avtr_b",))
+        self.assertEqual(self.bridge.param_history()[-1]["name"], "avatar_change")
+        self.assertNotIn("ScaleFactor", self.bridge.avatar_scale_snapshot())
+
     def test_missing_builtins_report_unavailable_not_zero_speed(self) -> None:
         # 最重要的一条：avatar 没配这些参数时不能读成「速度为零」，否则导航器
         # 会把「读不到」当成「卡住了」，一armed 就立刻停车。

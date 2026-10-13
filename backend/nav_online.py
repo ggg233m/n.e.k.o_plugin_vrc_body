@@ -66,6 +66,13 @@ class OnlineNavConfig:
     # 任一项为 0 = 不封顶（回到旧行为，只在明知道自己在赌时才这么配）。
     osc_zoh_max_s: float = 2.5
     osc_zoh_fade_s: float = 1.0
+    # 航位推算的朝向取样：True = 每个积分子段按**该段中点**的 HMD 朝向旋转；
+    # False = 旧行为（整批样本共用本帧朝向，系统性"偏超前"，转身时把早先那段位移多转一点）。
+    # VelocityX/Z 是角色局部系（实测 atan2(vx,vz) 尖峰钉在 0°/±90°/180°，与 HMD 航向圆相关 ≤0.19），
+    # 所以必须乘**被测量那一刻**的朝向。解析量级 ½·v·ω·ΔT·δ ≈ 8 cm/0.5 s（跑步 + 转身）；
+    # 离线 A/B 见 .tmp/dr_lag_sweep3.py 的 end vs exact 两列（方向差 14.0°→12.2°）。
+    # 关掉它只为对照，不是修复方案。
+    dr_heading_midpoint: bool = True
     pose_hz: float = 20.0
     # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
@@ -201,7 +208,9 @@ class SessionRecorder:
     """默认不开。把一次在线会话的原始输入落盘，离线能按同样顺序重放建图/回环（长时间场景复现）。
 
     目录内容：``meta.json``（配置、传感器）、``hmd.jsonl``（每个位姿周期的 HMD 旋转，base 系）、
-    ``osc.jsonl``（新到的 OSC 速度样本）、``vert.jsonl``（OSC VelocityY / Grounded）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
+    ``osc.jsonl``（新到的 OSC 速度样本）、``vert.jsonl``（OSC VelocityY / Grounded）、
+    ``params.jsonl``（内置运动/缩放参数逐条原始值 ``{"t","n","v"}``，含 Upright / AngularY / VelocityMagnitude /
+    ScaleFactor / /avatar/eyeheight 等；开录时的缓存值另在 meta.json ``avatar``）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
     ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右灰度原图，采集分辨率）。
 
@@ -326,6 +335,47 @@ def _json_default(o: Any) -> Any:
     raise TypeError(type(o).__name__)
 
 
+class HeadingTrack:
+    """近 ~1 s 的 (时刻, 展开 yaw)，给 ``DeadReckoner`` 按**积分区间中点**取朝向。
+
+    为什么另起一份而不是复用感知循环里的 ``yaw_hist``（0.25 s，给转速用）：积分区间要
+    覆盖到上一个位姿周期，跨静默时还可能更长；两处口径不同，各留各的，互不改对方的窗口。
+
+    只记 (t, yaw)，不记整帧旋转：积分只要基向量 [:,0]，一个标量够。yaw 在这里**展开**
+    （跨 ±π 累加），插值才不会在 ±π 附近跳变。
+    """
+
+    def __init__(self, span_s: float = 1.0) -> None:
+        self.span = float(span_s)
+        self._t: list[float] = []
+        self._y: list[float] = []
+
+    def push(self, t: float, yaw: float) -> None:
+        t = float(t)
+        if self._t and t <= self._t[-1]:
+            # 时钟回退 / 重复 tick：只改最后一点，不制造非单调序列（np.interp 要求升序）。
+            self._t[-1], self._y[-1] = t, float(yaw)
+            return
+        y = float(yaw)
+        if self._y:
+            y = self._y[-1] + _wrap(y - self._y[-1])
+        self._t.append(t)
+        self._y.append(y)
+        while len(self._t) > 2 and self._t[-1] - self._t[0] > self.span:
+            self._t.pop(0)
+            self._y.pop(0)
+
+    def at(self, t: float) -> float | None:
+        """t 处的朝向（弧度）；落在已知区间之外返回 None（调用方退回当前朝向）。"""
+        if len(self._t) < 2 or not (self._t[0] <= t <= self._t[-1]):
+            return None
+        return float(np.interp(t, self._t, self._y))
+
+    def span_s(self) -> float:
+        """当前覆盖时长（秒）。自检用：远小于一个位姿周期说明历史没在喂。"""
+        return 0.0 if len(self._t) < 2 else self._t[-1] - self._t[0]
+
+
 class DeadReckoner:
     """OSC 本地速度（ZOH 前值保持）× HMD 朝向 → 地图系位姿（追踪米）。
 
@@ -356,10 +406,15 @@ class DeadReckoner:
     """
 
     def __init__(self, world_scale: float, osc_lag_s: float = 0.18, *,
-                 zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0, speed_scale: float = 1.0) -> None:
+                 zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0, speed_scale: float = 1.0,
+                 heading_at: Callable[[float], float | None] | None = None) -> None:
         self.s = float(world_scale)
         self.k = float(speed_scale)     # OSC 速度 → 实际速度 的系数（见 OnlineNavConfig.osc_speed_scale）
         self.lag = float(osc_lag_s)
+        # 朝向取样器：传入则每个积分子段按**该段中点**的朝向旋转（见 _basis_at）。None = 旧行为。
+        self._heading_at = heading_at
+        self.heading_segments = 0       # 用历史朝向积分的段数（自检：接线掉了会一直是 0）
+        self.heading_fallbacks = 0      # 退回当前朝向的段数（启动头几帧、位姿长空档）
         self.zoh_max = max(0.0, float(zoh_max_s))
         self.zoh_fade = max(0.0, float(zoh_fade_s))
         self.xy = np.zeros(2)
@@ -381,7 +436,9 @@ class DeadReckoner:
         """最后一个被接受的 OSC 速度样本时刻（None = 一个都没有）。"""
         return self._v_at
 
-    def update(self, t_now: float, r_ob: np.ndarray, osc: Sequence[dict[str, Any]]) -> np.ndarray:
+    def update(self, t_now: float, r_ob: np.ndarray, osc: Sequence[dict[str, Any]],
+               heading_at: Callable[[float], float | None] | None = None) -> np.ndarray:
+        self._heading_at = heading_at if heading_at is not None else self._heading_at
         fwd = np.array([r_ob[0, 0], r_ob[1, 0]], float)
         n = float(np.hypot(*fwd))
         fwd = fwd / n if n > 1e-6 else np.array([1.0, 0.0])
@@ -431,6 +488,31 @@ class DeadReckoner:
 
         return min(max(_area(b - self._v_at) - _area(a - self._v_at), 0.0), b - a)
 
+    def _basis_at(self, a: float, b: float, fwd: np.ndarray, right: np.ndarray
+                  ) -> tuple[np.ndarray, np.ndarray]:
+        """积分区间 [a,b] 该用哪组基向量。
+
+        VelocityX/Z 是**角色局部系**（实测：atan2(vx,vz) 的直方图尖峰钉在 0°/±90°/180°，
+        与 HMD 航向的圆相关 ≤0.19 ⇒ 不是世界系）。局部系向量要落到地图里，必须乘
+        **它被测量那一刻**的朝向，而不是处理它那一刻的朝向。旧实现整批样本共用 update()
+        入口那一帧的朝向 —— 系统性地"偏超前"：转身时把早先那段位移多转了一点，
+        解析量级 ½·v·ω·ΔT·δ（跑步 + 转身约 8 cm / 0.5 s）。取区间中点是一阶精度，
+        与离线原型（.tmp/dr_lag_sweep3.py 的 exact 列）同口径。
+
+        没有取样器（旧行为）或它返回 None（启动头几帧、位姿长空档）时退回传入的当前基，
+        两种计数分开记，接线掉了表现为 heading_segments 一直是 0。
+        """
+        if self._heading_at is None:
+            return fwd, right
+        psi = self._heading_at(0.5 * (a + b))
+        if psi is None:
+            self.heading_fallbacks += 1
+            return fwd, right
+        c, s = math.cos(psi), math.sin(psi)
+        # 与 update() 同约定：fwd = 基向量 [:,0] = (cos, sin)，right = [:,1] = (sin, -cos)。
+        self.heading_segments += 1
+        return np.array([c, s]), np.array([s, -c])
+
     def _advance(self, t: float, fwd: np.ndarray, right: np.ndarray) -> None:
         dt = t - float(self._t)
         if dt <= 0.0:
@@ -438,7 +520,9 @@ class DeadReckoner:
         vx, vz = self._v
         speed = math.hypot(vx, vz)
         kept = dt if (speed <= 0.0 or self._v_at is None) else self._hold_dt(float(self._t), t)
-        self.xy = self.xy + (vz * fwd + vx * right) * kept / self.s
+        # 只在**真正积分的那一段**上取朝向：被封顶丢掉的尾部不该进中点。
+        seg_fwd, seg_right = self._basis_at(float(self._t), float(self._t) + kept, fwd, right)
+        self.xy = self.xy + (vz * seg_fwd + vx * seg_right) * kept / self.s
         self.dist_m += speed * kept
         dropped = dt - kept
         if dropped > 0.0:
@@ -631,7 +715,9 @@ class OnlineNavigator:
                  cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
                  record_root: Path | None = None, memory: NavMemoryStore | None = None,
                  world_identity: Callable[[], dict[str, Any]] | None = None,
-                 vertical_history: Callable[[], Sequence[dict[str, Any]]] | None = None) -> None:
+                 vertical_history: Callable[[], Sequence[dict[str, Any]]] | None = None,
+                 param_history: Callable[[], Sequence[dict[str, Any]]] | None = None,
+                 avatar_snapshot: Callable[[], dict[str, Any]] | None = None) -> None:
         self.cfg = cfg or OnlineNavConfig()
         # 持久记忆（按世界分区）。world_identity() → {"world_key", ...}；key 为空时本次会话不写记忆。
         self.memory = memory
@@ -643,6 +729,9 @@ class OnlineNavigator:
         self._motion_history = motion_history
         # VelocityY / Grounded：目前只录不用（多层/竖直漂移的离线评估数据）。
         self._vertical_history = vertical_history or (lambda: ())
+        # 内置运动/缩放参数逐条原始样本 + 开录时的缓存快照：同样只录不用（缩放会改双目尺度和移动速度）。
+        self._param_history = param_history or (lambda: ())
+        self._avatar_snapshot = avatar_snapshot or (lambda: {})
         self._send_move = send_move
         self._send_turn = send_turn
         self._stop_motion = stop_motion
@@ -663,6 +752,7 @@ class OnlineNavigator:
         c = self.cfg
         self.mapper = KeyframeGridMapper(c.mapper)
         self.session = NavSession(self.mapper, radius_m=c.radius_m, request_update=self._request_map_update)
+        self.heading_track = HeadingTrack()
         self.dr = DeadReckoner(c.world_scale, c.osc_lag_s,
                                zoh_max_s=c.osc_zoh_max_s, zoh_fade_s=c.osc_zoh_fade_s,
                                speed_scale=c.osc_speed_scale)
@@ -728,10 +818,14 @@ class OnlineNavigator:
                 self._fail("recorder", RuntimeError("record_root_not_configured"))
             else:
                 try:
+                    try:
+                        avatar = dict(self._avatar_snapshot() or {})
+                    except Exception as exc:  # 快照只是附带信息，拿不到不能挡住录制
+                        avatar = {"error": f"{type(exc).__name__}: {exc}"}
                     self.recorder = SessionRecorder(
                         self._record_root / time.strftime("%Y%m%d_%H%M%S"), self.cfg.record_max_mb * 1e6,
                         {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at,
-                         "record_images": bool(record_images)},
+                         "record_images": bool(record_images), "avatar": avatar},
                         images=record_images)
                 except (OSError, TypeError) as exc:
                     self._fail("recorder", exc)
@@ -955,6 +1049,7 @@ class OnlineNavigator:
                                 "cx": sensors.cx, "cy": sensors.cy, "baseline_m": sensors.baseline_m})
         osc_seen = -math.inf
         vert_seen = -math.inf
+        param_seen = 0
         matcher = None
         orb = None
         kf_id = -1
@@ -983,8 +1078,18 @@ class OnlineNavigator:
                                 vert_seen = ts
                                 rec.line("vert", {"t": ts, "src": o.get("source"), "vy": o.get("velocity_y"),
                                                   "g": o.get("grounded")})
+                        # 同一 bundle 的参数共用接收时刻，按 seq 去重。
+                        for o in self._param_history():
+                            seq = int(o.get("seq", 0))
+                            if seq > param_seen:
+                                param_seen = seq
+                                rec.line("params", {"t": o.get("timestamp"), "n": o.get("name"), "v": o.get("value")})
                         rec.line("hmd", {"t": tick, "R": np.round(r_ob, 6)})
-                    T = self.dr.update(tick, r_ob, hist)
+                    # 先喂朝向历史再积分：本帧 yaw 入历史后，区间中点一定能插到值
+                    # （否则每帧都会退回"当前朝向"，等于没改）。
+                    self.heading_track.push(tick, math.atan2(r_ob[1, 0], r_ob[0, 0]))
+                    head = (self.heading_track.at if c.dr_heading_midpoint else None)
+                    T = self.dr.update(tick, r_ob, hist, head)
                     yaw_now = math.atan2(T[1, 0], T[0, 0])
                     if prev_yaw is not None:
                         dyaw = math.degrees(_wrap(yaw_now - prev_yaw))
@@ -1292,6 +1397,12 @@ class OnlineNavigator:
             "hmd_yaw_jumps": yaw_jumps,
             "odometry_distance_m": round(self.dr.dist_m, 2),
             "osc_samples": self.dr.samples,
+            # 朝向取样的现场读数：segments 应随路程持续增长；fallbacks 只在启动头几帧、
+            # 位姿长空档里出现。segments 恒为 0 = 取样器没接上（dr_heading_midpoint 被关或历史没喂）。
+            "dr_heading": {"midpoint": bool(self.cfg.dr_heading_midpoint),
+                            "segments": self.dr.heading_segments,
+                            "fallbacks": self.dr.heading_fallbacks,
+                            "track_span_s": round(self.heading_track.span_s(), 2)},
             # 静默封顶的现场证据：丢包丢掉"停下"那个 0 包时，位姿不再被最后一个速度带着跑。
             # dropped_m 是**没算进** odometry_distance_m 的那部分，不是误差条。
             "odometry_holdout": {

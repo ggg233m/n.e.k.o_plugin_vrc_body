@@ -21,9 +21,9 @@ from neko_anyadance_body import config
 from neko_anyadance_body.backend.nav_loop import LoopConfig
 from neko_anyadance_body.backend.nav_mapping import MapperConfig
 from neko_anyadance_body.backend.nav_prior import PriorConfig
-from neko_anyadance_body.backend.nav_online import (DeadReckoner, KeyframePolicy, OnlineNavConfig, OnlineNavigator,
-                                                    SessionRecorder, check_baseline, hmd_to_base_rotation,
-                                                    near_obstacle)
+from neko_anyadance_body.backend.nav_online import (DeadReckoner, HeadingTrack, KeyframePolicy,
+                                                    OnlineNavConfig, OnlineNavigator, SessionRecorder,
+                                                    check_baseline, hmd_to_base_rotation, near_obstacle)
 
 S = 0.755
 CAM_H = 1.73
@@ -187,6 +187,105 @@ class DeadReckonerTest(unittest.TestCase):
         dr.update(5.0, r, [osc(5.0, 0.0, 1.0)])       # 3 s 的"两端非零"空档被记下
         self.assertAlmostEqual(dr.max_legit_gap_s, 3.0, places=6)
 
+    # ---- 朝向取样：局部系速度必须乘「被测量那一刻」的朝向（见 _basis_at）----
+
+    def test_midpoint_heading_uses_the_segment_heading_not_the_current_one(self) -> None:
+        # yaw 从 0 线性转到 90°，速度恒为前进 1 m/s，积分区间 [0,1]：
+        #   旧行为：整段共用 t=1 的朝向 ⇒ 位移指向 90°
+        #   中点：  用 t=0.5 的朝向 ⇒ 位移指向 45°
+        def psi(t: float) -> float:
+            return math.radians(90.0 * t)
+
+        r0, r1 = hmd_to_base_rotation(hmd_yaw(0.0)), hmd_to_base_rotation(hmd_yaw(90.0))
+        old = DeadReckoner(S, osc_lag_s=0.0)
+        old.update(0.0, r0, [osc(0.0, 0.0, 1.0)])
+        T_old = old.update(1.0, r1, [])
+        new = DeadReckoner(S, osc_lag_s=0.0, heading_at=psi)
+        new.update(0.0, r0, [osc(0.0, 0.0, 1.0)])
+        T_new = new.update(1.0, r1, [])
+        self.assertAlmostEqual(math.degrees(math.atan2(T_old[1, 3], T_old[0, 3])), 90.0, places=4)
+        self.assertAlmostEqual(math.degrees(math.atan2(T_new[1, 3], T_new[0, 3])), 45.0, places=4)
+        self.assertAlmostEqual(float(np.hypot(*T_new[:2, 3])) * S, 1.0, places=6)   # 中点保长度
+        self.assertEqual(new.heading_segments, 1)
+        self.assertEqual(new.heading_fallbacks, 0)
+
+    def test_without_heading_provider_behaviour_is_bit_identical(self) -> None:
+        # 关掉取样器（dr_heading_midpoint=False / 旧调用方）必须逐位等于旧实现：
+        # 不能因为新增通路悄悄改了没打开它的路径。
+        r = hmd_to_base_rotation(hmd_yaw(37.0))
+        a = DeadReckoner(S, osc_lag_s=0.13)
+        b = DeadReckoner(S, osc_lag_s=0.13, heading_at=None)
+        for dr in (a, b):
+            dr.update(0.0, r, [osc(0.0, 0.4, 1.2)])
+            dr.update(0.5, r, [osc(0.4, 0.0, 2.0)])
+        np.testing.assert_array_equal(a.update(1.0, r, []), b.update(1.0, r, []))
+        self.assertEqual((b.heading_segments, b.heading_fallbacks), (0, 0))
+
+    def test_heading_provider_returning_none_falls_back_and_is_counted(self) -> None:
+        # 位姿历史还没喂上（启动头几帧）时按当前朝向算，并如实计数 —— 接线掉了
+        # 表现为 heading_segments 恒 0，而不是静默换成另一套行为。
+        r = hmd_to_base_rotation(hmd_yaw(20.0))
+        plain = DeadReckoner(S, osc_lag_s=0.0)
+        fallback = DeadReckoner(S, osc_lag_s=0.0, heading_at=lambda t: None)
+        for dr in (plain, fallback):
+            dr.update(0.0, r, [osc(0.0, 0.0, 1.0)])
+        np.testing.assert_array_equal(plain.update(1.0, r, []), fallback.update(1.0, r, []))
+        self.assertEqual(fallback.heading_segments, 0)
+        self.assertEqual(fallback.heading_fallbacks, 1)
+
+    def test_output_lead_still_uses_the_current_heading(self) -> None:
+        # 超前项 v·lag 描述的是**现在**的位置，必须用当前朝向；只有积分段用中点。
+        def psi(t: float) -> float:
+            return math.radians(90.0 * t)
+
+        r0, r1 = hmd_to_base_rotation(hmd_yaw(0.0)), hmd_to_base_rotation(hmd_yaw(90.0))
+        base = DeadReckoner(S, osc_lag_s=0.0, heading_at=psi)
+        lead = DeadReckoner(S, osc_lag_s=0.2, heading_at=psi)
+        for dr in (base, lead):
+            dr.update(0.0, r0, [osc(0.0, 0.0, 1.0)])
+        d = (lead.update(1.0, r1, [])[:2, 3] - base.update(1.0, r1, [])[:2, 3]) * S
+        self.assertAlmostEqual(math.degrees(math.atan2(d[1], d[0])), 90.0, places=4)
+        self.assertAlmostEqual(float(np.hypot(*d)), 1.0 * 0.2, places=6)
+
+
+class HeadingTrackTest(unittest.TestCase):
+    """朝向历史：给积分器按区间中点插值用。"""
+
+    def test_interpolates_and_reports_span(self) -> None:
+        h = HeadingTrack()
+        for i, yaw in enumerate((0.0, 10.0, 20.0)):
+            h.push(float(i) * 0.5, math.radians(yaw))
+        self.assertAlmostEqual(math.degrees(h.at(0.25)), 5.0, places=6)
+        self.assertAlmostEqual(math.degrees(h.at(0.75)), 15.0, places=6)
+        self.assertAlmostEqual(h.span_s(), 1.0, places=6)
+
+    def test_outside_the_track_returns_none(self) -> None:
+        h = HeadingTrack()
+        self.assertIsNone(h.at(0.0))                       # 一个点都没有
+        h.push(0.0, 0.0)
+        self.assertIsNone(h.at(0.0))                       # 只有一个点：插不了，别猜
+        h.push(1.0, 0.1)
+        self.assertIsNone(h.at(-0.5))                      # 早于起点
+        self.assertIsNone(h.at(1.5))                       # 晚于终点
+
+    def test_unwraps_across_pi_so_interpolation_does_not_jump(self) -> None:
+        # 展开存储：跨 ±π 的两点插出来必须是连续的中值，不是绕远的那条。
+        h = HeadingTrack()
+        h.push(0.0, math.radians(170.0))
+        h.push(1.0, math.radians(-170.0))
+        self.assertAlmostEqual(abs(math.degrees(h.at(0.5))), 180.0, places=6)
+
+    def test_window_is_bounded_and_clock_rollback_overwrites(self) -> None:
+        h = HeadingTrack(span_s=1.0)
+        for i in range(40):                                # 20 s 的样本，窗口只留 1 s
+            h.push(i * 0.5, math.radians(i))
+        self.assertLessEqual(h.span_s(), 1.0 + 0.5)
+        t_last, y_last = h._t[-1], h._y[-1]
+        h.push(t_last - 0.1, math.radians(-90.0))          # 时钟回退：改最后一点，不新增
+        self.assertEqual(len(h._t), len(h._y))
+        self.assertAlmostEqual(h._t[-1], t_last - 0.1, places=9)
+        self.assertNotAlmostEqual(h._y[-1], y_last, places=6)
+
 
 def ground_and_wall(wall_x_track: float | None) -> np.ndarray:
     gx, gy = np.meshgrid(np.arange(0.3, 3.0, 0.05), np.arange(-1.5, 1.5, 0.05))
@@ -308,7 +407,12 @@ class Harness:
             vertical_history=lambda: [{"timestamp": 1.0, "source": "Grounded", "velocity_y": None,
                                        "grounded": True},
                                       {"timestamp": 2.0, "source": "VelocityY", "velocity_y": 0.4,
-                                       "grounded": False}])
+                                       "grounded": False}],
+            # 同一 bundle 两条共用时间戳：必须按 seq 去重，不能按 t。
+            param_history=lambda: [{"seq": 1, "timestamp": 1.0, "name": "ScaleFactor", "value": 1.1131},
+                                   {"seq": 2, "timestamp": 1.0, "name": "/avatar/eyeheight", "value": 1.4},
+                                   {"seq": 3, "timestamp": 1.5, "name": "Upright", "value": 0.98}],
+            avatar_snapshot=lambda: {"avatar_id": "avtr_x", "/avatar/eyeheight": 1.4})
 
     def _motion(self) -> list[dict]:
         # 时间戳必须和 navigator 同一个 monotonic 时钟且**新鲜**：真实回传是变化驱动的，
@@ -1003,6 +1107,11 @@ class RecorderTest(unittest.TestCase):
             vert = [json.loads(x) for x in (out / "vert.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(vert, [{"t": 1.0, "src": "Grounded", "vy": None, "g": True},
                                     {"t": 2.0, "src": "VelocityY", "vy": 0.4, "g": False}])
+            params = [json.loads(x) for x in (out / "params.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(params, [{"t": 1.0, "n": "ScaleFactor", "v": 1.1131},
+                                      {"t": 1.0, "n": "/avatar/eyeheight", "v": 1.4},
+                                      {"t": 1.5, "n": "Upright", "v": 0.98}])
+            self.assertEqual(meta["avatar"], {"avatar_id": "avtr_x", "/avatar/eyeheight": 1.4})
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
 

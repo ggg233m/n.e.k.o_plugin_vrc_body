@@ -51,6 +51,14 @@ _INPUT_HOLD_MAX_MS = 1000
 # 返回 available=false 而不是猜一个速度出来。
 _VELOCITY_AXIS_PARAMETERS = ("VelocityX", "VelocityY", "VelocityZ")
 BUILTIN_MOTION_PARAMETERS = _VELOCITY_AXIS_PARAMETERS + ("Upright", "Grounded", "AngularY")
+# 原样进录制（params.jsonl）的内置参数：运动 + 头像缩放。缩放参数决定双目尺度和（可能）移动速度，
+# 离线换算必须知道录制时的值。全部是变化驱动：缩放不改就不会再发，所以录制开始时另存一份缓存快照。
+RECORDED_AVATAR_PARAMETERS = BUILTIN_MOTION_PARAMETERS + (
+    "VelocityMagnitude", "ScaleFactor", "ScaleFactorInverse", "EyeHeightAsMeters", "EyeHeightAsPercent",
+    "ScaleModified")
+# 不在 /avatar/parameters/ 下的眼高地址；缓存键用完整地址，不会和参数名撞。
+_AVATAR_EYEHEIGHT_ADDRESSES = ("/avatar/eyeheight", "/avatar/eyeheightmin", "/avatar/eyeheightmax",
+                               "/avatar/eyeheightscalingallowed")
 
 # 「最后一次回传说自己是静止的」的判定阈值。低于它时链路沉默与取值不矛盾
 # （没变化自然没有包），可用性保持；高于它时沉默与取值矛盾，说明链路是在运动中
@@ -285,6 +293,12 @@ class VrchatOscBridge:
         # 竖直通道（VelocityY / Grounded）单独存：水平速度历史喂航位推算和视觉对齐，口径不能混。
         # 用途是录制与离线评估楼层/竖直位移；两者同样是变化驱动、无心跳。
         self._vertical_history: deque[dict[str, Any]] = deque(maxlen=512)
+        # RECORDED_AVATAR_PARAMETERS + 眼高地址的逐条原始样本，只供录制。同一个 bundle 里的消息
+        # 共用一个接收时刻，所以去重靠 seq 而不是时间戳。换 avatar 不清空，改记一条 avatar_change。
+        self._param_history: deque[dict[str, Any]] = deque(maxlen=1024)
+        self._param_seq = itertools.count(1)
+        # /avatar/eyeheight* 的最新值（不在 /avatar/parameters/ 下，_parameters 不收）。
+        self._avatar_values: dict[str, dict[str, Any]] = {}
         self._avatar_id: str | None = None
         self._avatar_changed_at_unix: float | None = None
         self._held_inputs: set[tuple[str, str]] = set()
@@ -795,6 +809,13 @@ class VrchatOscBridge:
                     self._vertical_history.clear()
                 self._avatar_id = avatar_id
                 self._avatar_changed_at_unix = now_wall
+                self._append_param_locked(now_mono, "avatar_change", avatar_id)
+            return
+        if address in _AVATAR_EYEHEIGHT_ADDRESSES and arguments:
+            value = self._safe_value(arguments[0])
+            with self._lock:
+                self._avatar_values[address] = {"value": value, "received_at_monotonic": now_mono}
+                self._append_param_locked(now_mono, address, value)
             return
         prefix = "/avatar/parameters/"
         if address.startswith(prefix) and arguments:
@@ -812,6 +833,8 @@ class VrchatOscBridge:
                 self._parameters[name] = record
                 while len(self._parameters) > self.config.parameter_cache_size:
                     self._parameters.popitem(last=False)
+                if name in RECORDED_AVATAR_PARAMETERS:
+                    self._append_param_locked(now_mono, name, record["value"])
                 if name in {"VelocityY", "Grounded"}:
                     vy = _numeric((self._parameters.get("VelocityY") or {}).get("value"))
                     g = (self._parameters.get("Grounded") or {}).get("value")
@@ -836,6 +859,10 @@ class VrchatOscBridge:
                             "velocity_x_timestamp": x_at,
                             "velocity_z_timestamp": z_at,
                         })
+
+    def _append_param_locked(self, timestamp: float, name: str, value: Any) -> None:
+        self._param_history.append({"seq": next(self._param_seq), "timestamp": timestamp,
+                                    "name": name, "value": value})
 
     def _receive_once(self) -> None:
         receiver = self._receive_socket
@@ -1108,6 +1135,33 @@ class VrchatOscBridge:
             size = 512
         with self._lock:
             return [dict(item) for item in list(self._vertical_history)[-size:]]
+
+    def param_history(self, *, limit: int = 1024) -> list[dict[str, Any]]:
+        """RECORDED_AVATAR_PARAMETERS、/avatar/eyeheight* 和 avatar 切换的逐条原始样本（单调时钟）。
+
+        每条 ``{"seq", "timestamp", "name", "value"}``；``seq`` 严格递增，消费方按它去重。"""
+        try:
+            size = max(1, min(1024, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            size = 1024
+        with self._lock:
+            return [dict(item) for item in list(self._param_history)[-size:]]
+
+    def avatar_scale_snapshot(self) -> dict[str, Any]:
+        """录制开始时的缓存值：缩放参数变化驱动、不改就不重发，只靠 param_history 会缺开头。
+
+        只含已经收到过的键；``None`` 不代表 0。"""
+        with self._lock:
+            out: dict[str, Any] = {"avatar_id": self._avatar_id}
+            for name in RECORDED_AVATAR_PARAMETERS:
+                rec = self._parameters.get(name)
+                if rec is not None:
+                    out[name] = rec.get("value")
+            for address in _AVATAR_EYEHEIGHT_ADDRESSES:
+                rec = self._avatar_values.get(address)
+                if rec is not None:
+                    out[address] = rec.get("value")
+            return out
 
     def awareness(self) -> dict[str, Any]:
         with self._lock:

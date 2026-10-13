@@ -458,6 +458,8 @@ class BackendService:
         self.navmesh = OnlineNavigator(
             motion_history=self._navmesh_motion_history,
             vertical_history=self._navmesh_vertical_history,
+            param_history=self._navmesh_param_history,
+            avatar_snapshot=self._navmesh_avatar_snapshot,
             send_move=lambda forward, ms: self.set_locomotion(forward, 0.0, ms),
             send_turn=self._navigator_send_turn,
             stop_motion=self.stop_movement,
@@ -536,6 +538,16 @@ class BackendService:
         osc = self.osc
         fn = None if osc is None else getattr(osc, "vertical_history", None)
         return [] if fn is None else fn(limit=64)
+
+    def _navmesh_param_history(self) -> list[dict[str, Any]]:
+        osc = self.osc
+        fn = None if osc is None else getattr(osc, "param_history", None)
+        return [] if fn is None else fn(limit=256)
+
+    def _navmesh_avatar_snapshot(self) -> dict[str, Any]:
+        osc = self.osc
+        fn = None if osc is None else getattr(osc, "avatar_scale_snapshot", None)
+        return {} if fn is None else fn()
 
     def _navmesh_drive_block(self) -> str | None:
         """None = 可以驾驶；否则是不能动的原因。与自主目标互斥。"""
