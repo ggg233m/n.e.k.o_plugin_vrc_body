@@ -73,8 +73,13 @@ class LoopConfig:
     reproj_px: float = 3.0
     min_coverage: float = 0.12
     yaw_tol_deg: float = 6.0
-    odo_sigma0_m: float = 0.03        # 世界米
-    odo_sigma_frac: float = 0.03
+    # 2026-10-14 默认 ×2（0.03/0.03 → 0.06/0.06）：实测里程增量误差约路程 17%，0.03 把位姿压得太死。
+    # 证据（.tmp/metric_arbiter.py + odo_online.py，三场带原图录制）σ×2 的回访错位 |e| 中位：
+    # 033237 28.4→26.2、223033 34.6→26.6、003723 26.1→19.1 cm，NCC 同向变好；σ×4/×8 无额外收益。
+    # 当初判否依据的点云倒角已被证为**钝尺子**（注入 20 cm 只变 ~1 cm、极小点≈随机，见记忆
+    # metric-arbiter-chamfer-blind），故该否决作废。位姿代价：非尾段最大挪 5.6 cm，未引入假回环。
+    odo_sigma0_m: float = 0.06        # 世界米
+    odo_sigma_frac: float = 0.06
     loop_sigma_m: float = 0.10
     loop_sigma_frac: float = 0.03     # 回环 σ 随两帧距离增长（远点深度更不准）
     robust_k: float = 3.0
