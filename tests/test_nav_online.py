@@ -1220,6 +1220,65 @@ class RecorderTest(unittest.TestCase):
             self.assertTrue(st["recording"]["images"])
             self.assertTrue(json.loads((out / "meta.json").read_text(encoding="utf-8"))["record_images"])
 
+    def test_record_images_keep_the_sensor_colour_space(self) -> None:
+        """存档原图必须跟采集端同一个颜色空间。
+
+        回归点：曾经上游递进来的是 read_stereo() 的灰度
+        （3 通道 RGB 就在手边却被丢掉），落盘的永远是 L 型 PNG
+        ⇒ 下游给点云上色时只能去猜颜色。
+        同时钉住另一件同等重要的事：灰度输入仍然原样落灰度 ——
+        所有既有读法（cv2.imread(..., IMREAD_GRAYSCALE)）在改动前后必须一致。
+        """
+        for name, has_rgb in (("rgb", True), ("gray", False)):
+            with self.subTest(sensor=name), tempfile.TemporaryDirectory() as d:
+                h = Harness(armed=False, vz=0.5, record_root=Path(d))
+                if has_rgb:
+                    def read_rgb():
+                        # 三通道**各不相同**：全填同一个值就等于自己造了一张灰图，
+                        # "三通道不全等"这条断言会永远为假。
+                        left = np.zeros((4, 4, 3), np.uint8)
+                        left[..., 0], left[..., 1], left[..., 2] = 7, 11, 13
+                        right = left + 5
+                        return left, right
+                else:
+                    read_rgb = None
+                h.sensors.read_stereo_rgb = read_rgb
+                with mock.patch.object(nav_online, "stereo_points",
+                                       return_value=ground_and_wall(None)), \
+                     mock.patch.object(nav_online, "stereo_disparity",
+                                       return_value=np.zeros((4, 4), np.float32)):
+                    h.nav.start(record=True, record_images=True)
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and h.nav.status()["keyframes"] < 3:
+                            time.sleep(0.05)
+                    finally:
+                        st = h.nav.stop()
+                out = Path(st["recording"]["dir"])
+                kfs = sorted(int(p.stem) for p in (out / "kf").glob("*.npz"))
+                self.assertGreaterEqual(len(kfs), 3, f"{name}: 关键帧一个都没落")
+                for k in kfs:
+                    for eye in "LR":
+                        p = out / "kf_img" / f"{k:06d}_{eye}.png"
+                        raw = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+                        self.assertIsNotNone(raw, f"{name} {k}_{eye}")
+                        self.assertEqual(raw.shape[:2], (4, 4))
+                        self.assertEqual(raw.ndim, 3 if has_rgb else 2,
+                                         f"{name} {k}_{eye} 颜色空间被改掉了")
+                        if has_rgb:
+                            # 只断颜色**真的过来了**（三通道不全等）。
+                            # 不断具体数值：传输路径上可能还有一次 cvtColor，
+                            # 分频道是否颠倒不是本用例要钉的东西（某测试数量级下也分不出）。
+                            # 比**同一个像素的三个通道**，不能比不同像素：
+                            # 测试 stub 里全图同值，拿像素集去重只会得到 1 行，
+                            # 那样不管颜色有没有真的过来都会失败。
+                            px = raw.reshape(-1, raw.shape[-1])[0]
+                            self.assertGreater(len(set(px.tolist())), 1,
+                                               f"{name} {k}_{eye} 三通道同值 = 其实还是灰度")
+                        else:
+                            # 灰度路径不能被我这次改动弄坏。
+                            self.assertEqual(set(np.unique(raw).tolist()), {0})
+
     def test_record_images_off_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             st = self.run_session(Path(d), record=True)

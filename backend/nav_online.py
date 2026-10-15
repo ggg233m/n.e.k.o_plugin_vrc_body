@@ -238,7 +238,8 @@ class SessionRecorder:
     ``params.jsonl``（内置运动/缩放参数逐条原始值 ``{"t","n","v"}``，含 Upright / AngularY / VelocityMagnitude /
     ScaleFactor / /avatar/eyeheight 等；开录时的缓存值另在 meta.json ``avatar``）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
-    ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右灰度原图，采集分辨率）。
+    ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右原图，采集分辨率、**采集端颜色空间**：
+    采集给的是 RGB 就存 RGB PNG，只有灰度就用灰度）。
 
     感知线程只往内存缓冲里追加（``line``），所有磁盘写都在建图线程（``flush`` / ``keyframe``）里做。
     写失败或超出上限就停录并留痕，不影响导航。
@@ -246,8 +247,9 @@ class SessionRecorder:
 
     def __init__(self, root: Path, max_bytes: float, meta: dict[str, Any], images: bool = False) -> None:
         self.dir = Path(root)
-        # 关键帧左右灰度原图另存 ``kf_img/<id>_{L,R}.png``（720 下每帧约 +0.26 MB）。
-        # 用途：离线重算视差 / 稠密重定位 / 跨经过对齐 —— kf/*.npz 只有体素点和稀疏 ORB，做不了这些。
+        # 关键帧左右原图另存 ``kf_img/<id>_{L,R}.png``（720 / 视差 64 档下每帧两图约 0.26 MB；
+        # 彩色是同尺寸的 3 倍，约 0.78 MB，见 navmesh.html 的提示）。
+        # 用途：离线重算视差 / 稠密重定位 / 跨经过对齐 / 给点云上色 —— kf/*.npz 只有体素点和稀疏 ORB。
         self.images = bool(images)
         (self.dir / "kf").mkdir(parents=True, exist_ok=True)
         self.max_bytes = float(max_bytes)
@@ -305,6 +307,9 @@ class SessionRecorder:
                 self.keyframes += 1
                 if images is not None and self.images:
                     # PNG 无损（视差要亚像素，JPEG 的块效应会直接变成深度偏置）；压缩级 1 求快。
+                    # 这里**原样存，不要在写入端 cvtColor**：颜色空间由管道上游决定（有 RGB 就传 RGB，
+                    # 见感知线程那处 `imgs=`）。曾经递进来的一直是 read_stereo() 的灰度，于是落盘全是
+                    # L 型 PNG，下游给点云上色时只能去猜颜色。
                     (self.dir / "kf_img").mkdir(exist_ok=True)
                     for eye, img in zip("LR", images):
                         ip = self.dir / "kf_img" / f"{int(k):06d}_{eye}.png"
@@ -1167,7 +1172,11 @@ class OnlineNavigator:
         if mem is not None:
             # 基线不对的会话也记，但带实测基线：跨会话重定位只拿同基线的记忆比。
             mem.annotate(sensors=info, baseline_m=round(float(sensors.baseline_m), 4), baseline_check=bl)
-        read_rgb = getattr(sensors, "read_stereo_rgb", None) if mem is not None else None
+        # 需要彩色的有两处：记忆缩略图（要彩色）与录制存档（要与采集端同颜色空间）。
+        # `read_stereo_rgb` 与 `read_stereo` 是**同一次采集**（只差一次 cvtColor），成本差可忽略。
+        # 曾经这里只看 mem，于是“没有世界记忆”的会话录下的原图**永远只有灰度**，下游无法上色。
+        need_rgb = mem is not None or (self.recorder is not None and self.recorder.images)
+        read_rgb = getattr(sensors, "read_stereo_rgb", None) if need_rgb else None
         if bl["ok"] is False:
             self._fail("baseline_mismatch", RuntimeError(
                 f"measured {bl['measured_m']} m, expected {bl['expected_m']}±{bl['tol_m']} m "
@@ -1245,6 +1254,11 @@ class OnlineNavigator:
                         next_stereo = tick + c.stereo_period_s
                         t0 = time.perf_counter()
                         left_rgb = None
+                        # ⚠️ `rgb` 必须每轮先置 None 再赋：下面存档原图要读它，
+                        # 而在 `read_rgb is None` 的路径上原来根本不绑定这个名字 ——
+                        # 直接用就是 NameError，还被感知线程的兜底 except 吃掉，
+                        # 表现成“关键帧一个都不落”。
+                        rgb = None
                         if read_rgb is not None:
                             rgb = read_rgb()
                             pair = None if rgb is None else (cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY),
@@ -1289,8 +1303,12 @@ class OnlineNavigator:
                                     if mem is not None:
                                         src = left_rgb if left_rgb is not None else pair[0]
                                         thumb = make_thumbnail(src, mem.cfg.thumb_width)
-                                    imgs = (pair[0].copy(), pair[1].copy()) if (
-                                        self.recorder is not None and self.recorder.images) else None
+                                    # 存档原图要与**采集端同样的颜色空间**：rgb 有就存 RGB，
+                                    # 没有（只给了灰度）就退回灰度。reason见下面 SessionRecorder.keyframe。
+                                    imgs = None
+                                    if self.recorder is not None and self.recorder.images:
+                                        imgs = ((rgb[0].copy(), rgb[1].copy()) if rgb is not None
+                                                else (pair[0].copy(), pair[1].copy()))
                                     self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
                                                                  kf_kind == "refresh", thumb, imgs)))
                             if new_kf:
