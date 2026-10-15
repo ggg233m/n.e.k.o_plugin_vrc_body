@@ -57,6 +57,24 @@ import smear_eval as SE
 S = 0.755
 
 
+def heldout_resid(P, hold, ws):
+    """被**留出**（没进优化）的那批回环：最终地图里两帧距离 vs 该回环自己记的几何位移。
+
+    口径同 `drift_shape` 证据 C。用它判「地图是否更自洽」比回访对更对：样本多，
+    而且**不看被优化的那批约束**。`hold` 里每项要 `a` / `b` / `offset_m`。
+    """
+    vals = []
+    for L in hold:
+        a, b = int(L['a']), int(L['b'])
+        if a not in P or b not in P:
+            continue
+        geo = float(L.get('offset_m', 0.0))
+        if geo <= 1e-6:
+            continue
+        vals.append(abs(float(np.hypot(*(P[b][:2, 3] - P[a][:2, 3]))) * ws - geo))
+    return np.array(vals) if vals else np.array([np.nan])
+
+
 def load_edges(name, span=3):
     rec = ROOT/'navmesh_recordings'/name
     ev = [json.loads(x) for x in (rec/'events.jsonl').read_text(encoding='utf-8').splitlines() if x.strip()]
