@@ -317,15 +317,30 @@ def load_recorded(rec: Path, skip: int) -> tuple[list[KeyframeFeatures], np.ndar
     npz 存的正是 ``KeyframeFeatures`` 的全部字段 + ``T_dr`` + ``dist_m``（见 `loop_replay.py`），
     而 ``T_dr[:3,:3]`` 是**该关键帧的 HMD 朝向（地图系）**、``T_dr[:2,3]`` 是航位推算平面位置
     （追踪米）—— 于是不需要图像、不需要重录，直接在真实游玩录制上跑同一套判据。
+
+    ⚠️ **必须先去掉「原地站立的重复帧」**：`kf_max_age_s = 3.0` 让站着不动也每 3 秒补一个关键帧
+    （刷新动态物体用），所以关键帧**不是按位置均匀取的**。实测 `20260929_045615` 的 3014 帧里
+    有 **1250 帧（41.5%）`T_dr` 冻结在同一个点**上（OSC 覆盖之外的长停顿）。
+    把它们当独立样本会同时污染两个统计：
+      * 那些段 `dw ≡ 0`、`gw` 是纯噪声 ⇒ 相似变换被往 0 拉（`skip=20` 实测 s=0.868、残差**恰好 0**）；
+      * 分弦长分档的样本会被重复的零位移段灌满。
+    口径与 `drift_shape.py` 的 `loc` 一致：**连续重合的位置只保留第一个**。
     """
-    files = sorted((rec / "kf").glob("*.npz"), key=lambda p: int(p.stem))[::skip]
+    files = sorted((rec / "kf").glob("*.npz"), key=lambda p: int(p.stem))
     kfs, mats, dist = [], [], []
+    prev: np.ndarray | None = None
     for f in files:
         z = np.load(f)
+        T = np.asarray(z["T_dr"], np.float64)
+        if prev is not None and bool(np.all(np.isclose(T[:2, 3], prev[:2, 3], atol=1e-6))):
+            continue                      # 同一位置的连续重复帧：只留第一帧
+        prev = T
         kfs.append(KeyframeFeatures(z["uv"], z["des"], z["xyz"], z["des3d"], z["K"],
                                     (int(z["size"][0]), int(z["size"][1])), float(z["eye_y"])))
-        mats.append(np.asarray(z["T_dr"], np.float64))
+        mats.append(T)
         dist.append(float(z["dist_m"]))
+    if skip > 1:
+        kfs, mats, dist = kfs[::skip], mats[::skip], dist[::skip]
     return kfs, np.array(mats), np.array(dist)
 
 
