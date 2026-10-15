@@ -75,12 +75,22 @@ def one(args):
     rec = G.ROOT / "navmesh_recordings" / name
     cfg, _ = G.recorded_config(rec)
     ng, trail, m = replay(rec, cfg, poses_for(rec, src))
-    # 走廊/环 一律用参照轨迹（loop），否则换位姿源连"走廊在哪"都变了，不可比
-    t = trail                # 自己的轨迹：图与轨迹同一坐标系（各位姿源全局偏移不同，跨源用参照轨迹会错位）
+    # 走廊/环 一律用参照轨迹（loop），否则换位姿源连"走廊在哪"都变了，不可比。
+    # ⚠️ 2026-10-15：这里以前写的是 `t = trail`（自己的轨迹），于是 `ref_trail` **从未生效**——
+    #     每换一个位姿源，**图和"走廊在哪"同时跟着换**，位姿误差在指标里自我抵消。
+    #     后果实测（Docs/点云拖影修复原型与栅格影响（2026-10-09）.md §13.4）：
+    #     `dr`（回访错位 143 cm）的走廊障碍在"跟随"口径下只与 `loop` 差 ±2%，
+    #     换成固定参照后变成 **+52% ~ +138%** ⇒ 原来的"换位姿源不影响栅格"是假象。
+    #     参照轨迹与本源的坐标系可能差一个全局偏移，所以先按首帧对齐再取掩码。
     g = ng.grid
     occ, free = g == OCC, g == FREE
     b = ng.build(radius_m=0.25, walked=m.walked())
     sh = G.occ_shape(occ, ng.meta.resolution_m)
+    if ref_trail is not None and len(ref_trail) and len(trail):
+        shift = np.asarray(trail[0], np.float64) - np.asarray(ref_trail[0], np.float64)
+        t = [np.asarray(p, np.float64) - shift for p in ref_trail]
+    else:
+        t = trail
     return name, src, {
         "occ": int(occ.sum()), "free": int(free.sum()),
         "walk_m2": b.get("walkable_m2", b.get("walkable_area_m2")),
