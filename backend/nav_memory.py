@@ -254,7 +254,13 @@ class SessionWriter:
 
     def _write_poses(self, table: dict[str, np.ndarray]) -> None:
         import io
-
+        # ⚠️ 这里的位姿表与 `kf/*.npz` 承载**同一批**关键帧 —— 整表重写就等于覆盖同目录的
+        # 关键帧文件。实测 16 场录制里 13 场中招（045615 的 3014 个 npz 全由录制器写、
+        # 时间戳同序；会话侧那批被自己的位姿表反复覆盖后只剩一份）。
+        # 🔴 **不能在这里加"有 kf 就跳过"的护栏**：`nav_memory` 的会话索引与 `store.session()`
+        # 依赖位姿表，拦掉会让它们找不到会话（实测 4 个用例回归）。
+        # 真正的修法在写入侧 —— `OnlineNavigator._mapping_loop` 在有录制器时跳过这个周期转存
+        # （录制器的 `kf/` 是权威副本，会话内部的消费方读的是内存里的 `_mem_rows`）。
         ids = np.asarray(table["ids"], np.int32)
         buf = io.BytesIO()
         np.savez_compressed(buf, ids=ids, T_map=np.asarray(table["T_map"], np.float32),

@@ -805,6 +805,14 @@ class OnlineNavigator:
         self._pending: list[tuple[str, Any]] = []
         self._keyframes = 0
         self._kf_refreshed = 0
+        # 落盘的关键帧里**位置不重复**的那些（追踪米下与上一帧同点即视为重复）。
+        # 为什么必须外显：`kf_max_age_s` 让原地不动也每 3 s 补一帧，于是**长停顿的会话**
+        # 会把同一地点反复计成独立关键帧。实测 20260929_045615 的 3014 帧里 1250 帧
+        # （41.5%）`T_dr` 冻结在同一点。它同时污染两件事——离线仿射/相似拟合把同一位置
+        # 放大上千倍权重（按位置去重后该场尺度从 −9.91% 变到 −5.09%，其余场动 ≤0.01pp），
+        # 以及位姿图里那串补帧边的 σ（path=0 ⇒ σ 取最小）。**只在建图线程写。**
+        self._kf_unique = 0
+        self._kf_last_xy: np.ndarray | None = None
         self._kf_policy: KeyframePolicy | None = None
         self._map_updates = 0
         self._map_ms: float | None = None
@@ -1332,6 +1340,12 @@ class OnlineNavigator:
                             # 原地补帧：上一帧的点云让给这帧；它的位姿、轨迹、回环节点都留着。
                             self.mapper.drop_points(k - 1)
                             self._kf_refreshed += 1
+                        # 位置去重只对**真正落盘**的帧计数（补帧判在下面，但它不新占一个地点）。
+                        # 只在建图线程写 `_kf_unique` / `_kf_last_xy`，感知线程读不到，无竞争。
+                        xy2 = np.asarray(T, float)[:2, 3]
+                        if self._kf_last_xy is None or not np.allclose(xy2, self._kf_last_xy, atol=1e-6):
+                            self._kf_unique += 1
+                            self._kf_last_xy = xy2
                         mem = self._mem
                         if mem is not None:
                             self._mem_rows[k] = (T.copy(), float(dist), t_kf - (self._started_at or t_kf))
@@ -1377,12 +1391,20 @@ class OnlineNavigator:
                 if rec is not None:
                     rec.flush()
                 mem = self._mem
+                # ⚠️ 录制**自带** `kf/<id>.npz`（且是权威副本：位置去重、终态位姿都从它算），
+                # 而会话侧的位姿表会覆盖同一批文件。有录制器时这个周期转存跳过：
+                # 会话内的消费方（xsession 的 `write_back`）读的是内存里的 `_mem_rows`，
+                # 不读这个文件，所以跳过一个信息损失都没有，省掉的是每 `pose_flush_s`
+                # 一次的全表重写（`kf_max_age_s` 的长停顿会话里 frames 极多）。
                 if mem is not None and self._clock() - self._mem_flushed_at >= mem.cfg.pose_flush_s:
-                    # 位姿整表写：回环会改之前所有帧的位姿，逐帧写的会过期。
-                    table = self._mem_table()
-                    if table is not None:
-                        mem.poses(table)
+                    if rec is not None:
                         self._mem_flushed_at = self._clock()
+                    else:
+                        # 位姿整表写：回环会改之前所有帧的位姿，逐帧写的会过期。
+                        table = self._mem_table()
+                        if table is not None:
+                            mem.poses(table)
+                            self._mem_flushed_at = self._clock()
                 if dirty and len(self.mapper):
                     wait = c.map_min_interval_s - (self._clock() - last_update)
                     if wait > 0.0:
@@ -1540,6 +1562,17 @@ class OnlineNavigator:
             "keyframes": self._keyframes,
             # 原地补帧（点云替换上一帧）与快转推迟的次数；地图里有点云的关键帧 = keyframes − refreshed。
             "keyframes_refreshed": self._kf_refreshed,
+            # 位置去重后的关键帧数，以及由此得到的重复率。**长停顿的会话会很高**（实测
+            # 045615 有 41.5%），而它同时是离线拟合的权重要紧事与位姿图 σ 的要紧事
+            # ⇒ 不做成事后翻盘才能发现的量。reason 让"为什么高"当场可读。
+            "keyframes_unique": self._kf_unique,
+            "keyframes_duplicate_frac": (round(1.0 - self._kf_unique / self._keyframes, 4)
+                                          if self._keyframes else None),
+            "keyframe_dedup_reason": (
+                None if self._keyframes < 2 else
+                "ok" if self._kf_unique >= 0.98 * self._keyframes else
+                "standing_still_refresh" if self._kf_refreshed >= 0.1 * (self._keyframes - self._kf_unique)
+                else "refresh_and_repeat"),
             "keyframes_deferred": 0 if self._kf_policy is None else self._kf_policy.deferred,
             "map_updates": self._map_updates,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),

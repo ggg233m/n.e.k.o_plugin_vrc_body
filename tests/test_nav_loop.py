@@ -349,5 +349,79 @@ class BowCandidateTest(unittest.TestCase):
             self.assertIn(0, lc._bow_candidates(61, lc._nodes[61]))
 
 
+class LoopGraphTopologyTest(unittest.TestCase):
+    """位姿图的**结构性质**：零位移串联边决定「原地长停顿」那一段的形状。
+
+    这不是数值巧合，而是 `LoopCloser.optimize` 的加权线性最小二乘在
+    「路径里出现一串 `Δdr = 0` 的边、且该段内没有任何回环」时的精确解。
+    实测见 `Docs/漂移形态诊断（2026-10-05）.md` §9.7（045615 的末 1250 帧）。
+    """
+
+    @staticmethod
+    def _chain(sigma: float = 0.03) -> tuple[LoopCloser, list[int]]:
+        """6 帧正常前进 + 10 帧原地不动（`dist_m` 不涨，与 `kf_max_age_s` 补帧同形）。"""
+        cfg = LoopConfig(world_scale=S, min_inliers=1, odo_sigma0_m=sigma, odo_sigma_frac=sigma)
+        cl = LoopCloser(cfg)
+        ids: list[int] = []
+        for k in range(1, 8):
+            T = np.eye(4)
+            T[:2, 3] = (k * 0.4 / S, 0.0)
+            cl.add_keyframe(k, T, k * 0.4, None)
+            ids.append(k)
+        for k in range(8, 18):
+            T = np.eye(4)
+            T[:2, 3] = (7 * 0.4 / S, 0.0)
+            cl.add_keyframe(k, T, 7 * 0.4, None)
+            ids.append(k)
+        return cl, ids
+
+    def test_zero_motion_chain_is_a_rigid_extension(self) -> None:
+        """零位移边串联 ⇒ 该段整体继承锚点位移，段内相对形状与 DR 逐点相同。"""
+        cl, ids = self._chain()
+        poses = cl.poses()
+        dr = {k: cl._nodes[k].dr_xy for k in ids}
+        off = {k: np.asarray(poses[k], float)[:2, 3] - dr[k] for k in ids}
+        tail = ids[6:]
+        for k in tail[1:]:
+            np.testing.assert_allclose(off[k], off[tail[0]], atol=1e-9,
+                                       err_msg="段内位移不再刚性")
+        np.testing.assert_allclose(off[tail[0]], off[ids[5]], atol=1e-9,
+                                   err_msg="段内位移不等于锚点位移")
+        pp = np.array([dr[k] for k in tail])
+        self.assertLess(float(np.ptp(pp, axis=0).max()), 1e-12,
+                        "段内 p_dr 必须有零方差，否则仿射分解不会退化")
+
+    def test_rigid_chain_is_invariant_to_odo_sigma(self) -> None:
+        """里程 σ 从 0.03 拉到 3.0，`off` 仍刚性 ⇒ 改 σ 治不了这个现象。
+
+        机制：端点位移 = `(Σ k_odo·Δdr + Σ k_loop·z_loop) / (Σ k_odo + Σ k_loop)`；
+        链上无回环时第二项恒为 0，而 `Σ k_odo = N/(1/σ²)` 里 σ² 在分子分母上约掉。
+        """
+        for sig in (0.03, 0.5, 3.0):
+            cl, ids = self._chain(sig)
+            poses = cl.poses()
+            dr = {k: cl._nodes[k].dr_xy for k in ids}
+            off = {k: np.asarray(poses[k], float)[:2, 3] - dr[k] for k in ids}
+            tail = ids[6:]
+            for k in tail[1:]:
+                np.testing.assert_allclose(off[k], off[tail[0]], atol=1e-9,
+                                           err_msg=f"sigma={sig} 时段内位移不再刚性")
+
+    def test_position_dedup_rule_is_consecutive_only(self) -> None:
+        """位置去重口径：**连续**重合才算重复，离开再回来不算。
+
+        离线工具（`drift_shape._unique_positions`、`stereo_geom_chain.load_recorded`）
+        与在线计数用同一条规则。
+        """
+        p = np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+        same = np.all(np.isclose(np.diff(p, axis=0), 0.0, atol=1e-6), axis=1)
+        keep = np.ones(len(p), bool)
+        keep[1:] = ~same
+        # 开头三个同点只丢后两个 ⇒ 剩 4（不是 5：连续段长度 3 丢 2）
+        self.assertEqual(int(keep.sum()), 4)
+        self.assertTrue(keep[4], "离开后回到同一位置不算重复")
+        self.assertTrue(keep[5], "每次离开都算一个新位置")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1369,5 +1369,41 @@ class XSessionAlignTest(unittest.TestCase):
         self.assertTrue(any("xsession_tree" in e for e in nav._errors), nav._errors)
 
 
+class KeyframeDedupStatusTest(unittest.TestCase):
+    """位置去重要**当场可读**：`kf_max_age_s` 让原地不动也每 3 s 补一帧，长停顿的会话
+    会把同一地点反复计成独立关键帧。它同时污染离线拟合的权重与位姿图的 σ，
+    所以不能再靠事后翻盘发现（实测 045615 有 41.5%，其余 15 场 ≤2%）。"""
+
+    def _status(self, keyframes: int, unique: int, refreshed: int) -> dict:
+        nav = OnlineNavigator(motion_history=lambda: [], send_move=lambda f, ms: None,
+                              send_turn=lambda d: None, stop_motion=lambda: None,
+                              drive_block_reason=lambda: None,
+                              sensors_factory=lambda: FakeSensors(),
+                              cfg=OnlineNavConfig(stereo_period_s=0.05),
+                              avatar_snapshot=lambda: {"avatar_id": "avtr_x"})
+        nav._keyframes = keyframes        # noqa: SLF001 - 直接摆状态，不跑线程
+        nav._kf_unique = unique           # noqa: SLF001
+        nav._kf_refreshed = refreshed     # noqa: SLF001
+        return nav.status()
+
+    def test_clean_session_reports_ok(self) -> None:
+        st = self._status(10, 10, 0)
+        self.assertEqual(st["keyframes_unique"], 10)
+        self.assertEqual(st["keyframes_duplicate_frac"], 0.0)
+        self.assertEqual(st["keyframe_dedup_reason"], "ok")
+
+    def test_standing_still_is_named_as_the_cause(self) -> None:
+        st = self._status(100, 55, 45)
+        self.assertEqual(st["keyframes_unique"], 55)
+        self.assertAlmostEqual(st["keyframes_duplicate_frac"], 0.45, places=4)
+        self.assertEqual(st["keyframe_dedup_reason"], "standing_still_refresh",
+                         "重复率高且几乎全来自补帧时必须点名补帧")
+
+    def test_repeats_without_refresh_are_named_differently(self) -> None:
+        st = self._status(100, 55, 0)
+        self.assertEqual(st["keyframe_dedup_reason"], "refresh_and_repeat",
+                         "补帧解释不了全部重复时不能把锅全给它")
+
+
 if __name__ == "__main__":
     unittest.main()
