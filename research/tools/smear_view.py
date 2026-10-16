@@ -63,9 +63,11 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     for src in a.src:
         P, _s, t = cloud(rec, poses_for(rec, src), cam_h, a.vox, a.z_min, a.z_max, a.range_m)
-        col = (t * 254).astype(np.uint8)
         sess = [{"name": f"{a.rec[-6:]} · 位姿={src}", "n": len(P)}]
-        html = V.build_html(P, col, sess, a.vox, f"拖影目视 · {a.rec} · {src}", default_mode=2)
+        # 单场：会话通道全 0，时间通道 = 本场累积路程 → "按时间"才是这场的本意。
+        html = V.build_html(P, np.zeros(len(P), np.uint8), sess, a.vox,
+                            f"拖影目视 · {a.rec} · {src}", default_mode=2,
+                            tval=(t * 254).astype(np.uint8))
         out = out_dir / f"smear_{a.rec}_{src}.html"
         out.write_text(html, encoding="utf-8")
         print(f"[out] {out}  {len(P):,} 点  {out.stat().st_size/1048576:.1f} MB  cam_h={cam_h:.3f}")

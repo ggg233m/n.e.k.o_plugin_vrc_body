@@ -345,15 +345,20 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
 <script>
 const RAW = atob("__DATA__");
 const buf = new Uint8Array(RAW.length); for (let i=0;i<RAW.length;i++) buf[i]=RAW.charCodeAt(i);
-const N = buf.length/6|0;
-const POS = new Float32Array(N*3), SID = new Float32Array(N);
+// 每点 7 字节：u16 x, u16 y, u8 z, u8 session, u8 time。
+// ⚠️ 以前是 6 字节，session 与 time **共用最后一格**，于是一个文件只能在
+// "按会话"和"按时间"里二选一 —— 界面却永远画三个按钮，其中一个必然废掉。
+// 现在两条通道各占一格，三个按钮都真能用。
+const N = buf.length/7|0;
+const POS = new Float32Array(N*3), SID = new Float32Array(N), TIM = new Float32Array(N);
 const XYO=__XYO__, XYS=__XYS__, ZS=__ZS__, ZO=__ZO__;
 for (let i=0;i<N;i++){
-  const o=i*6, u=buf[o]|buf[o+1]<<8, v=buf[o+2]|buf[o+3]<<8;
+  const o=i*7, u=buf[o]|buf[o+1]<<8, v=buf[o+2]|buf[o+3]<<8;
   POS[i*3]   = u/XYS - XYO;
   POS[i*3+1] = v/XYS - XYO;
   POS[i*3+2] = buf[o+4]/ZS - ZO;      // 有符号：编码前加了 +ZO
   SID[i]     = buf[o+5];
+  TIM[i]     = buf[o+6];
 }
 document.getElementById('np').textContent = N.toLocaleString();
 let mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9,mnz=1e9,mxz=-1e9;
@@ -380,7 +385,7 @@ if(2===__MODE__){const d=document.createElement('div');d.className='row';d.style
 const cv = document.getElementById('cv'), gl = cv.getContext('webgl');
 if(!gl){document.body.innerHTML='<p style="padding:20px">此浏览器不支持 WebGL</p>';}
 const VS = `
-attribute vec3 aP; attribute float aS;
+attribute vec3 aP; attribute float aS; attribute float aT;
 uniform mat4 uMVP; uniform float uMode; uniform vec3 uPal[8]; uniform float uZ0,uZ1;
 varying vec3 vC;
 vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);
@@ -393,7 +398,9 @@ void main(){
   int k = int(aS+0.5); vec3 sc = uPal[0];
   for(int i=0;i<8;i++){ if(i==k) sc = uPal[i]; }
   // uMode: 0=按会话(调色板) 1=按高度 2=按时间(彩虹:早→蓝,晚→红)
-  vec3 tc = hsv2rgb(vec3(0.62*(1.0-clamp(aS/254.0,0.0,1.0)), 0.85, 0.95));
+  // ⚠️ 时间必须读 aT（第 7 字节），不能读 aS —— aS 是**会话**格。
+  // 早期版本两者共用一格，"按时间"看到的其实是会话色。
+  vec3 tc = hsv2rgb(vec3(0.62*(1.0-clamp(aT/254.0,0.0,1.0)), 0.85, 0.95));
   vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : tc);
   gl_PointSize = clamp(240.0/max(gl_Position.w,1.0), 1.5, 5.0);   // 近大远小
 }`;
@@ -408,6 +415,8 @@ const bP=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bP); gl.bufferData(gl.
 const aP=gl.getAttribLocation(P,'aP'); gl.enableVertexAttribArray(aP); gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0);
 const bS=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.bufferData(gl.ARRAY_BUFFER,SID,gl.STATIC_DRAW);
 const aS=gl.getAttribLocation(P,'aS'); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
+const bT=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.bufferData(gl.ARRAY_BUFFER,TIM,gl.STATIC_DRAW);
+const aT=gl.getAttribLocation(P,'aT'); gl.enableVertexAttribArray(aT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
 const uMVP=gl.getUniformLocation(P,'uMVP'), uMode=gl.getUniformLocation(P,'uMode'),
       uPal=gl.getUniformLocation(P,'uPal'), uZ0=gl.getUniformLocation(P,'uZ0'), uZ1=gl.getUniformLocation(P,'uZ1');
 const pal=[]; for(let i=0;i<8;i++){const c=PAL[i%PAL.length].replace('#','');
@@ -454,9 +463,10 @@ function draw(){
   gl.uniformMatrix4fv(uMVP,false,M); gl.uniform1f(uMode,mode);
   gl.bindBuffer(gl.ARRAY_BUFFER,bP); gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
   gl.drawArrays(gl.POINTS,0,N);
   if(showGrid&&gridN){ gl.bindBuffer(gl.ARRAY_BUFFER,gridB);
-    gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0); gl.vertexAttrib1f(aS,0);
+    gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0); gl.vertexAttrib1f(aS,0); gl.vertexAttrib1f(aT,0);
     gl.uniform1f(uMode,0.86); gl.drawArrays(gl.LINES,0,gridN); }
   requestAnimationFrame(draw);
 }
@@ -490,16 +500,28 @@ _PALETTE = ["#4f9cf0", "#f2a33c", "#59c98d", "#e0655f", "#a97ae0",
 
 
 def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float,
-               title: str, default_mode: int = 0) -> str:
-    """点云 → 自包含 HTML。布局：每点 6 字节（u16 x, u16 y, u8 z, u8 sid）。"""
+               title: str, default_mode: int = 0, tval: np.ndarray | None = None) -> str:
+    """点云 → 自包含 HTML。布局：每点 **7 字节**（u16 x, u16 y, u8 z, u8 sid, u8 time）。
+
+    ⚠️ 为什么必须是 7 而不是 6：以前 session 与 time **共用最后一格**，一个文件只能在
+    "按会话"和"按时间"里二选一；但界面永远画三个按钮，于必有一个是死的 —— 🚩 用户实测
+    "按时间的按钮坏了" 就是这个。分成两格后三个按钮都真能用，代价是文件大 1/6。
+
+    ``tval`` 省略或长度不符时，时间格退化为全 0（按钮仍可点，只是单色），
+    绝不静默拿 sid 去冒充时间。
+    """
     x = np.clip((points[:, 0] + XY_OFFSET_M) * XY_SCALE, 0, 65535).astype(np.uint16)
     y = np.clip((points[:, 1] + XY_OFFSET_M) * XY_SCALE, 0, 65535).astype(np.uint16)
     z = np.clip((points[:, 2] + Z_OFFSET_M) * Z_SCALE, 0, 255).astype(np.uint8)   # 有符号编码
     s = sid.astype(np.uint8)
-    # 交错布局必须用结构化 dtype：直接 stack (N,2)+(N,1) 会因形状不同报错
-    dt = np.dtype([("x", "<u2"), ("y", "<u2"), ("z", "u1"), ("s", "u1")])
+    if tval is None or len(tval) != len(x):
+        t = np.zeros(len(x), np.uint8)
+    else:
+        t = np.clip(np.asarray(tval, np.float64), 0, 254).astype(np.uint8)
+    # 交错布局必须用结构化 dtype：直接 stack 会因形状不同报错
+    dt = np.dtype([("x", "<u2"), ("y", "<u2"), ("z", "u1"), ("s", "u1"), ("t", "u1")])
     arr = np.empty(len(x), dtype=dt)
-    arr["x"], arr["y"], arr["z"], arr["s"] = x, y, z, s
+    arr["x"], arr["y"], arr["z"], arr["s"], arr["t"] = x, y, z, s, t
     raw = arr.tobytes()
     b64 = base64.b64encode(raw).decode("ascii")
     html = (_HTML
@@ -584,18 +606,18 @@ def main() -> None:
 
     vox = float(args.vox)
     by_time = str(args.color_by).strip().lower() == "time"
-    allp, alls, allc, sess, stats = [], [], [], [], []
+    allp, alls, allt, sess, stats = [], [], [], [], []
     for i, (rec, sid) in enumerate(zip(args.rec, sids)):
         pts, s, tt, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
                                       float(args.z_min), float(args.z_max), max(1, int(args.every)),
                                       pose_mode=str(args.pose),
                                       range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
                                       pose_npz=args.pose_npz)
-        # 着色通道：按时间 = 本场累积路程进度 0..254；按会话 = 场索引（shader 取调色板）
-        col = (tt * 254.0).astype(np.float32) if by_time else np.full(len(pts), float(i), np.float32)
+        # 两条通道**分开存**：会话 = 场索引（shader 取调色板）；时间 = 本场累积路程进度 0..254。
+        # 以前这里用 `by_time` 二选一，再塞进同一个字节 —— 于是另一个按钮必然废掉。
         allp.append(pts)
         alls.append(np.full(len(pts), i, np.uint8))
-        allc.append(col)
+        allt.append((tt * 254.0).astype(np.uint8))
         sess.append({"name": f"{sid[-6:]}（{rec[-6:]}）", "n": len(pts), "h": round(float(st["cam_h_eff"]), 3)})
         stats.append(st)
         print(f"[load ] {rec} → {sid}  cam_h={st['cam_h']:.3f} − gc={st['gc_median']:+.3f} "
@@ -607,7 +629,7 @@ def main() -> None:
 
     P = np.concatenate(allp)
     S = np.concatenate(alls)
-    C = np.concatenate(allc)
+    T = np.concatenate(allt)
 
     # 🚨 跨场「有效离地高」一致性闸（2026-10-06 新增，起因见本文档 §地面口径）
     # cam_h 是**全局估计**，逐场可以被估偏 0.3 m；gc 会把它补回来，于是 cam_h−gc 才是
@@ -628,11 +650,12 @@ def main() -> None:
                   f"（换身高要重标 world_scale = 0.755×(眼高/1.26)），再查地面证据是否够。"
                   f"**不要**直接改 cam_h 去凑 —— 它和 gc 是一对。")
     # 跨会话再并一次体素：多场重叠区只留一份（sid 取先到的 ⇒ 图例按场次顺序稳定）
+    # ⚠️ 时间通道必须**一起过体素**，否则抽稀后长度对不上、整条通道会静默失效。
     while len(P) > int(args.max_pts):
         vox *= 1.5
-        P, S, C = voxelize(P, S, vox, C)
+        P, S, T = voxelize(P, S, vox, T)
         print(f"[thin ] 超过上限 {int(args.max_pts):,} ⇒ 体素加粗到 {vox:.3f} m（现 {len(P):,} 点）", flush=True)
-    P, S, C = voxelize(P, S, vox, C)
+    P, S, T = voxelize(P, S, vox, T)
 
     # 图例数字必须是**合并后**各场实际显示的点数：合并时同格只留一份（sid 取先到的），
     # 所以各场"体素后点数"之和 ≠ 显示点数（重叠区被先加载的场吃掉）。
@@ -642,8 +665,9 @@ def main() -> None:
     out = Path(args.out) if args.out else (ROOT / ".tmp" / "pointcloud" / f"{wdir.name}.html")
     out.parent.mkdir(parents=True, exist_ok=True)
     title = args.title or f"{wdir.name} · {len(sess)} 场稠密点云"
-    out.write_text(build_html(P, C.astype(np.uint8), sess, vox, title,
-                              default_mode=2 if by_time else 0), encoding="utf-8")
+    out.write_text(build_html(P, S.astype(np.uint8), sess, vox, title,
+                              default_mode=2 if by_time else 0, tval=T.astype(np.uint8)),
+                   encoding="utf-8")
     print(f"[out  ] {out}  ({out.stat().st_size/1048576:.1f} MB · {len(P):,} 点 · 体素 {vox:.3f} m)")
     print(json.dumps({"sessions": stats, "n_pts": len(P), "vox_m": round(vox, 4)},
                      ensure_ascii=False, indent=1))
