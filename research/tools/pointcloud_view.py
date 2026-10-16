@@ -334,6 +334,8 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
   <div class="kv"><span>点数</span><b id="np">–</b></div>
   <div class="kv"><span>体素</span><b>__VOX__ m</b></div>
   <div class="kv"><span>覆盖</span><b id="ext">–</b></div>
+  <div class="kv"><span>近/远裁面</span><b id="nf">–</b></div>
+  <div class="kv"><span>深度精度</span><b id="du">–</b></div>
   <div id="legend"></div>
   <div id="keys">
     <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button>
@@ -375,12 +377,20 @@ SESS.forEach((s,i)=>{const d=document.createElement('div');d.className='row';
   const t=document.createElement('span');
   t.textContent=s.name+' · '+s.n.toLocaleString()+' 点'+(s.h!==undefined?' · 相机高 '+s.h.toFixed(2)+' m':'');
   d.appendChild(sw);d.appendChild(t);lg.appendChild(d);});
-if(2===__MODE__){const d=document.createElement('div');d.className='row';d.style.marginTop='4px';
-  const bar=document.createElement('span');
-  bar.style.cssText='width:110px;height:8px;border-radius:4px;flex:none;'+
-    'background:linear-gradient(90deg,#2b6fd6,#3fc3ea,#57dba2,#e6d24e,#ef8b3a,#df4436)';
-  const lb=document.createElement('span');lb.textContent='早 → 晚（各场内部按累积路程）';
-  d.appendChild(bar);d.appendChild(lb);lg.appendChild(d);}
+// 时间图例的色带必须与 shader 用**同一个公式**生成，否则图例在说谎。
+function hsv2rgbJS(h,s,v){const i=Math.floor(h*6),f=h*6-i,p=v*(1-s),q=v*(1-s*f),w=v*(1-s*(1-f));
+  let r,g,b; switch(i%6){case 0:r=v;g=w;b=p;break; case 1:r=q;g=v;b=p;break;
+    case 2:r=p;g=v;b=w;break; case 3:r=p;g=q;b=v;break; case 4:r=w;g=p;b=v;break;
+    default:r=v;g=p;b=q;}
+  return 'rgb('+Math.round(r*255)+','+Math.round(g*255)+','+Math.round(b*255)+')';}
+const tLegend=document.createElement('div');tLegend.className='row';tLegend.style.marginTop='4px';
+{const bar=document.createElement('span');
+ bar.style.cssText='width:110px;height:8px;border-radius:4px;flex:none;background:linear-gradient(90deg,'+
+   [0,1,2,3,4,5,6,7,8,9,10,11,12].map(i=>{const t=i/12;
+     return hsv2rgbJS(0.62*(1-t),0.60,0.80+0.20*t);}).join(',')+')';
+ const lb=document.createElement('span');lb.textContent='早 → 晚（各场内部按累积路程）';
+ tLegend.appendChild(bar);tLegend.appendChild(lb);}
+lg.appendChild(tLegend);
 
 const cv = document.getElementById('cv'), gl = cv.getContext('webgl');
 if(!gl){document.body.innerHTML='<p style="padding:20px">此浏览器不支持 WebGL</p>';}
@@ -400,7 +410,11 @@ void main(){
   // uMode: 0=按会话(调色板) 1=按高度 2=按时间(彩虹:早→蓝,晚→红)
   // ⚠️ 时间必须读 aT（第 7 字节），不能读 aS —— aS 是**会话**格。
   // 早期版本两者共用一格，"按时间"看到的其实是会话色。
-  vec3 tc = hsv2rgb(vec3(0.62*(1.0-clamp(aT/254.0,0.0,1.0)), 0.85, 0.95));
+  // 饱和度 0.85→0.60、亮度加一点梯度：相邻两趟的色差不再被拉到最大对比，
+  // 2 cm 级抖动不至于跳成刺眼的红/绿。⚠️ 这是**视觉**改动，不改数据 ——
+  // 错位本身还要靠别的模式判定，别拿颜色好看当"修好了"。
+  float tt = clamp(aT/254.0, 0.0, 1.0);
+  vec3 tc = hsv2rgb(vec3(0.62*(1.0-tt), 0.60, 0.80+0.20*tt));
   vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : tc);
   gl_PointSize = clamp(240.0/max(gl_Position.w,1.0), 1.5, 5.0);   // 近大远小
 }`;
@@ -441,6 +455,12 @@ function resize(){ const r=window.devicePixelRatio||1;
 addEventListener('resize',resize); resize();
 function persp(f,ar,n,fa){const t=1/Math.tan(f/2);return new Float32Array(
   [t/ar,0,0,0, 0,t,0,0, 0,0,(fa+n)/(n-fa),-1, 0,0,2*fa*n/(n-fa),0]);}
+const nfEl=document.getElementById('nf'), duEl=document.getElementById('du');
+// 16 位深度缓冲在 zRef 处的量化步长（米）。自检用：它大于面厚就必然 z-fighting。
+function depthUnit(near,far,zRef){
+  const d01=z=>{const zc=((far+near)/(near-far))*z+(2*far*near/(near-far)); return (zc/(-z)+1)*0.5;};
+  return 1.0/65535.0/Math.max(Math.abs(d01(-(zRef+1))-d01(-zRef)),1e-12);
+}
 function draw(){
   const ar=cv.width/cv.height;
   const cp=Math.cos(pitch),sp=Math.sin(pitch),cyw=Math.cos(yaw),syw=Math.sin(yaw);
@@ -455,7 +475,21 @@ function draw(){
   xx=zy*yz-zz*yy; xy=zz*yx-zx*yz; xz=zx*yy-zy*yx;
   const V=new Float32Array([xx,yx,-zx,0, xy,yy,-zy,0, xz,yz,-zz,0,
      -(xx*ex+xy*ey+xz*ez), -(yx*ex+yy*ey+yz*ez), (zx*ex+zy*ey+zz*ez), 1]);
-  const Pm=persp(0.9,ar,0.05,dist*8+50);
+  // ⚠️ 近裁面必须随缩放自适应。原来硬编码 near=0.05、far=dist*8+50：默认 dist≈70 时
+  // 近远比 0.05:622 ⇒ 16 位深度缓冲的 1 个单位 ≈ **1.5 m**，而点云局部厚度只有 2.5 cm
+  // ⇒ 同一像素里的点深度全部相等、谁最后画谁赢，表现为满屏撒盐。
+  // 实测（单变量消融：同一份数据、同一视角，只改位深）共同像素里 17% 颜色会变。
+  // 取 near=dist*0.03、far 收紧到刚好包住场景 ⇒ 1 个单位降到 ~3.6 cm，与面厚同量级。
+  // 包围球半径 R：任何点都不会比 (dist−R) 更近 ⇒ near 取它的一半既安全又能把精度拉满。
+  const R=Math.hypot(Math.max(Math.abs(mnx-cx),Math.abs(mxx-cx)),
+                     Math.max(Math.abs(mny-cy),Math.abs(mxy-cy)),
+                     Math.max(Math.abs(mnz-cz),Math.abs(mxz-cz)));
+  const near=Math.max(0.05, 0.5*Math.max(dist-R, 0.1)), far=dist+R+20;
+  if(nfEl) nfEl.textContent='n '+near.toFixed(2)+' / f '+far.toFixed(0)+' m';
+  // 深度精度自检：这个数**大于**点云的局部厚度时，同一像素里的点深度相等 ⇒ 必然闪。
+  // 面厚实测约 25 mm（223033 全场 σ3 中位），所以这个数要做到几 mm 才算修好。
+  if(duEl) duEl.textContent=(depthUnit(near,far,Math.max(dist,1))*1000).toFixed(1)+' mm @ '+dist.toFixed(0)+' m';
+  const Pm=persp(0.9,ar,near,far);
   const M=new Float32Array(16);                      // 列主序 M = Pm · V
   for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;
     for(let k=0;k<4;k++) s+=Pm[r+k*4]*V[k+c*4]; M[r+c*4]=s;}
@@ -484,7 +518,8 @@ cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.6,dist*(1+Mat
 const btnSid=document.getElementById('bSid'), btnH=document.getElementById('bH'),
       btnT=document.getElementById('bT');
 function setMode(m){mode=m;btnSid.classList.toggle('on',m===0);btnH.classList.toggle('on',m===1);
-  btnT.classList.toggle('on',m===2);}
+  btnT.classList.toggle('on',m===2);
+  if(tLegend) tLegend.style.display = (m===2?'flex':'none');}
 btnSid.onclick=()=>setMode(0); btnH.onclick=()=>setMode(1); btnT.onclick=()=>setMode(2);
 setMode(__MODE__);
 btnH.onclick=()=>{mode=1;btnH.classList.add('on');btnSid.classList.remove('on');};
