@@ -447,6 +447,8 @@ let gridB=null,gridN=0,showGrid=true;
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW); }
 
 let yaw=0.7, pitch=0.50, dist=0, cx=0, cy=0, cz=0, mode=__MODE__;   // pitch>0 ⇒ 相机在上方俯视
+// 相机到点云的最近/最远距离缓存（键是相机参数；见 draw() 里 near/far 的推导）
+let _camKey='', _dmin=0.1, _dmax=1.0;
 function fit(){ cx=(mnx+mxx)/2; cy=(mny+mxy)/2; cz=(mnz+mxz)/2;
   dist = Math.max(mxx-mnx, mxy-mny, mxz-mnz)*1.6 + 4; }
 fit();
@@ -478,17 +480,37 @@ function draw(){
   // ⚠️ 近裁面必须随缩放自适应。原来硬编码 near=0.05、far=dist*8+50：默认 dist≈70 时
   // 近远比 0.05:622 ⇒ 16 位深度缓冲的 1 个单位 ≈ **1.5 m**，而点云局部厚度只有 2.5 cm
   // ⇒ 同一像素里的点深度全部相等、谁最后画谁赢，表现为满屏撒盐。
-  // 实测（单变量消融：同一份数据、同一视角，只改位深）共同像素里 17% 颜色会变。
-  // 取 near=dist*0.03、far 收紧到刚好包住场景 ⇒ 1 个单位降到 ~3.6 cm，与面厚同量级。
-  // 包围球半径 R：任何点都不会比 (dist−R) 更近 ⇒ near 取它的一半既安全又能把精度拉满。
-  const R=Math.hypot(Math.max(Math.abs(mnx-cx),Math.abs(mxx-cx)),
-                     Math.max(Math.abs(mny-cy),Math.abs(mxy-cy)),
-                     Math.max(Math.abs(mnz-cz),Math.abs(mxz-cz)));
-  const near=Math.max(0.05, 0.5*Math.max(dist-R, 0.1)), far=dist+R+20;
-  if(nfEl) nfEl.textContent='n '+near.toFixed(2)+' / f '+far.toFixed(0)+' m';
+  //
+  // ⚠️ 不要用包围球近似（曾写成 near=0.5*(dist−R)）：R 是**全场**包围球半径（本例 27.6 m），
+  // 用户把滚轮拉近到 dist<R 时 dist−R 变负、near 落回下限 0.05，于是修复在**最需要它的
+  // 缩放档位**（24 m / 17 m）完全失效 —— 精度 183 mm / 93 mm，看起来和没改一样。
+  // 正确做法是量**当前这台相机**到最近点的真实距离。
+  // 也不要用抽样近似：抽样只会**高估**最近距离，真更近的点会被裁掉。
+  // 相机只在交互时变，所以精确算一次、按相机参数缓存即可，不给每帧加开销。
+  const camKey=yaw.toFixed(4)+','+pitch.toFixed(4)+','+dist.toFixed(4)+','+
+               cx.toFixed(4)+','+cy.toFixed(4)+','+cz.toFixed(4);
+  if(camKey!==_camKey){
+    // 用**平方距离**比较、最后只开一次根号：1.2M 点约 3-5 ms，拖动时不掉帧。
+    let mn2=Infinity, mx2=0;
+    for(let i=0;i<N;i++){
+      const dx=POS[i*3]-ex, dy=POS[i*3+1]-ey, dz=POS[i*3+2]-ez;
+      const d2=dx*dx+dy*dy+dz*dz;
+      if(d2<mn2)mn2=d2; if(d2>mx2)mx2=d2;
+    }
+    const mn=Math.sqrt(mn2), mx=Math.sqrt(mx2);
+    _dmin=(isFinite(mn)&&mn>0)?mn:0.1; _dmax=(isFinite(mx)&&mx>_dmin)?mx:_dmin+1;
+    _camKey=camKey;
+  }
+  // near 取真实最近点：再近一点点就会裁掉贴面点，所以留 1% 余量。
+  const margin=Math.max(0.01, _dmin*0.01);
+  const near=Math.max(0.05, _dmin-margin), far=_dmax+margin*4+1;
+  if(nfEl) nfEl.textContent='n '+near.toFixed(2)+' / f '+far.toFixed(0)+' m  最近点 '+_dmin.toFixed(1)+' m';
   // 深度精度自检：这个数**大于**点云的局部厚度时，同一像素里的点深度相等 ⇒ 必然闪。
   // 面厚实测约 25 mm（223033 全场 σ3 中位），所以这个数要做到几 mm 才算修好。
-  if(duEl) duEl.textContent=(depthUnit(near,far,Math.max(dist,1))*1000).toFixed(1)+' mm @ '+dist.toFixed(0)+' m';
+  // ⚠️ 必须报**最远处**（深度精度随距离平方恶化），报在中心距离会显得比实际好。
+  const _uWorst=depthUnit(near,far,Math.max(_dmax,1));
+  if(duEl){ duEl.textContent=(_uWorst*1000).toFixed(1)+' mm @ '+_dmax.toFixed(0)+' m';
+    duEl.style.color = _uWorst*1000 > 25 ? '#ff8a7a' : (_uWorst*1000 > 8 ? '#e6c04b' : '#7fd6a0'); }
   const Pm=persp(0.9,ar,near,far);
   const M=new Float32Array(16);                      // 列主序 M = Pm · V
   for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;
