@@ -81,6 +81,54 @@ def voxelize(xyz: np.ndarray, sid: np.ndarray, vox: float,
     return center, sid_out, ex_out
 
 
+def _voxelize_hits(xyz: np.ndarray, vox: float, extra: np.ndarray, kf: np.ndarray):
+    """体素降采样 + 逐格「被多少个**不同关键帧**看到」（hits）。
+
+    ⚠️ 必须与 `voxelize` **用同一个体素键和同一套归约规则**，否则返回的
+    hits 会与点错位一格 —— 那种错不会报错，只会让颜色配错点，看不出来。
+    所以这里不另写一套，而是先调用 voxelize 保证点序一致，再用同一套键算 hits。
+
+    为什么 hits 有意义：它是**采集侧的事实**（这块地方被观测了几次），
+    而「孤立度」「深度梯度」都是下游推断。实测（223033）地板 60.4% 的体素被
+    ≥2 帧看到，膝盖以上只有 21–36% —— 同一个深度噪声，观测多的地方被平均掉，
+    观测少的地方就退化成孤立的空中点。
+
+    ⚠️ hits=1 占全体 **56.2%**，其中非孤立点也占 54.6% ⇒ **不可当过滤器**
+    （用 hits>=2 滤飞点会删掉 63.7 万个真点换 4 万个飞点）。它只是置信度标注。
+    """
+    c, _s, ex = voxelize(xyz, np.zeros(len(xyz), np.uint8), vox, extra)
+    q = np.floor(xyz / vox).astype(np.int64)
+    key = (q[:, 0] * (1 << 42)) + (q[:, 1] * (1 << 21)) + q[:, 2]
+    uk, inv = np.unique(key, return_inverse=True)
+    n = len(uk)
+    # (体素下标, 帧号) 去重 ⇒ 每个体素被多少**不同帧**看到
+    pair = inv.astype(np.int64) * (1 << 20) + kf.astype(np.int64)
+    hv = np.bincount(np.unique(pair) // (1 << 20), minlength=n).astype(np.int32)
+    return c, np.zeros(n, np.uint8), ex, hv
+
+
+def _merge_hits(P, S, T, H, vox):
+    """跨场/抽稀时的体素合并：几何与 sid/time 取首次出现，**hits 求和**。
+
+    ⚠️ 不能直接用 voxelize 处理 hits。voxelize 对 extra 通道是「格内首次出现」，
+    那对 time（取一个代表值）是对的，对 hits 是**错的**：同一块体素被 A 场看到 2 次、
+    B 场看到 3 次，真实观测次数是 5，取首次只留 2 或 3。
+    这个错不会报错，只会让"观测次数"系统性偏低，正好落在最需要它准的地方。
+    """
+    q = np.floor(P / vox).astype(np.int64)
+    key = (q[:, 0] * (1 << 42)) + (q[:, 1] * (1 << 21)) + q[:, 2]
+    uk, inv = np.unique(key, return_inverse=True)
+    n = len(uk)
+    acc = np.zeros((n, 3)); np.add.at(acc, inv, P)
+    cnt = np.bincount(inv, minlength=n).astype(np.float64)
+    cen = acc / cnt[:, None]
+    # sid / time / hits 都按"首次出现"取，但 hits 最后要**按格求和**覆盖回去
+    so = np.zeros(n, np.uint8); so[inv[::-1]] = np.asarray(S, np.uint8)[::-1]
+    to = np.zeros(n, np.uint8); to[inv[::-1]] = np.asarray(T, np.uint8)[::-1]
+    hv = np.bincount(inv, weights=np.asarray(H, np.float64), minlength=n)
+    return cen, so, to, hv
+
+
 def estimate_cam_h(rec_dir: Path, every: int = 10) -> float:
     """逐场估计相机离地高度——**必须逐场估，不能全场共用一个常数**。
 
@@ -239,7 +287,7 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
     if not kfs:
         raise SystemExit(f"[fail] 录制 {rec} 的 kf/ 是空的")
 
-    chunks, sids, tnorm, n_pts, n_used = [], [], [], 0, 0
+    chunks, sids, tnorm, kfnum, n_pts, n_used = [], [], [], [], 0, 0
     n_neg_raw = n_gc_used = n_far_drop = 0
     gc_vals = []
     t0 = time.perf_counter()
@@ -291,13 +339,17 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
         n_used += int(sel.sum())
         chunks.append(np.column_stack([xy[sel], zw[sel]]))
         tnorm.append(np.full(int(sel.sum()), dm, np.float32))
+        # 帧号必须**逐点带下来**：hits 是"这个体素被多少个不同帧看到"，
+        # 从点云坐标本身推不出来。用 int32 而不是 uint8 —— 帧数会超 255（本例 470）。
+        kfnum.append(np.full(int(sel.sum()), k, np.int32))
     if not chunks:
         raise SystemExit(f"[fail] 录制 {rec} 没有可用点（位姿表与 kf 对不上？）")
     allp = np.concatenate(chunks)
     allt = np.concatenate(tnorm)
+    allk = np.concatenate(kfnum)
     allt = np.clip(allt / max(float(allt.max()), 1e-6), 0.0, 1.0)   # 归一化到 0..1
-    c, s, t = voxelize(allp, np.zeros(len(allp), np.uint8), vox, allt)
-    return c, s, t, dict(rec=rec, sid=sid, n_kf=len(kfs), n_pts_raw=n_pts, n_pts_kept=n_used,
+    c, s, t, hits = _voxelize_hits(allp, vox, allt, allk)
+    return c, s, t, hits, dict(rec=rec, sid=sid, n_kf=len(kfs), n_pts_raw=n_pts, n_pts_kept=n_used,
                       n_vox=len(c), s=round(time.perf_counter() - t0, 1),
                       pose_src=pose_src, base=str(pose_src).split("base=")[-1],
                       cam_h=round(float(cam_h), 3),
@@ -336,9 +388,10 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
   <div class="kv"><span>覆盖</span><b id="ext">–</b></div>
   <div class="kv"><span>近/远裁面</span><b id="nf">–</b></div>
   <div class="kv"><span>深度精度</span><b id="du">–</b></div>
+  <div class="kv"><span>观测次数</span><b id="hitinfo">–</b></div>
   <div id="legend"></div>
   <div id="keys">
-    <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button>
+    <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button><button id="bHit">按观测次数</button>
     <button id="bTop">俯视</button><button id="bSide">侧视</button>
     <button id="bFit">复位</button><br>
     拖拽旋转 · 滚轮缩放 · 右键平移 · <span style="color:__FG__">G</span> 网格
@@ -347,20 +400,24 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
 <script>
 const RAW = atob("__DATA__");
 const buf = new Uint8Array(RAW.length); for (let i=0;i<RAW.length;i++) buf[i]=RAW.charCodeAt(i);
-// 每点 7 字节：u16 x, u16 y, u8 z, u8 session, u8 time。
-// ⚠️ 以前是 6 字节，session 与 time **共用最后一格**，于是一个文件只能在
-// "按会话"和"按时间"里二选一 —— 界面却永远画三个按钮，其中一个必然废掉。
-// 现在两条通道各占一格，三个按钮都真能用。
-const N = buf.length/7|0;
-const POS = new Float32Array(N*3), SID = new Float32Array(N), TIM = new Float32Array(N);
+// 每点 8 字节：u16 x, u16 y, u8 z, u8 session, u8 time, u8 hits。
+// ⚠️ 6 字节时代 session 与 time **共用最后一格**，界面却永远画三个按钮 ⇒ 必有废的。
+// 8 字节是为 hits 单独开的：它是"这块体素被多少帧看到"，**从坐标推不出来**，
+// 必须逐点带下来。它是采集侧的事实，不是下游推断。
+const N = buf.length/8|0;
+const POS = new Float32Array(N*3), SID = new Float32Array(N),
+      TIM = new Float32Array(N), HIT = new Float32Array(N);
 const XYO=__XYO__, XYS=__XYS__, ZS=__ZS__, ZO=__ZO__;
+const HMX=__HMAX__;                      // 编码前的 hits 最大值（解码时还原）
 for (let i=0;i<N;i++){
-  const o=i*7, u=buf[o]|buf[o+1]<<8, v=buf[o+2]|buf[o+3]<<8;
+  const o=i*8, u=buf[o]|buf[o+1]<<8, v=buf[o+2]|buf[o+3]<<8;
   POS[i*3]   = u/XYS - XYO;
   POS[i*3+1] = v/XYS - XYO;
   POS[i*3+2] = buf[o+4]/ZS - ZO;      // 有符号：编码前加了 +ZO
   SID[i]     = buf[o+5];
   TIM[i]     = buf[o+6];
+  // 编码用了 sqrt 压缩，解码要平方还原
+  HIT[i]     = HMX>0 ? Math.pow(buf[o+7]/254, 2)*HMX : 0;
 }
 document.getElementById('np').textContent = N.toLocaleString();
 let mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9,mnz=1e9,mxz=-1e9;
@@ -383,6 +440,23 @@ function hsv2rgbJS(h,s,v){const i=Math.floor(h*6),f=h*6-i,p=v*(1-s),q=v*(1-s*f),
     case 2:r=p;g=v;b=w;break; case 3:r=p;g=q;b=v;break; case 4:r=w;g=p;b=v;break;
     default:r=v;g=p;b=q;}
   return 'rgb('+Math.round(r*255)+','+Math.round(g*255)+','+Math.round(b*255)+')';}
+// 观测次数图例（默认隐藏，点按钮才显示）
+const hLegend=document.createElement('div');hLegend.className='row';hLegend.style.marginTop='4px';
+hLegend.style.display='none';hLegend.style.flexWrap='wrap';
+// 图例用**离散色块**，与 shader 的分档逐档对应（渐变图例会误导 —— 没有一个公式
+// 能把 56% 的 hits=1 和长尾同时铺开，见 shader 里的说明）
+{const defs=[['#d92a21','1'],['#f28c1a','2'],['#ebde26','3'],['#59c752','4-5'],
+             ['#2680eb','6-10'],['#7a38e0','≥11']];
+ for(const [c,t] of defs){
+   const sw=document.createElement('span');sw.className='sw';sw.style.background=c;
+   const tx=document.createElement('span');tx.textContent=t+' 帧';
+   tx.style.cssText='font-size:11px;margin-right:6px;';
+   hLegend.appendChild(sw);hLegend.appendChild(tx);}
+ const note=document.createElement('span');
+ note.style.cssText='color:#98a0ac;font-size:11px;';
+ note.textContent='（该体素被多少帧看到；不是过滤器）';
+ hLegend.appendChild(note);}
+lg.appendChild(hLegend);
 const tLegend=document.createElement('div');tLegend.className='row';tLegend.style.marginTop='4px';
 {const bar=document.createElement('span');
  bar.style.cssText='width:110px;height:8px;border-radius:4px;flex:none;background:linear-gradient(90deg,'+
@@ -395,8 +469,9 @@ lg.appendChild(tLegend);
 const cv = document.getElementById('cv'), gl = cv.getContext('webgl');
 if(!gl){document.body.innerHTML='<p style="padding:20px">此浏览器不支持 WebGL</p>';}
 const VS = `
-attribute vec3 aP; attribute float aS; attribute float aT;
+attribute vec3 aP; attribute float aS; attribute float aT; attribute float aH;
 uniform mat4 uMVP; uniform float uMode; uniform vec3 uPal[8]; uniform float uZ0,uZ1;
+uniform float uHMax;
 varying vec3 vC;
 vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);
   vec3 p=abs(fract(c.xxx+K.xyz)*6.0-K.www);
@@ -415,7 +490,21 @@ void main(){
   // 错位本身还要靠别的模式判定，别拿颜色好看当"修好了"。
   float tt = clamp(aT/254.0, 0.0, 1.0);
   vec3 tc = hsv2rgb(vec3(0.62*(1.0-tt), 0.60, 0.80+0.20*tt));
-  vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : tc);
+  // uMode 3 = 按观测次数（hits = 该体素被多少个不同关键帧看到）
+  // ⚠️ 这是**置信度视图，不是过滤器**。实测 hits=1 里非孤立点也占 54.6%：
+  // 真实几何也大量只被看到一次，删了就是制造盲区（223033：删 63.7 万真点换 4 万飞点）。
+  //
+  // ⚠️ **必须用离散分档，不能用渐变**。试过线性/log/等频三种，全部失败：
+  // hits 在 1 处有一个巨大众数（56.2%），而 2..10 是长尾。线性把 82% 压进最低档；
+  // log 仍有 56% 在最低档；等频的分位边界直接塌缩到同一个值（1.0），产生空档。
+  // ⇒ hits 本质上是**二值信号**（看过/没看过）+ 一条长尾，离散档位才是它的真实形态。
+  vec3 htc = vec3(0.85,0.16,0.13);                       // 1 帧
+  if(aH >= 1.5)      htc = vec3(0.95,0.55,0.10);         // 2
+  if(aH >= 2.5)      htc = vec3(0.92,0.87,0.15);         // 3
+  if(aH >= 3.5)      htc = vec3(0.35,0.78,0.32);         // 4-5
+  if(aH >= 5.5)      htc = vec3(0.15,0.50,0.92);         // 6-10
+  if(aH >= 10.5)     htc = vec3(0.48,0.22,0.88);         // >=11
+  vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : (uMode < 2.5 ? tc : htc));
   gl_PointSize = clamp(240.0/max(gl_Position.w,1.0), 1.5, 5.0);   // 近大远小
 }`;
 const FS = `precision mediump float; varying vec3 vC;
@@ -431,11 +520,20 @@ const bS=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.bufferData(gl.
 const aS=gl.getAttribLocation(P,'aS'); gl.enableVertexAttribArray(aS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
 const bT=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.bufferData(gl.ARRAY_BUFFER,TIM,gl.STATIC_DRAW);
 const aT=gl.getAttribLocation(P,'aT'); gl.enableVertexAttribArray(aT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
+const bH=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bH); gl.bufferData(gl.ARRAY_BUFFER,HIT,gl.STATIC_DRAW);
+const aH=gl.getAttribLocation(P,'aH'); gl.enableVertexAttribArray(aH); gl.vertexAttribPointer(aH,1,gl.FLOAT,false,0,0);
 const uMVP=gl.getUniformLocation(P,'uMVP'), uMode=gl.getUniformLocation(P,'uMode'),
-      uPal=gl.getUniformLocation(P,'uPal'), uZ0=gl.getUniformLocation(P,'uZ0'), uZ1=gl.getUniformLocation(P,'uZ1');
+      uPal=gl.getUniformLocation(P,'uPal'), uZ0=gl.getUniformLocation(P,'uZ0'), uZ1=gl.getUniformLocation(P,'uZ1'),
+      uHMax=gl.getUniformLocation(P,'uHMax');
 const pal=[]; for(let i=0;i<8;i++){const c=PAL[i%PAL.length].replace('#','');
   pal.push(parseInt(c.slice(0,2),16)/255, parseInt(c.slice(2,4),16)/255, parseInt(c.slice(4,6),16)/255);}
 gl.uniform3fv(uPal, new Float32Array(pal)); gl.uniform1f(uZ0,mnz); gl.uniform1f(uZ1,mxz);
+gl.uniform1f(uHMax, HMX);
+// 观测次数统计写进 HUD —— 让"哪些地方看够了、哪些只扫过一次"一眼可见
+{ let h1=0, h2=0, h3=0, hmx=0;
+  for(let i=0;i<N;i++){const h=HIT[i]; if(h<1.5)h1++; else if(h<2.5)h2++; else h3++; if(h>hmx)hmx=h;}
+  const el=document.getElementById('hitinfo');
+  if(el) el.textContent='1 帧 '+((100*h1/N).toFixed(1))+'% · ≥2 帧 '+((100*(h2+h3)/N).toFixed(1))+'% · max '+hmx.toFixed(0); }
 gl.enable(gl.DEPTH_TEST);
 
 // 网格（1 m 线，贴在 z 最低处）
@@ -520,9 +618,11 @@ function draw(){
   gl.bindBuffer(gl.ARRAY_BUFFER,bP); gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bH); gl.vertexAttribPointer(aH,1,gl.FLOAT,false,0,0);
   gl.drawArrays(gl.POINTS,0,N);
   if(showGrid&&gridN){ gl.bindBuffer(gl.ARRAY_BUFFER,gridB);
     gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0); gl.vertexAttrib1f(aS,0); gl.vertexAttrib1f(aT,0);
+    gl.vertexAttrib1f(aH,0);
     gl.uniform1f(uMode,0.86); gl.drawArrays(gl.LINES,0,gridN); }
   requestAnimationFrame(draw);
 }
@@ -538,13 +638,14 @@ addEventListener('mousemove',e=>{ if(!drag)return; const dx=e.clientX-lx,dy=e.cl
 cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.6,dist*(1+Math.sign(e.deltaY)*0.12));},{passive:false});
 // ⚠️ 勿用 bS/bH：那是上面的 WebGL buffer 名，重复声明会让整段脚本 SyntaxError（全黑）
 const btnSid=document.getElementById('bSid'), btnH=document.getElementById('bH'),
-      btnT=document.getElementById('bT');
+      btnT=document.getElementById('bT'), btnHit=document.getElementById('bHit');
 function setMode(m){mode=m;btnSid.classList.toggle('on',m===0);btnH.classList.toggle('on',m===1);
-  btnT.classList.toggle('on',m===2);
-  if(tLegend) tLegend.style.display = (m===2?'flex':'none');}
+  btnT.classList.toggle('on',m===2);btnHit.classList.toggle('on',m===3);
+  if(tLegend) tLegend.style.display = (m===2?'flex':'none');
+  if(hLegend) hLegend.style.display = (m===3?'flex':'none');}
 btnSid.onclick=()=>setMode(0); btnH.onclick=()=>setMode(1); btnT.onclick=()=>setMode(2);
+btnHit.onclick=()=>setMode(3);
 setMode(__MODE__);
-btnH.onclick=()=>{mode=1;btnH.classList.add('on');btnSid.classList.remove('on');};
 document.getElementById('bTop').onclick =()=>{pitch=1.45;yaw=0;};   // 不到 1.5，避免 up 与视线平行退化
 document.getElementById('bSide').onclick=()=>{pitch=0.08;yaw=0.7;};
 document.getElementById('bFit').onclick =()=>{fit();};
@@ -557,15 +658,25 @@ _PALETTE = ["#4f9cf0", "#f2a33c", "#59c98d", "#e0655f", "#a97ae0",
 
 
 def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float,
-               title: str, default_mode: int = 0, tval: np.ndarray | None = None) -> str:
-    """点云 → 自包含 HTML。布局：每点 **7 字节**（u16 x, u16 y, u8 z, u8 sid, u8 time）。
+               title: str, default_mode: int = 0, tval: np.ndarray | None = None,
+               hval: np.ndarray | None = None) -> str:
+    """点云 → 自包含 HTML。布局：每点 **8 字节**
+    （u16 x, u16 y, u8 z, u8 sid, u8 time, u8 hits）。
 
-    ⚠️ 为什么必须是 7 而不是 6：以前 session 与 time **共用最后一格**，一个文件只能在
+    ⚠️ 为什么 7 不是 6：以前 session 与 time **共用最后一格**，一个文件只能在
     "按会话"和"按时间"里二选一；但界面永远画三个按钮，于必有一个是死的 —— 🚩 用户实测
-    "按时间的按钮坏了" 就是这个。分成两格后三个按钮都真能用，代价是文件大 1/6。
+    "按时间的按钮坏了" 就是这个。
 
-    ``tval`` 省略或长度不符时，时间格退化为全 0（按钮仍可点，只是单色），
-    绝不静默拿 sid 去冒充时间。
+    ⚠️ 为什么再加一格（8 字节）：hits = "这块体素被多少个不同关键帧看到"。
+    它**从点云坐标本身推不出来**，必须逐点带下来。它是**采集侧的事实**，
+    与"孤立度/深度梯度"那类下游推断不同 —— 后者都要先发明一个判据，
+    而 hits 是直接记录下来的。
+
+    ⚠️ **hits 不是过滤器**：实测 hits=1 占全体 56.2%，其中非孤立点也占 54.6%
+    ⇒ 用 hits>=2 滤飞点会删掉 63.7 万个真点只换 4 万个飞点。它只是**置信度标注**。
+
+    ``tval``/``hval`` 省略或长度不符时，对应格退化为全 0（按钮仍可点，只是单色），
+    绝不静默拿别的通道冒充。
     """
     x = np.clip((points[:, 0] + XY_OFFSET_M) * XY_SCALE, 0, 65535).astype(np.uint16)
     y = np.clip((points[:, 1] + XY_OFFSET_M) * XY_SCALE, 0, 65535).astype(np.uint16)
@@ -575,10 +686,20 @@ def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float
         t = np.zeros(len(x), np.uint8)
     else:
         t = np.clip(np.asarray(tval, np.float64), 0, 254).astype(np.uint8)
+    # hits 用 sqrt 压缩：hits 分布长尾（中位 1、max 30），线性映射会让绝大多数点挤在最低档。
+    # sqrt 后 1→51、2→72、4→102、16→203，各档都看得见。
+    if hval is None or len(hval) != len(x):
+        h = np.zeros(len(x), np.uint8)
+        hmax = 0
+    else:
+        hv = np.maximum(np.asarray(hval, np.float64), 0.0)
+        hmax = int(hv.max())
+        h = np.clip(np.round(np.sqrt(hv) / max(np.sqrt(hmax), 1e-9) * 254.0), 0, 254).astype(np.uint8)
     # 交错布局必须用结构化 dtype：直接 stack 会因形状不同报错
-    dt = np.dtype([("x", "<u2"), ("y", "<u2"), ("z", "u1"), ("s", "u1"), ("t", "u1")])
+    dt = np.dtype([("x", "<u2"), ("y", "<u2"), ("z", "u1"), ("s", "u1"),
+                   ("t", "u1"), ("h", "u1")])
     arr = np.empty(len(x), dtype=dt)
-    arr["x"], arr["y"], arr["z"], arr["s"], arr["t"] = x, y, z, s, t
+    arr["x"], arr["y"], arr["z"], arr["s"], arr["t"], arr["h"] = x, y, z, s, t, h
     raw = arr.tobytes()
     b64 = base64.b64encode(raw).decode("ascii")
     html = (_HTML
@@ -588,6 +709,7 @@ def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float
             .replace("__SESS__", json.dumps(sess, ensure_ascii=False))
             .replace("__PAL__", json.dumps(_PALETTE))
             .replace("__MODE__", str(int(default_mode)))
+            .replace("__HMAX__", repr(float(hmax)))
             .replace("__XYO__", repr(float(XY_OFFSET_M)))
             .replace("__XYS__", repr(float(XY_SCALE)))
             .replace("__ZS__", repr(float(Z_SCALE)))
@@ -663,9 +785,9 @@ def main() -> None:
 
     vox = float(args.vox)
     by_time = str(args.color_by).strip().lower() == "time"
-    allp, alls, allt, sess, stats = [], [], [], [], []
+    allp, alls, allt, allh, sess, stats = [], [], [], [], [], []
     for i, (rec, sid) in enumerate(zip(args.rec, sids)):
-        pts, s, tt, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
+        pts, s, tt, hv, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
                                       float(args.z_min), float(args.z_max), max(1, int(args.every)),
                                       pose_mode=str(args.pose),
                                       range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
@@ -675,6 +797,7 @@ def main() -> None:
         allp.append(pts)
         alls.append(np.full(len(pts), i, np.uint8))
         allt.append((tt * 254.0).astype(np.uint8))
+        allh.append(hv.astype(np.float64))
         sess.append({"name": f"{sid[-6:]}（{rec[-6:]}）", "n": len(pts), "h": round(float(st["cam_h_eff"]), 3)})
         stats.append(st)
         print(f"[load ] {rec} → {sid}  cam_h={st['cam_h']:.3f} − gc={st['gc_median']:+.3f} "
@@ -687,6 +810,7 @@ def main() -> None:
     P = np.concatenate(allp)
     S = np.concatenate(alls)
     T = np.concatenate(allt)
+    H = np.concatenate(allh)
 
     # 🚨 跨场「有效离地高」一致性闸（2026-10-06 新增，起因见本文档 §地面口径）
     # cam_h 是**全局估计**，逐场可以被估偏 0.3 m；gc 会把它补回来，于是 cam_h−gc 才是
@@ -708,11 +832,15 @@ def main() -> None:
                   f"**不要**直接改 cam_h 去凑 —— 它和 gc 是一对。")
     # 跨会话再并一次体素：多场重叠区只留一份（sid 取先到的 ⇒ 图例按场次顺序稳定）
     # ⚠️ 时间通道必须**一起过体素**，否则抽稀后长度对不上、整条通道会静默失效。
+    # ⚠️ hits 必须走 _merge_hits（按格**求和**），不能用 voxelize 的"首次出现" ——
+    # 同一格被两场各自看到，总观测次数是两者之和，取首次会系统性偏低。
     while len(P) > int(args.max_pts):
         vox *= 1.5
-        P, S, T = voxelize(P, S, vox, T)
+        P, S, T, H = _merge_hits(P, S, T, H, vox)
         print(f"[thin ] 超过上限 {int(args.max_pts):,} ⇒ 体素加粗到 {vox:.3f} m（现 {len(P):,} 点）", flush=True)
-    P, S, T = voxelize(P, S, vox, T)
+    P, S, T, H = _merge_hits(P, S, T, H, vox)
+    print(f"[hits ] 中位 {np.median(H):.0f}  p90 {np.percentile(H, 90):.0f}  max {H.max():.0f}"
+          f"   仅 1 帧 {(H < 1.5).mean()*100:.1f}%  ≥2 帧 {(H >= 1.5).mean()*100:.1f}%")
 
     # 图例数字必须是**合并后**各场实际显示的点数：合并时同格只留一份（sid 取先到的），
     # 所以各场"体素后点数"之和 ≠ 显示点数（重叠区被先加载的场吃掉）。
@@ -723,7 +851,8 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     title = args.title or f"{wdir.name} · {len(sess)} 场稠密点云"
     out.write_text(build_html(P, S.astype(np.uint8), sess, vox, title,
-                              default_mode=2 if by_time else 0, tval=T.astype(np.uint8)),
+                              default_mode=2 if by_time else 0, tval=T.astype(np.uint8),
+                              hval=H),
                    encoding="utf-8")
     print(f"[out  ] {out}  ({out.stat().st_size/1048576:.1f} MB · {len(P):,} 点 · 体素 {vox:.3f} m)")
     print(json.dumps({"sessions": stats, "n_pts": len(P), "vox_m": round(vox, 4)},

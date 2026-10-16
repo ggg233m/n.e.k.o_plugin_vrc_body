@@ -33,19 +33,28 @@ BG = np.array([15, 17, 21], np.float32)
 
 
 def load(html_path: Path):
-    """解出点云字节。7 字节/点：u16 x, u16 y, u8 z, u8 sid, u8 time。"""
+    """解出点云字节。8 字节/点：u16 x, u16 y, u8 z, u8 sid, u8 time, u8 hits。
+
+    返回 (xyz, sid, time, hits)。hits 已按 build_html 的 sqrt 压缩逆变换还原。
+    ⚠️ 7 字节是**旧格式**（那一格只够放 sid 与 time 之一），遇到就明确报错，
+    不要猜 —— 猜错会把 sid 当成 hits 用，那种错不会报错只会让颜色配错点。
+    """
     h = html_path.read_text(encoding="utf-8", errors="replace")
     m = PAT.search(h)
     if not m:
         raise SystemExit("no payload in %s" % html_path)
     raw = base64.b64decode(m.group(1))
-    if len(raw) % 7:
-        raise SystemExit("payload %d bytes is not a multiple of 7" % len(raw))
-    a = np.frombuffer(raw, np.uint8).reshape(-1, 7)
+    if len(raw) % 8:
+        raise SystemExit("payload %d bytes is not a multiple of 8（旧版 7 字节格式？请重跑 pointcloud_view）" % len(raw))
+    a = np.frombuffer(raw, np.uint8).reshape(-1, 8)
     x = (a[:, 0].astype(np.int32) | (a[:, 1].astype(np.int32) << 8)) / XYS - XYO
     y = (a[:, 2].astype(np.int32) | (a[:, 3].astype(np.int32) << 8)) / XYS - XYO
     z = a[:, 4].astype(np.float64) / ZS - ZO
-    return np.column_stack([x, y, z]), a[:, 5].astype(np.int64), a[:, 6].astype(np.int64)
+    hm = re.search(r"const HMX=([0-9.eE+-]+);", h)
+    hmax = float(hm.group(1)) if hm else 0.0
+    hits = ((a[:, 7].astype(np.float64) / 254.0) ** 2 * hmax) if hmax > 0 else np.zeros(len(a))
+    return (np.column_stack([x, y, z]), a[:, 5].astype(np.int64),
+            a[:, 6].astype(np.int64), hits)
 
 
 def depth_unit(near: float, far: float, z_ref: float, bits: int = 16) -> float:
@@ -175,18 +184,34 @@ def main() -> None:
     a = ap.parse_args()
 
     src = Path(a.html)
-    P, sid, tim = load(src)
+    P, sid, tim, hits = load(src)
     tag = a.tag or src.stem
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     print("[load ] %s  %d 点  sid 值 %d 个  time 值 %d 个 [%d,%d]"
           % (src.name, len(P), len(set(sid.tolist())), len(set(tim.tolist())),
              int(tim.min()), int(tim.max())))
+    print("[hits ] 中位 %.0f  p90 %.0f  max %.0f  仅 1 帧 %.1f%%  ≥2 帧 %.1f%%"
+          % (np.median(hits), np.percentile(hits, 90), hits.max(),
+             100.0 * (hits < 1.5).mean(), 100.0 * (hits >= 1.5).mean()))
     lo, hi = P.min(0), P.max(0)
     span = float(max(hi - lo))
     R = float(np.linalg.norm(hi - (lo + hi) / 2.0))
     dist = a.dist if a.dist is not None else (span * 1.6 + 4.0)
-    near = 0.05 if a.old_near else max(0.05, 0.5 * max(dist - R, 0.1))
-    far = (dist * 8 + 50) if a.old_near else (dist + R + 20.0)
+    cen = (lo + hi) / 2.0
+    # ⚠️ 必须与 pointcloud_view 的实际公式一致：near 取**真实最近点距离**。
+    # 曾经用包围球近似 near=0.5*(dist−R)，拉近到 dist<R 时退化为 0.05，
+    # 复现工具会显示"修复后仍是旧精度"，把人引向错误结论（2026-10-16 踩过）。
+    if a.old_near:
+        near, far = 0.05, dist * 8 + 50
+    else:
+        cp_, sp_ = np.cos(0.50), np.sin(0.50)
+        eye = np.array([cen[0] + dist * cp_ * np.sin(0.7),
+                        cen[1] - dist * cp_ * np.cos(0.7),
+                        cen[2] + dist * sp_])
+        dd = np.linalg.norm(P - eye, axis=1)
+        dmin, dmax = float(dd.min()), float(dd.max())
+        m = max(0.01, dmin * 0.01)
+        near, far = max(0.05, dmin - m), dmax + m * 4 + 1
     u = depth_unit(near, far, max(dist, 1))
     print("[cam  ] dist=%.1f  near=%.2f  far=%.0f  16 位单位=%.4f m (%.0f mm) @%.0fm"
           % (dist, near, far, u, u * 1000, dist))
