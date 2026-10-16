@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """``ray_near_exempt`` 的 A/B——动的是 ray_clear 本体，两把尺子必须同时看。
 
-    python -m tools.ray_exempt_ab [录制名...]
+    python -m research.tools.ray_exempt_ab [录制名...]
 
 ## 为什么这一刀特别危险
 
-``ray_clear`` 是整套虚假障碍修复的主力：实测（tools/ray_clear_ab.py，044153）
+``ray_clear`` 是整套虚假障碍修复的主力：实测（research/tools/ray_clear_ab.py，044153）
 关掉它，用户走过的路径有 **12.97%** 被判障碍；开着是 **1.35%**。
 而尺子 1 就是"走过∩OCC 率"——**它恰好就是这个机制的验收指标**。
 
@@ -27,13 +27,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig   # noqa: E402
 from backend.nav_grid import OCC                                   # noqa: E402
-from tools.precision_probe import load                             # noqa: E402
-from tools.nav_audit import (MIN_HIT_LAYERS, MIN_NB, MIN_PTS, PLANAR_TOL,  # noqa: E402
+from research.tools.precision_probe import load                             # noqa: E402
+from research.tools.nav_audit import (MIN_HIT_LAYERS, MIN_NB, MIN_PTS, PLANAR_TOL,  # noqa: E402
                              band_pass, _spread)
 
 RECS = ("20261001_044153", "20260929_045615")

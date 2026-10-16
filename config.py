@@ -257,7 +257,7 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "record_max_mb": (float, 1.0, 100000.0),
     # 会话末自动**并树**（世界树 pass，逐对采纳之后跑一次）：收掉"别的会话之间的桥"，
     # 否则孤立会话的匹配会因"坐标系不同根"被丢（2026-10-06 实测漏过 18 条）。
-    # 代价是会话末后台线程里逐桥跑一次弹性优化；关掉 = 手动跑 tools/xsession_align.py --world-tree。
+    # 代价是会话末后台线程里逐桥跑一次弹性优化；关掉 = 手动跑 research/tools/xsession_align.py --world-tree。
     "xsession_world_tree": (bool, 0, 1),
 }
 NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
@@ -291,7 +291,7 @@ NAVMESH_MAPPER_KEYS: dict[str, tuple[type, float, float]] = {
     "hi_band_top_m": (float, 0.6, 40.0),
     "ray_clear": (bool, 0, 1),
     # 近距票豁免看穿清零（默认关，**实测净亏**，2026-10-04 两段录制）。打开前必须用
-    # tools/ray_exempt_conn.py 量连通性——tools/ray_exempt_ab.py 的"交换比"数的是格数，
+    # research/tools/ray_exempt_conn.py 量连通性——research/tools/ray_exempt_ab.py 的"交换比"数的是格数，
     # 与真实代价反向（赔率最好看的那段断裂最多），不能拿它定案。
     "ray_near_exempt": (bool, 0, 1),
     "ray_plane_pts": (int, 1, 1000000),

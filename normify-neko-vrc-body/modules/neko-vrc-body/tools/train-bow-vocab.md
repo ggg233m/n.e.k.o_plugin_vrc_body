@@ -10,16 +10,16 @@ description:
   en: >
       Trains the ORB bag-of-words vocabulary tree that gives loop closure its appearance-based candidate generator.
       
-revision: c6cd0a7c9179d635671c54c1871c6d311878af48
-updated_at: "2026-10-03T16:13:37.943Z"
-fingerprint: 7c142be5898d0161ee3cf0e108678407880309db97bc1b0b6688e740cbc2e4bf
+revision: 0eb991034d815aafdf6ad8342f413fecb385d5b5
+updated_at: "2026-10-16T21:51:59.431Z"
+fingerprint: ed275c95575bd6cfe8cf326754049a6422152067b51f628f50c9d647d67ed4db
 source:
-  - path: "tools/train_bow_vocab.py"
+  - path: "research/tools/train_bow_vocab.py"
     line: 29
     end_line: 102
 apis:
   - protocol: file
-    path: "tools/train_bow_vocab.py#main"
+    path: "research/tools/train_bow_vocab.py#main"
     description:
       zh: >
           训练并保存 ORB 词袋词汇树。
@@ -28,7 +28,7 @@ apis:
           Train the ORB bag-of-words vocabulary tree and save it.
           
   - protocol: file
-    path: "tools/train_bow_vocab.py#load_descriptors"
+    path: "research/tools/train_bow_vocab.py#load_descriptors"
     description:
       zh: >
           从录制里加载到指定比例为止的 ORB 描述子。

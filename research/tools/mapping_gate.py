@@ -5,18 +5,19 @@ r"""建图 golden 门：把"建图质量"变成一个会失败的门，而不是
     python research/tools/mapping_gate.py --update     # 重写基线（**必须**人工看过 diff 再提交）
     python research/tools/mapping_gate.py --strict     # 录制缺失也算失败
 
-放在 ``research/tools/`` 而不是根目录的 ``tools/``，有两个理由，都不是洁癖：
+放在 ``research/tools/`` 而不是仓库根，有一个理由，不是洁癖：
 
-* ``tests/test_research_isolation.py`` 明确断言根目录 ``tools/`` **不该存在**，
-  研究工具应并入 ``research/``。往那儿加文件等于把一个已知红灯越弄越红。
 * ``pyproject.toml`` 的 ``[tool.neko.build] exclude_dirs`` 含 ``research/``
-  **不含** ``tools/`` ⇒ 放在 ``tools/`` 会被打进**发行包**。
-  本门是开发期校验，不该出现在用户的安装目录里。
+  ⇒ 放这里不会被打进**发行包**。本门是开发期校验，不该出现在用户的安装目录里。
+
+（2026 迁移收尾：仓库根的 ``tools/`` 已整体并入 ``research/tools/``，原先那条
+"``tests/test_research_isolation.py`` 断言根目录不该有 ``tools/`` 却长期未满足"
+的状态到此结束。）
 
 为什么要有这个门
 ----------------
 建图侧的改动一直在发生（``q_tiers`` 分层、``cam_h`` 滞回、射线清除、``ray_clear``/``ray_exempt``），
-而每次改动的判据都是"量到的数字变好了"。这套数字散在 ``tools/q_tier_ab.py`` 等七八个
+而每次改动的判据都是"量到的数字变好了"。这套数字散在 ``research/tools/q_tier_ab.py`` 等七八个
 脚本里，口径各自略有不同，**没有一个能回答"这次改动有没有动到不该动的东西"**。
 
 本门把一条真实录制喂进**在线 ``KeyframeGridMapper`` 本体**（不另写一份分类器，
@@ -35,7 +36,7 @@ r"""建图 golden 门：把"建图质量"变成一个会失败的门，而不是
 第 5 项是本门与既有脚本最大的不同：既有脚本量的是**图**，
 本门量的是**图被规划器实际消费之后的结果**。后续把地形代价接进 ``_cost()`` 时，
 唯一该先问的问题是"路径变了吗"，而这件事只能从规划器输出上量。
-基线文件 ``tools/mapping_gate_baseline.json`` 只存**指标与指纹**，不存栅格本身
+基线文件 ``research/tools/mapping_gate_baseline.json`` 只存**指标与指纹**，不存栅格本身
 （栅格几百 KB × 三场，进了版本库没人会去看 diff）。栅格要对比用
 ``--dump-grid`` 落到临时文件。
 """
@@ -86,7 +87,7 @@ def load_events(rec: Path) -> list[dict]:
 def replay(rec: Path, cfg: MapperConfig):
     """按录制事件顺序把关键帧喂进 mapper，末尾做一次最终栅格化。
 
-    逐行沿用 ``tools/q_tier_ab.replay``：包括 ``refresh`` 时的 ``drop_points(k-1)``
+    逐行沿用 ``research/tools/q_tier_ab.replay``：包括 ``refresh`` 时的 ``drop_points(k-1)``
     （原地不动补帧，上一帧让出）与在线同口径。**这里不要"顺手优化"**——
     这段顺序是复现线上行为的一部分，改了它门量的就不是线上的东西了。
     """
@@ -359,7 +360,7 @@ def recorded_sensors(rec: Path) -> dict:
 def why_corridor(name: str, top: int = 10) -> dict:
     """把**当前**规则留下的走廊障碍拆成连通块，按票型指纹分类。
 
-    与 ``tools/q_tier_why.py`` 问的是不同的问题：那个比"新旧规则"，
+    与 ``research/tools/q_tier_why.py`` 问的是不同的问题：那个比"新旧规则"，
     这个问"**剩下**的还堵路的是什么"。现在 ``range_m=5`` + ``q_tiers=on``
     的代表样本是 044153（505 个走廊障碍），要判断的是这里面
     **真结构占多少、量化倾斜占多少**——决定下一步该改规则还是改感知。
@@ -381,7 +382,7 @@ def why_corridor(name: str, top: int = 10) -> dict:
         return out
     # ⚠️ 累加器→NavGrid 的行翻转逻辑**只从 q_tier_why.to_grid 取**，不重写。
     # 漏掉 g[::-1] 不会报错，只会让票型上下镜像、看着还挺像回事（该文件的原话）。
-    from tools.q_tier_why import to_grid            # TODO: tools/ 迁进 research/ 后改指新路径
+    from research.tools.q_tier_why import to_grid
     n_o = to_grid(mapper._acc_o, mapper, ng)
     o_n = to_grid(mapper._acc_on, mapper, ng)
     o_m = to_grid(mapper._acc_om, mapper, ng)
@@ -520,7 +521,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if not BASELINE.exists():
-        print(f"[fail] 基线不存在：{BASELINE}\n        先跑 python -m tools.mapping_gate --update",
+        print(f"[fail] 基线不存在：{BASELINE}\n        先跑 python -m research.tools.mapping_gate --update",
               file=sys.stderr)
         return 2
     base = json.loads(BASELINE.read_text(encoding="utf-8"))

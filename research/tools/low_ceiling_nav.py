@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """2 m 以下的水平面，现在到底算不算障碍？——低天花板的 OCC/FREE 交叉表。
 
-    python -m tools.low_ceiling_nav [录制名...]
+    python -m research.tools.low_ceiling_nav [录制名...]
 
 ## 要回答的
 
@@ -31,13 +31,13 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import (KeyframeGridMapper, MapperConfig,          # noqa: E402
                                  _ground_correction)
 from backend.nav_grid import FREE, OCC, UNK                                   # noqa: E402
-from tools.precision_probe import load                                       # noqa: E402
+from research.tools.precision_probe import load                                       # noqa: E402
 
 HBIN = 0.05
 MIN_PTS = 20        # 与 band_levels 一致：一格至少这么多票才谈"面"
@@ -399,7 +399,7 @@ def dump_frames(m, c, ng, sel, acc, keep=None, idx=None):
         print(f"    {i:5d}  {hits[i]:7d}   ({x:7.2f}, {y:7.2f})")
     if len(ks) > 20:
         print(f"    …另有 {len(ks) - 20} 帧")
-    out = ROOT / "tools" / f"low_ceiling_kf_{rec_name_of(m)}.json"
+    out = ROOT / "research" / "tools" / f"low_ceiling_kf_{rec_name_of(m)}.json"
     payload = {"frames": [{"i": int(i), "pts": hits[i], "xy_m": [round(poses[i][0], 3),
                                                                round(poses[i][1], 3)]} for i in ks]}
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -413,7 +413,7 @@ def rec_name_of(m):
 
 def save_art(ng, idx, g_h, g_r, ctr_all, near_real, occ_kind, rec_name):
     """左：nav 栅格 + 这批近距低面；右：高度 vs 观测距离。"""
-    from tools.plotfont import use_cjk
+    from research.tools.plotfont import use_cjk
     use_cjk()
     import matplotlib.pyplot as plt
     g = ng.grid
@@ -437,7 +437,7 @@ def save_art(ng, idx, g_h, g_r, ctr_all, near_real, occ_kind, rec_name):
     ax[1].set_xlabel("观测距离 m（δz = z^2/25.5）"); ax[1].set_ylabel("低面众数高度 m")
     ax[1].set_ylim(0, 2.05); ax[1].legend(); ax[1].grid(alpha=.3)
     fig.tight_layout()
-    out = ROOT / "tools" / f"low_ceiling_{rec_name}.png"
+    out = ROOT / "research" / "tools" / f"low_ceiling_{rec_name}.png"
     fig.savefig(out, dpi=110)
     print(f"\n  图已存 {out.relative_to(ROOT)}")
 

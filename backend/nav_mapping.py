@@ -15,7 +15,7 @@
   occ_ground_ratio 只压密度、补不回那一层不存在的信息（"空地中间冒孤岛"的物理来源）。
   所以近带单帧定案、中带要 ≥q_mid_kf 个关键帧一致（或"票够密且不含远带成分"的单帧例外）、
   远带没有定案权，只用来**否证**。实测走廊障碍 1652→1104（044153，−33%）、5396→3695（045615，−32%），
-  见 Docs/虚假障碍-根因与分层修复（2026-10-05）.md 与 tools/q_tier_ab.py（⚠️ 旧数 2168→502 已作废：那是朝向错的掩码量的，绝对值与相对值都不可引用）。
+  见 Docs/虚假障碍-根因与分层修复（2026-10-05）.md 与 research/tools/q_tier_ab.py（⚠️ 旧数 2168→502 已作废：那是朝向错的掩码量的，绝对值与相对值都不可引用）。
 
 栅格原点对齐到分辨率整数倍，所以地图变大时已有格子的编号含义不变。
 """
@@ -90,13 +90,13 @@ class MapperConfig:
     # 近带的独立票数门槛，**0 = 不启用**（默认，保持历史行为逐格不变）。调到 1~min_pts
     # 才会让"近距票够、但被地面压制挡掉"的格独立定案。
     #
-    # ⚠️ 实测（tools/q_near_pts_ab.py，044153，两把尺子同时看）：**开着是净亏，别开。**
+    # ⚠️ 实测（research/tools/q_near_pts_ab.py，044153，两把尺子同时看）：**开着是净亏，别开。**
     #   q_near_pts  OCC    尺子1 走过∩OCC   尺子2 漏放
     #        0     4057        1.35%          202      ← 基线
     #        2     4320        1.51%          201      交换率 −6.1×
     #        1     4414        1.84%          201      交换率 −2.0×
     # 202 个漏放格只回来 1 个。原因是 **ray_clear 的看穿清零在 ``_by_quality`` 上游**：
-    # tools/low_ceiling_nav 量到 1368/1405 的 n_o 在进质量分层之前就已经被置 0，
+    # research/tools/low_ceiling_nav 量到 1368/1405 的 n_o 在进质量分层之前就已经被置 0，
     # 票压根没走到这一层，降门槛降的是空气。
     # 保留这个开关是因为它让"近带不带地面压制"这句文档从死代码变成真代码（单测覆盖），
     # 而且**一旦上游 veto 修好，它就是现成的近距通道**。在那之前保持 0。
@@ -104,9 +104,9 @@ class MapperConfig:
     # ⚠️ 想改"真结构被误清掉"？**不要在这里调票数**。往这边看：
     #
     #   1. 症状一般在**上游**，不在这一层。``ray_clear`` 的看穿清零在 ``_by_quality``
-    #      之前就把 n_o 削了（tools/low_ceiling_nav.py 在 044153 上量到 1368/1405 个
+    #      之前就把 n_o 削了（research/tools/low_ceiling_nav.py 在 044153 上量到 1368/1405 个
     #      有票的格 n_o 被置 0）。票没走到这一层，这里怎么调都是调空气。
-    #   2. 先量，再改。跑 ``python -m tools.nav_audit <录制>``——它给两把尺子：
+    #   2. 先量，再改。跑 ``python -m research.tools.nav_audit <录制>``——它给两把尺子：
     #        尺子 1  走过∩OCC 率        抓**路径上**的虚假障碍
     #        尺子 2  近距平面证据的漏放  抓**路径外**的真结构被清掉
     #      **只报尺子 1 会把人往反方向推**：放宽阈值总能降低尺子 1，而尺子 1 对
@@ -114,7 +114,7 @@ class MapperConfig:
     #      实际情况是它一次清掉 14210 格、其中有 200 来格是坐在沙发后面的真矮墙。
     #   3. 🎯 **票数门和几何门都试过，都净亏**（见 ``ray_near_exempt`` 处的实测表）。
     #      真要继续，判据不是"回收几格 / 封死几格"的比值，而是
-    #      ``tools/ray_exempt_conn.py`` 的连通性——比值数的是格数，代价取决于位置。
+    #      ``research/tools/ray_exempt_conn.py`` 的连通性——比值数的是格数，代价取决于位置。
     #
     # 本开关保留只为让"近带不带地面压制"这句文档从死代码变成真代码（单测覆盖），
     # 实测净亏，**保持 0**：
@@ -126,14 +126,14 @@ class MapperConfig:
     q_near_pts: int = 0
     # 单帧例外：一堵墙如果只被一个关键帧看到（刚走近就看见了），单帧多帧确认会把它误杀成 unknown。
     # 放宽的条件是"这张票干净"：格内障碍点够多（≥q_solo_pts）**且**远带票占比 ≤q_far_tol。
-    # 实测（tools/q_tier_why.py，20261001_044153）：被清掉的格远带票占比中位数是 1.00、障碍点中位数 14；
+    # 实测（research/tools/q_tier_why.py，20261001_044153）：被清掉的格远带票占比中位数是 1.00、障碍点中位数 14；
     # 留住的格是 0.15 / 149。远带票占比是这个场景里最能分开"真结构"与"量化倾斜"的一维。
     q_solo_pts: int = 15
     q_far_tol: float = 0.15
     # 降级判回**空地**要多大范围内的地面证据。默认 = q_near_m，只认 1.5 m 内看清的地面；
     # 调到 q_mid_m（3.0）就是 Docs/离线多视角融合v1 那一版的近+中距口径：判回空地的格多得多，
     # 图外可探索面积涨得快，但中距地面本身就是被抖出来的，等于拿噪声治噪声。实测两者对
-    # "走廊上还有几个障碍"几乎没差别（见 tools/q_tier_ab.json），差别只在图外那圈——所以
+    # "走廊上还有几个障碍"几乎没差别（见 research/tools/q_tier_ab.json），差别只在图外那圈——所以
     # 默认取保守的那个，不伪造 free。
     q_free_m: float = 1.5
     # 重访替换（repl）：一次**更晚的经过**（晚 ≥ repl_dt_s 秒）在某格近距（≤ repl_r_m）看到地面、
@@ -164,7 +164,7 @@ class MapperConfig:
     ray_walk_w: float = 3.0
     # 近距票豁免看穿清零，**默认关，实测净亏**（几何门版，2026-10-04，044153 + 045615）。
     #
-    # 🎯 **判据是 tools/ray_exempt_conn.py 的连通性，不是 tools/ray_exempt_ab.py 的交换比。**
+    # 🎯 **判据是 research/tools/ray_exempt_conn.py 的连通性，不是 research/tools/ray_exempt_ab.py 的交换比。**
     #   ab 报的是"回收的真结构格 / 新封死的路径格"，两段录制都 >1，看着像划算：
     #         044153   135/29 = 4.7:1        045615   47/33 = 1.4:1
     #   但连通性量下来两段都是亏的：
@@ -177,12 +177,12 @@ class MapperConfig:
     # 门是"这里有没有一张连贯的近距水平面"（``_near_plane``），**不是**票数：按票数试过一次，
     # 045615 上回收 123 个真结构却封死 1155 个路径格，赔率 9:1。
     ray_near_exempt: bool = False
-    # _near_plane 的门。三个变体在 044153 + 045615 上量过（tools/ray_exempt_ab.py，
+    # _near_plane 的门。三个变体在 044153 + 045615 上量过（research/tools/ray_exempt_ab.py，
     # 括号里是**票面**比值"回收的真结构格 / 新封死的路径格"——它不是判据，见上一条注释）：
     #   每格平均高度 + 邻居≥6   135/29 (4.7:1)   47/33  (1.4:1)   ← 三个里最不差，代码里留它
     #   众数层     + 邻居≥6      59/10 (5.9:1)   30/127 (0.2:1)   亏
     #   众数层     + 边缘感知      70/16 (4.4:1)   44/145 (0.3:1)   亏
-    # ⚠️ "留它"≠"该打开"：三个变体**没有一个**在 tools/ray_exempt_conn.py 的连通性上翻正，
+    # ⚠️ "留它"≠"该打开"：三个变体**没有一个**在 research/tools/ray_exempt_conn.py 的连通性上翻正，
     #    开关保持 False。留着是因为它是几何门这个方向的现成实现（单测覆盖）。
     # 后两个都是"看见错杀就去修"，结果更差——flat 与 inside 是一对互相支撑的误杀集合。
     # **别再盲调这两个门**，细节见 ``_near_plane_parts`` 的注释。要继续先得第三段录制。
@@ -208,7 +208,7 @@ class MapperConfig:
     # 精度够用：墙面平面误差实测 0.06 m，avatar 半径 0.25 m，余量 4 倍。
     # 这次**不做**楼板/天花板识别（那要带内高度聚类，量过数据再定），只回答"这个高度有没有东西"。
     hi_bands: bool = True
-    # 边界按 `tools/band_height_hist.py` 在 044153 上量到的自然峰设，不再是随手取的整数：
+    # 边界按 `research/tools/band_height_hist.py` 在 044153 上量到的自然峰设，不再是随手取的整数：
     # 头顶之上的点合并起来是 3.0~4.0 m 占 60.8%（壳厚约 1 m，见下），原来 3.5/6.0 的边界
     # **正好劈在那个面上**（lo 堆在自己上沿、mid 堆在自己下沿），两层都拿不到完整的一张面。
     hi_band_m: float = 3.0
@@ -452,7 +452,7 @@ def label_cells(cfg: "MapperConfig", base_occ: np.ndarray, n_g: np.ndarray, n_o:
     # ``q_near_pts`` 把文档里那句"近带**故意不带**地面压制"真正接上。历史上它是死代码：
     # ``rasterize`` 的 base 规则先做了 (n_o > min_pts) & (n_o ≥ ratio·n_g)，而
     # ``occ = (base_occ > 0) & (...)`` 只能给已有障碍加分，救不回被地面压制杀掉的格。
-    # 后果实测（tools/near_band_check.py，044153）：201 格票数是门槛 8 倍、99.5% 判成可走，
+    # 后果实测（research/tools/near_band_check.py，044153）：201 格票数是门槛 8 倍、99.5% 判成可走，
     # 而它们的形状（n_g 中位 130 / n_o 中位 26）正是文档点名要保护的细障碍——桌腿、栏杆、矮墙。
     # 0 = 关闭，此时 near_only 恒 False，**与改动前逐格相同**（见 tests 的 no-op 断言）。
     if c.q_near_pts > 0:
@@ -613,7 +613,7 @@ class KeyframeGridMapper:
         # 把 cam_h 限流计数器夹回当前规模。背景（核查 issue #3-5 时实测澄清）：
         #   * 在线路径（nav_online.py:920-927）总是先 add_keyframe(k) 再 drop_points(k-1)，
         #     len(_pts) 单调不减，_cam_h_at <= len(_pts) 恒成立 ⇒ **线上不可达**，这里是 no-op；
-        #   * 离线回放（tools/q_tier_ab.py:87-92）是「先摘 k-1、可能再摘 k、最后加 k」，
+        #   * 离线回放（research/tools/q_tier_ab.py:87-92）是「先摘 k-1、可能再摘 k、最后加 k」，
         #     len 反而会下降，此时 _cam_h_at 会越过 len(_pts)；
         #   * 越过之后的后果与外界报告**相反**：d = len - _cam_h_at 为负 ⇒ 恒 < 阈值 ⇒
         #     走 :478 的 return，cam_h **冻结不再更新**，而不是"更频繁地重算"。冻结会一直
@@ -987,14 +987,14 @@ class KeyframeGridMapper:
                 np.fmax(hi[ys0:ys1, xs0:xs1], np.where(v, s, -np.inf), out=hi[ys0:ys1, xs0:xs1])
                 np.fmin(lo[ys0:ys1, xs0:xs1], np.where(v, s, np.inf), out=lo[ys0:ys1, xs0:xs1])
                 cnt[ys0:ys1, xs0:xs1] += v
-        # 三个变体在 044153 + 045615 上量过的结果（tools/ray_exempt_ab.py，
+        # 三个变体在 044153 + 045615 上量过的结果（research/tools/ray_exempt_ab.py，
         # 括号里是**票面**比值"回收的真结构格 / 新封死的路径格"——不是判据）：
         #
         #   每格平均高度 + 邻居≥6      135/29 (4.7:1)    47/33  (1.4:1)   ← 三个里最不差
         #   众数层     + 邻居≥6         59/10 (5.9:1)    30/127 (0.2:1)   亏
         #   众数层     + 边缘感知邻居     70/16 (4.4:1)    44/145 (0.3:1)   亏
         #
-        # ⚠️ 三个变体在 tools/ray_exempt_conn.py 的连通性上**全部净亏**，开关保持 False：
+        # ⚠️ 三个变体在 research/tools/ray_exempt_conn.py 的连通性上**全部净亏**，开关保持 False：
         # 后两个都是在修真问题（均值被立面+顶面混拉散、邻居≥6 误杀 0.4 m 细墙），结果更差：
         #   * 换成 ``_ray_hit`` 的众数层（``ray_z_m=0.10`` 已经切好层，argmax 零额外成本）
         #     确实把"卡在平面这一项"的漏放从 60~78% 降到 36~55%，但**同时放进大量幻影**：
@@ -1004,7 +1004,7 @@ class KeyframeGridMapper:
         # 幻影，正是众数版放进来的那批。只放松一个，另一个就顶上。
         #
         # **这两个门在两段录制上调不出一个共同好的版本，别再盲调。** 要继续先得有第三段录制
-        # ——现在是在两点之间过拟合，分不清哪个门真的更好。归因看 tools/plane_gate_why.py。
+        # ——现在是在两点之间过拟合，分不清哪个门真的更好。归因看 research/tools/plane_gate_why.py。
         inside = pts & (cnt >= 6)
         flat = inside & ((hi - lo) <= c.ray_plane_tol)
         return {"pts": pts, "near": near, "inside": inside, "flat": flat, "all": near & flat}
@@ -1012,12 +1012,12 @@ class KeyframeGridMapper:
     def _near_plane(self) -> np.ndarray:
         """障碍带里"有一张连贯水平面"的格（**累加器行序**，可以直接喂给 ``_ray_veto``）。
 
-        这是 ``ray_near_exempt`` 的门。用票数当门已经实测是净亏（tools/ray_exempt_ab.py：
+        这是 ``ray_near_exempt`` 的门。用票数当门已经实测是净亏（research/tools/ray_exempt_ab.py：
         044153 回收 195 但封死 129 个路径格，045615 回收 123 封死 1155）——``_acc_on > min_pts``
         把"近距看过一次"和"近距看清一张面"混成了一件事。
 
         ⚠️ **换成这个几何门之后仍然是净亏**，只是亏的方式变了：票面比值变成 4.7:1 / 1.4:1
-        看着划算，但 tools/ray_exempt_conn.py 量连通性——044153 可达域 −1104 格、隔离出 1 块
+        看着划算，但 research/tools/ray_exempt_conn.py 量连通性——044153 可达域 −1104 格、隔离出 1 块
         区域、4 对走过的路变得走不通、绕行 +13%；045615 可达域 −954 格、+3%。
         **格数比值与真实代价反向**（赔率最好看的那段损伤最重），所以别拿 ab 的比值定案。
 
@@ -1060,7 +1060,7 @@ class KeyframeGridMapper:
         # 近距票豁免（默认关）。1.5 m 处 δz 只有 9 cm，一次近距打中本身就是可信的，不该让
         # **远距离**的"看穿"统计把它抹掉。现有判据要求整列**所有** z 层都不通过才清零，而一根
         # 从相机掠过矮墙顶、往墙后地面俯冲的射线会在墙顶那一层 0.80~0.90 m 处穿过去记一次看穿，
-        # 于是真实矮墙被"自己上方的空间"判成透明。实测（tools/low_ceiling_nav.py，044153）：
+        # 于是真实矮墙被"自己上方的空间"判成透明。实测（research/tools/low_ceiling_nav.py，044153）：
         # 0.85 m 那一层 349 个有打中的格，**349 个全部**被看穿票压过。
         if c.ray_near_exempt:
             veto &= ~self._near_plane()
@@ -1313,7 +1313,7 @@ class KeyframeGridMapper:
                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """薄壳：规则本体在模块级 ``label_cells``（离线 ``offline_fusion`` 也走那一份）。
 
-        保留这个方法名，是因为 ``tools/`` 下三个探针（``nav_audit`` / ``low_ceiling_nav`` /
+        保留这个方法名，是因为 ``research/tools/`` 下三个探针（``nav_audit`` / ``low_ceiling_nav`` /
         ``near_band_check``）用**继承覆写**它来截取入参出参——那是它们看生产路径的唯一窗口。
         规则本体一旦在这里和离线各写一份，就会漂移；实测过（见 ``label_cells`` 的 docstring）。
         """

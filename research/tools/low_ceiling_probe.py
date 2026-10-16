@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """这三段录制里到底有没有"低矮区域"？——2 m 以下的水平面筛查。
 
-    python -m tools.low_ceiling_probe [录制名...]
+    python -m research.tools.low_ceiling_probe [录制名...]
 
 ## 要回答的
 
@@ -28,13 +28,13 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import MapperConfig  # noqa: E402
-from tools import band_levels                            # noqa: E402
-from tools.band_levels import CELL_M, HBIN, MIN_PTS       # noqa: E402
-from tools.precision_probe import load                    # noqa: E402
+from research.tools import band_levels                            # noqa: E402
+from research.tools.band_levels import CELL_M, HBIN, MIN_PTS       # noqa: E402
+from research.tools.precision_probe import load                    # noqa: E402
 
 RECS = ("20261001_044153", "20260929_045615", "20261001_044120")
 

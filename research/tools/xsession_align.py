@@ -8,10 +8,10 @@
 
 用法::
 
-    python tools/xsession_align.py --world wrld_home-7cf435ea \\
+    python research/tools/xsession_align.py --world wrld_home-7cf435ea \\
         --new 20261001_044153 --old 20261001_013519
-    python tools/xsession_align.py --world wrld_home-7cf435ea --world-tree --no-write
-    python tools/xsession_align.py --world wrld_home-7cf435ea --world-tree --bridge-min 5
+    python research/tools/xsession_align.py --world wrld_home-7cf435ea --world-tree --no-write
+    python research/tools/xsession_align.py --world wrld_home-7cf435ea --world-tree --bridge-min 5
 
 方法与两个已付学费的坑见 ``backend/nav_xsession.align_into`` docstring 与
 ``Docs/archive/P0.2跨会话位姿图合并v1（2026-10-03）.md``；世界树的选根/次序/质量闸见
@@ -23,7 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_xsession import XSessionConfig, align_into, align_world_tree  # noqa: E402

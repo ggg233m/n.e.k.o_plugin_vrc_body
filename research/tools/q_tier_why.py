@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """诊断：改动后被降级/删掉的障碍块，各自的票长什么样。
 
-    python -m tools.q_tier_why 20261001_044153 [topN]
+    python -m research.tools.q_tier_why 20261001_044153 [topN]
 
 回答一个问题：新规则清掉的到底是"纯远场票的量化倾斜孤岛"，还是**真结构**。
 判据看每块（baseline 的 8 连通障碍块）的中位票：
@@ -20,11 +20,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import MapperConfig            # noqa: E402
-from tools.q_tier_ab import replay                       # noqa: E402
+from research.tools.q_tier_ab import replay                       # noqa: E402
 
 REC = "20261001_044153"
 TOP = 12

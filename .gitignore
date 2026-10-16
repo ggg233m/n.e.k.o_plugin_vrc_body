@@ -29,7 +29,7 @@ models/depth_anything_v2_small/
 navmesh_recordings/
 navmesh_memory/
 
-tools/*.png
+research/tools/*.png
 
 # 点云查看器生成的根目录 HTML（4–8 MB，纯产物，可随时重跑 pointcloud_view.py 再生）
 /world_*.html

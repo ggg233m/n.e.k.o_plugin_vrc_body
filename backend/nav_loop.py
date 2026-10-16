@@ -73,7 +73,7 @@ class LoopConfig:
     # 先取这么多外观候选，**过完 min_path_m 再截断**到 bow_candidates（顺序不能反，见
     # `_bow_candidates` 的注释）。
     bow_shortlist: int = 32
-    # 离线训好的词汇树（tools/train_bow_vocab.py）。空字符串 = 不启用。
+    # 离线训好的词汇树（research/tools/train_bow_vocab.py）。空字符串 = 不启用。
     # ⚠️ 词汇树是世界相关的：跨路线迁移实测只掉 0.5~4.6 pt，但**跨世界未测**，换世界要重训。
     bow_vocab: str = "models/bow_vocab.npz"
     ratio: float = 0.8

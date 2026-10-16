@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """几何门为什么漏？——把 045615 那批漏放格逐条归因到 ``_near_plane`` 的某一项。
 
-    python -m tools.plane_gate_why [录制名...]
+    python -m research.tools.plane_gate_why [录制名...]
 
 ## 要回答的
 
@@ -31,13 +31,13 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig   # noqa: E402
 from backend.nav_grid import OCC                                   # noqa: E402
-from tools.precision_probe import load                             # noqa: E402
-from tools.nav_audit import (MIN_HIT_LAYERS, MIN_NB, MIN_PTS, PLANAR_TOL,  # noqa: E402
+from research.tools.precision_probe import load                             # noqa: E402
+from research.tools.nav_audit import (MIN_HIT_LAYERS, MIN_NB, MIN_PTS, PLANAR_TOL,  # noqa: E402
                              band_pass, _spread)
 
 RECS = ("20261001_044153", "20260929_045615")

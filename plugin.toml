@@ -207,7 +207,7 @@ baseline_tol_m = 0.01
 loop_closure = true
 # 会话末自动并树（世界树 pass）：逐对采纳之后，按整张跨会话约束图选根 + 链式采纳，
 # 把"没被别人采纳过、但与谁都有够格约束"的孤立会话收进同一坐标系。关掉就得手动跑
-# `tools/xsession_align.py --world <世界目录> --world-tree`；代价是会话末后台线程里逐桥一次弹性优化。
+# `research/tools/xsession_align.py --world <世界目录> --world-tree`；代价是会话末后台线程里逐桥一次弹性优化。
 xsession_world_tree = true
 
 [navmesh.mapper]

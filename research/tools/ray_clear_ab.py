@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ray_clear 到底在去虚假障碍，还是在清真结构？——2×2 消融 + 走过证据。
 
-    python -m tools.ray_clear_ab [录制名...]
+    python -m research.tools.ray_clear_ab [录制名...]
 
 ## 要回答的
 
@@ -27,12 +27,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig   # noqa: E402
 from backend.nav_grid import FREE, OCC, UNK                        # noqa: E402
-from tools.precision_probe import load                            # noqa: E402
+from research.tools.precision_probe import load                            # noqa: E402
 
 RECS = ("20261001_044153", "20260929_045615", "20261001_044120")
 COMBOS = ((True, True), (False, True), (True, False), (False, False))

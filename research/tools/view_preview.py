@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """把"多层/净空视图"到底长什么样画出来（用现有数据，不假设任何新累加器）。
 
-    python -m tools.view_preview [录制名]
+    python -m research.tools.view_preview [录制名]
 
 两个候选，都是**俯视**、一格一像素，和 ``/navmesh`` 现在的画法一致：
 
@@ -20,12 +20,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import OCC, UNK                  # noqa: E402
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig  # noqa: E402
-from tools.precision_probe import load                 # noqa: E402
+from research.tools.precision_probe import load                 # noqa: E402
 
 REC = "20261001_044153"
 BAND_NAMES = ("below", "lo 2-3m", "mid 3-4.5m", "hi >4.5m")
@@ -101,7 +101,7 @@ def main() -> None:
     if B.shape[1] < W:
         B = np.hstack([B, np.full((B.shape[0], W - B.shape[1], 3), 40, np.uint8)])
     canvas = np.vstack([A, np.full((10, W, 3), 40, np.uint8), B])
-    out = ROOT / "tools" / f"view_{rec_name}.png"
+    out = ROOT / "research" / "tools" / f"view_{rec_name}.png"
     cv2.imwrite(str(out), canvas)
     print(f"录制 {rec_name}  {len(frames)} 关键帧  栅格 {g.shape}")
     print(f"  净空高度范围 {lo:.2f}–{hi:.2f} m，有头顶票的格 {int(v.sum())}")

@@ -177,7 +177,7 @@ class TerrainChannelTests(unittest.TestCase):
     def test_no_terrain_channel_is_inert(self):
         """没挂地形层时，_cost() 必须与"加地形之前"逐位相同。
 
-        这是 tools/mapping_gate 之外的第二道保证：门要跑真实录制（慢），
+        这是 research/tools/mapping_gate 之外的第二道保证：门要跑真实录制（慢），
         这里只要 1 ms。
         """
         ng = make(room())

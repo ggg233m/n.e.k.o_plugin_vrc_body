@@ -10,16 +10,16 @@ description:
   en: >
       Runs the real online mapper over real recordings to compare flat vote counting against quality-tiered counting.
       
-revision: c6cd0a7c9179d635671c54c1871c6d311878af48
-updated_at: "2026-10-03T16:13:37.942Z"
-fingerprint: 79353e489fda580c79a40a92426017590cd2e5c9e8e1dcffaa0cc2a8fc59b927
+revision: 0eb991034d815aafdf6ad8342f413fecb385d5b5
+updated_at: "2026-10-16T21:51:59.429Z"
+fingerprint: 6066353185a0ea85820c32a6b0f1fdcd4c329ed5823be98f3947d5d2b9ff1ab9
 source:
-  - path: "tools/q_tier_ab.py"
+  - path: "research/tools/q_tier_ab.py"
     line: 32
     end_line: 305
 apis:
   - protocol: file
-    path: "tools/q_tier_ab.py#replay"
+    path: "research/tools/q_tier_ab.py#replay"
     description:
       zh: >
           把录制回放进真实在线 mapper，按环距报告走廊障碍格数量。
@@ -28,7 +28,7 @@ apis:
           Replay a recording into the real online mapper and report corridor blockers per ring.
           
   - protocol: file
-    path: "tools/q_tier_ab.py#components"
+    path: "research/tools/q_tier_ab.py#components"
     description:
       zh: >
           按大小给 baseline 障碍连通块分组，用来分辨墙与噪点。
@@ -37,7 +37,7 @@ apis:
           Group baseline obstacle blocks by size to tell walls from speckle.
           
   - protocol: file
-    path: "tools/q_tier_ab.py#main"
+    path: "research/tools/q_tier_ab.py#main"
     description:
       zh: >
           对全部录制跑 A/B 并渲染改动前后的栅格图。

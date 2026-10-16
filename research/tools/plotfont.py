@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """matplotlib 中文字体——省得每张图都画成口口。
 
-    from tools.plotfont import use_cjk
+    from research.tools.plotfont import use_cjk
     use_cjk()            # 之后 plt 的中文/减号都正常
 
 ## 为什么不用 ``rcParams['font.sans-serif'] = ['Microsoft YaHei']`` 就完事

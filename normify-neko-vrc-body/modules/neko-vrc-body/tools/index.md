@@ -10,11 +10,11 @@ description:
   en: >
       Offline diagnostics and experiments that replay recorded sessions against the real mapper, vocabulary and alignment code.
       
-revision: c6cd0a7c9179d635671c54c1871c6d311878af48
-updated_at: "2026-10-03T16:13:37.941Z"
-fingerprint: 79353e489fda580c79a40a92426017590cd2e5c9e8e1dcffaa0cc2a8fc59b927
+revision: 0eb991034d815aafdf6ad8342f413fecb385d5b5
+updated_at: "2026-10-16T21:51:59.427Z"
+fingerprint: 6066353185a0ea85820c32a6b0f1fdcd4c329ed5823be98f3947d5d2b9ff1ab9
 source:
-  - path: "tools/q_tier_ab.py"
+  - path: "research/tools/q_tier_ab.py"
     line: 32
     end_line: 305
 ---

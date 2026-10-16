@@ -10,16 +10,16 @@ description:
   en: >
       Command-line wrapper around the cross-session alignment entry point, so a saved session can be aligned offline.
       
-revision: c6cd0a7c9179d635671c54c1871c6d311878af48
-updated_at: "2026-10-03T16:13:37.944Z"
-fingerprint: 80bf40ca66dac544928935fc4a7b67c3a4c925dbed2213d314233482077d14d5
+revision: 0eb991034d815aafdf6ad8342f413fecb385d5b5
+updated_at: "2026-10-16T21:51:59.432Z"
+fingerprint: cfcd463db0539f2af18d504a880decaaad801111026337ae70a0cb4780f265ab
 source:
-  - path: "tools/xsession_align.py"
+  - path: "research/tools/xsession_align.py"
     line: 23
     end_line: 59
 apis:
   - protocol: file
-    path: "tools/xsession_align.py#main"
+    path: "research/tools/xsession_align.py#main"
     description:
       zh: >
           在命令行把一个已保存会话对齐进另一个会话的世界系。

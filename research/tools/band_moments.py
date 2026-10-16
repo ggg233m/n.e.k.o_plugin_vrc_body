@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """只用矩（A 方案）能不能把"面"和"杂物"分开？
 
-    python -m tools.band_moments [录制名]
+    python -m research.tools.band_moments [录制名]
 
 A 方案每个 (格,带) 只存 n / Σh / Σh² 三个可加量 ⇒ 均值高度 + 方差。
 本脚本按这个最小实现跑一遍，看它够不够：
@@ -22,11 +22,11 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig, _ground_correction, _voxelize  # noqa: E402
-from tools.precision_probe import load                            # noqa: E402
+from research.tools.precision_probe import load                            # noqa: E402
 
 REC = "20261001_044153"
 CELL_M = 0.3

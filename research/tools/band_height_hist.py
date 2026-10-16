@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """带内高度分布：能分出"楼板/天花板"和"墙/杂物"吗？
 
-    python -m tools.band_height_hist [录制名]
+    python -m research.tools.band_height_hist [录制名]
 
 ## 问题
 
-`tools/band_report.py` 只给出"每个带每格有多少点"。但点数区分不了东西：楼板、天花板、
+`research/tools/band_report.py` 只给出"每个带每格有多少点"。但点数区分不了东西：楼板、天花板、
 横梁、栏杆、桥面全都会落进同一条带。要做多层行走/净空，必须先能把**水平面**从
 **竖直杂物**里分出来。
 
@@ -35,11 +35,11 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig, _ground_correction, _voxelize  # noqa: E402
-from tools.precision_probe import load                            # noqa: E402
+from research.tools.precision_probe import load                            # noqa: E402
 
 REC = "20261001_044153"
 HBIN = 0.05           # 高度直方图分辨率（追踪米）

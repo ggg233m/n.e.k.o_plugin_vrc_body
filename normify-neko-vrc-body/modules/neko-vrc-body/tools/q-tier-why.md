@@ -10,16 +10,16 @@ description:
   en: >
       Diagnoses what the votes of each demoted obstacle block actually looked like, to tell walls from speckle.
       
-revision: c6cd0a7c9179d635671c54c1871c6d311878af48
-updated_at: "2026-10-03T16:13:37.943Z"
-fingerprint: 27842d95968507ba1ca77c7acc88dc7028316a74e14c61f10d8629789c000125
+revision: 0eb991034d815aafdf6ad8342f413fecb385d5b5
+updated_at: "2026-10-16T21:51:59.430Z"
+fingerprint: bcb6a0eab7c33f53cab1d4ba81da07ed060fc78748c90324759caf9eb91d93b5
 source:
-  - path: "tools/q_tier_why.py"
+  - path: "research/tools/q_tier_why.py"
     line: 23
     end_line: 108
 apis:
   - protocol: file
-    path: "tools/q_tier_why.py#main"
+    path: "research/tools/q_tier_why.py#main"
     description:
       zh: >
           报告每个被降级障碍块的票分布。
@@ -28,7 +28,7 @@ apis:
           Report the vote distribution of each demoted obstacle block.
           
   - protocol: file
-    path: "tools/q_tier_why.py#to_grid"
+    path: "research/tools/q_tier_why.py#to_grid"
     description:
       zh: >
           把 mapper 累加器布局转换成 NavGrid 布局。

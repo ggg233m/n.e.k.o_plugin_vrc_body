@@ -11,7 +11,7 @@
 
 所以"随 N 涨"就是位姿精度问题，"与 N 无关"才是深度精度问题。
 
-    python -m tools.precision_probe 20261001_044153
+    python -m research.tools.precision_probe 20261001_044153
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import FREE, OCC, UNK          # noqa: E402
@@ -71,7 +71,7 @@ def floor_polluted(ng, s: float) -> tuple[int, int]:
 
 
 def corridor_blockers(ng, trail: list[np.ndarray], half_m: float = 0.5) -> int:
-    """走廊上还有几个障碍格（与 tools/q_tier_ab.py 同口径）。
+    """走廊上还有几个障碍格（与 research/tools/q_tier_ab.py 同口径）。
 
     ⚠️ 2026-10-08：本函数原来是**转置**的（``cv2.circle(m, (cx, cy))`` 而 ``cx`` 其实是行号），
     量的是一片镜像区域。实现已迁到 ``trail_geom.trail_mask``（唯一实现）。

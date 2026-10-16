@@ -52,7 +52,7 @@ class TerrainClass(IntEnum):
 #   STAIRS   = 1.25  上下一级台阶有实打实的时间与打滑风险，但远没到"危险"
 #   WATER    = 4.0   **关键**：刻意给成有限值而不是 inf。见下方 TERRAIN_HARD_BLOCK 注释。
 #   PIT/OBC  = inf   真的过不去
-# 上下都可以调，但**改这里等于改规划行为**，必须跑 tools/mapping_gate 看漂移。
+# 上下都可以调，但**改这里等于改规划行为**，必须跑 research/tools/mapping_gate 看漂移。
 TERRAIN_COST: dict[int, float] = {
     TerrainClass.FLAT: 1.0,
     TerrainClass.STAIRS: 1.25,
@@ -121,7 +121,7 @@ class NavGrid:
         # ---- 地形层（S0）----
         # 三个通道默认**全为 None**。None 的含义是"这张图没有地形信息"，
         # 与"有地形信息但判成 UNKNOWN"是**两件不同的事**，必须能区分：
-        # 前者让 _cost() 逐位退回改动前的行为（可用 tools/mapping_gate 证明），
+        # 前者让 _cost() 逐位退回改动前的行为（可用 research/tools/mapping_gate 证明），
         # 后者按 TERRAIN_MISSING 策略处理，默认禁行。
         self.terrain_class: np.ndarray | None = None   # uint8，TerrainClass 取值
         self.terrain_conf: np.ndarray | None = None     # float32 0..1，证据强度
@@ -342,7 +342,7 @@ class NavGrid:
         ``plan()`` 出来的折点却正好横跨坑。
 
         无地形层时 ``_cost()`` 与改动前逐位相同（``C_max`` 判据不会命中），
-        所以这条掩码对既有行为是惰性的，可用 tools/mapping_gate 证明。
+        所以这条掩码对既有行为是惰性的，可用 research/tools/mapping_gate 证明。
         """
         if self.terrain_class is None:
             return self.center
@@ -352,7 +352,7 @@ class NavGrid:
         base = np.where(self.center, 1.0 + 2.0 * np.clip(0.6 - self.clearance, 0, None) / 0.6, np.inf)
         if self.terrain_class is None:
             # 没有地形层 ⇒ **逐位退回**加地形之前的行为。这条分支是
-            # tools/mapping_gate 证明"S0 没有动到既有规划"的依据，别在这里"顺手优化"。
+            # research/tools/mapping_gate 证明"S0 没有动到既有规划"的依据，别在这里"顺手优化"。
             return base
         t = self.terrain_cost_map()
         if t is None:                       # 不可达，但显式写出来比隐含假设好

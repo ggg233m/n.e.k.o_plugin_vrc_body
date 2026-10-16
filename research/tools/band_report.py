@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """高度分带占用：真实录制上量覆盖，并出俯视图。
 
-    python -m tools.band_report [录制名 ...]
+    python -m research.tools.band_report [录制名 ...]
 
 回答"分层之后到底捡回了多少头顶之上的几何"：每条带有多少格见过东西、总共多少点，
 以及**哪一条带在这个格是主导带**（俯视图上按主导带上色）。
 
-    python -m tools.band_report 20261001_044153
+    python -m research.tools.band_report 20261001_044153
 """
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import OCC, UNK                      # noqa: E402
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig  # noqa: E402
-from tools.precision_probe import load                     # noqa: E402
+from research.tools.precision_probe import load                     # noqa: E402
 
 RECS = ("20261001_044153", "20260929_045615")
 BAND_COLOR = {           # BGR
@@ -91,8 +91,8 @@ def main() -> None:
             tot += v["cells"]
         print(f"  高带非空格合计 {tot}（占全图 {100.0 * tot / max(st['grid_cells'], 1):.1f}%）")
         print(f"  地面层障碍格 {st['ground_occ_cells']}（未变，导航照旧）")
-        render(ng, bg, trail, ROOT / "tools" / f"band_{name}.png")
-        print(f"  俯视图：tools/band_{name}.png")
+        render(ng, bg, trail, ROOT / "research" / "tools" / f"band_{name}.png")
+        print(f"  俯视图：research/tools/band_{name}.png")
 
 
 if __name__ == "__main__":

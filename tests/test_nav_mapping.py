@@ -224,7 +224,7 @@ class DropPointsTests(unittest.TestCase):
         """``_cam_h_at`` 必须跟着 len(_pts) 一起缩，否则 cam_h 会被冻结。
 
         它记录的是「上次改 cam_h 时的关键帧数」，而 len(_pts) 可能下降（离线回放
-        tools/q_tier_ab.py:87-92 是「先摘 k-1、可能再摘 k、最后加 k」）。一旦
+        research/tools/q_tier_ab.py:87-92 是「先摘 k-1、可能再摘 k、最后加 k」）。一旦
         _cam_h_at 越过 len(_pts)，_update_cam_h 的 d 变负 ⇒ 恒 < 阈值 ⇒ 走 return，
         cam_h **不再更新**（注意：是冻结，不是"更频繁重算"），且要多等
         (_cam_h_at - len) 帧才恢复。夹回之后等待帧数就是设计值。
@@ -759,7 +759,7 @@ class QualityTierTests(unittest.TestCase):
         """近距、票少、但背后地面清楚的**细**障碍：关着不是障碍，调低门槛后应当是障碍。
 
         直接调 ``_by_quality`` 并喂手工数组，不走整条管线——要复现的是
-        ``tools/near_band_check.py`` 在 044153 上量到的那种形状（n_g 中位 130 / n_o 中位 26）：
+        ``research/tools/near_band_check.py`` 在 044153 上量到的那种形状（n_g 中位 130 / n_o 中位 26）：
         ``n_o`` 远大于 min_pts，却因为 ``n_o < occ_ground_ratio * n_g`` 被 base 规则判 0。
         用真实场景去凑这个比值要靠点的疏密碰运气，测的就不是这条规则了。
         """
@@ -985,7 +985,7 @@ class SharedRuleTests(unittest.TestCase):
     def test_thin_shell_matches_shared_rule(self) -> None:
         """``KeyframeGridMapper._by_quality`` 必须与模块级 ``label_cells`` 逐位一致。
 
-        留方法名是因为 ``tools/`` 下三个探针用继承覆写它截取入参；但**规则本体只有一份**。
+        留方法名是因为 ``research/tools/`` 下三个探针用继承覆写它截取入参；但**规则本体只有一份**。
         """
         rng = np.random.default_rng(7)
         c = MapperConfig()

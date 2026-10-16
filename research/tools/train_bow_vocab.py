@@ -3,8 +3,8 @@
 
 用法::
 
-    python tools/train_bow_vocab.py --rec 20261001_044153
-    python tools/train_bow_vocab.py --rec 20261001_044153,20260929_045615 \
+    python research/tools/train_bow_vocab.py --rec 20261001_044153
+    python research/tools/train_bow_vocab.py --rec 20261001_044153,20260929_045615 \
         --out models/bow_vocab.npz --branching 16 --depth 3
 
 输出到 `models/bow_vocab.npz`；`backend/nav_loop.py` 的 `LoopConfig.bow_vocab`
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
 import nav_bow  # noqa: E402

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """导航尺子 + 常数审计。**不改变任何行为**，纯观测。
 
-    python -m tools.nav_audit [录制名...]
+    python -m research.tools.nav_audit [录制名...]
 
 ## 为什么要两个尺子
 
@@ -33,13 +33,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import (KeyframeGridMapper, MapperConfig,      # noqa: E402
                                  _ground_correction)
 from backend.nav_grid import FREE, OCC, UNK                               # noqa: E402
-from tools.precision_probe import load                                   # noqa: E402
+from research.tools.precision_probe import load                                   # noqa: E402
 
 HBIN = 0.05
 MIN_PTS = 20

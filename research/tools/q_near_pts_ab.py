@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """``q_near_pts`` 的 A/B——两把尺子必须同时看。
 
-    python -m tools.q_near_pts_ab [录制名...]
+    python -m research.tools.q_near_pts_ab [录制名...]
 
 ## 为什么非看两把不可
 
@@ -19,13 +19,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig, _ground_correction  # noqa: E402
 from backend.nav_grid import FREE, OCC, UNK                                          # noqa: E402
-from tools.precision_probe import load                                              # noqa: E402
-from tools.nav_audit import HBIN, MIN_PTS, MIN_NB, MIN_HIT_LAYERS, PLANAR_TOL, band_pass, _spread  # noqa: E402
+from research.tools.precision_probe import load                                              # noqa: E402
+from research.tools.nav_audit import HBIN, MIN_PTS, MIN_NB, MIN_HIT_LAYERS, PLANAR_TOL, band_pass, _spread  # noqa: E402
 
 VALUES = (0, 2, 1)
 RECS = ("20261001_044153", "20260929_045615")

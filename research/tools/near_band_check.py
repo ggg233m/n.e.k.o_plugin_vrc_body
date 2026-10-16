@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """``_by_quality`` 里"近带故意不带地面压制"这句注释，是活的吗？
 
-    python -m tools.near_band_check [录制名...]
+    python -m research.tools.near_band_check [录制名...]
 
 ## 疑点
 
@@ -31,12 +31,12 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig    # noqa: E402
 from backend.nav_grid import FREE, OCC, UNK                          # noqa: E402
-from tools.precision_probe import load                               # noqa: E402
+from research.tools.precision_probe import load                               # noqa: E402
 
 RECS = ("20261001_044153", "20260929_045615")
 

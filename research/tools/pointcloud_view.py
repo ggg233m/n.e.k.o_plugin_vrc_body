@@ -229,7 +229,7 @@ def pose_table_rigid(world_dir: Path, sid: str) -> tuple[dict, str]:
     raw_path = world_dir / "sessions" / sid / "poses.npz"
     got = session_pose_table(world_dir, sid)
     if got is None:
-        raise SystemExit(f"[fail] 会话 {sid} 没有位姿表（没并树？先跑 tools/xsession_align.py --world-tree）")
+        raise SystemExit(f"[fail] 会话 {sid} 没有位姿表（没并树？先跑 research/tools/xsession_align.py --world-tree）")
     if str(got.get("source", "")).startswith("raw"):
         raise SystemExit(f"[fail] 会话 {sid} 的位姿是 raw（未并进世界树）⇒ 不猜坐标系，先并树")
     with np.load(raw_path) as z:
@@ -272,7 +272,7 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
     elif pose_mode == "merged":
         tab = session_pose_table(world_dir, sid)
         if tab is None:
-            raise SystemExit(f"[fail] 会话 {sid} 没有位姿表（没并树？先跑 tools/xsession_align.py --world-tree）")
+            raise SystemExit(f"[fail] 会话 {sid} 没有位姿表（没并树？先跑 research/tools/xsession_align.py --world-tree）")
         if str(tab.get("source", "")).startswith("raw"):
             raise SystemExit(f"[fail] 会话 {sid} 的位姿是 raw（未并进世界树）⇒ 不猜坐标系，先并树")
         pose_of = {int(k): np.asarray(T, np.float64) for k, T in zip(tab["ids"], tab["T_map"])}

@@ -1,3 +1,5 @@
+import pytest
+
 from backend.time_alignment import TimeAlignmentBuffer
 
 
@@ -8,8 +10,12 @@ def test_motion_interpolates_to_wgc_timestamp():
     result = alignment.sample_motion(1.1)
     assert result["available"] is True
     assert result["method"] == "interpolated"
-    assert result["velocity_x"] == 0.5
-    assert result["velocity_z"] == 1.0
+    # 1.0 / 1.1 / 1.2 在 float64 中都不精确：插值比例 (1.1-1.0)/(1.2-1.0) 正确舍入后的实数结果
+    # 就是 0.5000000000000006（用 Fraction 验证过：这是实数比值的正确舍入，不是实现的精度损失），
+    # 无论写成 ratio 还是重心插值都得到同一个值。所以精确相等在 float 下不可达，这里按容差比较：
+    # rel=1e-9 比 float64 舍入误差（~1e-16）宽 7 个数量级，仍能捕捉真正的插值错误。
+    assert result["velocity_x"] == pytest.approx(0.5, rel=1e-9)
+    assert result["velocity_z"] == pytest.approx(1.0, rel=1e-9)
     assert result["clock_domain"] == "monotonic"
 
 

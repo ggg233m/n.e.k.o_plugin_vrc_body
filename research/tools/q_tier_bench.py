@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """建图耗时基准：把录制按真实节奏灌进去，量 ``rasterize()`` 每次多贵、花在哪。
 
-    python -m tools.q_tier_bench [录制名] [--rows]
+    python -m research.tools.q_tier_bench [录制名] [--rows]
 
 回答两个问题：
   1. 质量分层（``q_tiers``）让 rasterize 贵了多少？——它加了 4 个累加器，
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import FREE, OCC, UNK                # noqa: E402

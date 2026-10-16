@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """把审计的"精确 3D 墙体已证伪"结论，拿**双目路线**重新量一遍。
 
-    python -m tools.stereo_3d_audit [录制名]
+    python -m research.tools.stereo_3d_audit [录制名]
 
 ## 为什么值得重做
 
@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import OCC                       # noqa: E402

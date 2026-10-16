@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """观测质量分层（``MapperConfig.q_tiers``）A/B：拿真实录制跑**在线 mapper 本体**。
 
-    python -m tools.q_tier_ab [录制名 ...]        # 默认三场全跑
+    python -m research.tools.q_tier_ab [录制名 ...]        # 默认三场全跑
 
 与 ``.tmp/_fusion_v1.py`` 的离线实验同一套度量口径（run5-7「已知内障碍%」+ 轨迹距离环
 R∈{1.5,2.5,3.0}），但**不另写一份分类器**：直接把录制喂进 ``KeyframeGridMapper``，
@@ -29,7 +29,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_grid import FREE, OCC, UNK                       # noqa: E402

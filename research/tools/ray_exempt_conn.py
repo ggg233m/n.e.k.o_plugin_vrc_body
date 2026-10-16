@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """``ray_near_exempt`` 的**第三把尺子**：连通性。
 
-    python -m tools.ray_exempt_conn [录制名...]
+    python -m research.tools.ray_exempt_conn [录制名...]
 
 ## 为什么需要第三把
 
-``tools/ray_exempt_ab.py`` 给的两把尺子是：
+``research/tools/ray_exempt_ab.py`` 给的两把尺子是：
 
   尺子 1  走过∩OCC 率          抓路径上的虚假障碍
   尺子 2  近距平面证据的漏放    抓路径外的真结构被清掉
@@ -34,11 +34,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from backend.nav_mapping import KeyframeGridMapper, MapperConfig   # noqa: E402
-from tools.precision_probe import load                             # noqa: E402
+from research.tools.precision_probe import load                             # noqa: E402
 
 RECS = ("20261001_044153", "20260929_045615")
 SAMPLES = 40          # 采样点数（沿最长折线按弧长均匀取）

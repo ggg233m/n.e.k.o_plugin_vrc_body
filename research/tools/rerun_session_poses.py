@@ -26,7 +26,7 @@ r"""用**当前**回环配置重放一场录制，并把结果写回该会话的
 -------------------------------
 ``session_pose_table`` 优先返回 ``xsession/merged_*.npz``，而 ``pose_table_rigid`` 是
 "把原表刚体拟合到 merged"。所以换掉原表**立刻**就会改变点云（实测最终世界位置移动
-中位 1.37 m），但要让**跨会话**一致，还得重跑 ``tools/xsession_align.py --world-tree``。
+中位 1.37 m），但要让**跨会话**一致，还得重跑 ``research/tools/xsession_align.py --world-tree``。
 本工具会在结尾提示这一点。
 
 用法
@@ -223,7 +223,7 @@ def main() -> int:
     print(f"[write] {sdir / 'session.json'}：loops {old_meta.get('loops')} → {st['loops']}")
     print(f"[bak  ] {bak}")
     print("\n⚠️ 世界树/merged 还是旧的：要让**跨会话**一致，接着跑"
-          "\n      python tools/xsession_align.py --world "
+          "\n      python research/tools/xsession_align.py --world "
           f"{a.world} --world-tree")
     return 0
 
