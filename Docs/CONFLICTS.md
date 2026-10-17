@@ -141,7 +141,7 @@
 >
 > ⚠️ **但能力开关类确实调不到**：`body_enable` / `body_disable` / `body_reset`
 > 只有面板能分派。根 `README.md` 让 agent「必须显式调用 `body_enable`」是错的
-> （同一文件 `README.md:320` 写对了，见 **C17**）。
+> （根 README 的「安全与运行约束」一节写对了，见 **C17**）。
 
 ➡ **B 胜但需按 C 修正数量。** **不要从文档抄工具清单**，直接读 `tool_defs.py` **并查 `@llm_tool`**；
 **再判断某动作 agent 能不能做，要查它在 `_DEBUG_COMMAND_NAMES`（`__init__.py:160-177`）还是 `_PANEL_SWITCH_NAMES` 里**。
@@ -260,8 +260,8 @@
 
 | 说法 | 出处 |
 |---|---|
-| A：**「插件默认不自动启动；启动后仍处于 `disabled`，**必须显式调用 `body_enable`**」**；「建议调用」清单列 `body_enable()` / `body_reset()` / `body_disable()`；能力列表还承诺「**复位**和**显式启停**输出」 | `README.md:46`、`:27`、`:339`、`:346`、`:347` —— **这 5 处已改写，登记此条只为留痕** |
-| B：能力开关「走独立的 `panel_command` 入口，`metadata.agent_auto=false` **由宿主保证 Agent 既看不到也分派不了**」 | `README.md:320`（**同一文件**） |
+| A：**「插件默认不自动启动；启动后仍处于 `disabled`，**必须显式调用 `body_enable`**」**；「建议调用」清单列 `body_enable()` / `body_reset()` / `body_disable()`；能力列表还承诺「**复位**和**显式启停**输出」 | 根 `README.md` 的 5 处（**修复前**位于 `:46`、`:27`、`:339`、`:346`、`:347`）—— **这 5 处已改写，登记此条只为留痕** |
+| B：能力开关「走独立的 `panel_command` 入口，`metadata.agent_auto=false` **由宿主保证 Agent 既看不到也分派不了**」 | 根 `README.md` 的「安全与运行约束」一节（**同一文件**；修复前位于 `:320`） |
 
 ➡ **B 胜。** 代码侧确认：`body_enable` / `body_disable` / `body_reset` / `body_freeze` / `vrc_vision_start` / `vrc_vision_stop`
 在 `plugin.toml:65` 的 **`panel_command`** enum 里，而该 entry 带 `metadata = { agent_auto = false }`（`plugin.toml:64`），
@@ -299,17 +299,18 @@
 
 | 值 | 属于 |
 |---|---|
-| **`desktop_mirror`** | **代码默认**：`config.py:353` dataclass 默认、`config.py:664` `vision.get("capture", "desktop_mirror")` |
-| **`wgc`** | **发行实配**：`plugin.toml:240-241` `source/capture = "wgc"`；`plugin.toml:239` 注释「改回 `desktop_mirror` 可退到旧行为」 |
+| **`desktop_mirror`** | **代码默认**：`config.py` 的 `VisionConfig.capture` dataclass 默认值，以及同文件 `[vision]` 解析处的 `vision.get("capture", "desktop_mirror")`（**只给符号名，行号见 C20：会漂**） |
+| **`wgc`** | **发行实配**：`plugin.toml` 的 `[vision]` 段 `source = "wgc"` / `capture = "wgc"`；同段注释写明「改回 `desktop_mirror` 可退到旧行为」 |
 
 ➡ **`backend/README.md:378` 表述正确**（`capture = "desktop_mirror" # 随插件部署的 plugin.toml 用 wgc`）。
-🔴 **根 `README.md` 两句话互斥**：
-- `README.md:138`「`[vision]` **默认** `capture = "wgc"`」——把**发行值**说成默认值；
-- `README.md:121`（同文件，17 行之前）「当前发布配置启用**桌面采集**」——**已过时**，wgc 后来才上线。
+🔴 **修复前根 `README.md` 两句话互斥**（引文照录，行号已不导航）：
+- 「`[vision]` **默认** `capture = "wgc"`」——把**发行值**说成默认值；
+- 同文件 17 行之前「当前发布配置启用**桌面采集**」——**当时已过时**，wgc 后来才上线。
 
-⚠️ 危害不止措辞：`README.md:144-152` 接着把 `desktop_mirror` 描述成「改成…**会退到**桌面镜像」
+⚠️ 危害不止措辞：修复前的根 `README.md` 接着把 `desktop_mirror` 描述成「改成…**会退到**桌面镜像」
 并详述其风险，**方向正好反了** —— 代码默认走的就是那条有风险的路。
-**同类错误还有 `README.md:40`「120 Hz（默认）」**：代码默认 `rate_hz = 60`（`config.py:443`），
+✅ **2026-10-18 复核**：根 `README.md` 现已按「代码默认 ⟷ 发行实配」分开陈述，且不再引用代码行号。
+**同类错误还有根 `README.md` 的「120 Hz（默认）」**（修复前位于 `:40`）：代码默认 `rate_hz = 60`（`config.py` 的 `[anyadance].rate_hz` 回退值），
 120 是 `plugin.toml:95` 的发行值（`backend/README.md:371-372` 表述正确）。
 
 ### C20 —— ⚠️ 权威矩阵自己的代码行号大面积失效 ｜ 🔧 **2026-10-04 已修已知项，但这类漂移会复发**
