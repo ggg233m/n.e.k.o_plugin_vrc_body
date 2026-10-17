@@ -11,11 +11,12 @@ import numpy as np
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.nav_bow import BowVocabulary
 from neko_anyadance_body.backend.nav_loop import M_OPT, KeyframeFeatures, LoopConfig
+from neko_anyadance_body.backend import nav_xsession as XS
 from neko_anyadance_body.backend.nav_xsession import (BowIndex, XSessionConfig, XSessionTracker,
                                                       align_into, align_into_auto,
                                                       align_world_tree, build_index,
                                                       estimate_gauge, load_index,
-                                                      session_pose_table)
+                                                      session_pose_table, _same_scale)
 
 K = np.array([[200.0, 0.0, 160.0], [0.0, 200.0, 120.0], [0.0, 0.0, 1.0]])
 SIZE = (320, 240)
@@ -733,6 +734,56 @@ class TestYawConsensusGate(XSessionTestBase):
         st = tr.status()
         self.assertEqual(st["confirmed"], 0, "40° 超硬顶：共识窗再宽也不放")
         self.assertGreaterEqual(st["rejects"].get("rotation_mismatch", 0), 4)
+
+
+class SameScaleTests(unittest.TestCase):
+    """``_same_scale``：尺度一致性判据。
+
+    2026-10-16 修的真 bug：原先 ``1e-6`` **绝对**阈值把 0.0009% 的浮点尾巴当成"换 avatar"。
+    10-14 起 world_scale 按 ScaleFactor **逐会话**换算，新会话带上尾巴
+    （043041 = 0.7550069214836606，旧会话常量 0.755，绝对差 6.9e-6 > 1e-6）⇒
+    建索引时 19 场旧会话被全部排除，**索引塌成只剩自己 1 场**，跨会话检索（P0）静默失效。
+    改判据为 **1% 相对容差**：浮点噪声 0.0009% 放行，真换 avatar 11.3% 仍拒。
+    """
+
+    FLOAT_TAIL = 0.7550069214836606      # 043041 的真实值
+
+    def tearDown(self) -> None:
+        XS.SCALE_REL_TOL = 0.01          # 任何单测改过都还原，避免污染其它用例
+
+    def test_float_tail_passes(self) -> None:
+        """核心回归：0.0009% 的浮点尾巴必须放行，否则索引会被清空。"""
+        self.assertTrue(_same_scale({"world_scale": 0.755}, self.FLOAT_TAIL))
+        self.assertTrue(_same_scale({"world_scale": self.FLOAT_TAIL}, 0.755))
+
+    def test_identical_passes(self) -> None:
+        self.assertTrue(_same_scale({"world_scale": 0.755}, 0.755))
+
+    def test_real_avatar_change_refused(self) -> None:
+        """真换 avatar（0.755 → 0.840，11.3%）必须拒：那才是"差一个倍数"的情况。"""
+        self.assertFalse(_same_scale({"world_scale": 0.755}, 0.840))
+        self.assertFalse(_same_scale({"world_scale": 0.840}, 0.755))
+
+    def test_scale_anchor_tolerance_passes(self) -> None:
+        """外部锚 0.762（相对 0.93%，在 ±2.3% 内）应放行 —— 别把标定误差当换 avatar。"""
+        self.assertTrue(_same_scale({"world_scale": 0.755}, 0.762))
+
+    def test_missing_or_bad_refused_or_defaulted(self) -> None:
+        self.assertTrue(_same_scale({}, 0.755), "旧会话没记 ⇒ 当作一致")
+        self.assertTrue(_same_scale({"world_scale": 0.755}, None), "不给基准 ⇒ 不过滤")
+        self.assertFalse(_same_scale({"world_scale": 0.0}, 0.755), "非正尺度 ⇒ 拒")
+        self.assertFalse(_same_scale({"world_scale": float("nan")}, 0.755))
+        self.assertFalse(_same_scale({"world_scale": "x"}, 0.755))
+
+    def test_tolerance_has_discriminating_power(self) -> None:
+        """反向验证：把容差收到 1e-9 ⇒ 浮点尾巴必须被拒。
+
+        ⇒ 证明上面的放行真的来自容差，而不是"这函数现在恒真"。
+        """
+        XS.SCALE_REL_TOL = 1e-9
+        self.assertFalse(_same_scale({"world_scale": 0.755}, self.FLOAT_TAIL),
+                         "容差收到 1e-9 仍放行 ⇒ 这条判据没有分辨力")
+        self.assertTrue(_same_scale({"world_scale": 0.755}, 0.755), "完全相同仍该放行")
 
 
 if __name__ == "__main__":

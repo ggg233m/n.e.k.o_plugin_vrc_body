@@ -230,15 +230,32 @@ class XSessionIndex:
         return xyz, des3d
 
 
+# 尺度一致性的**相对**容差。见 ``_same_scale`` 注释里的由来：原先用 1e-6 的**绝对**阈值，
+# 把 0.0009% 的浮点尾巴当成了"换 avatar"，直接把跨会话索引清空。
+SCALE_REL_TOL = 0.01
+
+
 def _same_scale(meta: dict[str, Any], world_scale: float | None) -> bool:
     """会话的 world_scale 与当前一致（旧会话没记 ⇒ 当作一致）。头像缩放会让双目单位跟着缩放，
-    不同缩放的会话之间 xyz/位姿差一个倍数，混进同一索引会把尺度误差当成位移。"""
+    不同缩放的会话之间 xyz/位姿差一个倍数，混进同一索引会把尺度误差当成位移。
+
+    2026-10-16：``1e-6`` **绝对**阈值 ⇒ ``1%`` **相对**容差。
+    起因（真 bug，**静默**）：10-14 起 world_scale 按 ScaleFactor **逐会话**换算，新会话带上
+    浮点尾巴（043041 = 0.7550069214836606，旧会话是常量 0.755）——绝对差 6.9e-6 刚好越过
+    1e-6，但**相对只差 0.0009%**。建索引时 19 场旧会话被全部排除，**索引塌成只剩自己 1 场**
+    ⇒ 跨会话检索（P0）完全失效，且每录一场新会话就重演一次（基准总是取最新那场的 ws）。
+    真换 avatar 的量级是 **11.3%**（0.755 vs 0.840），与浮点噪声差 4 个数量级 ⇒ 1% 是安全分界；
+    且 1% 的尺度误差相对 17%/路程 的 DR 误差本就可忽略，混进来不会"把尺度误差当成位移"。
+    """
     if world_scale is None or meta.get("world_scale") is None:
         return True
     try:
-        return abs(float(meta["world_scale"]) - float(world_scale)) <= 1e-6
+        a, b = float(meta["world_scale"]), float(world_scale)
     except (TypeError, ValueError):
         return False
+    if not (np.isfinite(a) and np.isfinite(b)) or a <= 0.0 or b <= 0.0:
+        return False
+    return abs(a - b) / max(a, b) <= SCALE_REL_TOL
 
 
 def _scan_sessions(world_dir: Path, min_kf: int, world_scale: float | None = None) -> list[dict[str, Any]]:

@@ -647,6 +647,102 @@ def session_world_scale(world_dir: Path, sid: str) -> float | None:
     return ws if ws > 0.0 and np.isfinite(ws) else None
 
 
+# ---- 对齐质量闸 ---------------------------------------------------------------
+# 世界树的 ``bridge_min`` 只保证约束**条数**够，不保证残差小 ⇒
+# **「进了树」≠「质量合格」**，别把门控当验收。写先验前必须查**留出**（out-of-sample）
+# 残差：它是不参与求解的样本上的误差，唯一诚实的指标。否则会把错 gauge 混进图 ⇒
+# 废图 + 假障碍自困（035644 已演示），且不可逆（图已写盘、会被在线消费）。
+#
+# 阈值依据：现有先验三场实测留出 0.169 / 0.270 / 0.354 m —— 这批已被证明能产出可用
+# 先验，取 0.40 留余量；且先验注入的验收线是 pos_med ≤ 0.5 m，对齐残差应显著低于它。
+#
+# ⚠️ **只用留出残差，不要再加旋转闸**：``gauge.R_dev_deg`` 与质量**不相关**
+#   （001523 旋转 11.01° 但留出 0.270 最好；223033 旋转 3.63° 却 0.566 不合格）。
+#   若按旋转设闸，会把现有三场里最好的两场拒掉。``gauge.pos_med_m`` 同理无区分力。
+MAX_HOLDOUT_M = 0.40     # 留出残差中位上限（m）
+MIN_HOLDOUT_N = 4        # 留出样本数下限（少于此，中位不可信）
+
+
+def session_align_quality(world_dir: Path, sid: str,
+                          base_sid: str) -> tuple[str, float, int]:
+    """查 sid 的跨会话对齐质量。返回 ``(状态, 留出中位 m, 留出样本数)``。
+
+    状态：``root``=坐标系根（就是基准，无需对齐）／``ok``／``unverified``=没留出样本／
+    ``missing``=找不到对齐记录。后两者都不可信，写先验必须拦。
+    """
+    if sid == base_sid:
+        return "root", float("nan"), 0
+    xs = Path(world_dir) / "xsession"
+    if not xs.is_dir():
+        return "missing", float("nan"), 0
+    best: tuple[float, int] | None = None
+    for p in xs.glob(f"align_{sid}_into_*.json"):
+        try:
+            j = json.loads(p.read_text(encoding="utf-8"))
+            ho = j.get("holdout") or {}
+            n = int(ho.get("n") or 0)
+            med = ho.get("med_m")
+            med = float(med) if med is not None else float("nan")
+        except (OSError, ValueError, TypeError):
+            continue
+        # 同一 sid 被对齐过多次时取留出样本最多的那份（最有统计力）
+        if best is None or n > best[1]:
+            best = (med, n)
+    if best is None:
+        return "missing", float("nan"), 0
+    med, n = best
+    if n < 1 or not np.isfinite(med):
+        return "unverified", med, n
+    return "ok", med, n
+
+
+def gate_align_quality(world_dir: Path, sids, base_sid: str,
+                       max_m: float = MAX_HOLDOUT_M,
+                       min_n: int = MIN_HOLDOUT_N) -> list[str]:
+    """返回**问题列表**；空列表＝全部合格。调用方决定是拦截还是仅告警。
+
+    纯函数，只依赖 ``<world>/xsession/align_<sid>_into_*.json`` ⇒ 可直接喂假目录单测。
+    """
+    problems: list[str] = []
+    for sid in sids:
+        st, med, n = session_align_quality(world_dir, sid, base_sid)
+        if st == "root":
+            continue
+        if st == "missing":
+            problems.append(f"{sid}: 没有跨会话对齐记录，位姿可能不在主 gauge 下")
+        elif st == "unverified":
+            problems.append(f"{sid}: 对齐留出样本 {n} 个，残差无法验证")
+        elif n < min_n:
+            problems.append(f"{sid}: 留出样本仅 {n} 个（< {min_n}），中位不可信")
+        elif med > max_m:
+            problems.append(f"{sid}: 对齐留出残差 {med:.3f} m > {max_m:.2f} m")
+    return problems
+
+
+def check_world_scale(scales: dict[str, float | None]) -> tuple[str | None, float, str | None]:
+    """world_scale 检查。返回 ``(致命错误 or None, 基准 ws, 警告 or None)``。
+
+    2026-10-16：**不一致不再拒绝**，降级为警告。依据（实证，``.tmp/ws_grid_invariance.py``）：
+    同一场录制只改 world_scale（0.755 ↔ 0.840），``aggregate → dense → classify`` 全链
+    产出的三态栅格**逐格完全一致**（形状 361×406、障碍格 7933、原点 (-169,-319) 全同）。
+    离线建图全程在**追踪米**空间，world_scale 只在"追踪米 ↔ 世界米"的**对外换算**里用，
+    **不进栅格**（``_ray_voxels`` 只取 ``res_m`` / ``ground_tol_m`` / ``ray_z_m``）。
+    ⇒ 换 avatar 的会话，栅格仍落在同一追踪米空间 ⇒ 可以直接融合。
+    位姿尺度到底对不对，由**对齐残差闸**（``gate_align_quality``）把关——那才是直接判据；
+    world_scale 一致与否只是个**错代理指标**。
+    """
+    if not scales or any(v is None for v in scales.values()):
+        return (f"会话 session.json 缺 world_scale（{scales}）：不能固化先验（尺度不明）",
+                float("nan"), None)
+    vals = [float(v) for v in scales.values()]
+    ws = float(min(vals))
+    if max(vals) - min(vals) > 1e-6:
+        return None, ws, (f"会话 world_scale 不一致（{scales}）：换过 avatar。"
+                          "离线建图与 world_scale 无关（实证见 .tmp/ws_grid_invariance.py）"
+                          "⇒ 继续融合；尺度是否正确交给对齐残差闸判断。")
+    return None, ws, None
+
+
 def veto_grid(agg: dict, x0: int, y0: int, shape: tuple[int, int],
               **kw) -> np.ndarray | None:
     """射线清除 → ``(H, W)`` 稠密掩码（``True`` = 该格被看穿）。没开射线清除返回 ``None``。
@@ -684,6 +780,11 @@ def main() -> None:
     ap.add_argument("--write-prior", action="store_true",
                     help="把融合结果固化为**世界先验** <world>/prior/prior.npz+json（原子写）。"
                          "强制 rigid 口径（弹性形变会拉坏多视一致性，见 ROADMAP 2026-10-06 A/B）")
+    ap.add_argument("--max-holdout", type=float, default=MAX_HOLDOUT_M,
+                    help=f"对齐留出残差上限（m，默认 {MAX_HOLDOUT_M}）。--write-prior 时超过即拒绝；"
+                         "依据是现有先验三场 0.169/0.270/0.354 m，别为「让它过」而调大")
+    ap.add_argument("--min-holdout-n", type=int, default=MIN_HOLDOUT_N,
+                    help=f"对齐留出样本数下限（默认 {MIN_HOLDOUT_N}），少于此中位不可信")
     ap.add_argument("--out", default=None, help="输出目录（默认 .tmp/offline_fusion）")
     ap.add_argument("--ray-clear", dest="ray_clear", action="store_true", default=None,
                     help="开射线清除（默认跟随 MapperConfig.ray_clear=True，与在线同一开关）")
@@ -768,14 +869,31 @@ def main() -> None:
         bases = {a["base"] for a in aggs}
         if None in bases or len(bases) != 1:
             raise SystemExit(f"[fail] 会话位姿表坐标系根不一致（{sorted(str(b) for b in bases)}）："
-                             "先验必须落在**同一棵树**里；先跑 tools/xsession_align.py --world-tree")
+                             "先验必须落在**同一棵树**里；先跑 research/tools/xsession_align.py --world-tree")
         base_sid = str(bases.pop())
         scales = {sid: session_world_scale(world_dir, sid) for sid in sids}
-        if any(v is None for v in scales.values()):
-            raise SystemExit(f"[fail] 会话 session.json 缺 world_scale（{scales}）：不能固化先验（尺度不明）")
-        if max(scales.values()) - min(scales.values()) > 1e-6:
-            raise SystemExit(f"[fail] 会话 world_scale 不一致（{scales}）：换过 avatar，先验不能混尺度")
-        ws = float(min(scales.values()))
+        fatal, ws, warn = check_world_scale(scales)
+        if fatal is not None:
+            raise SystemExit(f"[fail] {fatal}")
+        if warn is not None:
+            print(f"[警告] {warn}")
+        # 对齐质量闸：**进了树 ≠ 质量合格**（bridge_min 只保约束条数）。判据只用留出残差，
+        # 不看旋转（R_dev_deg 与质量不相关，见 MAX_HOLDOUT_M 处的注释）。
+        for sid in sids:
+            st, med, n = session_align_quality(world_dir, sid, base_sid)
+            if st == "root":
+                print(f"[对齐] {sid}: 坐标系根，无需对齐")
+            elif st == "ok":
+                print(f"[对齐] {sid}: 留出 {med:.3f} m（n={n}，上限 {args.max_holdout:.2f} m）")
+            else:
+                print(f"[对齐] {sid}: {st}（无法验证）")
+        probs = gate_align_quality(world_dir, sids, base_sid,
+                                   max_m=args.max_holdout, min_n=args.min_holdout_n)
+        if probs:
+            raise SystemExit("[fail] 对齐质量不合格 ⇒ 先验不能写"
+                             "（错 gauge 混进图 = 废图 + 假障碍自困，且不可逆）：\n  - "
+                             + "\n  - ".join(probs)
+                             + "\n  先跑 research/tools/xsession_align.py 重对齐，或只挑合格的会话。")
         # 存储布局：行 = y、列 = x（labels_f 是行 = x、列 = y）⇒ 转置；origin = 最小格下标 × 分辨率。
         npz_path = write_prior(
             world_dir, labels_f.T, (x0 * RES, y0 * RES), RES, world_scale=ws, base_sid=base_sid,

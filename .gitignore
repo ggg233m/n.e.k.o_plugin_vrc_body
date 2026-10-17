@@ -28,7 +28,7 @@ models/depth_anything_v2_small/
 # 在线 navmesh 会话录制（大文件）
 navmesh_recordings/
 navmesh_memory/
-
+world_identity.json
 research/tools/*.png
 
 # 点云查看器生成的根目录 HTML（4–8 MB，纯产物，可随时重跑 pointcloud_view.py 再生）
@@ -39,3 +39,4 @@ Docs/assets/
 
 # 文献调研抓取的论文全文/HTML 缓存（~4 MB 原始素材；结论已提炼进 research/*.md）
 /_research/
+
