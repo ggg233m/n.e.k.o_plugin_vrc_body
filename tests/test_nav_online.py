@@ -22,8 +22,9 @@ from neko_anyadance_body.backend.nav_loop import LoopConfig
 from neko_anyadance_body.backend.nav_mapping import MapperConfig
 from neko_anyadance_body.backend.nav_prior import PriorConfig
 from neko_anyadance_body.backend.nav_online import (DeadReckoner, HeadingTrack, KeyframePolicy,
-                                                    OnlineNavConfig, OnlineNavigator, SessionRecorder,
-                                                    check_baseline, hmd_to_base_rotation, near_obstacle)
+                                                    OnlineNavConfig, OnlineNavigator, RateMeter,
+                                                    SessionRecorder, check_baseline, hmd_to_base_rotation,
+                                                    near_obstacle)
 
 S = 0.755
 CAM_H = 1.73
@@ -38,6 +39,68 @@ def hmd_yaw(deg: float) -> np.ndarray:
 
 def osc(ts: float, vx: float, vz: float) -> dict:
     return {"timestamp": ts, "velocity_x": vx, "velocity_z": vz}
+
+
+class RateMeterTest(unittest.TestCase):
+    """实测频率必须能看出「配置 10 Hz、跑出来 7.94 Hz」这种缺口。
+
+    2026-10-18：`stereo_period_s = 0.1` 的门写在 `tick >= next_stereo` 上，而 tick 是位姿
+    循环的实际节拍。位姿跑 15.87 Hz（tick 0.063 s）时，0.1 s 只能等到第 2 个 tick ⇒
+    实际步长 0.126 s = 7.94 Hz，比配置低 21%。此前没有任何字段报过这件事。
+    """
+
+    def test_hz_and_gap_from_regular_marks(self) -> None:
+        m = RateMeter(16)
+        for i in range(16):
+            m.mark(i * 0.063)                 # 15.87 Hz 的位姿 tick
+        self.assertAlmostEqual(m.hz(), 1.0 / 0.063, places=4)
+        self.assertAlmostEqual(m.gap_p50_s(), 0.063, places=6)
+        self.assertEqual(m.samples(), 16)
+
+    def test_empty_and_single_mark_are_none_not_zero(self) -> None:
+        """没测到要给 None —— 报 0 会被读成「卡死」，那是另一回事。"""
+        m = RateMeter(8)
+        self.assertIsNone(m.hz())
+        self.assertIsNone(m.gap_p50_s())
+        m.mark(1.0)
+        self.assertIsNone(m.hz())
+        self.assertIsNone(m.gap_p50_s())        # <3 个点算不出中位间隔
+
+    def test_window_forgets_old_marks(self) -> None:
+        """只报最近 N 次：换速度档后读数要跟着变，不能被全局平均糊住。"""
+        m = RateMeter(4)
+        for i in range(10):
+            m.mark(i * 1.0)                     # 1 Hz
+        self.assertAlmostEqual(m.hz(), 1.0, places=6)
+        m.mark(10.0)
+        m.mark(10.5)
+        m.mark(11.0)
+        m.mark(11.5)                            # 后四个是 2 Hz
+        self.assertAlmostEqual(m.hz(), 2.0, places=6)
+
+    def test_quantization_step_is_visible_as_integer_ticks(self) -> None:
+        """核心判据：`stereo_gap / pose_gap` ≈ 整数 ⇒ 撞在量化台阶上，不是算不过来。"""
+        tick = 0.063
+        pose, stereo = RateMeter(64), RateMeter(64)
+        for i in range(64):
+            pose.mark(i * tick)
+        for j in range(32):
+            stereo.mark(j * 2 * tick)           # 每 2 个 tick 才等到门
+            # 注意：stereo 的 mark 时刻必须落在 pose 的 tick 网格上（它们同源）
+        ticks = stereo.gap_p50_s() / pose.gap_p50_s()
+        self.assertAlmostEqual(ticks, 2.0, places=6)
+        self.assertLess(stereo.hz(), 1.0 / 0.1)  # 7.94 < 10（配置的目标）
+
+    def test_non_integer_ticks_means_really_too_slow(self) -> None:
+        """反例：算不过来时步长不是整数个 tick —— 判据要能区分这两种病。"""
+        tick = 0.063
+        pose, stereo = RateMeter(64), RateMeter(64)
+        for i in range(64):
+            pose.mark(i * tick)
+        for j in range(20):
+            stereo.mark(j * 0.235)              # 1440 那种 235 ms，非 tick 整数倍
+        ticks = stereo.gap_p50_s() / pose.gap_p50_s()
+        self.assertGreater(abs(ticks - round(ticks)), 0.2)
 
 
 class DeadReckonerTest(unittest.TestCase):
@@ -607,6 +670,7 @@ class ThreadsTest(unittest.TestCase):
                 self.assertTrue(h.nav.explore()["ok"])
                 time.sleep(0.3)
                 st = h.nav.status()
+                cfg_used = h.nav.cfg
             finally:
                 h.nav.stop()
         self.assertGreaterEqual(st["keyframes"], 2)
@@ -623,6 +687,19 @@ class ThreadsTest(unittest.TestCase):
         self.assertEqual(st["drive_block"], "autonomy_not_armed")
         self.assertEqual(h.moves, [])
         self.assertEqual(st["errors"], [])
+        # 实测频率必须与「配置频率」**并排**出现在 status 里（声明值 != 生效值的第二例）。
+        rt = st["rates"]
+        # 目标值必须**跟着配置走**：测试台自己把 stereo_period_s 调成 0.05（20 Hz），
+        # 这里写死 10.0 就会红 —— 而红得对，说明字段没被写死。
+        self.assertEqual(rt["pose_hz_target"], cfg_used.pose_hz)
+        self.assertEqual(rt["stereo_hz_target"], round(1.0 / cfg_used.stereo_period_s, 2))
+        for k in ("pose_hz", "stereo_hz", "keyframe_hz", "pose_gap_p50_s",
+                  "stereo_gap_p50_s", "stereo_ticks", "samples"):
+            self.assertIn(k, rt, "status()[\"rates\"] 少了 %s" % k)
+        # 跑起来了就三个表都该有样本；没样本说明打点位置挪了。
+        self.assertGreaterEqual(rt["samples"]["pose"], 2)
+        self.assertGreaterEqual(rt["samples"]["stereo"], 1)
+        self.assertGreaterEqual(rt["samples"]["keyframe"], 1)
         self.assertIsNotNone(h.nav.grid_png())
         view, ng = h.nav.grid_view(), h.nav.session.ng
         self.assertEqual((view["rows"], view["cols"]), ng.grid.shape)

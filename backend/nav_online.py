@@ -1,11 +1,24 @@
 # -*- coding: utf-8 -*-
 """在线增量 navmesh：航位推算位姿 + 镜像双目关键帧 → NavSession → OSC 走位 / HMD 转向。
 
-三个频率各管各的（别混成一个"1 Hz"）：
-* 位姿 20 Hz：OSC 速度（ZOH，前值保持）× HMD 朝向，与离线 ``dr_odom_db.py`` 同一口径；
-* 双目 ~10 Hz：SGBM 约 21 ms/帧，既做近距急停，也按**距离/转角/时长**触发关键帧（``KeyframePolicy``：快转推迟、原地补帧替换）；
-* 地图更新：有新关键帧才栅格化 + 重规划（~130 ms），最快 2 Hz；
-* 控制 10 Hz：跟随器吃最新位姿，每拍重发带 400 ms 自动过期的轴（线程死了人就停）。
+三个频率各管各的（别混成一个"1 Hz"）。**下面每一条都区分「目标」与「实测」**——
+2026-10-18 实测 223033（720×405）之前，第 2 行那句"~10 Hz"一直没被核过：
+
+* 位姿：目标 ``pose_hz = 20``，**实测 15.87 Hz**（每轮 ~63 ms，超出 50 ms 预算）。它是另外
+  两条的**上游**——感知循环是单线程，立体块内联在里面。
+* 双目：目标 ``stereo_period_s = 0.1`` ⇒ 10 Hz，**实测 7.94 Hz**。原因不是 SGBM 慢
+  （20 ms/帧，余量 3 倍），而是门写在 ``tick >= next_stereo`` 上、被**向上量化到整数个
+  位姿 tick**：0.1 / 0.063 = 1.59 ⇒ 只能等到第 2 个 tick = 0.126 s。既做近距急停，也按
+  **距离/转角/时长**触发关键帧（``KeyframePolicy``：快转推迟、原地补帧替换）。
+* 关键帧：**实测全程平均 1.86 Hz**，但它不是周期量——跑动时 46.1% 的间隔卡在双目台阶
+  （7.94 Hz），原地时落到 0.3–0.7 Hz。
+* 地图更新：有新关键帧才栅格化 + 重规划，``map_min_interval_s = 0.3`` ⇒ 上限 3.3 Hz
+  （栅格化已是增量，853 帧约 50 ms）。
+* 控制：目标 ``control_hz = 10``：跟随器吃最新位姿，每拍重发带 400 ms 自动过期的轴
+  （线程死了人就停）。
+
+``status()["rates"]`` 把上面三条的**实测值**与目标并排报出来（``stereo_ticks`` 是关键：
+≈整数 ⇒ 撞在量化台阶上；明显非整数 ⇒ 才是真算不过来）。见 ``RateMeter``。
 
 位姿源 = 航位推算 + 回环（``nav_loop.LoopCloser``：ORB+PnP，只修平移，朝向来自 HMD）。
 回环只在重访时出现；两次回环之间仍是纯航位推算（实测漂移约 2.8% 路程）。status 如实报 ``pose_source``。
@@ -183,6 +196,51 @@ def avatar_scale_factor(snapshot: dict[str, Any], ref_eye_m: float) -> tuple[flo
     return 1.0, "none"
 
 
+class RateMeter:
+    """最近 N 次事件的**实际**频率。用来把「配置的频率」和「跑出来的频率」分开报。
+
+    为什么必须外显：`stereo_period_s = 0.1` 意图 10 Hz，但门写的是
+    `if tick >= next_stereo: next_stereo = tick + stereo_period_s`，而 `tick` 是
+    **位姿循环的实际节拍**。位姿循环跑不满 `pose_hz` 时，这个门会被**向上量化到整数个
+    tick** —— 0.1 s / 0.063 s = 1.59 ⇒ 只能等到第 2 个 tick，实际步长变成 2 tick =
+    0.126 s = 7.94 Hz，比配置低 21%，而**此前没有任何字段报过这件事**。
+
+    🔴 与 `baseline_m` 同类：声明值（配置/驱动）不等于生效值。凡是「按周期推进」的量，
+    都要有一个实测频率跟它并排，否则缺口只能靠事后从日志反推。
+
+    ⚠️ 读数只在**最近 N 次**上算，长会话里换速度档后它会跟着变；`samples` 说明窗口多满。
+    """
+
+    __slots__ = ("_t",)
+
+    def __init__(self, n: int = 64) -> None:
+        self._t: deque[float] = deque(maxlen=n)      # maxlen 就是窗口大小
+
+    def mark(self, t: float) -> None:
+        self._t.append(t)
+
+    def hz(self) -> float | None:
+        """窗口内 (n−1)/跨度。样本 < 2 时返回 None（不是 0 —— 那会被读成卡死）。"""
+        t = self._t
+        if len(t) < 2:
+            return None
+        span = t[-1] - t[0]
+        return None if span <= 0.0 else (len(t) - 1) / span
+
+    def gap_p50_s(self) -> float | None:
+        """间隔中位。**这个数才看得出「量化台阶」**：它应当等于整数个位姿 tick。"""
+        try:
+            vals = list(self._t)
+        except RuntimeError:          # 另一线程正在改写 deque
+            return None
+        if len(vals) < 3:
+            return None
+        return float(np.median(np.diff(vals)))
+
+    def samples(self) -> int:
+        return len(self._t)
+
+
 class KeyframePolicy:
     """双目帧要不要成为关键帧。``decide`` 返回 None（不取）、``"new"``（追加）或
     ``"refresh"``（原地补帧：点云替换上一关键帧的，位姿/回环节点照留）。在线与离线回放共用。"""
@@ -354,6 +412,11 @@ class SessionRecorder:
             except OSError:
                 pass
         self._files = {}
+
+
+def _rnd(v: float | None, nd: int = 3) -> float | None:
+    """四舍五入，但 None 保持 None（别把「还没测到」写成 0）。"""
+    return None if v is None else round(float(v), nd)
 
 
 def _json_default(o: Any) -> Any:
@@ -822,6 +885,11 @@ class OnlineNavigator:
         self._map_updates = 0
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
+        # 实测频率（与配置值并排报，见 RateMeter）。`_rate_pose` 记的是感知循环的
+        # **节拍**，它是另外两个的上游：双目门被量化在它上面，关键帧又只能跟着双目走。
+        self._rate_pose = RateMeter(int(self.cfg.pose_hz * 4))
+        self._rate_stereo = RateMeter(64)
+        self._rate_kf = RateMeter(64)
         self._sensor_info: dict[str, Any] | None = None
         self._baseline_check: dict[str, Any] | None = None
         self._errors: list[str] = []
@@ -1200,6 +1268,7 @@ class OnlineNavigator:
         try:
             while not self._stop.is_set():
                 tick = self._clock()
+                self._rate_pose.mark(tick)
                 r = sensors.hmd_rotation()
                 if r is not None:
                     r_ob = hmd_to_base_rotation(r)
@@ -1293,6 +1362,7 @@ class OnlineNavigator:
                                 feat = extract_features(pair[0], disp, fx=sensors.fx, cx=sensors.cx,
                                                         cy=sensors.cy, baseline_m=sensors.baseline_m,
                                                         orb=orb, max_depth_m=c.loop.max_depth_m)
+                            self._rate_stereo.mark(tick)
                             with self._state_lock:
                                 self._near, self._near_pts = near, n
                                 self._stereo_at = tick
@@ -1395,6 +1465,7 @@ class OnlineNavigator:
                             with self._state_lock:
                                 self._offset = self.loops.offset()
                                 self._loop_status = loop_status
+                        self._rate_kf.mark(self._clock())
                         self._keyframes += 1
                     elif kind == "trail":
                         k, T, dist, t_tr = item
@@ -1526,6 +1597,38 @@ class OnlineNavigator:
         self._halt()
         return {"ok": True, "mode": "idle"}
 
+    def _rate_summary(self) -> dict[str, Any]:
+        """实测频率 —— 与配置值**并排**报，缺口自己会说话。
+
+        `stereo_hz` 低于 `stereo_hz_target` 时**先看 `stereo_ticks`**：
+
+        * ≈ 整数 ⇒ 门撞在**量化台阶**上（门按位姿 tick 推进，0.1 s 只能等到第 2 个 tick）
+          —— 这时调 `stereo_period_s` 没用，要先把位姿循环喂饱；
+        * 明显非整数 ⇒ 才真的是 SGBM 算不过来。
+
+        2026-10-18 实测 223033：pose 15.87 Hz（目标 20）、stereo 7.94 Hz（目标 10）、
+        `stereo_ticks = 2.00`，关键帧全程平均 1.86 Hz。
+        """
+        pose_gap = self._rate_pose.gap_p50_s()
+        stereo_gap = self._rate_stereo.gap_p50_s()
+        return {
+            "pose_hz": _rnd(self._rate_pose.hz(), 2),
+            "pose_hz_target": self.cfg.pose_hz,
+            "pose_gap_p50_s": _rnd(pose_gap, 4),
+            "stereo_hz": _rnd(self._rate_stereo.hz(), 2),
+            "stereo_hz_target": _rnd(1.0 / self.cfg.stereo_period_s, 2),
+            "stereo_gap_p50_s": _rnd(stereo_gap, 4),
+            "stereo_ticks": (_rnd(stereo_gap / pose_gap, 2)
+                             if pose_gap and stereo_gap else None),
+            # 关键帧不是周期量（位移/转角/时长三选一触发），所以它没有 target。
+            # 它会随走路速度在「卡在 stereo 台阶上」和「原地 3 s 补一帧」之间摆。
+            "keyframe_hz": _rnd(self._rate_kf.hz(), 2),
+            "keyframe_gap_p50_s": _rnd(self._rate_kf.gap_p50_s(), 4),
+            "samples": {"pose": self._rate_pose.samples(),
+                        "stereo": self._rate_stereo.samples(),
+                        "keyframe": self._rate_kf.samples()},
+        }
+
     def status(self) -> dict[str, Any]:
         est = self._est()
         with self._state_lock:
@@ -1596,6 +1699,7 @@ class OnlineNavigator:
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),
             "stereo_age_s": None if stereo_at is None else round(now - stereo_at, 2),
+            "rates": self._rate_summary(),
             # cam_h 是**追踪米**（双目单位），而 status 的对外契约是导航系世界米（见模块
             # docstring）。两个口径都给出、键名自带单位，避免"读到 1.7 就当成世界米"——
             # 那正是 C9 六个 cam_h 值的来源（1.73 追踪米 ≡ 1.306 世界米）。
