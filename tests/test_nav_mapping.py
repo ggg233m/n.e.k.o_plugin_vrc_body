@@ -496,6 +496,65 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((out["forward"], asked), (0.0, [1]))
         self.assertEqual(sess.step(self.est(0.5, 0.0))["reason"], "replanning")
 
+    # ---- 卡住自救（2026-10-19）----
+    # 背景：三个停住状态里只有 off_path 会触发重规划，另三个（local_obstacle /
+    # blocked / wait_map）原本只能等外部条件自己变好。实测 30 tick 状态不变、
+    # 0 次 replan 请求。这里用注入时钟验「卡住 >STALL_S 就原地扫」。
+
+    def _sess(self, clock):
+        self.add(0, pose(0, 0))
+        self.add(1, pose(1.0, 0))
+        sess = NavSession(self.m, clock=clock)
+        sess.goto((2.0 * self.s, 0.5 * self.s))
+        self.assertTrue(sess.on_map_update(self.est(0.5, 0.0))["accepted"])
+        return sess
+
+    def test_local_stop_scans_after_stall_instead_of_hanging(self) -> None:
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        # 计时从第一次看到这个卡法开始（t=0）。STALL_S 之前原样返回 stopped，不抢跑。
+        self.assertEqual(sess.step(self.est(0.5, 0.0), local_stop=True)["state"], "stopped")
+        now[0] = sess.STALL_S - 0.1
+        self.assertEqual(sess.step(self.est(0.5, 0.0), local_stop=True)["state"], "stopped")
+        # 超过 STALL_S：原地扫，且真的转得动
+        now[0] = sess.STALL_S + 0.1
+        out = sess.step(self.est(0.5, 0.0), local_stop=True)
+        self.assertEqual(out["state"], "stalled_scan")
+        self.assertEqual(out["reason"], "stall_local_obstacle")
+        self.assertGreater(out["turn_rate"], 0.0)
+        self.assertEqual(out["forward"], 0.0)
+
+    def test_scan_budget_eventually_gives_up(self) -> None:
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        seen = set()
+        t = 0.0
+        while t < 200.0:
+            now[0] = t
+            seen.add(sess.step(self.est(0.5, 0.0), local_stop=True)["state"])
+            t += 0.5
+        self.assertEqual(sess._scan_budget, 0)          # 额度用光
+        self.assertEqual(seen, {"stopped", "stalled_scan"})
+        # 额度用光后必须退回 stopped（不再原地转圈）
+        now[0] = 500.0
+        self.assertEqual(sess.step(self.est(0.5, 0.0), local_stop=True)["state"], "stopped")
+
+    def test_changing_stall_reason_resets_the_timer(self) -> None:
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        sess.step(self.est(0.5, 0.0), local_stop=True)       # 开始计 stopped/local_obstacle
+        now[0] = sess.STALL_S + 0.1
+        self.assertEqual(sess.step(self.est(0.5, 0.0), local_stop=True)["state"], "stalled_scan")
+        # 换一种卡法 ⇒ 计时重来，不该立刻扫。
+        # ⚠️ 必须 local_stop=False：local_stop=True 时 follower 一律先返回
+        #    stopped/local_obstacle（nav_follow.py:195 在 est 检查之前），换不出新卡法。
+        # 位姿丢失时 follower 自己就返回 wait_localization + scan_turn_rate
+        # （nav_follow.py:197-199），本来就在转，不需要 _stall_scan 兜。
+        lost = {"state": "unknown", "reason": "no_reloc"}
+        out = sess.step(lost, local_stop=False)
+        self.assertEqual(out["state"], "wait_localization")
+        self.assertGreater(out["turn_rate"], 0.0)
+
 
 class StereoPointsTests(unittest.TestCase):
     def test_flat_disparity_gives_points_ahead_in_base_frame(self) -> None:

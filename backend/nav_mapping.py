@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -1529,14 +1530,30 @@ class NavSession:
       就是 OSC 门控过的当前 SLAM 位姿，回环后它和地图一起跳。
     """
 
+    # 卡住多久之后放弃「原地等」，改成原地扫描换视角。
+    # 依据：三个停住状态（local_obstacle / blocked / wait_map）里 **只有 off_path 会触发重规划**，
+    # 另三个只能等外部条件自己变好；而站着不动时补帧看到的是同一批几何，图不会变好。
+    # 扫描能把前向近距锥（along < 0.927、|lat| < 0.331 追踪米，半角 19.7°）扫出去，
+    # 且 kf_turn_deg = 25° ⇒ 扫 180° 约出 7 个新视角关键帧 ⇒ 图真的会变。
+    STALL_S = 2.5               # s；scan_turn_rate 30°/s ⇒ 75°，足够把前向锥扫开
+    STALL_SCAN_S = 6.0          # 一次扫描最多持续多久（30°/s ⇒ 180°）
+    STALL_SCAN_TURNS = 3        # 扫满几轮还是同一个卡法就放弃（避免永久原地转圈）
+
     def __init__(self, mapper: KeyframeGridMapper, *, radius_m: float = 0.25,
                  keep_m: float = 1.0, follow_cfg: Any = None,
                  request_update: Callable[[], Any] | None = None,
-                 prior: Callable[[], Any] | None = None) -> None:
+                 prior: Callable[[], Any] | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.mapper = mapper
         self.radius_m = radius_m
         self.keep_m = keep_m
         self.follow_cfg = follow_cfg
+        # 卡住检测用的时钟。注入是为了让测试不用真等 2.5 s。
+        self._clock = clock
+        self._stuck_since: float | None = None
+        self._stuck_key: tuple[str, str] | None = None
+        self._scan_turn_since: float | None = None
+        self._scan_budget = self.STALL_SCAN_TURNS
         # 跨会话世界先验（P0.3b）：callable 返回已投影到本会话帧的 ``nav_prior.PriorOverlay``，
         # 没有 gauge / 过不了质量闸时返回 None —— 先验一格不许用（见 backend/nav_prior.py）。
         self.prior = prior
@@ -1674,6 +1691,48 @@ class NavSession:
             self.follower, self._awaiting = None, True
             self.request_update()
 
+    def _stall_scan(self, state: str, reason: str, idle: dict[str, float]) -> dict[str, Any] | None:
+        """卡住超过 STALL_S 就原地扫一圈，返回扫描指令；还不到时候 / 额度用完返回 None。
+
+        为什么是扫描而不是重规划：local_obstacle 与 blocked 都不是"路径不好"，
+        而是"看不到 / 过不去"。同一个视角重规划会得到同一条路（或同一个拒绝理由），
+        再停一次 —— 死循环。扫描换的是【观测】：前向近距锥半角只有 19.7 度
+        （框边 atan(0.331 / 0.927)），扫 75 度就把挡在前面的东西移出判定区；同时
+        kf_turn_deg = 25 度 会产出新视角关键帧，于是下一轮 on_map_update 看到的是
+        【新的几何】，而不是同一批点重算一遍。
+
+        额度：扫满 STALL_SCAN_S 还是同一个卡法就扣一次，扣完 STALL_SCAN_TURNS 次
+        仍卡 ⇒ 放弃（交给上层 LLM / 用户），不再原地转圈。
+        """
+        key = (state, reason)
+        now = self._clock()
+        if self._stuck_key != key:
+            # 换了停住的原因 ⇒ 重新计时（换了一种卡法，值得再等一次）
+            self._stuck_key, self._stuck_since = key, now
+            self._scan_turn_since = None
+            return None
+        if self._stuck_since is None:
+            self._stuck_since = now
+            return None
+        if now - self._stuck_since < self.STALL_S:
+            return None
+        if self._scan_budget <= 0:
+            return None                 # 扫过了还是卡 ⇒ 交给上层
+        if self._scan_turn_since is None:
+            self._scan_turn_since = now
+        elif now - self._scan_turn_since >= self.STALL_SCAN_S:
+            # 扫满还是同一个卡法 ⇒ 扣一次额度、重新计时
+            self._scan_budget -= 1
+            self._stuck_since, self._scan_turn_since = now, None
+            return None
+        return {"state": "stalled_scan", "reason": "stall_" + str(reason),
+                "forward": 0.0, "turn_rate": self._scan_rate(),
+                "stuck_for_s": round(now - self._stuck_since, 2)}
+
+    def _scan_rate(self) -> float:
+        rate = getattr(self.follow_cfg, "scan_turn_rate", None)
+        return float(rate) if rate else math.radians(30.0)
+
     def step(self, est: dict[str, Any], *, local_stop: bool = False) -> dict[str, Any]:
         idle = {"forward": 0.0, "turn_rate": 0.0}
         if self.mode == "idle":
@@ -1682,15 +1741,26 @@ class NavSession:
             return {"state": "explore_done", "reason": "no_frontier", **idle}
         if self.follower is None:
             if self._awaiting and self.ng is not None:
-                return {"state": "wait_map", "reason": "replanning", **idle}
+                return self._stall_scan("wait_map", "replanning", idle) or {
+                    "state": "wait_map", "reason": "replanning", **idle}
             if self.ng is None or est.get("state") != "localized":
-                return {"state": "wait_map", "reason": self.last.get("reason", "no_map"), **idle}
+                why = str(self.last.get("reason", "no_map"))
+                return self._stall_scan("wait_map", why, idle) or {
+                    "state": "wait_map", "reason": why, **idle}
             # 规划被拒（目标在 unknown / 不连通……）：等下一次地图更新，不猜。
-            return {"state": "blocked", "reason": self.last.get("reason", "no_plan"), **idle}
+            why = str(self.last.get("reason", "no_plan"))
+            return self._stall_scan("blocked", why, idle) or {
+                "state": "blocked", "reason": why, **idle}
         out = self.follower.step(est, local_stop=local_stop)
         if out["state"] == "replan":
             self._need_update(est)
             return {**out, "forward": 0.0, "turn_rate": 0.0}
+        if out["state"] == "stopped":
+            # local_obstacle 原本唯一出口是"障碍物自己离开"，现在多一条"扫一圈换视角"。
+            scanned = self._stall_scan("stopped", str(out.get("reason", "stopped")), idle)
+            if scanned is not None:
+                return scanned
+            return out
         if out["state"] == "arrived":
             if self.mode == "explore":
                 self._intent("explore")     # 到了就当看过，下一次更新选新的 frontier
