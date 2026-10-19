@@ -6,7 +6,7 @@
     "dxcam": "0.3.0",
     "flatbuffers": "25.12.19",
     "numpy": "2.4.6",
-    "opencv-python-headless": "4.14.0.94",
+    "opencv-contrib-python-headless": "4.14.0.94",
     "packaging": "26.3",
     "pillow": "12.3.0",
     "protobuf": "7.36.1",

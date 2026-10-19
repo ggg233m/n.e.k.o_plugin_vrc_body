@@ -9,7 +9,13 @@ dependencies = [
     # 1.25.0。打包器的 host-provided 允许清单只认 n-e-k-o，声明了就会强制
     # vendor 一份副本，于是同一进程里出现两个版本的 onnxruntime.dll，后加载
     # 的那份 DllMain 返回 1114，检测器整条降级到 OpenCV DNN。
-    "opencv-python-headless>=4.10,<5",
+    # 必须是 contrib 变体：cv2.ximgproc（WLS 视差滤波、createRightMatcher）
+    # 只在 contrib 里，普通 headless 没有。⚠️ 目前 backend/ 还没有 ximgproc 调用
+    # （WLS 只做过基准，见 _stereo_bench/wls_bench.py），这一条是为它上线铺路——
+    # 若决定不用 WLS，可以退回 opencv-python-headless。
+    # ⚠️ 不能两个都装 —— 它们共用同一个 cv2 目录，后装的覆盖先装的；
+    # 卸载任一个都会把 cv2 本体一起删掉（2026-10-18 实测踩过）。
+    "opencv-contrib-python-headless>=4.10,<5",
     "dxcam[winrt]>=0.0.5,<1; sys_platform == 'win32'",
     "websocket-client>=1.8,<2",
     # scipy 被 backend/nav_loop.py 的稀疏求解用到，代码里是
