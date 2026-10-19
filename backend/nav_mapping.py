@@ -355,11 +355,27 @@ def disparity_range_px(fx: float, *, base_fx: float = 202.5, base_px: int = 64) 
     fx 202.5→405→810）时范围不跟着缩放，近场会被裁掉：64@fx202.5 覆盖到 Z≈0.40 m，
     仍用 64 的话边界退到 ≈0.80 / 1.60 m。默认参数下返回 64 —— 720×405 行为逐位不变。
     见 `Docs/全分辨率验证录制SOP（2026-10-05）.md`。
+
+    **2026-10-19 实测钉死的两条**（`Docs/FACTS.md`「`nd` 调参三臂全量实测」）：
+      * `nd` **直接买视野**：SGBM 只填 `u >= nd-1` 的列，`first_ok` 精确等于 `nd`。
+        故 `nd/width` 恒为 8.89%（720/64、1440/128、2880/256）——**提分辨率的视野代价是中性的**，
+        `z_min` 同时减半（0.405→0.201→0.100 追踪米），这条设计是对的，别为了"省 4 ms"砍 `nd`。
+      * `nd` **不是近场精度的杠杆**：`near_obstacle` 的高度 `h` 满足 `abs(h-cam_h) <= z`，
+        所以 z<=0.30 世界米处的命中是构造性必然、不是检测。想补近场只能改判据或加基线/加分辨率。
     """
     return max(16, int(16 * round(base_px * float(fx) / base_fx / 16.0)))
 
 
 def make_sgbm(num_disparities: int = 64) -> Any:
+    """SGBM 配置。**2026-10-19 全量实测：`nd=64` 是 720p/fx202.5 下的正确值，别改。**
+
+    两条已钉死的实测（`Docs/FACTS.md`「`nd` 调参三臂全量实测」）：
+      * `nd=32`：`z<0.8` 追踪米的点 **精确归零**（四场 76k/118k/24k/131k → 0），
+        总点数 +5.3~6.0% 全来自远场，且**孤立率同时上升** ⇒ 近场全丢 + 远场变脏。
+      * `nd=128`：与"`nd=64` 但丢掉 `u∈[64,128)` 列"的对照组统计上不可区分
+        （IoU 0.7422 vs 0.7477）⇒ **质量贡献 0，只有 −17.78% 视野 + 延迟 p95 超 33.3 ms 帧预算**。
+    另注 `nd=24` 在 OpenCV 4.13/4.14 实测不报错（与"16 的倍数"不符），但不建议用。
+    """
     return cv2.StereoSGBM_create(minDisparity=0, numDisparities=int(num_disparities), blockSize=5,
                                  P1=8 * 25, P2=32 * 25, uniquenessRatio=10,
                                  speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1,
