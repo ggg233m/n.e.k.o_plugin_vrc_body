@@ -63,6 +63,22 @@ def load_euroc(path: Path) -> np.ndarray:
     return arr
 
 
+def contiguous_runs(t: np.ndarray, max_gap: float) -> list[tuple[float, float]]:
+    """把时间轴切成连续段，返回 [(起, 止), ...]（秒）。
+
+    与 ``stereo_seq_ground_truth.contiguous`` 同义：相邻样本间隔超过 ``max_gap`` 即断开。
+    这里用它算**最长连续追踪段**——那才是「追得稳不稳」的决策量，覆盖率不是。
+    """
+    if len(t) == 0:
+        return []
+    if len(t) == 1:
+        return [(float(t[0]), float(t[0]))]
+    breaks = np.flatnonzero(np.diff(t) > max_gap)
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [len(t) - 1]))
+    return [(float(t[a]), float(t[b])) for a, b in zip(starts, ends)]
+
+
 def quat_angle_deg(qa: np.ndarray, qb: np.ndarray) -> float:
     dot = abs(float(np.dot(qa / np.linalg.norm(qa), qb / np.linalg.norm(qb))))
     return math.degrees(2.0 * math.acos(min(1.0, dot)))
@@ -126,6 +142,10 @@ def main() -> int:
     report: dict[str, Any] = {"frames": len(frame_t), "duration_s": duration, "log": log}
 
     # ---- 1. 覆盖 ----------------------------------------------------------
+    # WARNING 口径（2026-10-18 加）：coverage = 轨迹行数/总帧数，不是「追得多稳」。
+    # SaveTrajectoryEuRoC 只写最终最大的那张地图（System.cc:778-782），丢追后另起的
+    # 地图整段不进文件 => 覆盖率被「最终地图数」机械决定，实测与地图数相关 r = -0.92~-1.00。
+    # 不同 rep 之间直接比覆盖率会得到伪结论；决策应看 longest_run_s。
     if traj.size == 0:
         print("逐帧轨迹为空：ORB-SLAM3 没有留下任何当前地图帧。")
         report["coverage"] = 0.0
@@ -133,11 +153,17 @@ def main() -> int:
         span = float(traj[-1, 0] - traj[0, 0])
         coverage = len(traj) / len(frame_t)
         path_len = float(np.sum(np.linalg.norm(np.diff(traj[:, 1:4], axis=0), axis=1)))
+        period_c = float(np.median(np.diff(frame_t))) if len(frame_t) > 1 else 1.0
+        runs = contiguous_runs(traj[:, 0], 2.5 * period_c)
+        longest = max((r[1] - r[0] for r in runs), default=0.0)
         print(f"逐帧轨迹：{len(traj)} 帧（覆盖 {coverage:.1%}），时间跨度 "
               f"[{traj[0, 0]:.2f}, {traj[-1, 0]:.2f}] s = {span:.1f} s，"
               f"路径 {path_len:.2f} 追踪米 ≈ {path_len * args.world_scale:.2f} 世界米")
+        print(f"  -> 覆盖率口径：只计最终最大地图；连续段 {len(runs)} 段，"
+              f"最长连续追踪 {longest:.1f} s（决策看这个，不看覆盖率）")
         report.update(coverage=coverage, traj_frames=len(traj), traj_span_s=span,
-                      path_tracking_m=path_len)
+                      path_tracking_m=path_len,
+                      segments=len(runs), longest_run_s=longest)
     print(f"关键帧：{len(kf)}")
     if log:
         print("日志计数：" + "，".join(f"{k}={v}" for k, v in log.items()))

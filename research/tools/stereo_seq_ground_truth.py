@@ -174,10 +174,23 @@ def score(seq: Path, traj: np.ndarray, *, scale: float, yaw_sign: float | None,
     Q = np.column_stack([np.interp(t, frame_t, gt["x"]), np.interp(t, frame_t, gt["z"])])
     seg = seg[ok]
 
+    # 全局 Sim3（gauge 口径，跨段可比）——保留作为主读数。
     s, R, tr = umeyama2d(P, Q, with_scale=True)
     e_sim = np.linalg.norm((s * (R @ P.T)).T + tr - Q, axis=1)
     _, R1, t1 = umeyama2d(P * scale, Q, with_scale=False)
     e_fix = np.linalg.norm((R1 @ (P * scale).T).T + t1 - Q, axis=1)
+
+    # 逐段 Sim3（2026-10-18 加）：ORB-SLAM3 丢追后另起地图，新图落在任意坐标系，
+    # 强制一个全局变换会把「分段」的代价算成系统误差。逐段各自对齐后再合并误差，
+    # 回答的是「在它确实活着的那几段里轨迹有多准」——这是**诊断量**，不是跨运行可比读数。
+    # 实测 run4：全局 1.802 / 0.380 / 1.247 m → 逐段 0.984 / 0.334 / 0.963 m（放大 1.14–1.83×）。
+    e_seg = np.full_like(e_sim, np.inf)
+    for sid in np.unique(seg):
+        m = seg == sid
+        if int(m.sum()) < 3:
+            continue        # 点太少拟合不出 2D 相似变换，留 inf 不参与
+        s2, R2, t2 = umeyama2d(P[m], Q[m], with_scale=True)
+        e_seg[m] = np.linalg.norm((s2 * (R2 @ P[m].T)).T + t2 - Q[m], axis=1)
 
     # RPE：同一连续段内，每 rpe_window 秒一对（起点每 rpe_window/2 秒滑一次）。
     rel, lens = [], []
@@ -206,6 +219,8 @@ def score(seq: Path, traj: np.ndarray, *, scale: float, yaw_sign: float | None,
         "scored_frames": int(ok.sum()), "segments": int(len(np.unique(seg))),
         "sim_scale": s, "ate_sim": err_stats(e_sim),
         "fixed_scale": scale, "ate_fixed": err_stats(e_fix),
+        # 逐段 Sim3：仅供诊断「它活着的那几段有多准」，不要当跨运行可比读数。
+        "ate_segwise": err_stats(e_seg[np.isfinite(e_seg)]),
         "rpe_window_s": rpe_window, "rpe_pairs": int(len(rel_a)),
         "rpe_median_m": float(np.median(rel_a)) if len(rel_a) else None,
         "rpe_pct_median": float(np.median(rel_a / len_a)) if len(rel_a) else None,
@@ -348,6 +363,11 @@ def main() -> int:
         e = res[key]
         print(f"  {title:18s} rmse {e['rmse']:.3f}  中位 {e['median']:.3f}  "
               f"p95 {e['p95']:.3f}  max {e['max']:.3f} m")
+    seg = res.get("ate_segwise") or {}
+    if seg.get("n"):
+        print(f"  逐段Sim3(诊断)     rmse {seg['rmse']:.3f}  中位 {seg['median']:.3f}  "
+              f"p95 {seg['p95']:.3f}  max {seg['max']:.3f} m  "
+              f"（{seg['n']} 帧；仅供诊断，不作跨运行可比读数）")
     print(f"  相似变换尺度 {res['sim_scale']:.3f}（标定 {args.scale}）")
     if res["rpe_pairs"]:
         print(f"  RPE({args.rpe_window:g}s) 中位 {res['rpe_median_m']:.3f} m = "
