@@ -539,6 +539,46 @@ class SessionTests(unittest.TestCase):
         now[0] = 500.0
         self.assertEqual(sess.step(self.est(0.5, 0.0), local_stop=True)["state"], "stopped")
 
+
+    # ---- 临时障碍（卡住自救的第二半，2026-10-19）----
+    # 扫描只换「观测」，不换「选项」：障碍若真在必经之路上，A* 转完回来还会
+    # 规划同一条路。临时障碍改的是搜索空间本身。
+
+    def test_mark_blocked_places_the_disc_outside_the_body(self) -> None:
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        here = (1.0, 2.0)
+        sess._mark_blocked(here, (1.0, 0.0))
+        blocks = sess.blocks_status()
+        self.assertEqual(len(blocks), 1)
+        # 必须标在身体之外：标在脚下会把起点盖成障碍（plan 直接 start_obstacle）
+        off = sess.BLOCK_R_M + sess.radius_m + 0.15
+        self.assertAlmostEqual(blocks[0]["x"], here[0] + off, places=6)
+        self.assertAlmostEqual(blocks[0]["y"], here[1], places=6)
+        self.assertGreater(blocks[0]["left_s"], 0.0)
+
+    def test_blocks_expire_after_ttl(self) -> None:
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        sess._mark_blocked((1.0, 2.0), (1.0, 0.0))
+        self.assertEqual(len(sess.blocks_status()), 1)
+        now[0] = sess.BLOCK_TTL_S + 0.1
+        self.assertEqual(sess.blocks_status(), [])      # 过期自动消失，不留永久疤痕
+
+    def test_block_detours_the_path_in_an_open_room(self) -> None:
+        # 开阔房间 + 一段墙垛留出两侧通道 ⇒ 挡住中线后 A* 应该绕开，而不是拒绝
+        now = [0.0]
+        sess = self._sess(lambda: now[0])
+        before = sess.contract.waypoints_xy_m if sess.contract else []
+        self.assertTrue(before)
+        here = (self.s * 0.5, 0.0)
+        sess._last_xy, sess._last_fwd = here, (1.0, 0.0)
+        sess._mark_blocked(here, (1.0, 0.0))
+        info = sess.on_map_update(self.est(0.5, 0.0))
+        self.assertTrue(info["accepted"], info)
+        after = sess.contract.waypoints_xy_m
+        self.assertNotEqual(before, after)             # 路径真的变了
+        self.assertFalse(info.get("blocks_retracted"))
     def test_changing_stall_reason_resets_the_timer(self) -> None:
         now = [0.0]
         sess = self._sess(lambda: now[0])

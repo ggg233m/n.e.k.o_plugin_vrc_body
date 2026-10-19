@@ -1538,6 +1538,12 @@ class NavSession:
     STALL_S = 2.5               # s；scan_turn_rate 30°/s ⇒ 75°，足够把前向锥扫开
     STALL_SCAN_S = 6.0          # 一次扫描最多持续多久（30°/s ⇒ 180°）
     STALL_SCAN_TURNS = 3        # 扫满几轮还是同一个卡法就放弃（避免永久原地转圈）
+    # 扫描 N 轮仍卡 ⇒ 把挡路的那块临时标成障碍，逼 A* 绕路。
+    # 为什么需要它：扫描只换「观测」，不换「选项」。
+    # 如果障碍真的在必经之路上，A* 转完回来还会规划同一条路，再停一次——
+    # 只是从「静默卡死」变成「转几圈再卡死」。临时障碍改的是搜索空间本身。
+    BLOCK_TTL_S = 30.0          # 临时障碍存活多久（秒）；过期自动消失，不留永久疤痕
+    BLOCK_R_M = 0.45            # 标记半径（世界米）；比 radius_m 0.25 宽，留出贴边通过余量
 
     def __init__(self, mapper: KeyframeGridMapper, *, radius_m: float = 0.25,
                  keep_m: float = 1.0, follow_cfg: Any = None,
@@ -1554,6 +1560,13 @@ class NavSession:
         self._stuck_key: tuple[str, str] | None = None
         self._scan_turn_since: float | None = None
         self._scan_budget = self.STALL_SCAN_TURNS
+        # 临时障碍：[(x_world, y_world, expires_at), ...]，导航系世界米。
+        # 只在「扫描也用完了还是卡」时才写，且带 TTL —— 不留永久疤痕。
+        self._blocks: list[tuple[float, float, float]] = []
+        self._blocks_painted = 0      # 上一轮涂了几格（诊断用）
+        self._block_marked_for: tuple[str, str] | None = None
+        self._last_xy: tuple[float, float] | None = None
+        self._last_fwd: tuple[float, float] | None = None
         # 跨会话世界先验（P0.3b）：callable 返回已投影到本会话帧的 ``nav_prior.PriorOverlay``，
         # 没有 gauge / 过不了质量闸时返回 None —— 先验一格不许用（见 backend/nav_prior.py）。
         self.prior = prior
@@ -1621,6 +1634,9 @@ class NavSession:
         if ovl is not None:
             extra = ovl.corners if extra is None else np.vstack([extra, ovl.corners])
         ng = self.mapper.rasterize(extra)
+        # 临时障碍必须在 build() 之前叠：可走区/中心区都是从三态图算的。
+        saved = self._stamp_blocks(ng)
+        self._blocks_painted = len(saved)
         walked = self.mapper.walked()
         # 脚下 ~1.6 m 双目看不到，身体走过的走廊（OSC 门控）是当前位置可走的唯一证据。
         # 先验必须在 build 之前叠：可走区/中心区都从三态图算，晚一步等于没叠。
@@ -1628,7 +1644,8 @@ class NavSession:
         stats = ng.build(radius_m=self.radius_m, walked=walked)
         res: dict[str, Any] = {"gen": snap["gen"], "ng": ng, "mode": mode, "anchor": anchor,
                                "contract": None, "follower": None}
-        info: dict[str, Any] = {"mode": mode, "grid": stats}
+        info: dict[str, Any] = {"mode": mode, "grid": stats,
+                                "blocks": len(self.blocks_status())}
         if prior_info is not None:
             info["prior"] = prior_info
         res["info"] = info
@@ -1657,6 +1674,20 @@ class NavSession:
             info["reason"] = "goal_anchor_lost"
             return res
         c = ng.plan(here, goal)
+        # 临时障碍把目标切断了 ⇒ 撤销它重试一次。
+        # 为什么必须撤：卡住时标的块可能正好封住唯一通道，那就从「卡住」变成「彻底走不到」。
+        # 撤销后重试一次即可 —— 再失败就说明是真的不通，不该无限重试。
+        if (not c.accepted) and saved and c.reason in ("goal_disconnected", "no_path", "start_obstacle", "goal_obstacle"):
+            for rr, cc, old_v in saved:
+                ng.grid[rr, cc] = old_v
+            saved = []
+            self._blocks_painted = 0
+            self._blocks_dropped = int(getattr(self, "_blocks_dropped", 0)) + 1
+            self._blocks = []          # 整批清掉：同一轮标的多半是同一个死结
+            stats = ng.build(radius_m=self.radius_m, walked=walked)
+            info["grid"] = stats
+            info["blocks_retracted"] = True
+            c = ng.plan(here, goal)
         res["contract"] = c
         info.update(c.to_dict())
         if c.accepted:
@@ -1691,7 +1722,71 @@ class NavSession:
             self.follower, self._awaiting = None, True
             self.request_update()
 
-    def _stall_scan(self, state: str, reason: str, idle: dict[str, float]) -> dict[str, Any] | None:
+    # ---- 临时障碍（卡住自救的第二半）----
+    def _prune_blocks(self, now: float) -> None:
+        """丢掉过期的临时障碍。过期就自动消失 —— 不留永久疤痕。"""
+        if self._blocks:
+            self._blocks = [b for b in self._blocks if b[2] > now]
+
+    def _mark_blocked(self, here: tuple[float, float],
+                      forward_xy: tuple[float, float] | None = None) -> None:
+        """在 here 前方标一块临时障碍，逼下一轮 A* 绕路。
+
+        标的是【当前位置正前方一个半径】，不是【挡住的那个点】——我们不知道障碍在哪
+        （正是不知道才卡住的）。取当前位置 + 前向 R 与半径 R 的圆盘，等价于把
+        【我现在过不去】翻译成【这块地此刻不可走】。
+        """
+        now = self._clock()
+        self._prune_blocks(now)
+        fx, fy = forward_xy if forward_xy is not None else (0.0, 0.0)
+        n = math.hypot(fx, fy)
+        if n > 1e-6:
+            fx, fy = fx / n, fy / n
+        else:
+            fx, fy = 1.0, 0.0        # 朝向未知：按 +x 标，至少能让 A* 换个方向试
+        r = self.BLOCK_R_M
+        # 必须标在【自己身体之外】：标在脚下会把起点盖成障碍，规划直接 start_obstacle，
+        # 于是从「卡住」变成「连起点都不可走」。offset = 块半径 + 身体半径 + 0.15 余量。
+        off = r + self.radius_m + 0.15
+        self._blocks.append((here[0] + fx * off, here[1] + fy * off, now + self.BLOCK_TTL_S))
+        if len(self._blocks) > 16:      # 有界：最老的最先丢
+            self._blocks = self._blocks[-16:]
+
+    def _stamp_blocks(self, ng: NavGrid) -> list[tuple[int, int, int]]:
+        """把未过期的临时障碍画进三态图（OCC）。返回 [(row, col, 原值), ...] 以便撤销。
+
+        **必须在 build() 之前调**：可走区/中心区都是从三态图算的，晚一步等于没叠
+        （与 nav_prior.apply_into 同一条理由）。
+        """
+        self._prune_blocks(self._clock())
+        if not self._blocks:
+            return []
+        r = self.BLOCK_R_M
+        cw = ng.meta.cell_world_m
+        k = max(1, int(math.ceil(r / cw)))
+        saved: list[tuple[int, int, int]] = []
+        for x, y, _exp in self._blocks:
+            rc = ng.to_cell((x, y))
+            if not ng.inside(rc):
+                continue        # 图还没长到那儿：不扩图
+            r0, c0 = max(0, rc[0] - k), max(0, rc[1] - k)
+            r1 = min(ng.grid.shape[0], rc[0] + k + 1)
+            c1 = min(ng.grid.shape[1], rc[1] + k + 1)
+            for rr in range(r0, r1):
+                for cc in range(c0, c1):
+                    if ng.grid[rr, cc] != OCC:
+                        saved.append((rr, cc, int(ng.grid[rr, cc])))
+                        ng.grid[rr, cc] = OCC
+        return saved
+
+    def blocks_status(self) -> list[dict[str, float]]:
+        """当前生效的临时障碍（给 status / 日志看）。"""
+        now = self._clock()
+        return [{"x": round(x, 3), "y": round(y, 3), "left_s": round(t - now, 1)}
+                for x, y, t in self._blocks if t > now]
+
+    def _stall_scan(self, est: dict[str, Any], state: str, reason: str,
+                    idle: dict[str, float]) -> dict[str, Any] | None:
         """卡住超过 STALL_S 就原地扫一圈，返回扫描指令；还不到时候 / 额度用完返回 None。
 
         为什么是扫描而不是重规划：local_obstacle 与 blocked 都不是"路径不好"，
@@ -1717,7 +1812,15 @@ class NavSession:
         if now - self._stuck_since < self.STALL_S:
             return None
         if self._scan_budget <= 0:
-            return None                 # 扫过了还是卡 ⇒ 交给上层
+            # 扫也扫过了还是卡 ⇒ 换【选项】而不是【观测】：在当前位置前方标一块临时障碍，
+            # 让下一轮 A* 绕路。同一个卡法只标一次，避免每 tick 都标。
+            if self._block_marked_for != key:
+                here = self._last_xy
+                if here is not None:
+                    self._mark_blocked(here, self._last_fwd)
+                    self._block_marked_for = key
+                    self._need_update(est)
+            return None
         if self._scan_turn_since is None:
             self._scan_turn_since = now
         elif now - self._scan_turn_since >= self.STALL_SCAN_S:
@@ -1735,21 +1838,28 @@ class NavSession:
 
     def step(self, est: dict[str, Any], *, local_stop: bool = False) -> dict[str, Any]:
         idle = {"forward": 0.0, "turn_rate": 0.0}
+        # 记下这次的位置与朝向：卡住时 _mark_blocked 要把"过不去"落到具体格上。
+        xy = est.get("xy")
+        if est.get("state") == "localized" and xy is not None:
+            self._last_xy = (float(xy[0]), float(xy[1]))
+            th = est.get("theta")
+            if th is not None:
+                self._last_fwd = (math.cos(float(th)), math.sin(float(th)))
         if self.mode == "idle":
             return {"state": "idle", "reason": "no_goal", **idle}
         if self.mode == "done":
             return {"state": "explore_done", "reason": "no_frontier", **idle}
         if self.follower is None:
             if self._awaiting and self.ng is not None:
-                return self._stall_scan("wait_map", "replanning", idle) or {
+                return self._stall_scan(est, "wait_map", "replanning", idle) or {
                     "state": "wait_map", "reason": "replanning", **idle}
             if self.ng is None or est.get("state") != "localized":
                 why = str(self.last.get("reason", "no_map"))
-                return self._stall_scan("wait_map", why, idle) or {
+                return self._stall_scan(est, "wait_map", why, idle) or {
                     "state": "wait_map", "reason": why, **idle}
             # 规划被拒（目标在 unknown / 不连通……）：等下一次地图更新，不猜。
             why = str(self.last.get("reason", "no_plan"))
-            return self._stall_scan("blocked", why, idle) or {
+            return self._stall_scan(est, "blocked", why, idle) or {
                 "state": "blocked", "reason": why, **idle}
         out = self.follower.step(est, local_stop=local_stop)
         if out["state"] == "replan":
@@ -1757,7 +1867,7 @@ class NavSession:
             return {**out, "forward": 0.0, "turn_rate": 0.0}
         if out["state"] == "stopped":
             # local_obstacle 原本唯一出口是"障碍物自己离开"，现在多一条"扫一圈换视角"。
-            scanned = self._stall_scan("stopped", str(out.get("reason", "stopped")), idle)
+            scanned = self._stall_scan(est, "stopped", str(out.get("reason", "stopped")), idle)
             if scanned is not None:
                 return scanned
             return out
