@@ -242,6 +242,10 @@ FFS 的覆盖度稳定在 **98.5%**（三档尺寸、两种精度都一样），
 | **ScatterNDUpdate 30%** | ❌ **大概率不会**。这是 `corr_agg` 的相关体散射，PyTorch 里同样是 `scatter_`，**同一类操作** | 51 ms |
 | **Convolution 24%** | ❌ **不会更快**。torch 的 XPU Conv 走 oneDNN，与 OpenVINO 共用同一后端 | 41 ms |
 | **Reorder 12%** | ⚠️ 可能。这是 layout 转换（NCHW 与 NHWC 之间），**torch 的 layout 策略不同，可能少一些** | 21 ms |
+
+> 🔴 **2026-10-21 追加（见 §3B）**：本节关于「换 PyTorch」的估计**建立在 OpenVINO 的耗时剖面上**。
+> 但 torch XPU 的 **fp16 是真 XMX（matmul 11×）、且数值保真度远好于 OpenVINO 的 f16**。
+> ⇒ **本节「乐观 200–230 ms」的估计偏保守**：若 torch 的 fp16 能保住质量，算力上限比这里假设的高得多。
 | **形状算子（85% 的算子数）** | ⚠️ **不确定**。`reshape()` 后仍有 **22,202 个算子、85.2% 是形状管理**（对比未 reshape 的 28,540 / 86.3%）⇒ **reshape 只砍掉 22%，没砍掉形状开销** | `.tmp/_reshape_ops.py` |
 
 ⇒ **乐观估计：省掉框架开销 + Reorder 的一部分 ≈ 90–120 ms，落在 200–230 ms。**
@@ -263,6 +267,75 @@ FFS 的覆盖度稳定在 **98.5%**（三档尺寸、两种精度都一样），
 ⇒ **SGBM 的 130 ms（mip1）是 CPU 串行 DP 的固有成本，换框架不改变它。**
 要动它只能改**算法**（比如块匹配 + 置信传播的 GPU 实现），那是重写而不是移植。
 
+---
+
+## 三·补、torch XPU 在 A770 上跑通（2026-10-21）
+
+用户建议：**装最新版 xpu-pytorch**（旧版会导致特定选择掉驱动），并在「换 PyTorch」这条上继续。
+照做，结果推翻了我上一轮 §3.7 的一个前提。
+
+### 3B.1 环境（隔离，不动主 `.venv`）
+
+| 项 | 值 |
+|---|---|
+| 解释器 | **python 3.11.9**（系统 `python`，**不是**主 `.venv` 的 3.12.9）|
+| 包 | **`torch 2.14.1+xpu`** + `triton-xpu 3.8.0` + Intel SYCL/MKL 全家桶 |
+| 目录 | `.venv_xpu/`（**未纳入版本控制**）|
+
+**三个安装坑（都会静默浪费几十分钟）**：
+
+1. **wheel 的 cp 标签必须匹配解释器**。我先下了 `cp312` 的 673 MB wheel，而 `python -m venv` 用的是 PATH 上的 **3.11.9** ⇒ `not a supported wheel on this platform`。
+2. **依赖 `triton-xpu` 不在国内镜像里**。只用 `--index-url`（阿里云）会报 `No matching distribution found for triton-xpu~=3.8.0`；**必须加 `--extra-index-url https://download.pytorch.org/whl/xpu`**。
+3. **`pip install <url>` 解析会卡住**（`cache` 停在 130 MB 不动）。改成 **`curl` 直下 wheel 再本地安装**，21.8 MB/s 走完。
+
+验证：
+
+```
+torch 2.14.1+xpu
+xpu available : True
+  [0] Intel(R) Arc(TM) A770 Graphics  mem=16.7 GB  EUs=512
+conv ok on xpu out (1, 32, 480, 736)
+```
+
+### 3B.2 🔑 XMX 在 torch 里是**真生效**的
+
+| 算子 | fp32 | fp16 | 倍数 |
+|---|---|---|---|
+| **matmul n=2048** | 11,901 GF/s | **131,546 GF/s** | **11.0×** |
+| matmul n=1024 | 6,266 GF/s | 12,677 GF/s | 2.0× |
+| conv C=32 @480×736 | 4,079 GF/s | 14,679 GF/s | 3.6× |
+| conv C=64 @480×736 | 24,575 GF/s | 47,950 GF/s | 2.0× |
+| conv C=3 @480×736 | 223 GF/s | 170 GF/s | 0.8×（太小，launch 主导）|
+
+**对照 `core.get_property('GPU','DEVICE_GOPS')` 的理论值：f16 是 f32 的 8×** ⇒ **torch 把硬件算力兑现出来了。**
+
+⚠️ 而 **OpenVINO 的 f16 只快 28%**（205.1 vs 285.7 ms）——**两者对同一块 GPU 的利用率完全不同。**
+
+### 3B.3 🔴 更关键：torch 的 fp16 **数值保真度远好于 OpenVINO**
+
+在 `conv + 相关 + softmax` 流水线上（480×736，32 通道）：
+
+| 量 | 值 |
+|---|---|
+| `\|fp16 − fp32\|` p50 | **1.5e-08** |
+| p99 | 5.3e-08 |
+| max | 9.9e-06 |
+| **相对 p50** | **1.6%** |
+
+**对照 OpenVINO：同一个 FFS 模型，f16 把光度和残差从 `0.686` 打到 `2.765`（4×）。**
+
+⇒ 🔴 **【推理·中高】OpenVINO 那个 f16 崩，很可能不是 fp16 位宽本身的错，而是 OpenVINO 的量化/近似策略。**
+**torch 的 fp16 在数值上保得住。**
+
+⇒ **这改变了「换 PyTorch」的理由**：不是「更快」，而是 **「fp16 能用」**。
+如果 torch 的 fp16 能保住 FFS 的质量，那 286 ms（OpenVINO f32）→ 约 **205 ms×（8× 算力里的可用部分）** 就有了真实空间。
+
+### 3B.4 还没做的（诚实边界）
+
+- ❌ **FFS 的 ONNX 无法直接喂 torch**（需要 ONNX→torch 前端，未装）⇒ **「torch 跑 FFS 到底多快多准」仍未测**。
+- ❌ **AANet / StereoNet-AA 的权重还没下**（Google Drive 可达，`haofeixu/aanet` 的 MODEL_ZOO 有链接）。
+- ⚠️ **3B.3 的数值保真度是在合成张量上测的**，不是真模型。真实模型有权重分布、会累积更多层。
+- ⚠️ **torch XPU 在 Windows 上是较新路径**，稳定性未知（用户提示过旧版会掉驱动）。
 ---
 
 ## 四、这条路的真实瓶颈

@@ -11,6 +11,8 @@ build/
 store.db
 tmp/
 .venv/
+# 隔离的 torch-XPU 试验环境（2026-10-21）。约 4 GB，只为 OpenVINO ↔ torch 对照而存在。
+.venv_xpu/
 .trae/
 world_memory.json
 backend.settings.json
