@@ -237,11 +237,14 @@ def _has_section(text: str, sec: str) -> bool:
     ``## 四、已知陷阱`` 下的第 0 条）被报成失效，而它其实指得中。
     """
     def match(s: str) -> bool:
+        # 标题里允许带一个 `§` 前缀：有的是 `## 四、`，有的是 `## §四`。
+        # 不认这个前缀时，`§1` 会被判成"目标文件没有该小节"（2026-10-20 实测踩到，
+        # `学习型立体-实测裁定（2026-10-07）.md` 全篇用 `## §N` 风格）。
+        lead = r"^#{2,4}\s*§?\s*"
         if re.fullmatch(r"[\d.]+", s):
             # 阿拉伯号：`17.8` 精确命中；`(?![\d])` 保证 `3` 不误吞 `31`
-            return re.search(r"^#{2,4}\s*" + re.escape(s) + r"(?![\d])", text, re.M) is not None
-        return re.search(
-            r"^#{2,4}\s*" + re.escape(s) + r"\s*[、.．:：\s]", text, re.M) is not None
+            return re.search(lead + re.escape(s) + r"(?![\d])", text, re.M) is not None
+        return re.search(lead + re.escape(s) + r"\s*[、.．:：\s]", text, re.M) is not None
 
     if match(sec):
         return True
