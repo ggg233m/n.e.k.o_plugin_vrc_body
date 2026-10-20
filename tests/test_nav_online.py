@@ -928,7 +928,10 @@ class ThreadsTest(unittest.TestCase):
             sessions = store.list_sessions(wid)
             self.assertEqual(len(sessions), 1)
             info = store.session(wid, sessions[0]["session_id"])
-            self.assertEqual(info["status"], "complete")
+            # 把 error 带进断言消息：这条曾经只报 "'error' != 'complete'"，
+            # 看不到写盘线程到底抛了什么（`SessionWriter._run` 把异常吞进 _meta["error"]）。
+            self.assertEqual(info["status"], "complete",
+                             f"会话状态异常，error={info.get('error')!r}")
             self.assertGreaterEqual(info["keyframes"], 3)
             self.assertEqual(info["baseline_m"], 0.126)
             self.assertEqual(info["world_scale"], S)

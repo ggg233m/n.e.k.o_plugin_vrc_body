@@ -63,9 +63,29 @@ def world_dir_name(world_key: str) -> str:
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
+    """写临时文件再原子改名。
+
+    ⚠️ Windows 上 ``os.replace`` 会**偶发** ``PermissionError: [WinError 5]``：
+    目标文件正被另一个进程短暂打开（杀毒实时扫描 / 索引器 / 阅读器）时，
+    改名要 ``DELETE`` 权限，拿不到就抛。2026-10-21 实测在
+    ``session.json.tmp -> session.json`` 上命中，概率约 **1/10**，
+    表现为会话 ``status='error'``（``SessionWriter._run`` 把异常吞进 ``_meta["error"]``）。
+
+    这是**真实的写盘缺陷**，不是测试问题：线上同样会在同样的时机丢会话状态。
+    重试几次即可——竞争窗口是毫秒级。超过预算仍然抛出，**不静默吞掉**。
+    """
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_bytes(data)
-    os.replace(tmp, path)
+    last: OSError | None = None
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:          # WinError 5：目标被占用
+            last = exc
+            time.sleep(0.01 * (attempt + 1))    # 10/20/30/40 ms
+    assert last is not None
+    raise last
 
 
 def _write_json(path: Path, obj: dict[str, Any]) -> None:

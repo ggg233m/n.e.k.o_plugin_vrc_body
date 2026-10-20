@@ -36,19 +36,32 @@ IM_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 #: StereoNet-AA（0.526 M 参数）：从 checkpoint 的形状反推出来的配置。
 #: num_scales=1（只有 scale-0 分支）、max_disp=192（-> 48 通道）、num_fusions=4、
 #: num_deform_blocks=4、refinement_type='stereonet'。strict=True 加载，missing=0/unexpected=0。
-CFG = dict(max_disp=192, num_downsample=2, feature_type='stereonet',
-           aggregation_type='adaptive', num_scales=1, num_fusions=4,
-           deformable_groups=2, mdconv_dilation=2, refinement_type='stereonet',
-           no_intermediate_supervision=False, num_stage_blocks=1,
-           num_deform_blocks=4, feature_pyramid=False)
+#: 每个 entry = (显示名, 权重文件, AANet 构造参数, 输入尺寸必须整除的数)。
+#: StereoNet-AA 与 AANet 本体的结构**不一样**，都是从那本 checkpoint 的张量形状反推的。
+MODELS = (
+    ('StereoNetAA', 'stereonet_aa_sceneflow.pth',
+     dict(max_disp=192, num_downsample=2, feature_type='stereonet',
+          aggregation_type='adaptive', num_scales=1, num_fusions=4,
+          deformable_groups=2, mdconv_dilation=2, refinement_type='stereonet',
+          no_intermediate_supervision=False, num_stage_blocks=1,
+          num_deform_blocks=4, feature_pyramid=False), 1),
+    ('AANet', 'aanet_sceneflow.pth',
+     dict(max_disp=192, num_downsample=2, feature_type='aanet',
+          aggregation_type='adaptive', num_scales=3, num_fusions=6,
+          deformable_groups=2, mdconv_dilation=2, refinement_type='stereodrnet',
+          no_intermediate_supervision=False, num_stage_blocks=1,
+          num_deform_blocks=3, feature_pyramid=False,
+          feature_pyramid_network=True), 64),
+)
 
 
-def build(half: bool = False) -> torch.nn.Module:
+def build(ckpt: str, cfg: dict, half: bool = False) -> torch.nn.Module:
     sys.path.insert(0, str(AANET_SRC))
     from nets.aanet import AANet  # noqa: E402
 
-    model = AANet(**CFG)
-    state = torch.load(str(CKPT), map_location='cpu', weights_only=False)
+    model = AANet(**cfg)
+    state = torch.load(str(ROOT / '.tmp' / 'stereo_models' / 'aanet' / ckpt),
+                       map_location='cpu', weights_only=False)
     model.load_state_dict(state, strict=True)
     model.eval().to('xpu')
     if half:
@@ -80,15 +93,15 @@ def main() -> int:
 
     if not torch.xpu.is_available():
         print('[skip] torch XPU 不可用'); return 2
-    if not AANET_SRC.exists() or not CKPT.exists():
-        print('[skip] 缺 AANet 源码或权重，见模块 docstring'); return 2
+    if not AANET_SRC.exists():
+        print('[skip] 缺 AANet 源码，见模块 docstring'); return 2
 
     name = sys.argv[1] if len(sys.argv) > 1 else '20261010_033237'
     rec = ROOT / 'navmesh_recordings' / name
     if not rec.exists():
         print('[skip] 录制不存在：', name); return 2
 
-    print('%-5s %-10s %-9s %-9s %-8s %-8s'
+    print('%-5s %-12s %-9s %-9s %-8s %-8s'
           % ('kf', 'method', 'ms', 'resid', 'cov%', 'disp_p50'))
     models = {}
     for k in (0, 20, 60, 120):
@@ -100,13 +113,27 @@ def main() -> int:
         ds = stereo_disparity(left, right, make_sgbm(disparity_range_px(202.5)))
         t = (time.perf_counter() - t0) * 1e3
         r = residual(left, right, ds)
-        print('%-5d %-10s %-9.1f %-9.3f %-8.1f %-8.2f'
+        print('%-5d %-12s %-9.1f %-9.3f %-8.1f %-8.2f'
               % (k, 'SGBM', t, r[0], r[1], float(np.median(ds[ds > 1]))))
-        for half in (False, True):
-            if half not in models:
-                models[half] = build(half)
-            m = models[half]
-            x1, x2 = prep(left, half), prep(right, half)
+        for name, ckpt, cfg, align in MODELS:
+            if name not in models:
+                try:
+                    models[name] = build(ckpt, cfg)
+                except Exception as exc:
+                    models[name] = None
+                    print('%-5d %-12s SKIP: %s' % (k, name, str(exc)[:70]))
+                    continue
+            m = models[name]
+            if m is None:
+                continue
+            l2, r2 = left, right
+            if align > 1:
+                hh = (left.shape[0] + align - 1) // align * align
+                ww = (left.shape[1] + align - 1) // align * align
+                if (hh, ww) != left.shape:
+                    l2 = cv2.resize(left, (ww, hh), interpolation=cv2.INTER_LINEAR)
+                    r2 = cv2.resize(right, (ww, hh), interpolation=cv2.INTER_LINEAR)
+            x1, x2 = prep(l2), prep(r2)
             with torch.no_grad():
                 m(x1, x2)                      # warmup
             torch.xpu.synchronize()
@@ -118,9 +145,9 @@ def main() -> int:
                 torch.xpu.synchronize()
                 ts.append((time.perf_counter() - t0) * 1e3)
             disp = out[-1].detach().float().cpu()[0].numpy()
-            rr = residual(left, right, disp)
-            print('%-5d %-10s %-9.1f %-9.3f %-8.1f %-8.2f'
-                  % (k, 'AANet' + ('16' if half else '32'), float(np.median(ts)),
+            rr = residual(l2, r2, disp)
+            print('%-5d %-12s %-9.1f %-9.3f %-8.1f %-8.2f'
+                  % (k, name, float(np.median(ts)),
                      rr[0], rr[1], float(np.median(disp))))
     return 0
 
