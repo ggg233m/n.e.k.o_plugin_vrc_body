@@ -275,7 +275,9 @@ class OpticalFlowTraversability:
         self,
         config: TraversabilityConfig | None = None,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        # perf_counter：captured_at 会与 osc.py 的 OSC 接收时间戳相减（time_alignment）。
+        # 2026-10-24 全链路统一；单机构造时也必须用 perf_counter，否则静默跨域 23-37 ms。
+        clock: Callable[[], float] = time.perf_counter,
         sectors: tuple[float, ...] = _DEFAULT_SECTORS,
     ) -> None:
         self.config = config or TraversabilityConfig()
@@ -489,7 +491,7 @@ class GroundExtentEstimator:
         self,
         config: GroundExtentConfig | None = None,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.perf_counter,
         sectors: tuple[float, ...] = _DEFAULT_SECTORS,
     ) -> None:
         self.config = config or GroundExtentConfig()

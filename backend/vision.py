@@ -2757,7 +2757,12 @@ class VisionRuntime:
         main_llm_semantic: bool = False,
         main_llm_min_interval_s: float = 12.0,
         detect_interval_s: float = 0.0,
-        clock: Any = time.monotonic,
+        # perf_counter：VisionRuntime 是 captured_at 的**最终生产者**（VisionWorker 的 clock
+        # 默认也取自它）。2026-10-24 全链路统一到 perf_counter —— 它要和 osc.py 的 OSC
+        # 接收时间戳相减（time_alignment.sample_motion）。留 monotonic 会让两域差 23-37 ms，
+        # 每个 captured_at 落在样本窗口中间 ⇒ 从 held 静默变成 interp，且 CLOCK_DOMAIN 撒谎。
+        # 注意它同时喂给 WorldStateStore（见下 store= 一行），必须一起改。
+        clock: Any = time.perf_counter,
         observation_callback: Callable[[VisionObservation, Mapping[str, Any]], None] | None = None,
         frame_cache_interval_s: float = 1.0,
         frame_cache_max_width: int = 960,
