@@ -27,6 +27,7 @@ models/depth_anything_v2_small/
 /__*.txt
 /_clean.log
 /_wm_out.txt
+/_tc_*
 # 在线 navmesh 会话录制（大文件）
 navmesh_recordings/
 navmesh_memory/
@@ -42,3 +43,4 @@ Docs/assets/
 # 文献调研抓取的论文全文/HTML 缓存（~4 MB 原始素材；结论已提炼进 research/*.md）
 /_research/
 
+las_ckpt/

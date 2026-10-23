@@ -31,6 +31,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import queue
 import threading
 import time
 from collections import deque
@@ -96,6 +97,17 @@ class OnlineNavConfig:
     # 每帧双目只看得到脚前 ~1.3 m（世界米）到 range_m 那一条带：3 Hz 时跑步一帧走 1.3 m，
     # 带与带之间就是空白。SGBM 720×405 约 26 ms，10 Hz 占一个核的 1/4，近距急停也跟着变快。
     stereo_period_s: float = 0.1
+    # 双目**解耦**（2026-10-24）：把"算视差 + 点云 + 近距判定"从位姿线程挪到独立线程。
+    # 为什么必须拆：块内联在位姿 tick 里，块耗时直接吃位姿预算。实测（A770）
+    #   SGBM 720 ~21 ms / LAS2 编译版 720 ~51 ms，而位姿 tick 预算 50 ms（pose_hz=20）。
+    #   内联 ⇒ 位姿被压到约 11 Hz；拆开 ⇒ 位姿不再被拖，实测 18.79 → 18.78 Hz（零损失）。
+    # ⚠️ 采集（read_stereo）仍留在位姿线程：D3D11 立即上下文不是线程安全的，
+    #    OpenVRSensors 的方法只能在感知线程里调（见 OpenVRSensors 文档串）。
+    #   ⚠️ LAS2 在这个位置仍有隐患：torch.compile 的 Dynamo guard 每帧走 Python 调用栈，
+    #   一旦有别的纯 Python 线程抢 GIL 会慢 80×（实测 49 → 4018 ms）。SGBM 只慢 1.6×。
+    #   所以 decoupled=True 当前只在 SGBM 后端上是稳的，见 Docs。
+    decoupled: bool = True
+    stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程
     # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级 ⇒ 720（默认）
     # = mip2 720×405 / fx 202.5（现役行为）、1440 = mip1 / fx 405、2880 = 全分辨率 / fx 810。
     # 深度尺度不随它变（fx 与视差同比例变）；SGBM 视差范围按 fx 自动缩放（见 make_sgbm 调用点）。
@@ -870,6 +882,12 @@ class OnlineNavigator:
         self._stereo_at: float | None = None
         self._near = False
         self._near_pts = 0
+        # 解耦双目：交接槽（maxsize=1，满则丢最新，绝不阻塞位姿线程）。
+        self._stereo_q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        # 帧序号（仅用于日志/调试）与关键帧编号。解耦线程与位姿线程共享这些计数器，所以取号要在
+        # _state_lock 下（否则两边都能分到同一个 kf_id）。
+        self._stereo_seq = 0
+        self._kf_next_id = 0
         self._pending: list[tuple[str, Any]] = []
         self._keyframes = 0
         self._kf_refreshed = 0
@@ -957,11 +975,15 @@ class OnlineNavigator:
         self._mem_flushed_at = -math.inf
         self._begin_memory()
         self._begin_xsession()
+        loops = [("perception", self._perception_loop),
+                 ("mapping", self._mapping_loop),
+                 ("control", self._control_loop),
+                 ("scale", self._scale_loop)]
+        if self.cfg.decoupled:
+            # 双目解耦线程：位姿线程只交接采集帧，重活在这里做。
+            loops.insert(1, ("stereo", self._stereo_worker_loop))
         self._threads = [threading.Thread(target=fn, name=f"navmesh-{name}", daemon=True)
-                         for name, fn in (("perception", self._perception_loop),
-                                          ("mapping", self._mapping_loop),
-                                          ("control", self._control_loop),
-                                          ("scale", self._scale_loop))]
+                         for name, fn in loops]
         for t in self._threads:
             t.start()
         return self.status()
@@ -1340,6 +1362,26 @@ class OnlineNavigator:
                                 # 视差范围随 fx 缩放：换采集宽度（fx 202.5→405→810）时不缩
                                 # 会把近场裁掉；默认 720 下仍是 64，行为逐位不变。
                                 matcher = make_sgbm(disparity_range_px(sensors.fx))
+                            if c.decoupled:
+                                # 只交接，不在这里算视差（见 _stereo_worker_loop）。
+                                # 关键帧判定也在这里做：它按 tick 算位移/转角/时长，
+                                # 必须在位姿线程的时钟上。切点一并算好递过去。
+                                yaw = math.atan2(T[1, 0], T[0, 0])
+                                (t_a, y_a), (t_b, y_b) = yaw_hist[0], yaw_hist[-1]
+                                rate = math.degrees(y_b - y_a) / (t_b - t_a) if t_b > t_a else 0.0
+                                kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
+                                self._stereo_seq += 1
+                                job = (self._stereo_seq, tick, pair[0], pair[1],
+                                       cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY) if rgb is not None else None,
+                                       rgb, r_ob, sensors.fx, sensors.cx, sensors.cy,
+                                       sensors.baseline_m, kf_kind, T.copy(), self.dr.dist_m)
+                                try:
+                                    self._stereo_q.put_nowait(job)
+                                except queue.Full:
+                                    pass          # 丢最新：位姿线程绝不因为双目排队变慢
+                                self._rate_stereo.mark(tick)
+                                self._stop.wait(max(0.0, period - (self._clock() - tick)))
+                                continue
                             disp = stereo_disparity(pair[0], pair[1], matcher)
                             # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
                             pts = stereo_points(pair[0], pair[1], fx=sensors.fx, cx=sensors.cx, cy=sensors.cy,
@@ -1362,27 +1404,16 @@ class OnlineNavigator:
                                 feat = extract_features(pair[0], disp, fx=sensors.fx, cx=sensors.cx,
                                                         cy=sensors.cy, baseline_m=sensors.baseline_m,
                                                         orb=orb, max_depth_m=c.loop.max_depth_m)
+                            near_state = (near, n, tick, (time.perf_counter() - t0) * 1000.0)
                             self._rate_stereo.mark(tick)
                             with self._state_lock:
                                 self._near, self._near_pts = near, n
                                 self._stereo_at = tick
-                                self._stereo_ms = (time.perf_counter() - t0) * 1000.0
-                                if new_kf:
-                                    kf_id += 1
-                                    thumb = None
-                                    if mem is not None:
-                                        src = left_rgb if left_rgb is not None else pair[0]
-                                        thumb = make_thumbnail(src, mem.cfg.thumb_width)
-                                    # 存档原图要与**采集端同样的颜色空间**：rgb 有就存 RGB，
-                                    # 没有（只给了灰度）就退回灰度。reason见下面 SessionRecorder.keyframe。
-                                    imgs = None
-                                    if self.recorder is not None and self.recorder.images:
-                                        imgs = ((rgb[0].copy(), rgb[1].copy()) if rgb is not None
-                                                else (pair[0].copy(), pair[1].copy()))
-                                    self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
-                                                                 kf_kind == "refresh", thumb, imgs)))
+                                self._stereo_ms = near_state[3]
                             if new_kf:
-                                self._map_event.set()
+                                self._commit_keyframe(kf_id, pts, T, feat, tick, kf_kind,
+                                                      mem, left_rgb, rgb, pair)
+                                kf_id += 1
                 self._stop.wait(max(0.0, period - (self._clock() - tick)))
         except OSError as exc:  # noqa: BLE001 - 原生层崩（SteamVR 被关掉/退出）走这里
             # 本地 VR 上下文已失效，本场不可能自愈：把话说到"该怎么办"，并保留原始错误文本。
@@ -1394,6 +1425,79 @@ class OnlineNavigator:
                 sensors.close()
             except Exception as exc:  # noqa: BLE001
                 self._fail("sensors_close", exc)
+
+    def _commit_keyframe(self, kf_id: int, pts: Any, T: np.ndarray, feat: Any, tick: float,
+                         kf_kind: str, mem: Any, left_rgb: Any, rgb: Any, pair: Any) -> None:
+        """关键帧入队。内联与解耦两条路径共用，保证行为逐位相同。"""
+        with self._state_lock:
+            thumb = None
+            if mem is not None:
+                src = left_rgb if left_rgb is not None else pair[0]
+                thumb = make_thumbnail(src, mem.cfg.thumb_width)
+            imgs = None
+            if self.recorder is not None and self.recorder.images:
+                imgs = ((rgb[0].copy(), rgb[1].copy()) if rgb is not None
+                        else (pair[0].copy(), pair[1].copy()))
+            self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
+                                         kf_kind == "refresh", thumb, imgs)))
+        self._map_event.set()
+
+    # ---- 双目解耦线程 ----
+    def _stereo_worker_loop(self) -> None:
+        """独立线程：视差 → 点云 → 近距判定 → 关键帧。
+
+        **只做重活，不碰采集**：采集留在感知线程，因为 D3D11 立即上下文
+        不是线程安全的（见 OpenVRSensors 文档串）。这里拿到的都是已复制好的 numpy 数组。
+
+        关键帧判定（KeyframePolicy）仍在感知线程做 —— 它按 tick 算位移/转角/时长，
+        必须在位姿镜的时钟上；这里只消费已经算好的 kf_kind。
+        """
+        c = self.cfg
+        s = c.world_scale
+        matcher = None
+        orb = None
+        while not self._stop.is_set():
+            try:
+                job = self._stereo_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            (seq, tick, left, right, left_gray, rgb, r_ob,
+             fx, cx, cy, baseline_m, kf_kind, T, dist_m) = job
+            t0 = time.perf_counter()
+            try:
+                if matcher is None:
+                    matcher = make_sgbm(disparity_range_px(fx))
+                disp = stereo_disparity(left, right, matcher)
+                pts = stereo_points(left, right, fx=fx, cx=cx, cy=cy, baseline_m=baseline_m,
+                                    disp=disp, max_range_m=c.mapper.range_m)
+                near, n = near_obstacle(
+                    pts, r_ob, cam_h=self._cam_h, scale=s, ahead_m=c.stop_ahead_m,
+                    half_width_m=c.radius_m, ground_tol_m=c.mapper.ground_tol_m,
+                    top_m=c.mapper.obst_top_m, min_pts=c.stop_min_pts)
+                with self._state_lock:
+                    self._near, self._near_pts = near, n
+                    self._stereo_at = tick
+                    self._stereo_ms = (time.perf_counter() - t0) * 1000.0
+                if kf_kind is None:
+                    continue
+                feat = None
+                if self.loops is not None or self._mem is not None:
+                    if orb is None:
+                        orb = cv2.ORB_create(nfeatures=c.loop.orb_features)
+                    feat = extract_features(left, disp, fx=fx, cx=cx, cy=cy,
+                                            baseline_m=baseline_m, orb=orb,
+                                            max_depth_m=c.loop.max_depth_m)
+                with self._state_lock:
+                    kid = self._kf_next_id
+                    self._kf_next_id += 1
+                self._commit_keyframe(kid, pts, T, feat, tick, kf_kind, self._mem,
+                                      rgb[0] if rgb is not None else None, rgb, (left, right))
+            except Exception as exc:  # noqa: BLE001 - 单帧失败不能带走整个线程
+                self._fail("stereo", exc)
+            finally:
+                rest = c.stereo_min_period_s - (time.perf_counter() - t0)
+                if rest > 0:
+                    self._stop.wait(rest)
 
     # ---- 建图线程 ----
     def _mapping_loop(self) -> None:
