@@ -49,10 +49,10 @@ SKIP_PREFIX = ("boost-", "glew-")
 # A 类里**已登记、已知、待用户裁决**的项目。命中的不再计入失败，但会在报告里显式列出。
 # 登记理由必须写在注释里 —— 不要用它来"让检查变绿"。
 KNOWN_MD_ISSUES = {
-    # 第 3 行只有 3 个 `**`（奇数），导致全文件 167 个 `**` 失衡。
-    # 两种改法都说得通（只强调"永远" / 加粗整个分句），按仓库"不猜"惯例留给作者定。
-    # 见 Docs/文档勘误与过时清单（2026-09-29）.md §7.8
-    "Docs/archive/丢跟踪根因-图优化撕碎地图几何（2026-09-23）.md": "bold_parity: 待作者选改法（勘误 §7.8）",
+    # 2026-10-24：原唯一登记项 `Docs/archive/丢跟踪根因-图优化撕碎地图几何…md` 已修复，
+    # 故本表现为空。改法取勘误 §7.8 的 (a)（只强调"永远"），与该文 L4 的平行句风格一致。
+    # ⚠️ 本表是「待裁决豁免」，不是「历史豁免」—— 修好了就必须从表里删掉，
+    # 否则门禁会把已修的问题继续当豁免，等于把绿变成假绿。
 }
 
 
@@ -392,21 +392,51 @@ def check_index_coverage() -> list[str]:
     ⚠️ **这就是 README §五 规矩 8 自己写了、但一直没实现的那道门。**
     2026-09-30 → 10-04 新增 11 份文档、一份都没进索引，而门禁一条告警都没触发 ——
     因为旧门禁只查 markdown 结构，**语义陈旧完全不在检查范围**。
+
+    🔴 **2026-10-24 二次修复：本门自己失效过一轮，别再退回去。**
+    旧实现扫**全文**的「首列是文档名」表格行，于是 §二 权威矩阵里
+    「主题列误写成文件名」的那几行（README.md:99-102）也被当成 §三 登记项 ——
+    结果是 建图刷新率… / 深度扰动… / 跨帧可重复性… 三份 2026-10-18 文档
+    **从未进 §三，本门却报"一致"**（现役 49 份 vs 登记 46 份）。
+    ⇒ **登记项必须只在 §三 的两个小节里取**，不能全文扫。
     """
     readme = REPO / "Docs" / "README.md"
     if not readme.exists():
         return []
-    text = readme.read_text(encoding="utf-8", errors="replace")
-    registered = set(re.findall(r"^\| `(?:archive/)?([^`]+\.md)` \|", text, re.M))
+    lines = readme.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    def _names(block):
+        """只在给定小节里取「首列是文档名」的表格行。"""
+        out = set()
+        for s in block:
+            m = re.match(r"^\|\s*`(?:archive/)?([^`]+\.md)`\s*\|", s)
+            if m:
+                out.add(m.group(1))
+        return out
+
+    def _section(start_pat):
+        """取 ### 3.x 到下一个 ###/## 标题之间的行。"""
+        i0 = next((i for i, s in enumerate(lines) if start_pat in s), None)
+        if i0 is None:
+            return []
+        for i in range(i0 + 1, len(lines)):
+            if lines[i].startswith("### ") or lines[i].startswith("## "):
+                return lines[i0:i]
+        return lines[i0:]
+
+    registered = _names(_section("### 3.1"))
+    registered_arch = _names(_section("### 3.2"))
 
     actual = {p.name for p in (REPO / "Docs").glob("*.md")}
-    actual |= {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
+    actual_arch = {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
     actual.discard("README.md")  # 索引自身不必登记
+    actual_arch.discard("README.md")
 
     missing = sorted(actual - registered)
-    return [f"文档未登记进 README §三 索引: Docs/{n}" for n in missing]
-
-
+    missing_arch = sorted(actual_arch - registered_arch)
+    return [f"文档未登记进 README §三 索引: Docs/{n}" for n in missing] + [
+        f"文档未登记进 README §三 索引: Docs/archive/{n}" for n in missing_arch
+    ]
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__ or "")
     ap.add_argument("--refs", action="store_true", help="额外跑引用存在性检查（软报告）")
