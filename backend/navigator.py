@@ -401,7 +401,9 @@ class LocalNavigator:
         direction_memory: "DirectionMemory | None" = None,
         turn_retarget_supported: bool = False,
         config: NavigatorConfig | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        # perf_counter：与 nav_online / osc 统一（2026-10-24）。service.py 里读
+        # occurred_at_monotonic 的那处也改成吃 self._clock，两边必须同域。
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.config = config or NavigatorConfig()
         self._world_provider = world_provider

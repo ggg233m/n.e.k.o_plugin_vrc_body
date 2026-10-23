@@ -1,6 +1,6 @@
 import pytest
 
-from backend.time_alignment import TimeAlignmentBuffer
+from backend.time_alignment import CLOCK_DOMAIN, TimeAlignmentBuffer
 
 
 def test_motion_interpolates_to_wgc_timestamp():
@@ -16,7 +16,7 @@ def test_motion_interpolates_to_wgc_timestamp():
     # rel=1e-9 比 float64 舍入误差（~1e-16）宽 7 个数量级，仍能捕捉真正的插值错误。
     assert result["velocity_x"] == pytest.approx(0.5, rel=1e-9)
     assert result["velocity_z"] == pytest.approx(1.0, rel=1e-9)
-    assert result["clock_domain"] == "monotonic"
+    assert result["clock_domain"] == CLOCK_DOMAIN
 
 
 def test_stale_and_gap_are_not_fabricated_as_zero():

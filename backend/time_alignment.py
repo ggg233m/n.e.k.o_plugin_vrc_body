@@ -1,7 +1,13 @@
 """把 OSC 速度样本对齐到 WGC 视觉帧时刻。
 
-WGC 的 ``captured_at`` 和 OSC 接收时间都必须来自 ``time.monotonic()`` 同一时钟域。缺样本、跨越过大的间隔或旧样本不会被
-补成零速度；调用方得到 ``available=false`` 后应保持安全暂停。
+WGC 的 ``captured_at`` 和 OSC 接收时间必须来自同一时钟域。缺样本、跨越过大的间隔或旧样本
+不会被补成零速度；调用方得到 ``available=false`` 后应保持安全暂停。
+
+**时钟域（2026-10-24 统一）**：全链路用 ``time.perf_counter``。原因是 Windows 上
+``time.monotonic`` 是 ``GetTickCount64()``，读数台阶 15.625 ms；OSC 接收时刻是航位推算的
+积分锚点，16 ms 的台阶会直接变成 ±16 ms 的 dt 误差。两侧（``osc.py`` 的接收时间戳与
+``vision.py`` 的 ``captured_at``）在**同一次提交**里一起换，禁止只换一端。
+``CLOCK_DOMAIN`` 是外显给 ``status()`` 的域名，改时钟必须同步改它。
 """
 from __future__ import annotations
 
@@ -9,6 +15,9 @@ from collections import deque
 import math
 import threading
 from typing import Any
+
+#: 本模块消费的时间戳来自哪个时钟。改时钟必须改这里，否则 status() 会撒谎。
+CLOCK_DOMAIN = "perf_counter"
 
 
 class TimeAlignmentBuffer:
@@ -105,15 +114,15 @@ class TimeAlignmentBuffer:
             result["value_age_ms"] = round(float(result.get("sample_age_s", 0.0)) * 1000.0, 1)
             result["horizontal_speed_mps"] = math.hypot(result["velocity_x"], result["velocity_z"])
             result["time_aligned"] = True
-            result["clock_domain"] = "monotonic"
+            result["clock_domain"] = CLOCK_DOMAIN
         else:
-            result.update({"time_aligned": False, "clock_domain": "monotonic"})
+            result.update({"time_aligned": False, "clock_domain": CLOCK_DOMAIN})
         return result
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "clock_domain": "monotonic",
+                "clock_domain": CLOCK_DOMAIN,
                 "motion_samples": len(self._motions),
                 "max_age_s": self.max_age_s,
                 "max_gap_s": self.max_gap_s,

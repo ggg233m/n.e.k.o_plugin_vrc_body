@@ -25,6 +25,13 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .config import DriverLogConfig
 
+#: 本模块 *_monotonic 字段实际来自哪个时钟。
+#: 故意保留 time.monotonic，与 backend/nav_online 等不同域。VideoTimebase 的 anchor
+#: 要与驱动自报的 monotonic_ms（相对录制起点的毫秒）一起用；改成 perf_counter 会让
+#: frame_index 变成大负数（实测 research/tests/test_route_v2 6 条失败）。
+#: 这个域的边界由 to_record 外显，读取方据此判断可比性。
+CLOCK_DOMAIN = "monotonic"
+
 MAX_DRIVER_LOG_PACKET_BYTES = 65507
 DRIVER_LOG_PROTOCOL_VERSION = 1
 # 动作时间轴记录格式版本。与 DRIVER_LOG_PROTOCOL_VERSION 分开：时间轴是我们
@@ -596,6 +603,8 @@ class VideoTimebase:
         self._fps = float(fps)
         self._clock = clock
         self._anchor: float | None = None
+        # 这段记录用哪个时钟打的锚点（from_record 会覆盖成记录里的值）
+        self.recorded_domain: str = CLOCK_DOMAIN
 
     @property
     def fps(self) -> float:
@@ -624,7 +633,11 @@ class VideoTimebase:
         return int(round((float(monotonic_time) - self._require_anchor()) * self._fps))
 
     def to_record(self) -> dict[str, Any]:
-        return {"fps": self._fps, "anchor_monotonic": self._anchor}
+        # clock_domain 必须随记录落盘：anchor_monotonic 是跨进程/跨会话的绝对读数，
+        # 只有知道它来自哪个时钟，读的一方才能判断能否与自己现在的时刻相减。
+        # 2026-10-24 之前没有该字段；历史记录按 "monotonic" 读（那时确实是它）。
+        return {"fps": self._fps, "anchor_monotonic": self._anchor,
+                "clock_domain": CLOCK_DOMAIN}
 
     @classmethod
     def from_record(cls, record: dict[str, Any], *,
@@ -633,6 +646,8 @@ class VideoTimebase:
         tb = cls(float(record["fps"]), clock=clock)
         anchor = record.get("anchor_monotonic")
         tb._anchor = None if anchor is None else float(anchor)
+        # 记录自己是哪个时钟打的锚点。旧记录没有该字段 ⇒ "monotonic"。
+        tb.recorded_domain = str(record.get("clock_domain") or "monotonic")
         return tb
 
 

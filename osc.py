@@ -318,7 +318,10 @@ class VrchatOscBridge:
         config: VrchatOscConfig,
         *,
         logger: Any = None,
-        clock: Callable[[], float] = time.monotonic,
+        # perf_counter：OSC 接收时刻是 nav 航位推算的积分锚点，必须与 nav_online 同域。
+        # time.monotonic 在 Windows 上是 GetTickCount64()，读数台阶 15.6 ms；nav 侧已改
+        # perf_counter（2026-10-24），两边不同域会让 DeadReckoner 的 dt 出现 ±16 ms 偏移。
+        clock: Callable[[], float] = time.perf_counter,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config

@@ -674,6 +674,8 @@ class BackendService:
             # provider 在 worker 真正启动后才调用，此时 scheduler/OSC 已完成初始化。
             motion_provider=self._vision_motion_feedback,
             turning_provider=self._navigator_turn_state,
+            # 显式传，不依赖默认值：captured_at 要与 OSC 样本时间戳相减，必须同域。
+            clock=self.vision._clock,
         )
 
     def _build_configured_vision_source(self) -> FrameSource | None:
@@ -1761,7 +1763,12 @@ class BackendService:
             behavior = navigation.get("behavior") if isinstance(navigation.get("behavior"), Mapping) else {}
             outcome = behavior.get("last_outcome") if isinstance(behavior.get("last_outcome"), Mapping) else {}
             try:
-                outcome_age_s = time.monotonic() - float(outcome.get("occurred_at_monotonic"))
+                # 必须用 navigator 自己的时钟：这行原来是硬编码 time.monotonic()，跨域相减
+                # 会得到负 age，被下面的 0.0 <= age 守卫静默拒绝，快路径永远走不到。
+                # 必须用 navigator 自己的时钟。原先硬编码 time.monotonic()，跨域相减得负数，
+                # 被下面的 0.0 <= age 守卫静默拒绝，快路径永远走不到。
+                # 不设 getattr 兜底：兜底值恰好是错的域，宁可 AttributeError 炸出来。
+                outcome_age_s = self.navigator._clock() - float(outcome.get("occurred_at_monotonic"))
             except (TypeError, ValueError, OverflowError):
                 outcome_age_s = math.inf
             if (

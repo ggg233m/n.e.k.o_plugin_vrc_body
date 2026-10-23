@@ -2370,7 +2370,11 @@ class VisionWorker:
         ground_extent: "GroundExtentEstimator | None" = None,
         motion_provider: Callable[..., Mapping[str, Any]] | None = None,
         turning_provider: Callable[[], Mapping[str, Any]] | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        # perf_counter：captured_at 要和 osc.py 的接收时间戳相减（time_alignment.sample_motion）。
+        # 2026-10-24 osc/nav 两侧已统一到 perf_counter；这里若留 monotonic，两域相差 23-37 ms，
+        # 每个 captured_at 都会落在样本窗口中间 ⇒ 从 held 变成 interp，且 CLOCK_DOMAIN 会撒谎。
+        # 该默认值同时喂给 OpticalFlowTraversability / GroundExtentEstimator（下面两行）。
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.runtime = runtime
         self.source = source

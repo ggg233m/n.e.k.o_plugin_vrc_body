@@ -42,6 +42,11 @@ from typing import Any, Callable, Sequence
 import cv2
 import numpy as np
 
+# 共享节拍器。为什么需要：Windows 上 threading.Event.wait 被量化到 15.625 ms 的
+# 系统时钟节拍，请求 49.7 ms 实测 62.26 ms；time.monotonic 本身也是 GetTickCount64()，
+# 读数台阶 16.000 ms。两者叠加让 pose_hz=20 的循环实测只有 16.1 Hz（gap p50 62 ms）。
+# Pacer 用绝对截止点 + time.sleep（高精度 waitable timer，不受 tick 影响）+ 1.5 ms
+# 自旋收尾，实测 |err|p99 = 0.014 ms、spin_frac 2.32%。详见 backend/pacing.py。
 from .nav_grid import FREE, OCC, UNK
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
@@ -49,6 +54,7 @@ from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
 from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, align_world_tree
 from .nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
                           make_sgbm, stereo_disparity, stereo_points)
+from .pacing import Gate, Pacer, sleep_until
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -818,7 +824,7 @@ class OnlineNavigator:
                  send_move: Callable[[float, int], Any], send_turn: Callable[[float], Any],
                  stop_motion: Callable[[], Any], drive_block_reason: Callable[[], str | None],
                  sensors_factory: Callable[[], Any] | None = None,
-                 cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.monotonic,
+                 cfg: OnlineNavConfig | None = None, clock: Callable[[], float] = time.perf_counter,
                  record_root: Path | None = None, memory: NavMemoryStore | None = None,
                  world_identity: Callable[[], dict[str, Any]] | None = None,
                  vertical_history: Callable[[], Sequence[dict[str, Any]]] | None = None,
@@ -903,6 +909,9 @@ class OnlineNavigator:
         self._map_updates = 0
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
+        # 节拍器的实测遥测：声明值旁边必须并排给实测值（见 RateMeter 的教训）。
+        # pose / control / stereo / trail 各一份，None 表示那一路还没起过。
+        self._pacer_telemetry: dict[str, Any] = {}
         # 实测频率（与配置值并排报，见 RateMeter）。`_rate_pose` 记的是感知循环的
         # **节拍**，它是另外两个的上游：双目门被量化在它上面，关键帧又只能跟着双目走。
         self._rate_pose = RateMeter(int(self.cfg.pose_hz * 4))
@@ -1237,7 +1246,9 @@ class OnlineNavigator:
     def _est(self) -> dict[str, Any]:
         with self._state_lock:
             T, at, off = self._pose, self._pose_at, self._offset
-        if T is None or at is None or self._clock() - at > self.cfg.pose_stale_s:
+        # max(0.0, ...)：跨时钟域相减会得到负数，旧写法 "负数 > 0.5" 恒为假 ⇒
+        # 位姿过期永不触发、控制线程带着失效位姿继续驱动。负 age 一律按 0 处理（= 最新）。
+        if T is None or at is None or max(0.0, self._clock() - at) > self.cfg.pose_stale_s:
             return {"state": "unknown", "reason": "pose_stale"}
         s = self.cfg.world_scale
         x, y = T[0, 3] + off[0], T[1, 3] + off[1]
@@ -1283,14 +1294,33 @@ class OnlineNavigator:
         kf_id = -1
         policy = self._kf_policy = KeyframePolicy(c)
         yaw_hist: list[tuple[float, float]] = []    # 近 ~0.25 s 的 (时刻, 展开 yaw)，算转速
-        next_stereo = next_trail = self._clock()
+        # 节拍器：绝对截止点，tick 取自 Tick.actual（perf_counter 域，与 self._clock 同域）。
+        # 为什么不用 while + Event.wait：那会回到 62 ms（Event.wait 向上取整到 15.625 ms tick）。
+        pacer = Pacer(hz=c.pose_hz, clock=self._clock, stop=self._stop, name="pose")
+        pacer.reset()
+        # 双目门：绝对累加。相对累加（tick + period）在以实际 tick 为锚时，49.9 ms 的
+        # 周期会把 0.1 s 向上取整成 3 个 tick = 6.73 Hz；绝对累加与 tick 无关，实测恒定 10.0 Hz。
+        gate = Gate(period_s=c.stereo_period_s)
+        gate.reset(self._clock())
+        # trail 门同理：相对累加在 tick 与网格不同步时整拍取整，实测 798/800 个间隔
+        # 是 0.25 s 而不是 0.2 s（4 Hz vs 5 Hz，与双目门同样的 20% 误差）。
+        trail_gate = Gate(period_s=c.trail_period_s)
+        trail_gate.reset(self._clock())
         period = 1.0 / c.pose_hz
         prev_yaw: float | None = None
         prev_tick = -math.inf
         try:
-            while not self._stop.is_set():
-                tick = self._clock()
+            for _tk in pacer.ticks():
+                if _tk.stopped:
+                    break
+                tick = _tk.actual
                 self._rate_pose.mark(tick)
+                # 每 20 拍刷新一次遥测：status() 要在运行中就能读到，不能只在退出时写。
+                if _tk.index % 20 == 0:
+                    with self._state_lock:
+                        self._pacer_telemetry["pose"] = pacer.telemetry()
+                        self._pacer_telemetry["stereo_gate"] = gate.telemetry()
+                        self._pacer_telemetry["trail_gate"] = trail_gate.telemetry()
                 r = sensors.hmd_rotation()
                 if r is not None:
                     r_ob = hmd_to_base_rotation(r)
@@ -1337,12 +1367,10 @@ class OnlineNavigator:
                     prev_yaw, prev_tick = yaw_now, tick
                     with self._state_lock:
                         self._pose, self._pose_at = T, tick
-                    if kf_id >= 0 and tick >= next_trail:
-                        next_trail = tick + c.trail_period_s
+                    if kf_id >= 0 and trail_gate.due(tick):
                         with self._state_lock:
                             self._pending.append(("trail", (kf_id, T.copy(), self.dr.dist_m, tick)))
-                    if tick >= next_stereo:
-                        next_stereo = tick + c.stereo_period_s
+                    if gate.due(tick):
                         t0 = time.perf_counter()
                         left_rgb = None
                         # ⚠️ `rgb` 必须每轮先置 None 再赋：下面存档原图要读它，
@@ -1380,7 +1408,6 @@ class OnlineNavigator:
                                 except queue.Full:
                                     pass          # 丢最新：位姿线程绝不因为双目排队变慢
                                 self._rate_stereo.mark(tick)
-                                self._stop.wait(max(0.0, period - (self._clock() - tick)))
                                 continue
                             disp = stereo_disparity(pair[0], pair[1], matcher)
                             # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
@@ -1414,13 +1441,16 @@ class OnlineNavigator:
                                 self._commit_keyframe(kf_id, pts, T, feat, tick, kf_kind,
                                                       mem, left_rgb, rgb, pair)
                                 kf_id += 1
-                self._stop.wait(max(0.0, period - (self._clock() - tick)))
         except OSError as exc:  # noqa: BLE001 - 原生层崩（SteamVR 被关掉/退出）走这里
             # 本地 VR 上下文已失效，本场不可能自愈：把话说到"该怎么办"，并保留原始错误文本。
             self._fail("perception", RuntimeError(_steamvr_failed(exc)))
         except Exception as exc:  # noqa: BLE001 - 线程死了控制线程会因位姿过期而停车
             self._fail("perception", exc)
         finally:
+            with self._state_lock:
+                self._pacer_telemetry["pose"] = pacer.telemetry()
+                self._pacer_telemetry["stereo_gate"] = gate.telemetry()
+                self._pacer_telemetry["trail_gate"] = trail_gate.telemetry()
             try:
                 sensors.close()
             except Exception as exc:  # noqa: BLE001
@@ -1495,9 +1525,11 @@ class OnlineNavigator:
             except Exception as exc:  # noqa: BLE001 - 单帧失败不能带走整个线程
                 self._fail("stereo", exc)
             finally:
-                rest = c.stereo_min_period_s - (time.perf_counter() - t0)
-                if rest > 0:
-                    self._stop.wait(rest)
+                # 这个 worker 的两端本来就用 perf_counter；旧写法 Event.wait(20 ms) 实测 30.95 ms
+                # （向上取整到 2 个 15.625 ms tick）。sleep_until 不受 tick 影响。
+                deadline = t0 + c.stereo_min_period_s
+                if deadline > time.perf_counter():
+                    sleep_until(deadline, clock=time.perf_counter, stop=self._stop, spin_s=0.0)
 
     # ---- 建图线程 ----
     def _mapping_loop(self) -> None:
@@ -1628,14 +1660,25 @@ class OnlineNavigator:
     def _control_loop(self) -> None:
         c = self.cfg
         period = 1.0 / c.control_hz
-        while not self._stop.is_set():
-            tick = self._clock()
+        # 与感知循环同一个道理：Event.wait 被 15.625 ms tick 量化，100 ms 的周期实测 109 ms
+        # （9.17 Hz）。Pacer 绝对截止点 + sleep，实测 10.00 Hz。
+        # spin_s=0：控制环只要不晚于 100 ms 就够，纯 sleep 的 p99 是 0.79 ms，远超需求。
+        # 为什么刻意关掉自旋：两个循环同时自旋时（switchinterval=5 ms），位姿的
+        # late_p99 会从 0.02 ms 涨到 4.16 ms（双峰，最差 8.10 ms）—— 另一个线程的
+        # 自旋抢 GIL。控制环不值得为 0.79 ms 的精度付这个代价。
+        pacer = Pacer(hz=c.control_hz, clock=self._clock, stop=self._stop, name="control", spin_s=0.0)
+        pacer.reset()
+        for _tk in pacer.ticks():
+            if _tk.stopped:
+                break
+            tick = _tk.actual
             try:
                 self._control_tick(tick)
             except Exception as exc:  # noqa: BLE001 - 控制出错先停车
                 self._fail("control", exc)
                 self._halt()
-            self._stop.wait(max(0.0, period - (self._clock() - tick)))
+        with self._state_lock:
+            self._pacer_telemetry["control"] = pacer.telemetry()
         self._halt()
 
     def _control_tick(self, tick: float) -> None:
@@ -1652,7 +1695,7 @@ class OnlineNavigator:
             stereo_at, near = self._stereo_at, self._near
         if block is None and est.get("state") != "localized":
             block = est.get("reason", "pose_stale")
-        if block is None and (stereo_at is None or tick - stereo_at > c.stereo_stale_s):
+        if block is None and (stereo_at is None or max(0.0, tick - stereo_at) > c.stereo_stale_s):
             # 双目断了就没有近距急停，不能盲走。
             block = "stereo_stale"
         self._drive_block = block
@@ -1711,7 +1754,12 @@ class OnlineNavigator:
         * 明显非整数 ⇒ 才真的是 SGBM 算不过来。
 
         2026-10-18 实测 223033：pose 15.87 Hz（目标 20）、stereo 7.94 Hz（目标 10）、
-        `stereo_ticks = 2.00`，关键帧全程平均 1.86 Hz。
+        `stereo_ticks = 2.00`，关键帧全程平均 1.86 Hz。**该症状已于 2026-10-24 根治**：
+        根因是 Windows 定时器 —— `Event.wait` 被量化到 15.625 ms tick、`time.monotonic`
+        本身就是 `GetTickCount64()`（读数台阶 16 ms），叠加后 50 ms 的周期实测 62 ms。
+        改用 `backend/pacing.py` 的 Pacer（perf_counter + sleep + 自旋）与 Gate（绝对累加）后，
+        真机 SteamVR 实测 pose 20.00 Hz / stereo 10.00 Hz。⇒ **`stereo_ticks` 若再出现
+        非整数且远低于 target，先看 `pacer` 里的 `late_p99_ms` / `skipped_total`。**
         """
         pose_gap = self._rate_pose.gap_p50_s()
         stereo_gap = self._rate_stereo.gap_p50_s()
@@ -1724,6 +1772,10 @@ class OnlineNavigator:
             "stereo_gap_p50_s": _rnd(stereo_gap, 4),
             "stereo_ticks": (_rnd(stereo_gap / pose_gap, 2)
                              if pose_gap and stereo_gap else None),
+            # 节拍器自报的实测（perf_counter 域，不受 15.6 ms 量化污染）：
+            # late_p99_ms = 抖动、skipped_total = 掉拍、spin_frac = 真正自旋的比例。
+            # 这三个是「声明 vs 实测」里实测的那一半，别只信上面 RateMeter 的 hz。
+            "pacer": dict(self._pacer_telemetry),
             # 关键帧不是周期量（位移/转角/时长三选一触发），所以它没有 target。
             # 它会随走路速度在「卡在 stereo 台阶上」和「原地 3 s 补一帧」之间摆。
             "keyframe_hz": _rnd(self._rate_kf.hz(), 2),

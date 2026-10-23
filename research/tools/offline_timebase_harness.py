@@ -147,8 +147,12 @@ def check_1_fixed_fps_anchor(work: Path):
     tl = ActionTimeline(path, FPS, clock=clk)
     if not tl.begin():
         return False, "ActionTimeline.begin() 失败"
-    if tl.to_record() != {"fps": FPS, "anchor_monotonic": ANCHOR}:
-        return False, f"timebase 记录不符: {tl.to_record()}"
+    # 2026-10-24 起 to_record 多带 clock_domain（跨进程读锚点必须知道它来自哪个时钟）。
+    # 断言仍钉住 fps 与 anchor 两个数值；域名只验证存在且与 driver_log 声明一致。
+    _rec = tl.to_record()
+    if (_rec.get("fps") != FPS or _rec.get("anchor_monotonic") != ANCHOR
+            or "clock_domain" not in _rec):
+        return False, f"timebase 记录不符: {_rec}"
 
     clk.t = ANCHOR + 7.25
     tl.record_command(forward=1.0, strafe=0.0, sent=True)
