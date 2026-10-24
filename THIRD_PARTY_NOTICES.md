@@ -14,3 +14,9 @@
 
 该模型由 [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) 8.0.20 训练导出（见 `person_detect_v1.3_s_model_artifacts.json`）。Ultralytics 以 AGPL-3.0 发布，并主张用其训练的模型同样受 AGPL-3.0 约束；这一主张与上游模型卡的 MIT 声明之间的关系未经确认。本插件只通过 ONNX Runtime / OpenVINO 推理该 ONNX 文件，不包含也不调用 Ultralytics 代码。
 
+## LiteAnyStereo
+
+`backend/las2_model.py` 携带 LiteAnyStereo v2 Medium（LAS2-M）的网络结构，用于可选的学习型双目视差后端（`backend/stereo_backend.py`，配置 `navmesh.stereo_backend = "las2"`）。代码取自 GitHub 仓库 [TomTomTommi/LiteAnyStereo](https://github.com/TomTomTommi/LiteAnyStereo) 提交 8c97bd4 的 `core/liteanystereov2.py` / `aggregation_fasternet.py` / `fnet.py` / `submodule.py`，按 MIT License（Copyright (c) 2025 Junpeng Jing）发布。只保留 M 尺寸的前馈推理路径，模块名与层级逐字保持不变以便 `strict=True` 载入发布权重；训练分支（`kd_mode`、线性上采样）已删除，两眼特征提取改为合批一次前向（eval 下数值等价）。
+
+预训练权重 `las_ckpt/LAS2_M.pth`（同一上游，MIT，SHA-256 `c41b61efce9b36e6b8b38b580421cd20cc9e84a47f0f45361767281938f69696`）**不随发行包分发**（`pyproject.toml` 的 `exclude_dirs`），需另行放到该路径。LAS2 后端运行时依赖 PyTorch（XPU）与 timm（FasterNet-T0 主干，`pretrained=False`，主干权重已在 checkpoint 里，不联网下载），二者都不在发行包依赖内；默认的 SGBM 后端不依赖它们。
+

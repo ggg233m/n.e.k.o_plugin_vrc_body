@@ -20,7 +20,7 @@ from unittest import mock
 import numpy as np
 
 # 同一模块对象：Harness 用的就是它。
-from tests.test_nav_online import Harness, ground_and_wall, nav_online
+from tests.test_nav_online import Harness, _FakeMatcher, ground_and_wall, nav_online
 
 
 class PosePacingRegressionTest(unittest.TestCase):
@@ -34,8 +34,8 @@ class PosePacingRegressionTest(unittest.TestCase):
         if decoupled is not None:
             h.nav.cfg.decoupled = decoupled
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
-                mock.patch.object(nav_online, "stereo_disparity",
-                                  return_value=np.zeros((4, 4), np.float32)):
+                mock.patch.object(nav_online, "make_stereo_backend",
+                                  return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(seconds)

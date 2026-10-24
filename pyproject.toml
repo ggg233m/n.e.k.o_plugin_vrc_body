@@ -31,7 +31,7 @@ dependencies = [
 [tool.neko.build]
 # 安装包保留运行源码、界面和模型，排除开发及本机运行数据。
 # research/ = 离线研究工具、录制器与其测试，运行时代码不得 import 它。
-exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory", "packaging", "research"]
+exclude_dirs = [".trae", ".claude", ".codex_staging", ".tmp", "tmp", "tests", "memory", "packaging", "research", "las_ckpt"]
 exclude_files = [".git", "test_*.py", "backend.settings.json", "world_memory.json", "store.db"]
 
 [tool.pytest.ini_options]

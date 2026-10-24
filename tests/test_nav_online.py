@@ -428,6 +428,16 @@ class NearObstacleTest(unittest.TestCase):
         self.assertFalse(far[0])
 
 
+class _FakeMatcher:
+    """替身视差后端（``make_stereo_backend`` 的返回值）：恒返回 4×4 零视差，不跑 SGBM / LAS2。"""
+
+    def compute(self, left, right):
+        return np.zeros((4, 4), np.float32)
+
+    def describe(self):
+        return {"kind": "fake"}
+
+
 class FakeSensors:
     fx, cx, cy, baseline_m = 202.5, 360.0, 202.5, 0.126
 
@@ -647,7 +657,7 @@ class ThreadsTest(unittest.TestCase):
             time.sleep(1.5)
             return real(self, est, snap)
 
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)),                 mock.patch.object(nav_online.NavSession, "compute", slow):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()),                 mock.patch.object(nav_online.NavSession, "compute", slow):
             h.nav.start()
             try:
                 self.assertTrue(gate.wait(5.0))
@@ -661,7 +671,7 @@ class ThreadsTest(unittest.TestCase):
 
     def test_end_to_end_keyframes_map_and_shutdown(self) -> None:
         h = Harness(armed=False, vz=0.5)
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 deadline = time.monotonic() + 5.0
@@ -719,7 +729,7 @@ class ThreadsTest(unittest.TestCase):
         import cv2
         h = Harness(armed=False)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
-             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+             mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(0.4)
@@ -784,7 +794,7 @@ class ThreadsTest(unittest.TestCase):
         新图层，实际拿到旧图。回落白名单是 HTTP 层（process.py）的事，两者职责不同。"""
         h = Harness(armed=False)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
-             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+             mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(0.3)
@@ -901,7 +911,7 @@ class ThreadsTest(unittest.TestCase):
             h = Harness(armed=False, vz=0.5)
             h.nav.memory = store
             h.nav._world_identity = lambda: {"world_key": "wrld_test", "world_name": "t", "world_source": "manual"}
-            with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
                 h.nav.start()
                 try:
                     self.assertEqual(h.nav.status()["memory"]["status"], "recording")
@@ -1013,7 +1023,7 @@ class ThreadsTest(unittest.TestCase):
             h.nav.memory = NavMemoryStore(Path(tmp), MemoryConfig(min_session_keyframes=1))
             h.nav._world_identity = lambda: {"world_key": "wrld_test", "world_name": "t",
                                              "world_source": "manual"}
-            with mock.patch.object(nav_online, "XSessionTracker", FakeTracker),                     mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+            with mock.patch.object(nav_online, "XSessionTracker", FakeTracker),                     mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                     mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
                 h.nav.start()
                 try:
                     self.assertIsInstance(h.nav._prior, PriorConsumer)
@@ -1031,7 +1041,7 @@ class ThreadsTest(unittest.TestCase):
         h = Harness(armed=False)
         yaw = {"deg": 0.0}
         h.sensors.hmd_rotation = lambda: hmd_yaw(yaw["deg"])
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(0.3)
@@ -1062,7 +1072,7 @@ class ThreadsTest(unittest.TestCase):
     def test_baseline_mismatch_reported_but_keeps_running(self) -> None:
         h = Harness(armed=False)
         h.sensors.baseline_m = 0.063          # 发行版驱动
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(0.2)
@@ -1075,7 +1085,7 @@ class ThreadsTest(unittest.TestCase):
 
     def test_baseline_ok_has_no_error(self) -> None:
         h = Harness(armed=False)
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 time.sleep(0.2)
@@ -1221,7 +1231,7 @@ class RecorderTest(unittest.TestCase):
     def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False,
                     record_images: bool = False, avatar: dict | None = None) -> dict:
         h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc, avatar=avatar)
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start(record=record, record_images=record_images)
             try:
                 deadline = time.monotonic() + 5.0
@@ -1325,8 +1335,8 @@ class RecorderTest(unittest.TestCase):
                 h.sensors.read_stereo_rgb = read_rgb
                 with mock.patch.object(nav_online, "stereo_points",
                                        return_value=ground_and_wall(None)), \
-                     mock.patch.object(nav_online, "stereo_disparity",
-                                       return_value=np.zeros((4, 4), np.float32)):
+                     mock.patch.object(nav_online, "make_stereo_backend",
+                                       return_value=_FakeMatcher()):
                     h.nav.start(record=True, record_images=True)
                     try:
                         deadline = time.monotonic() + 5.0
@@ -1387,7 +1397,7 @@ class CoverageViewTest(unittest.TestCase):
     """覆盖可视化快照：available 语义、指标口径、meta 同构、status()/grid_view() 契约不动。"""
 
     def run_nav(self, h, until, timeout=5.0):
-        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),             mock.patch.object(nav_online, "stereo_disparity", return_value=np.zeros((4, 4), np.float32)):
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),             mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start()
             try:
                 deadline = time.monotonic() + timeout

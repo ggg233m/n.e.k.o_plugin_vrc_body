@@ -243,6 +243,9 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     # 双目采集宽度下限（像素）：720 = 现役（mip2 720×405 / fx 202.5），1440 / 2880 = mip1 / 全分辨率。
     # 深度尺度不随它变；SGBM 视差范围按 fx 自动缩放（nav_mapping.disparity_range_px）。
     "capture_width": (int, 360, 2880),
+    # 双目视差后端，取值见 NAVMESH_CHOICES。"las2" 需 `.venv_las`（torch-xpu + timm）；
+    # 发行包（Py3.11）没有 torch，选了会在会话里报 stereo_backend 错误并退回 sgbm。
+    "stereo_backend": (str, 0, 0),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
     "kf_turn_deg": (float, 1.0, 180.0),
@@ -344,7 +347,12 @@ NAVMESH_PRIOR_KEYS: dict[str, tuple[type, float, float]] = {
     "inject_free": (bool, 0, 1),
 }
 
-NavmeshOverrides = tuple[tuple[str, "float | int | bool"], ...]
+# 字符串型覆盖项的合法取值（spec 里写 ``(str, 0, 0)``，范围位不用）。
+NAVMESH_CHOICES: dict[str, tuple[str, ...]] = {
+    "stereo_backend": ("sgbm", "las2"),
+}
+
+NavmeshOverrides = tuple[tuple[str, "float | int | bool | str"], ...]
 
 
 def _navmesh_overrides(data: Mapping[str, Any], spec: Mapping[str, tuple[type, float, float]], *,
@@ -352,13 +360,19 @@ def _navmesh_overrides(data: Mapping[str, Any], spec: Mapping[str, tuple[type, f
     unknown = sorted(set(data) - set(spec) - nested)
     if unknown:
         raise ValueError(f"{prefix} has unknown keys: {', '.join(unknown)}")
-    out: list[tuple[str, float | int | bool]] = []
+    out: list[tuple[str, float | int | bool | str]] = []
     for key, (kind, lo, hi) in spec.items():
         raw = data.get(key)
         if raw is None:
             continue
         name = f"{prefix}.{key}"
-        if kind is bool:
+        if kind is str:
+            choices = NAVMESH_CHOICES[key]
+            value = str(raw).strip().lower()
+            if value not in choices:
+                raise ValueError(f"{name} must be one of {', '.join(choices)}, got {raw!r}")
+            out.append((key, value))
+        elif kind is bool:
             out.append((key, _boolean(raw, False, name=name)))
         elif kind is int:
             out.append((key, _bounded_int(raw, 0, minimum=int(lo), maximum=int(hi), name=name)))

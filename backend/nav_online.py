@@ -52,9 +52,9 @@ from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
 from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
 from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, align_world_tree
-from .nav_mapping import (KeyframeGridMapper, MapperConfig, NavSession, disparity_range_px,
-                          make_sgbm, stereo_disparity, stereo_points)
+from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, stereo_points
 from .pacing import Gate, Pacer, sleep_until
+from .stereo_backend import make_stereo_backend
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -109,10 +109,12 @@ class OnlineNavConfig:
     #   内联 ⇒ 位姿被压到约 11 Hz；拆开 ⇒ 位姿不再被拖，实测 18.79 → 18.78 Hz（零损失）。
     # ⚠️ 采集（read_stereo）仍留在位姿线程：D3D11 立即上下文不是线程安全的，
     #    OpenVRSensors 的方法只能在感知线程里调（见 OpenVRSensors 文档串）。
-    #   ⚠️ LAS2 在这个位置仍有隐患：torch.compile 的 Dynamo guard 每帧走 Python 调用栈，
-    #   一旦有别的纯 Python 线程抢 GIL 会慢 80×（实测 49 → 4018 ms）。SGBM 只慢 1.6×。
-    #   所以 decoupled=True 当前只在 SGBM 后端上是稳的，见 Docs。
     decoupled: bool = True
+    # 视差后端（backend/stereo_backend.py）："sgbm"（CPU，默认）或 "las2"（LAS2-M，XPU）。
+    # las2 载不起来（发行包没有 torch、没有 XPU、缺权重）⇒ errors 里记 stereo_backend、退回 sgbm。
+    # las2 首帧要编译 70–330 s，期间没有双目 ⇒ 控制按 stereo_stale 停车，不会盲走。
+    # 实测（A770，部署块 p50）：720 档 51 vs SGBM 21 ms；1080 档 58.7 vs 64.6 ms。
+    stereo_backend: str = "sgbm"
     stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程
     # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级 ⇒ 720（默认）
     # = mip2 720×405 / fx 202.5（现役行为）、1440 = mip1 / fx 405、2880 = 全分辨率 / fx 810。
@@ -867,6 +869,9 @@ class OnlineNavigator:
         self._nav_lock = threading.RLock()
         self._stop = threading.Event()
         self._map_event = threading.Event()
+        # 会话代号：start 时 +1。stop 只等线程 2 s，LAS2 首次编译（70–330 s）会超时，
+        # 旧双目线程编完那一帧时可能已经换了会话 ⇒ 它要据此丢掉结果，不能写进新会话的图。
+        self._gen = 0
         self._threads: list[threading.Thread] = []
         self._reset()
 
@@ -916,6 +921,7 @@ class OnlineNavigator:
         self._map_updates = 0
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
+        self._matcher: Any = None
         # 节拍器的实测遥测：声明值旁边必须并排给实测值（见 RateMeter 的教训）。
         # pose / control / stereo / trail 各一份，None 表示那一路还没起过。
         self._pacer_telemetry: dict[str, Any] = {}
@@ -992,6 +998,7 @@ class OnlineNavigator:
                         images=record_images)
                 except (OSError, TypeError) as exc:
                     self._fail("recorder", exc)
+        self._gen += 1
         self._mem_rows = {}
         self._mem_flushed_at = -math.inf
         self._begin_memory()
@@ -1242,6 +1249,33 @@ class OnlineNavigator:
         except Exception as exc:  # noqa: BLE001
             self._fail("memory_end", exc)
 
+    def _make_matcher(self, fx: float) -> Any:
+        """按 ``cfg.stereo_backend`` 建视差后端；LAS2 载不起来就记错误并退回 SGBM。"""
+        kind = self.cfg.stereo_backend
+        try:
+            if kind != "sgbm" and not self.cfg.decoupled:
+                # 内联路径上首帧编译会把位姿线程卡住几分钟。
+                raise RuntimeError(f"stereo_backend={kind!r} requires decoupled=True")
+            m = make_stereo_backend(kind, fx=fx)
+        except Exception as exc:  # noqa: BLE001 - 缺 torch / XPU / 权重：退回 SGBM，不能丢掉双目
+            if kind == "sgbm":
+                raise
+            self._fail("stereo_backend", exc)
+            m = make_stereo_backend("sgbm", fx=fx)
+        self._matcher = m
+        return m
+
+    def _stereo_backend_status(self) -> dict[str, Any]:
+        m = self._matcher
+        out: dict[str, Any] = {"configured": self.cfg.stereo_backend}
+        if m is None:
+            out["active"] = None          # 还没收到第一帧
+        else:
+            d = dict(m.describe())
+            out["active"] = d.pop("kind", None)
+            out.update(d)
+        return out
+
     def _fail(self, where: str, exc: BaseException) -> None:
         with self._state_lock:
             self._errors = (self._errors + [f"{where}: {type(exc).__name__}: {exc}"[:300]])[-5:]
@@ -1414,10 +1448,6 @@ class OnlineNavigator:
                         else:
                             pair = sensors.read_stereo()
                         if pair is not None:
-                            if matcher is None:
-                                # 视差范围随 fx 缩放：换采集宽度（fx 202.5→405→810）时不缩
-                                # 会把近场裁掉；默认 720 下仍是 64，行为逐位不变。
-                                matcher = make_sgbm(disparity_range_px(sensors.fx))
                             if c.decoupled:
                                 # 只交接，不在这里算视差（见 _stereo_worker_loop）。
                                 # 关键帧判定也在这里做：它按 tick 算位移/转角/时长，
@@ -1437,7 +1467,9 @@ class OnlineNavigator:
                                     pass          # 丢最新：位姿线程绝不因为双目排队变慢
                                 self._rate_stereo.mark(tick)
                                 continue
-                            disp = stereo_disparity(pair[0], pair[1], matcher)
+                            if matcher is None:
+                                matcher = self._make_matcher(sensors.fx)
+                            disp = matcher.compute(pair[0], pair[1])
                             # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
                             pts = stereo_points(pair[0], pair[1], fx=sensors.fx, cx=sensors.cx, cy=sensors.cy,
                                                 baseline_m=sensors.baseline_m, disp=disp,
@@ -1518,6 +1550,7 @@ class OnlineNavigator:
         """
         c = self.cfg
         s = c.world_scale
+        gen = self._gen
         matcher = None
         orb = None
         while not self._stop.is_set():
@@ -1530,8 +1563,10 @@ class OnlineNavigator:
             t0 = time.perf_counter()
             try:
                 if matcher is None:
-                    matcher = make_sgbm(disparity_range_px(fx))
-                disp = stereo_disparity(left, right, matcher)
+                    matcher = self._make_matcher(fx)
+                disp = matcher.compute(left, right)
+                if gen != self._gen:
+                    return                        # 编译期间会话已换（见 _gen）：这一帧不属于新会话
                 pts = stereo_points(left, right, fx=fx, cx=cx, cy=cy, baseline_m=baseline_m,
                                     disp=disp, max_range_m=c.mapper.range_m)
                 near, n = near_obstacle(
@@ -1894,6 +1929,7 @@ class OnlineNavigator:
             "map_updates": self._map_updates,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),
+            "stereo_backend": self._stereo_backend_status(),
             "stereo_age_s": None if stereo_at is None else round(now - stereo_at, 2),
             "rates": self._rate_summary(),
             # cam_h 是**追踪米**（双目单位），而 status 的对外契约是导航系世界米（见模块
