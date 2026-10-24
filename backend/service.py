@@ -348,6 +348,8 @@ class BackendService:
                     model=model,
                     api_key=api_key,
                     max_per_minute=self.config.vision.semantic_max_per_minute,
+                    # 显式传：限流窗口与 status().last_call_age_ms 必须和 VisionRuntime 同域。
+                    clock=time.perf_counter,
                 )
         self.clip_library = ClipLibrary(self.config_dir / self.config.clip_directory, self.config)
         # W1 世界身份子系统。身份会落盘（`<state_dir>/world_identity.json`）：重启后自动沿用

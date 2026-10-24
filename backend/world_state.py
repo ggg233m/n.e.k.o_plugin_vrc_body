@@ -522,6 +522,12 @@ class WorldStateStore:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             now = self._clock()
+            # ⚠️ 落盘**不存** observed_at 绝对时刻（那是进程内的 perf_counter 读数，
+            # 跨进程没有意义）：to_dict 只写 age_ms / ttl_ms / visible。于是 from_mapping
+            # 找不到 observed_at 就回退成 now ⇒ 重载后每个实体 age_ms≈0、TTL 满血。
+            # 这是**有意**的设计（世界记忆是「上次看到的形状」，不是「上次看到的时间」），
+            # 但容易被误读成 bug —— 见 Docs/FACTS.md 的口径规矩。
+            # 想恢复真实年龄的话，必须把 observed_at 换成 wall clock 落盘，那是另一个决定。
             for raw in (payload.get("entities") or ())[: self.max_entities]:
                 if not isinstance(raw, Mapping):
                     continue
