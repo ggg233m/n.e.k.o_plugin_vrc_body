@@ -116,10 +116,13 @@ class OnlineNavConfig:
     # 实测（A770，部署块 p50）：720 档 51 vs SGBM 21 ms；1080 档 58.7 vs 64.6 ms。
     stereo_backend: str = "sgbm"
     stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程
-    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级 ⇒ 720（默认）
-    # = mip2 720×405 / fx 202.5（现役行为）、1440 = mip1 / fx 405、2880 = 全分辨率 / fx 810。
-    # 深度尺度不随它变（fx 与视差同比例变）；SGBM 视差范围按 fx 自动缩放（见 make_sgbm 调用点）。
-    capture_width: int = 720
+    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级。
+    # ⚠️ 实际分辨率由镜像纹理决定：镜像 = AnyaDance 驱动 render × 1.5（SteamVR 滑块不改它）。
+    #   驱动 1440×810（现行）⇒ 镜像 2160×1212 ⇒ 1080 = mip1 1080×606 / fx 303.75；
+    #   驱动 1920×1080（旧）⇒ 镜像 2880×1620 ⇒ 1080 拿到 mip1 1440×810 / fx 405、720 = mip2 720×405。
+    # 深度尺度不随它变（fx 与视差同比例变）；SGBM 视差范围按 fx 自动缩放（720/1080/1440 档 nd 64/96/128）。
+    # 1080 档部署块 p50：LAS2 58.7 ms、SGBM 64.6 ms（720 档 51 / 21 ms），都在 10 Hz 预算内。
+    capture_width: int = 1080
     control_hz: float = 10.0
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
     kf_dist_m: float = 0.4           # 世界米；< 条带深度，快走也首尾相接
@@ -860,7 +863,7 @@ class OnlineNavigator:
         self._send_turn = send_turn
         self._stop_motion = stop_motion
         self._drive_block_reason = drive_block_reason
-        # 默认工厂吃 ``cfg.capture_width``（720 = 现役 mip2；1440 / 2880 = 高分辨率录制实验）。
+        # 默认工厂吃 ``cfg.capture_width``（默认 1080；实际分辨率看镜像纹理，见 OnlineNavConfig）。
         # 测试注入的假传感器不受影响。
         self._sensors_factory = sensors_factory or (
             lambda: OpenVRSensors(target_width=self.cfg.capture_width))
