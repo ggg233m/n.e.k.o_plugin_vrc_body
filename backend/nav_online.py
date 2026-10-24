@@ -1326,10 +1326,12 @@ class OnlineNavigator:
         if mem is not None:
             # 基线不对的会话也记，但带实测基线：跨会话重定位只拿同基线的记忆比。
             mem.annotate(sensors=info, baseline_m=round(float(sensors.baseline_m), 4), baseline_check=bl)
-        # 需要彩色的有两处：记忆缩略图（要彩色）与录制存档（要与采集端同颜色空间）。
+        # 需要彩色的有三处：记忆缩略图（要彩色）、录制存档（要与采集端同颜色空间）、
+        # LAS2 后端（RGB 比 gray3 精度高 5.5–9.5% EPE）。
         # `read_stereo_rgb` 与 `read_stereo` 是**同一次采集**（只差一次 cvtColor），成本差可忽略。
         # 曾经这里只看 mem，于是“没有世界记忆”的会话录下的原图**永远只有灰度**，下游无法上色。
-        need_rgb = mem is not None or (self.recorder is not None and self.recorder.images)
+        need_rgb = (mem is not None or (self.recorder is not None and self.recorder.images)
+                    or c.stereo_backend == "las2")
         read_rgb = getattr(sensors, "read_stereo_rgb", None) if need_rgb else None
         if bl["ok"] is False:
             self._fail("baseline_mismatch", RuntimeError(
@@ -1472,7 +1474,11 @@ class OnlineNavigator:
                                 continue
                             if matcher is None:
                                 matcher = self._make_matcher(sensors.fx)
-                            disp = matcher.compute(pair[0], pair[1])
+                            # 内联路径实际只跑 SGBM（_make_matcher 不许 las2 走内联），分支留着防配置漂移。
+                            if rgb is not None and matcher.describe()["kind"] == "las2":
+                                disp = matcher.compute(rgb[0], rgb[1])
+                            else:
+                                disp = matcher.compute(pair[0], pair[1])
                             # 深度上限 = 建图视距：水平半径 ≥ 前向深度，再远的点建图也会丢。
                             pts = stereo_points(pair[0], pair[1], fx=sensors.fx, cx=sensors.cx, cy=sensors.cy,
                                                 baseline_m=sensors.baseline_m, disp=disp,
@@ -1567,7 +1573,11 @@ class OnlineNavigator:
             try:
                 if matcher is None:
                     matcher = self._make_matcher(fx)
-                disp = matcher.compute(left, right)
+                # LAS2 喂 RGB（比 gray3 EPE 低 5.5–9.5%）；传感器没给 RGB 就退回灰度。SGBM 只吃灰度。
+                if rgb is not None and matcher.describe()["kind"] == "las2":
+                    disp = matcher.compute(rgb[0], rgb[1])
+                else:
+                    disp = matcher.compute(left, right)
                 if gen != self._gen:
                     return                        # 编译期间会话已换（见 _gen）：这一帧不属于新会话
                 pts = stereo_points(left, right, fx=fx, cx=cx, cy=cy, baseline_m=baseline_m,

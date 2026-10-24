@@ -431,11 +431,18 @@ class NearObstacleTest(unittest.TestCase):
 class _FakeMatcher:
     """替身视差后端（``make_stereo_backend`` 的返回值）：恒返回 4×4 零视差，不跑 SGBM / LAS2。"""
 
+    def __init__(self, kind: str = "fake") -> None:
+        self.kind = kind
+        self.last_left = None
+        self.last_right = None
+
     def compute(self, left, right):
+        self.last_left = left
+        self.last_right = right
         return np.zeros((4, 4), np.float32)
 
     def describe(self):
-        return {"kind": "fake"}
+        return {"kind": self.kind}
 
 
 class FakeSensors:
@@ -1368,6 +1375,39 @@ class RecorderTest(unittest.TestCase):
                         else:
                             # 灰度路径不能被我这次改动弄坏。
                             self.assertEqual(set(np.unique(raw).tolist()), {0})
+
+    def test_las2_gets_rgb_sgbm_gets_gray(self) -> None:
+        """LAS2 喂真彩（RGB 比 gray3 EPE 低 5.5–9.5%），SGBM 照旧吃灰度。
+
+        回归点：选 las2 但没有记忆、没开录图时，``need_rgb`` 曾经为假 ⇒ 根本不读 RGB。
+        """
+        for kind in ("las2", "sgbm"):
+            with self.subTest(backend=kind):
+                h = Harness(armed=False, vz=0.5)
+                h.nav.cfg.stereo_backend = kind
+
+                def read_rgb():
+                    left = np.zeros((4, 4, 3), np.uint8)
+                    left[..., 0], left[..., 1], left[..., 2] = 7, 11, 13
+                    return left, left + 5
+                h.sensors.read_stereo_rgb = read_rgb
+                spy = _FakeMatcher(kind)
+                with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+                     mock.patch.object(nav_online, "make_stereo_backend", return_value=spy):
+                    h.nav.start()
+                    try:
+                        deadline = time.monotonic() + 5.0
+                        while time.monotonic() < deadline and spy.last_left is None:
+                            time.sleep(0.02)
+                    finally:
+                        h.nav.stop()
+                self.assertIsNotNone(spy.last_left, f"{kind}: 视差后端一帧都没收到")
+                if kind == "las2":
+                    self.assertEqual(spy.last_left.shape, (4, 4, 3))
+                    self.assertEqual(spy.last_left[0, 0].tolist(), [7, 11, 13], "通道序必须是 RGB")
+                    self.assertEqual(spy.last_right[0, 0].tolist(), [12, 16, 18])
+                else:
+                    self.assertEqual(spy.last_left.shape, (4, 4))
 
     def test_record_images_off_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as d:

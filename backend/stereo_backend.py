@@ -96,13 +96,15 @@ def _las2_adapter() -> Any:
 
 
 class _LAS2Adapter:
-    """灰度 → 复制成 3 通道 → replicate pad 到 32 的倍数 → 网络（half）→ 去 pad → float32。
+    """RGB → replicate pad 到 32 的倍数 → 网络（half）→ 去 pad → float32。
 
-    ⚠️ 现在喂的是灰度复制，但 **LAS2 喂真彩更准**（2026-10-25，Middlebury 10 场 eager half，
+    ⚠️ **LAS2 喂 RGB 比 gray3 更准**（2026-10-25，Middlebury 10 场 eager half，
     `.tmp/las2_color_probe.py`）：RGB 比 gray3 EPE 720 档 −5.5%（10/10 场胜）、1080 档 −9.5%
     （9/10），耗时相同；BGR 介于两者之间 ⇒ 通道序要对。FACTS「真彩色」行的「学习型 gray3 胜
     6–9/10」是 AANet/StereoNet 的结论，**对 LAS2 不成立**。上游 loader 只对单通道图 tile 成
-    三通道，彩色图保留 RGB（`core/stereo_datasets.py:71`）。VRChat 镜像上的收益还没测。
+    三通道，彩色图保留 RGB（`core/stereo_datasets.py:71`）。``nav_online`` 选 las2 时递 RGB
+    （镜像读回已按 DXGI 格式转成 RGB，`openvr_mirror.map_rgb`）；拿不到 RGB 时收灰度，照旧复制。
+    VRChat 镜像上的收益还没测。
 
     ``dynamic=False``：每个新尺寸编一次（采集尺寸会话内不变）。某尺寸的首次编译失败（没有 cl、
     没设 PYTHONUTF8 …）就**永久**退回 eager 并把原因留在 ``describe()``——eager 720 档约 105 ms，
@@ -125,26 +127,28 @@ class _LAS2Adapter:
     def _eager(self, a: Any, b: Any) -> Any:
         return self._model(a.half(), b.half())
 
-    def compute(self, left_gray: np.ndarray, right_gray: np.ndarray) -> np.ndarray:
+    def compute(self, left_rgb: np.ndarray, right_rgb: np.ndarray) -> np.ndarray:
         with self._lock:
-            return self._compute(left_gray, right_gray)
+            return self._compute(left_rgb, right_rgb)
 
-    def _compute(self, left_gray: np.ndarray, right_gray: np.ndarray) -> np.ndarray:
+    def _compute(self, left_rgb: np.ndarray, right_rgb: np.ndarray) -> np.ndarray:
         import torch
         import torch.nn.functional as F
-        H, W = left_gray.shape[:2]
+        H, W = left_rgb.shape[:2]
         if self._shape != (H, W):
             ph, pw = (-H) % 32, (-W) % 32
             self._pad = [pw // 2, pw - pw // 2, ph // 2, ph - ph // 2]
             self._shape = (H, W)
         pad = self._pad
 
-        def to_dev(g: np.ndarray) -> Any:
-            t = torch.from_numpy(np.ascontiguousarray(g)).to(self._dev)[None, None].float()
-            return F.pad(t.expand(1, 3, -1, -1), pad, mode="replicate")
+        def to_dev(img: np.ndarray) -> Any:
+            # (H, W, 3) RGB → (1, 3, H, W)；(H, W) 灰度 → 复制成 3 通道（没有 RGB 时的退路）。
+            t = torch.from_numpy(np.ascontiguousarray(img)).to(self._dev)
+            t = t.permute(2, 0, 1)[None].float() if t.ndim == 3 else t[None, None].float().expand(1, 3, -1, -1)
+            return F.pad(t, pad, mode="replicate")
 
         with torch.no_grad():
-            a, b = to_dev(left_gray), to_dev(right_gray)
+            a, b = to_dev(left_rgb), to_dev(right_rgb)
             if self.compile_error is not None:
                 d = self._eager(a, b)
             elif (H, W) in self._ok_shapes:
