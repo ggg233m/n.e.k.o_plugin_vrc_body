@@ -870,6 +870,11 @@ class OnlineNavigator:
         self._threads: list[threading.Thread] = []
         self._reset()
 
+    def _clock_domain_name(self) -> str:
+        """注入时钟的名字，落盘用。测试注入假时钟时如实写 custom，不谎称 perf_counter。"""
+        name = getattr(self._clock, "__name__", "") or "custom"
+        return name if name in ("perf_counter", "monotonic") else "custom"
+
     def _reset(self) -> None:
         c = self.cfg
         self.mapper = KeyframeGridMapper(c.mapper)
@@ -894,6 +899,8 @@ class OnlineNavigator:
         # _state_lock 下（否则两边都能分到同一个 kf_id）。
         self._stereo_seq = 0
         self._kf_next_id = 0
+        #: 最近一个**已入队**的关键帧号（-1 = 还没有）。trail 挂它。
+        self._last_committed_kf = -1
         self._pending: list[tuple[str, Any]] = []
         self._keyframes = 0
         self._kf_refreshed = 0
@@ -974,7 +981,12 @@ class OnlineNavigator:
                 try:
                     self.recorder = SessionRecorder(
                         self._record_root / time.strftime("%Y%m%d_%H%M%S"), self.cfg.record_max_mb * 1e6,
-                        {"config": asdict(self.cfg), "started_wall": time.time(), "started_clock": self._started_at,
+                        # clock_domain 必须落盘：started_clock 是**绝对读数**，只有知道它来自
+                        # 哪个时钟，离线分析才能判断能否与自己算出的时刻相减。2026-10-24 之前
+                        # 是 monotonic，之后是 perf_counter —— 没这个字段就分不清新旧录制。
+                        {"config": asdict(self.cfg), "started_wall": time.time(),
+                         "started_clock": self._started_at,
+                         "clock_domain": self._clock_domain_name(),
                          "record_images": bool(record_images), "avatar": avatar,
                          "avatar_scale": self._avatar_scale},
                         images=record_images)
@@ -1246,8 +1258,12 @@ class OnlineNavigator:
     def _est(self) -> dict[str, Any]:
         with self._state_lock:
             T, at, off = self._pose, self._pose_at, self._offset
-        # max(0.0, ...)：跨时钟域相减会得到负数，旧写法 "负数 > 0.5" 恒为假 ⇒
-        # 位姿过期永不触发、控制线程带着失效位姿继续驱动。负 age 一律按 0 处理（= 最新）。
+        # ⚠️ 这里的 max(0.0, ...) **不提供安全性**：max(0.0, 负数) 仍是 0.0，而 0.0 > 阈值
+        # 依旧为假 —— 跨域负 age 照样永远判“新鲜”。它只让**报告出来的** age 非负。
+        # 真正的防线是两端同域（_pose_at 与 _clock() 都是 perf_counter，见 __init__ 的 clock=
+        # 与 _perception_loop 里 tick = _tk.actual）。若将来有人把某一侧换回 monotonic，
+        # 这条守卫不会拦住，只能靠 tests/test_pacing_regression.py 的 `mocks_are_effective`
+        # 与 status().rates.pacer 的实测值发现。
         if T is None or at is None or max(0.0, self._clock() - at) > self.cfg.pose_stale_s:
             return {"state": "unknown", "reason": "pose_stale"}
         s = self.cfg.world_scale
@@ -1356,7 +1372,10 @@ class OnlineNavigator:
                             with self._state_lock:
                                 self._yaw_jumps = (self._yaw_jumps + [{
                                     "t_s": round(tick - (self._started_at or tick), 2),
-                                    "delta_deg": round(dyaw, 1), "keyframe": kf_id,
+                                    # 用已入队的号：局部 kf_id 在解耦分支永不递增，会永远记 -1
+                            # （2026-10-24 审查发现，与 trail 是同一个根因）。
+                            "delta_deg": round(dyaw, 1),
+                            "keyframe": self._last_committed_kf,
                                     "odometry_m": round(self.dr.dist_m, 2),
                                     # 精确单位旋转 = 驱动收到了别的发送端的中立帧，不是 VRChat 转的。
                                     "neutral": bool(np.allclose(r_ob, np.eye(3), atol=1e-6))}])[-10:]
@@ -1367,9 +1386,18 @@ class OnlineNavigator:
                     prev_yaw, prev_tick = yaw_now, tick
                     with self._state_lock:
                         self._pose, self._pose_at = T, tick
-                    if kf_id >= 0 and trail_gate.due(tick):
+                    # trail 挂到「最近一个**已入队**的关键帧」上（_last_committed_kf 由
+                    # _commit_keyframe 在同一临界区里发布）。
+                    # ⚠️ 两个坑都踩过（2026-10-24）：
+                    #   ① 用局部 kf_id —— 解耦分支在下面 continue 掉了，它永远 -1 ⇒ 一次都不写；
+                    #   ② 用 _kf_next_id-1 —— 那是**正在提交**的那帧，mapper 里还没有，
+                    #      add_trail 的 `if k not in self._pose: return` 会静默丢弃；
+                    #      且 inline 路径根本不递增 _kf_next_id，kid 恒为 -1 ⇒ 一条都不写。
+                    if trail_gate.due(tick):
                         with self._state_lock:
-                            self._pending.append(("trail", (kf_id, T.copy(), self.dr.dist_m, tick)))
+                            kid = self._last_committed_kf
+                            if kid >= 0:
+                                self._pending.append(("trail", (kid, T.copy(), self.dr.dist_m, tick)))
                     if gate.due(tick):
                         t0 = time.perf_counter()
                         left_rgb = None
@@ -1470,6 +1498,12 @@ class OnlineNavigator:
                         else (pair[0].copy(), pair[1].copy()))
             self._pending.append(("kf", (kf_id, pts, T.copy(), self.dr.dist_m, feat, tick,
                                          kf_kind == "refresh", thumb, imgs)))
+            # 发布「已入队」的关键帧号：它与上面的 append 在同一个临界区里，且排在任何
+            # 后续 trail 入队之前 ⇒ 建图线程按 _pending 顺序必先见到 kf、再见 trail。
+            # trail 必须挂这个号，不能挂 _kf_next_id-1（那是**正在提交**的那一帧，
+            # mapper 里还没有它，add_trail 会静默丢弃），也不能挂局部 kf_id（解耦路径
+            # 永远停在 -1，inline 路径又根本不递增 _kf_next_id）。
+            self._last_committed_kf = int(kf_id)
         self._map_event.set()
 
     # ---- 双目解耦线程 ----
@@ -1677,6 +1711,10 @@ class OnlineNavigator:
             except Exception as exc:  # noqa: BLE001 - 控制出错先停车
                 self._fail("control", exc)
                 self._halt()
+            # 运行中也要能读到（旧写法只在 finally 写 ⇒ 活着的会话里 pacer.control 永远缺失）。
+            if _tk.index % 10 == 0:
+                with self._state_lock:
+                    self._pacer_telemetry["control"] = pacer.telemetry()
         with self._state_lock:
             self._pacer_telemetry["control"] = pacer.telemetry()
         self._halt()
@@ -1695,6 +1733,8 @@ class OnlineNavigator:
             stereo_at, near = self._stereo_at, self._near
         if block is None and est.get("state") != "localized":
             block = est.get("reason", "pose_stale")
+        # 同 _est()：max(0.0, ...) 只保证报告值为非负，**不**能让跨域错误触发出停车。
+        # 安全性来自 tick 与 _stereo_at 同域（都是 Pacer 的 Tick.actual / perf_counter）。
         if block is None and (stereo_at is None or max(0.0, tick - stereo_at) > c.stereo_stale_s):
             # 双目断了就没有近距急停，不能盲走。
             block = "stereo_stale"

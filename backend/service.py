@@ -360,6 +360,8 @@ class BackendService:
         )
         self.world_state = WorldStateStore(
             lifecycle_watermark_limit=self.config.vision.lifecycle_watermark_limit,
+            # 显式传：store 的 observed_at 要和 vision 侧同域（否则 ingest 的 clamp 会吞掉偏差）。
+            clock=time.perf_counter,
             persistence_path=self.state_dir / "world_memory.json",
             # 除非调用方明确提供该配置段，否则隔离库/测试调用方；随插件发布的
             # plugin.toml 会启用持久化配置段。
@@ -481,6 +483,9 @@ class BackendService:
         self.cognition = CognitionRuntime(
             self._cognition_sources,
             world_provider=lambda: self.vision.snapshot(),
+            # 显式传：StateEstimator 拿 observed_at 与 now 比较，必须和 vision 侧同域。
+            # 跨域的后果是 min(now, observed_at) 把新鲜的观测钳成 ~0 age，且 sources.stale 乱翻。
+            clock=time.perf_counter,
         )
 
     def _sync_osc_alignment_samples(self) -> None:

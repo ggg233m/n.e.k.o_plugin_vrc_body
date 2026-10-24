@@ -466,7 +466,7 @@ class StateEstimator:
     def __init__(
         self,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.perf_counter,
         max_observations: int = 128,
         stale_after_s: float = 5.0,
     ) -> None:
@@ -598,7 +598,7 @@ class Plan:
 class SkillPlanner:
     """确定性的基线规划器；LLM 输出可以对齐同一套 schema。"""
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.perf_counter) -> None:
         self._clock = clock
 
     def plan(self, goal: Mapping[str, Any] | None) -> Plan:
@@ -714,7 +714,7 @@ class CognitionRuntime:
         source_provider: Callable[[], Mapping[str, Mapping[str, Any]]],
         *,
         world_provider: Callable[[], Mapping[str, Any]] | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._clock = clock
         self._source_provider = source_provider

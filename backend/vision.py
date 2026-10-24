@@ -1604,7 +1604,9 @@ class OpenAICompatibleSemanticBackend:
                 "model": self.model,
                 "max_per_minute": self.max_per_minute,
                 "calls_last_minute": len(self._calls),
-                "last_call_age_ms": None if self._last_call_at is None else round(max(0.0, (time.monotonic() - self._last_call_at) * 1000.0), 1),
+                # 用 observe() 记录的同一时钟（现在由调用方注入的 now 决定域）；这里取
+                # 模块统一域，避免 status 里的 age 与 _last_submit_at 那组字段跨域。
+                "last_call_age_ms": None if self._last_call_at is None else round(max(0.0, (time.perf_counter() - self._last_call_at) * 1000.0), 1),
                 "last_error": self._last_error,
             }
 
@@ -1648,7 +1650,9 @@ class OpenAICompatibleSemanticBackend:
         return result
 
     def observe(self, frame: Any, *, world: Mapping[str, Any], now: float) -> VisionObservation:
-        current = time.monotonic()
+        # now 是 perf_counter 域（VisionRuntime 传入）；限流窗口也用同一域，
+        # 否则 _calls 里混着两种时刻，60 s 窗口会算错、status 的 age 也不可比。
+        current = time.perf_counter()
         with self._lock:
             while self._calls and current - self._calls[0] >= 60.0:
                 self._calls.popleft()

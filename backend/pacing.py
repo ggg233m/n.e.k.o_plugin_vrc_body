@@ -45,7 +45,14 @@
 绝对截止点定拍，目标 50 ms，n=400。误差 = 实际唤醒 − 该拍的理论截止点，
 ``p99`` 一律取 |err| 的第 99 百分位。CPU 是**本进程**占用，单线程台架。
 
-tick = 1.0000 ms（本机现役）：
+⚠️ **2026-10-24 复核：下面两张表的 tick 标签曾经写反**（把默认态标成 1 ms）。
+本机实测（绝对截止点定拍、50 ms、120 拍）：`Event.wait` 默认 tick 下 |err| p50 **8.29** /
+p99 **15.87** ms；`timeBeginPeriod(1)` 下 p50 **1.01** / p99 **2.33** ms。
+⇒ 凡 p99 ≈ 10–16 的那一行属于**默认 tick**，不是 1 ms。结论不受影响
+（两者都远差于 Pacer 的 0.08 ms），但引用数字时请按本段复核值。
+
+tick = 1.0000 ms（⚠️ 标签存疑 —— 见上段复核值：本组里 `D Event.wait` p99=10.67 远超 tBMP(1)
+实测的 1.8–2.3 ms，说明这一组数字实际是**默认 tick**；其余行不受影响）：
 
     原语                       |err|p50   |err|p99   max      CPU
     A time.sleep                 0.420      0.787   1.173     0.00%
@@ -146,8 +153,10 @@ tBMP 帮不上忙，因为 ``Event.wait`` 的唤醒走的是另一条路径，ti
 
 ================================ 4. 时钟域（本模块最危险的一条） ================================
 
-``backend/nav_online.py:821`` 的默认是 ``clock: Callable[[], float] = time.monotonic``。
-在这台 CPython 3.12.9 上 ``time.monotonic`` 的实现是 **GetTickCount64()**，
+``backend/nav_online.py:827`` 的默认**曾经**是 ``clock: Callable[[], float] = time.monotonic``；
+2026-10-24 起已改为 ``time.perf_counter``（osc / navigator / vision / world_state / cognition /
+traversability 同步）。⚠️ 下面这张表记录的是**改之前**的事实，保留它是为了给「为什么必须换时钟」
+留证据 —— 它不是现状。在这台 CPython 3.12.9 上 ``time.monotonic`` 的实现是 **GetTickCount64()**，
 ``time.get_clock_info("monotonic").resolution`` 自报 0.015625 s，实测读数台阶：
 
     clock           读数台阶 p50    纯自旋定拍的 |err|p50   |err|p99
@@ -752,7 +761,11 @@ class Gate:
     """
 
     __slots__ = ("period", "name", "_clock", "_next", "_t0", "_fires", "_skipped",
-                 "_last_fire")
+                 "_last_fire", "_k")
+
+    #: 网格判定的浮点容差（以「格」为单位）。t0 + k*period 的乘法误差在 1e-16 量级，
+    #: 1e-3 格的余量足够吸收，又远小于任何真实抖动（0.1 s 周期下 = 0.1 ms）。
+    _EPS_GRID = 1e-3
 
     def __init__(self, hz: float | None = None, *, period_s: float | None = None,
                  clock: Callable[[], float] = HIGH_RES_CLOCK,
@@ -767,6 +780,9 @@ class Gate:
         self._clock = clock
         self._next = -math.inf
         self._t0: float | None = None
+        #: 下一个到期格子的**整数**编号（第 k 格 = t0 + k*period）。
+        #: 用整数而不是浮点累加：否则 (next-t0)/period 反复取整会漂，实测每 20 格偏 1 格。
+        self._k = 0
         self._fires = 0
         self._skipped = 0
         self._last_fire: float | None = None
@@ -775,6 +791,7 @@ class Gate:
         """``t0=None`` ⇒ 现在；第一拍**立即到期**（与位姿循环"第一帧就采双目"对齐）。"""
         base = self._clock() if t0 is None else float(t0)
         self._t0 = base
+        self._k = 0
         self._next = base
         self._fires = 0
         self._skipped = 0
@@ -785,13 +802,26 @@ class Gate:
         if self._next == -math.inf:
             self.reset(t)
         now = self._clock() if t is None else float(t)
-        if now < self._next:
+        # ⚠️ 守卫必须和下面的网格公式用**同一个**容差，否则两者互相打架：
+        # 公式带 +EPS 会把「早到 0.001 格」的 tick 算作到期，而裸守卫 `now < _next`
+        # 会先把它拒掉 ⇒ 该格被跳过，并且 skipped/grids_per_fire 报出假值。
+        # 实测（period=0.1、t0=0、首次 due 在 0.09995）：_k 跳到 2、skipped=1，
+        # 之后 10 个格只发 5 次。两者都用同一容差后不再出现。
+        if now < self._next - self._EPS_GRID * self.period:
             return False
-        # 绝对累加：next 只由它自己推进，永远不看 now。这正是悬崖的解药。
-        crossed = 0
-        while self._next <= now:
-            self._next += self.period
-            crossed += 1
+        # 绝对网格：第 k 格 = t0 + k*period，next 永远只由**整数格号**推进，不看 now。
+        # 这正是「相对累加悬崖」的解药（tick+period 在 49.9 ms 时会整拍取整成 6.7 Hz）。
+        # ⚠️ 两点：①不要用 `while next <= now: next += period`——那是 O(经过格数)，
+        #   长停顿（断点 / 长 GC / 合盖恢复）会卡感知线程：period=0.02 s 时 24 小时跳跃
+        #   = 432 万次迭代 ≈ 873 ms。②格号必须用**整数**：用 (next-t0)/period 反复
+        #   浮点取整会漂（实测每 20 格偏 1 格，5.00 Hz 漂成 5.22 Hz）。
+        # 容差：t0 + k*period 的浮点乘法会把 0.6 算成 0.6000000000000001，
+        # 于是 t=0.60 判「还没到」、t=0.65 才发 —— 实测每 20 格多漂一次（500→522）。
+        # 取周期千分之一（0.1 ms 量级）远小于任何真实抖动，只吸收浮点误差。
+        k = int(math.floor((now - self._t0) / self.period + self._EPS_GRID)) + 1
+        crossed = k - self._k
+        self._k = k
+        self._next = self._t0 + k * self.period
         if crossed > 1:
             self._skipped += crossed - 1     # 只记"本该发但没发"的格子
         self._fires += 1

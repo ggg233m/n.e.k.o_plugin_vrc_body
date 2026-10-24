@@ -319,7 +319,10 @@ class WorldStateStore:
         event_history_size: int = 64,
         revision_history_size: int = 512,
         default_ttl_s: float = 2.0,
-        clock: Any = time.monotonic,
+        # perf_counter：store 里的 observed_at / received_at 会和 vision 侧（VisionRuntime，
+        # 2026-10-24 起 perf_counter）直接比较。留 monotonic 会让每个 observed_at 被
+        # ingest() 的 min(received_at, observed_at) 静默改写 —— 那是跨域在互相吞。
+        clock: Any = time.perf_counter,
         persistence_path: str | Path | None = None,
         persist_world: bool = False,
         persist_players: bool = False,
@@ -412,8 +415,15 @@ class WorldStateStore:
         self._revision_journal.append({
             "revision": self._revision,
             "kind": _text(kind, default="observation", limit=32) or "observation",
+            # ⚠️ 字段名里的 monotonic 是历史名。2026-10-24 起这两个值来自
+            # **time.perf_counter**（与 vision/cognition 同域），不再等于 clock.monotonic。
+            # 保留旧键名是为了不让树外消费者立刻断掉；同时给出 clock_domain 与规范化键名，
+            # 新代码请读 received_at / observed_at + clock_domain，不要拿它们和 monotonic() 相减。
             "received_at_monotonic": received_at,
             "observed_at_monotonic": observed_at,
+            "received_at": received_at,
+            "observed_at": observed_at,
+            "clock_domain": "perf_counter",
             "entities": entity_items,
             "events": event_items,
             "removed_entity_ids": [item for item in removed if item],
