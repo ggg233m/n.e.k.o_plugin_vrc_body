@@ -98,8 +98,11 @@ def _las2_adapter() -> Any:
 class _LAS2Adapter:
     """灰度 → 复制成 3 通道 → replicate pad 到 32 的倍数 → 网络（half）→ 去 pad → float32。
 
-    灰度复制而不是真彩：Middlebury 实测学习型立体在 gray3 上逐场胜 6–9/10（FACTS「真彩色」行），
-    镜像采集端本来就给灰度。
+    ⚠️ 现在喂的是灰度复制，但 **LAS2 喂真彩更准**（2026-10-25，Middlebury 10 场 eager half，
+    `.tmp/las2_color_probe.py`）：RGB 比 gray3 EPE 720 档 −5.5%（10/10 场胜）、1080 档 −9.5%
+    （9/10），耗时相同；BGR 介于两者之间 ⇒ 通道序要对。FACTS「真彩色」行的「学习型 gray3 胜
+    6–9/10」是 AANet/StereoNet 的结论，**对 LAS2 不成立**。上游 loader 只对单通道图 tile 成
+    三通道，彩色图保留 RGB（`core/stereo_datasets.py:71`）。VRChat 镜像上的收益还没测。
 
     ``dynamic=False``：每个新尺寸编一次（采集尺寸会话内不变）。某尺寸的首次编译失败（没有 cl、
     没设 PYTHONUTF8 …）就**永久**退回 eager 并把原因留在 ``describe()``——eager 720 档约 105 ms，
