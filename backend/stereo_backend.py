@@ -42,7 +42,7 @@ from .nav_mapping import disparity_range_px, make_sgbm, stereo_disparity
 from .stereo_worker import (
     CTRL, CTRL_BYTES, H_IX, LAUNCH_MS, LAST_MS, PHASE, PHASE_COMPILING, PHASE_EAGER, PHASE_EXITED,
     PHASE_FAILED, PHASE_LOADING, PHASE_READY, PROTOCOL_VERSION, SEQ_DONE, SEQ_REQ, SYNC_MS, FRAMES,
-    UPLOAD_MS, VERSION_IX, W_IX, control, disparity, read_error,
+    UPLOAD_MS, VERSION_IX, W_IX, WORKER_PID, control, disparity, read_error,
 )
 
 __all__ = ("STEREO_BACKENDS", "NamedSemaphore", "StereoBusy", "StereoWorkerError", "close_las2",
@@ -197,6 +197,11 @@ _las2: "_LAS2Adapter | None" = None
 # 因为建子进程要几秒，不能把进程内路径一起堵住。
 _sub_lock = threading.Lock()
 _sub: "_LAS2SubprocessAdapter | None" = None
+# 关闭闸门：close_las2() 之后禁止再起新子进程。为什么需要 —— prewarm 跑在后台线程里，
+# 后端 stop() 时它可能正卡在 _spawn_las2 中间（建共享内存 / 等握手）。那时 close_las2()
+# 看到 _sub 还是 None 就直接返回了，紧接着 prewarm 线程把 adapter 建完、塞进 _sub，
+# 于是这个刚起来的子进程再也没人关（实测后端退出后残留 2 个 worker 进程）。
+_closing = threading.Event()
 
 # 启动预热（`las2_prewarm`）：热缓存下首帧仍要 ~80 s（AOT 反序列化 + 载 Triton 内核），新尺寸
 # 冷编译 ~5 min。挪到后端启动时的后台线程里做，会话首帧就不用等。每进程只成功一次。
@@ -406,6 +411,15 @@ def _poll_prewarm(m: Any, h: int, w: int) -> None:
         time.sleep(0.05)
 
 
+def wait_prewarm_thread(timeout_s: float = 10.0) -> bool:
+    """等后台预热线程收尾。退出路径上先等它，免得它在解释器关闭时还在起子进程。"""
+    for th in threading.enumerate():
+        if th.name == "las2-prewarm" and th.is_alive():
+            th.join(timeout=timeout_s)
+            return not th.is_alive()
+    return True
+
+
 def _warm_view() -> dict[str, Any]:
     out = dict(_warm)
     t0, t1 = out.pop("started", None), out.pop("done", None)
@@ -435,15 +449,25 @@ def las2_worker_status() -> dict[str, Any] | None:
 
 
 def close_las2() -> None:
-    """关 LAS2 子进程并释放共享内存/信号量。幂等；也注册在 atexit 上。"""
+    """关 LAS2 子进程并释放共享内存/信号量。幂等；也注册在 atexit 上。
+
+    先竖闸门再抢 _sub_lock：抢锁意味着「如果有 spawn 正在跑，等它跑完」，
+    拿到锁时它建出来的 adapter 一定已经在 _sub 里，能一起关掉。
+    """
     global _sub
-    sub = _sub
-    _sub = None
-    if sub is not None:
-        try:
-            sub.close()
-        except Exception:  # noqa: BLE001 - 退出路径上不能抛
-            pass
+    _closing.set()
+    try:
+        with _sub_lock:
+            sub, _sub = _sub, None
+        if sub is not None:
+            try:
+                sub.close()
+            except Exception:  # noqa: BLE001 - 退出路径上不能抛
+                pass
+    finally:
+        # 闸门只挡「close 正在进行」这段时间，不永久关死：关闭完成后允许再起（测试用例之间、
+        # 以及运维手动重启都会用到）。真正禁止再起的是解释器退出，那时也没人再调了。
+        _closing.clear()
 
 
 atexit.register(close_las2)
@@ -625,7 +649,17 @@ class _LAS2SubprocessAdapter:
     # -- 状态 --
     @property
     def pid(self) -> int:
+        """父进程 Popen 的 pid（= venv 启动器包装层）。真正在算的进程见 real_pid。"""
         return int(self.proc.pid)
+
+    @property
+    def real_pid(self) -> int:
+        """真正跑推理那个解释器的 pid（包装层会再起一个）。还没握手时回落 Popen 的 pid。"""
+        try:
+            got = int(self._ctrl[WORKER_PID])
+        except (TypeError, ValueError, IndexError):
+            got = 0
+        return got if got > 0 else self.pid
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -762,13 +796,15 @@ class _LAS2SubprocessAdapter:
                 try:
                     proc.wait(timeout=1.0 if compiling else 5.0)
                 except _subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5.0)
-                    except _subprocess.TimeoutExpired:
-                        proc.kill()
-                        with contextlib.suppress(Exception):
-                            proc.wait(timeout=2.0)
+                    pass
+            # ⚠️ 不管上面等没等到，都要按**真实** worker 的 pid 收整棵树：
+            #   ① .venv_las/Scripts/python.exe 是 venv 启动器包装层，terminate() 只杀它，
+            #      真正在算的解释器（WORKER_PID）会留下来继续占 XPU 并抢信号量；
+            #   ② 编译中时子进程不看 CTRL，上面那 1 s 必然等不到。
+            # taskkill /T 连包装层带真实解释器一起收，覆盖这两种情况。
+            _kill_tree(self.real_pid, wait_s=5.0)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=3.0)
         finally:
             if proc.stderr is not None:
                 with contextlib.suppress(Exception):
@@ -792,12 +828,36 @@ class _LAS2SubprocessAdapter:
                     shm.unlink()
 
 
+def _kill_tree(pid: int, *, wait_s: float = 5.0) -> None:
+    """杀掉 pid 及其所有子孙进程。Windows 上没有进程组，靠 taskkill /T /F。
+
+    为什么需要：``.venv_las/Scripts/python.exe`` 是 venv 启动器包装层，它再起真实解释器。
+    ``Popen.terminate()`` 只杀包装层，真正在算的那个（= WORKER_PID）会变孤儿并继续占着 XPU。
+    """
+    if pid <= 0:
+        return
+    if os.name != "nt":
+        import signal as _signal
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except OSError:
+            pass
+        return
+    try:
+        _subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                        capture_output=True, timeout=max(1.0, wait_s))
+    except Exception:  # noqa: BLE001 - 收尸失败不能挡住退出
+        pass
+
 def _las2_subprocess(shape_hw: tuple[int, int], *, fx: float, engine: str | None,
                      timeout_s: float, spec_extra: dict[str, Any] | None) -> _LAS2SubprocessAdapter:
     """起（或复用）LAS2 子进程。形状/引擎变了就重建 —— 共享内存尺寸绑死在形状上。"""
     global _sub
     h, w = int(shape_hw[0]), int(shape_hw[1])
     engine = (engine or os.environ.get("NEKO_LAS_ENGINE") or "las2").strip().lower()
+    if _closing.is_set():
+        # 后端正在退出：别再造新进程（造出来没人关，见 _closing 的注释）。
+        raise StereoWorkerError("LAS2 已关闭（后端正在退出）")
     with _sub_lock:
         cur = _sub
         if cur is not None and cur.shape_hw == (h, w) and cur.engine == engine and cur.alive():

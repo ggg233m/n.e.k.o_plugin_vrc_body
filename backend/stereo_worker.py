@@ -70,6 +70,11 @@ CTRL_BYTES = CTRL_FLOATS * 4 + ERR_BYTES      # 384：控制块总长（视差�
 
 PHASE, SEQ_REQ, SEQ_DONE, FRAMES, LAST_MS, HEARTBEAT = 0, 1, 2, 3, 4, 5
 H_IX, W_IX, VERSION_IX = 6, 7, 8
+# 真实解释器的 pid。⚠️ 不等于父进程 Popen 的 pid：`.venv_las/Scripts/python.exe` 是 venv 的
+# **启动器包装层**（255 KB 的 exe），它会再起一个真实解释器（106 KB 的 F:/py314/python.exe），
+# 两个进程是父子关系、argv 完全相同。terminate() 只会杀掉包装层，真正在算的那个变孤儿。
+# 所以 worker 一进来就把自己的 pid 写进控制块，父进程按这个 pid 收尸。
+WORKER_PID = 9
 UPLOAD_MS, LAUNCH_MS, SYNC_MS, CTRL = 10, 11, 12, 16
 ERR_OFFSET = CTRL_FLOATS * 4      # 128
 
@@ -194,6 +199,7 @@ def run(spec: dict[str, Any]) -> int:
 
     # 尺寸/版本先自检：父进程按错尺寸开共享内存是**协议错**，宁可立刻报死也不要算错。
     ctrl[H_IX], ctrl[W_IX], ctrl[VERSION_IX] = h, w, PROTOCOL_VERSION
+    ctrl[WORKER_PID] = float(os.getpid())     # 父进程按这个 pid 杀，见 WORKER_PID 的注释
     ctrl[HEARTBEAT] = 1.0        # 进程已经起来了：从 1 开始，之后按 HEARTBEAT_S 递增
     ctrl[PHASE] = PHASE_LOADING
 

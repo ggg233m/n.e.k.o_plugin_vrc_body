@@ -56,7 +56,8 @@ from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, alig
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, stereo_points
 from .pacing import Gate, Pacer, sleep_until
 from .stereo_backend import (StereoBusy, StereoWorkerError, close_las2, las2_prewarm,
-                             las2_prewarm_status, las2_worker_status, make_stereo_backend)
+                             las2_prewarm_status, las2_worker_status, make_stereo_backend,
+                             wait_prewarm_thread)
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -1224,6 +1225,9 @@ class OnlineNavigator:
         幂等由 ``close_las2`` 保证，这里只管别把关闭失败抛给退出路径（没人接得住）。
         """
         try:
+            # 顺序要紧：预热跑在后台线程里，它可能正卡在起子进程的中间。先等它收尾，
+            # 再竖闸门关 worker —— 反过来的话它会在闸门之后把新 worker 建出来，没人关。
+            wait_prewarm_thread(10.0)
             close_las2()
         except Exception as exc:  # noqa: BLE001 - 关闭失败只留痕，不能挡住退出
             self._fail("stereo_close", exc)

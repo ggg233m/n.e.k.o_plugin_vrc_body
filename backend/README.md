@@ -595,3 +595,64 @@ python -m pip install --user "dxcam[winrt]"
 OSC 接收器保存每个 `VelocityX/Z` 样本的接收单调时间，光流处理该帧时按
 `captured_at` 插值或在有界间隔内保持；超过 `0.25 s` 的旧样本和断档返回
 `available=false`，不会伪造静止速度。两轴不在同一小窗口内到达时同样按 unknown 处理。
+
+
+## LAS2 双目后端：两个解释器怎么起
+
+LAS2（学习型立体）需要 torch-xpu + timm + MSVC `cl`，这些只在 `.venv_las`（CPython 3.14）里。
+主后端跑 `.venv`（CPython 3.12），**不需要**装 torch —— 它会按需把 LAS2 拉起成一个独立进程。
+
+### 正常启动（一条命令，和以前一样）
+
+```powershell
+.\.venv\Scripts\python.exe backend\process.py --standalone --open-ui
+```
+
+后端启动时会在后台自动拉 `.venv_las\Scripts\python.exe -m backend.stereo_worker`（预热，非阻塞），
+冷编译约 70–150 s，期间 `GET /snapshot` 的 `stereo_backend.prewarm.state` 从 `loading` → `compiling` → `ready`。
+导航会话首帧就不必再等编译。
+
+### 解释器怎么选
+
+`stereo_backend._las2_python()` 按顺序找：
+
+1. 环境变量 `NEKO_LAS_PYTHON`（换机器 / 换路径时钉死用）；
+2. `<仓库>/.venv_las/Scripts/python.exe`（默认，本仓库自带）；
+3. 当前解释器 —— 这时子进程 import torch 会失败，父进程收到 `StereoWorkerError` 并**自动退回 SGBM**。
+
+所以：**没有 `.venv_las` 的机器照常能跑，只是双目退回 SGBM**（精度低一些，功能不断）。
+
+### 关掉子进程（A/B 或排障）
+
+配置里加一条，或改 `plugin.toml`：
+
+```toml
+[navmesh]
+stereo_subprocess = false   # 回到进程内后端（此时必须用 .venv_las 启动整个后端）
+```
+
+临时全局禁用（测试/CI 用）：`$env:NEKO_LAS_DISABLE="1"`。
+
+### 环境要求（缺了就退回 SGBM，不会崩）
+
+| 条件 | 缺了会怎样 |
+|---|---|
+| `.venv_las` 里有 torch-xpu | `StereoWorkerError` → 退回 SGBM |
+| XPU 设备可用 | 同上 |
+| `las_ckpt/LAS2_M.pth` | 同上 |
+| MSVC `cl`（vcvars64） | 编译失败 → 退回 eager（慢一倍，结果相同），`prewarm.error` 里写明原因 |
+| `PYTHONUTF8=1` | 同上（inductor 用 gbk 解 cl 输出会 UnicodeDecodeError） |
+
+后两条 `stereo_backend._las2_env()` 会自动补（会去找 vcvars64.bat），不用手动设。
+
+### 单独验证
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys;sys.path.insert(0,'.');from backend import stereo_backend as sb;import time;print(sb.las2_prewarm((606,1080),subprocess=True));time.sleep(90);print(sb.las2_prewarm_status())"
+```
+
+### 进程数为什么是 2 倍
+
+`.venv_las\Scripts\python.exe` 是 venv 的启动器包装层，它会再起一个真实解释器。所以一个 LAS2 后端
+在进程表里是**两个** python.exe（argv 完全相同），这不是重复启动。`adapter.real_pid` 是真正干活的
+那个 pid（worker 自己写进共享内存控制块），`close()` 按它做 `taskkill /T`，两个一起收。
