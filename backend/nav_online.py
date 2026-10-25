@@ -55,7 +55,8 @@ from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
 from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, align_world_tree
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, stereo_points
 from .pacing import Gate, Pacer, sleep_until
-from .stereo_backend import las2_prewarm, las2_prewarm_status, make_stereo_backend
+from .stereo_backend import (StereoBusy, StereoWorkerError, close_las2, las2_prewarm,
+                             las2_prewarm_status, las2_worker_status, make_stereo_backend)
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -116,11 +117,18 @@ class OnlineNavConfig:
     # las2 首帧要编译 70–330 s，期间没有双目 ⇒ 控制按 stereo_stale 停车，不会盲走。
     # 实测（A770，部署块 p50）：720 档 51 vs SGBM 21 ms；1080 档 58.7 vs 64.6 ms；
     # 20261025_202630 真机（VRChat 同跑）SGBM 1080 档 85.9 ms，队列满丢了 16% 关键帧决策。
-    # ⚠️ las2 编译需 MSVC cl + PYTHONUTF8=1（_tc_run314.bat）；纯 `.venv` 启动会退回 sgbm。
+    # ⚠️ las2 编译需 MSVC cl + PYTHONUTF8=1（_tc_run314.bat）。纯 `.venv` 启动没有 torch，
+    #    但 `stereo_subprocess=True` 时由 .venv_las 的子进程去载，本进程照常吃 LAS2。
     stereo_backend: str = "las2"
     # 后端启动时在后台线程预热 LAS2（``prewarm``）：热缓存下首帧也要 ~80 s，冷编译 ~5 min。
     # 预热尺寸按 capture_width 猜（见 ``prewarm_shape``）；猜错档只是会话首帧照旧再编一次。
     stereo_prewarm: bool = True
+    # LAS2 跑独立子进程（默认开）。为什么：主后端留在 .venv（py3.12）也要能用 LAS2 ——
+    # 父进程全程不 import torch，子进程由 stereo_backend 用 `.venv_las` 的 3.14 解释器拉起，
+    # 有没有 torch / XPU 由子进程自己报（起不来 = 本会话退回 SGBM，后端不受影响）。
+    # 顺带把 torch.compile 的 GIL 争用挪出本进程（2026-10-24 实测 Dynamo guard 在争用下慢 81.5×）。
+    # 关掉 = 回到进程内后端（只有从 .venv_las 启动时可用），留给 A/B。
+    stereo_subprocess: bool = True
     stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级。
     # ⚠️ 实际分辨率由镜像纹理决定：镜像 = AnyaDance 驱动 render × 1.5（SteamVR 滑块不改它）。
     #   驱动 1440×810（现行）⇒ 镜像 2160×1212 ⇒ 1080 = mip1 1080×606 / fx 303.75；
@@ -968,8 +976,13 @@ class OnlineNavigator:
         # _state_lock 下（否则两边都能分到同一个 kf_id）。
         self._stereo_seq = 0
         # 交接槽计数（见 _offer_stereo）：kf = 关键帧没送进去（已撤销策略，下一拍重判）；
-        # frame = 普通帧让路给槽里的关键帧；replaced = 槽里的旧普通帧被新帧顶掉。
-        self._stereo_drops = {"kf": 0, "frame": 0, "replaced": 0}
+        # frame = 普通帧让路给槽里的关键帧；replaced = 槽里的旧普通帧被新帧顶掉；
+        # busy = LAS2 子进程还在编译/上一帧没回来（StereoBusy）——丢帧，但不记错误。
+        self._stereo_drops = {"kf": 0, "frame": 0, "replaced": 0, "busy": 0}
+        # 上一次 las2 子进程在**运行期**崩过：子进程是会话级的，重建只会再崩一次，
+        # 所以本会话直接走 SGBM，下次 start()（_reset 复位）再试。载入失败不进这里 ——
+        # 它本来就在 _make_matcher 里退回 SGBM，不需要额外的会话级标记。
+        self._stereo_degraded = False
         self._kf_next_id = 0
         #: 最近一个**已入队**的关键帧号（-1 = 还没有）。trail 挂它。
         self._last_committed_kf = -1
@@ -1203,6 +1216,18 @@ class OnlineNavigator:
         self._end_xsession(None if mem is None else str(mem.session_id))
         return self.status()
 
+    def shutdown(self) -> None:
+        """后端收工：关掉 LAS2 子进程（可重复调）。``stop()`` 是**会话**停止，不碰它。
+
+        为什么分开：子进程里那份已编译的模型是这里最贵的资产（冷编译 ~5 min），会话重开
+        （缩放变化、手动停再启）要直接复用它；只有进程真的要退出时才值得付一次重启代价。
+        幂等由 ``close_las2`` 保证，这里只管别把关闭失败抛给退出路径（没人接得住）。
+        """
+        try:
+            close_las2()
+        except Exception as exc:  # noqa: BLE001 - 关闭失败只留痕，不能挡住退出
+            self._fail("stereo_close", exc)
+
     # ---- 跨会话地点检索（P0）----
     def _begin_xsession(self) -> None:
         """世界索引装载在 tracker 的后台线程里做，start() 不阻塞。依赖记忆会话（world_key + 目录）。"""
@@ -1341,14 +1366,27 @@ class OnlineNavigator:
         except Exception as exc:  # noqa: BLE001
             self._fail("memory_end", exc)
 
-    def _make_matcher(self, fx: float) -> Any:
-        """按 ``cfg.stereo_backend`` 建视差后端；LAS2 载不起来就记错误并退回 SGBM。"""
+    def _make_matcher(self, fx: float, shape: tuple[int, int] | None = None) -> Any:
+        """按 ``cfg.stereo_backend`` 建视差后端；LAS2 载不起来就记错误并退回 SGBM。
+
+        ``shape`` 只给 las2 子进程用：共享内存按采集尺寸开，不给就由它按 capture_width 的
+        默认档猜。SGBM 两样都不吃，别往里塞（保持调用干净）。
+        """
         kind = self.cfg.stereo_backend
         try:
             if kind != "sgbm" and not self.cfg.decoupled:
                 # 内联路径上首帧编译会把位姿线程卡住几分钟。
                 raise RuntimeError(f"stereo_backend={kind!r} requires decoupled=True")
-            m = make_stereo_backend(kind, fx=fx)
+            if kind == "sgbm":
+                m = make_stereo_backend("sgbm", fx=fx)
+            elif self._stereo_degraded:
+                # 本会话的 las2 子进程已经崩过一次：同一个子进程重建只会再崩一次，直接建 SGBM。
+                # 崩溃现场由 _stereo_worker_loop 记在 stereo_worker 下，这里只补"为什么降级"；
+                # 建出来的就是 SGBM，matcher 不再为 None，所以本会话只会记这一次。
+                self._fail("stereo_backend", StereoWorkerError("las2 子进程本会话崩过，改用 SGBM"))
+                m = make_stereo_backend("sgbm", fx=fx)
+            else:
+                m = make_stereo_backend(kind, fx=fx, subprocess=self.cfg.stereo_subprocess, shape=shape)
         except Exception as exc:  # noqa: BLE001 - 缺 torch / XPU / 权重：退回 SGBM，不能丢掉双目
             if kind == "sgbm":
                 raise
@@ -1368,11 +1406,19 @@ class OnlineNavigator:
         return round(w * 606 / 1080), w
 
     def prewarm(self) -> dict[str, Any] | None:
-        """后端启动时调：配置是 las2（且走解耦路径）就在后台线程预热，立即返回。否则 None。"""
+        """后端启动时调：配置是 las2（且走解耦路径）就在后台线程预热，立即返回。否则 None。
+
+        走子进程时这里拉起的是 `.venv_las` 的 3.14 进程，本进程仍不 import torch；预热尺寸
+        猜错档只是会话首帧再编一次，不会错算（fx 跟着 capture_width 线性缩放）。
+        """
         c = self._cfg_user
         if c.stereo_backend != "las2" or not c.decoupled or not c.stereo_prewarm:
             return None
-        return las2_prewarm(self.prewarm_shape())
+        # fx 与 prewarm_shape 同一口径：镜像路径 fx@720 = 202.5（openvr_mirror.projection_intrinsics
+        # 由 getProjectionRaw 得，见 Docs/FACTS.md），按宽度线性缩放到 720/1080/1440 档 =
+        # 202.5 / 303.75 / 405 ⇒ 202.5 / 720 = 0.28125。预热的编译缓存不认 fx，它只影响视差范围。
+        fx = float(c.capture_width) * 0.28125
+        return las2_prewarm(self.prewarm_shape(), subprocess=c.stereo_subprocess, fx=fx)
 
     def _stage_summary(self) -> dict[str, Any] | None:
         """最近 ≤64 帧解耦双目的分段 [中位, p90]（ms；``*_cpu`` 是 [均值, p90]）。
@@ -1400,6 +1446,9 @@ class OnlineNavigator:
         out: dict[str, Any] = {"configured": self.cfg.stereo_backend}
         if self.cfg.stereo_backend == "las2":
             out["prewarm"] = las2_prewarm_status()
+            # 子进程是另一条命：它活没活、编没编成、累计帧数/超时数都只能从这里看，
+            # 而父进程侧 active 只反映当前用的适配器（子进程崩了就会显示 sgbm）。
+            out["worker"] = las2_worker_status()
         if m is None:
             out["active"] = None          # 还没收到第一帧
         else:
@@ -1749,7 +1798,8 @@ class OnlineNavigator:
             c0 = time.thread_time()
             try:
                 if matcher is None:
-                    matcher = self._make_matcher(fx)
+                    # shape 给子进程开共享内存用：采集尺寸（H, W）只有到帧这里才真的知道。
+                    matcher = self._make_matcher(fx, left.shape[:2])
                 # LAS2 喂 RGB（比 gray3 EPE 低 5.5–9.5%）；传感器没给 RGB 就退回灰度。SGBM 只吃灰度。
                 if rgb is not None and matcher.describe()["kind"] == "las2":
                     disp = matcher.compute(rgb[0], rgb[1])
@@ -1794,6 +1844,15 @@ class OnlineNavigator:
                     self._kf_next_id += 1
                 self._commit_keyframe(kid, pts, T, feat, tick, kf_kind, self._mem,
                                       rgb[0] if rgb is not None else None, rgb, (left, right))
+            except StereoBusy:
+                # 子进程还在载入/编译，或上一帧没回来。这是**预期状态**：编译期每 ~100 ms
+                # 就有一帧到这里，记错误会把 _errors 刷爆、把真正的故障挤掉。只计数。
+                self._stereo_drops["busy"] += 1
+            except StereoWorkerError as exc:
+                # 子进程起不来 / 崩了 / 预热失败：本会话不再重建（重建只会再崩），下一帧走 SGBM。
+                self._fail("stereo_worker", exc)
+                self._stereo_degraded = True
+                matcher = None
             except Exception as exc:  # noqa: BLE001 - 单帧失败不能带走整个线程
                 self._fail("stereo", exc)
             finally:

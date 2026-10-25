@@ -249,6 +249,9 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     "stereo_backend": (str, 0, 0),
     # 后端启动时后台预热 LAS2（默认开）：会话首帧不用再等 ~80 s（热缓存）/ ~5 min（新尺寸冷编译）。
     "stereo_prewarm": (bool, 0, 1),
+    # LAS2 跑子进程（默认开）还是进程内：子进程用 .venv_las 的 3.14 解释器，主后端留在 .venv
+    # 也能吃到 LAS2；关掉 = 回到进程内后端（仅 .venv_las 启动时可用）。A/B 用。
+    "stereo_subprocess": (bool, 0, 1),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
     "kf_turn_deg": (float, 1.0, 180.0),

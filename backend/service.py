@@ -906,6 +906,7 @@ class BackendService:
                         self._vision_stop_reason = "running"
                 self.navigator.start()
                 # LAS2 预热放后台：首帧编译 ~80 s（热缓存）起，等到开 navmesh 会话才编就会卡住首帧。
+                # 子进程模式下这里拉起的是 .venv_las 的 3.14 进程，主后端不必自带 torch，仍是非阻塞。
                 self.navmesh.prewarm()
                 self._started = True
                 self._last_error = None
@@ -1075,6 +1076,11 @@ class BackendService:
         # 先停 navmesh 控制环（它会在 OSC/scheduler 拆除前发一次停车）。
         try:
             self.navmesh.stop()
+        except Exception:
+            pass
+        # 会话 stop 不关 LAS2 子进程（已编译的进程要跨会话复用），只有后端收工才释放它。
+        try:
+            self.navmesh.shutdown()
         except Exception:
             pass
         with self._lock:

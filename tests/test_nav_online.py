@@ -129,6 +129,12 @@ class DeadReckonerTest(unittest.TestCase):
     def test_speed_scale_default_is_1(self) -> None:
         self.assertEqual(OnlineNavConfig().osc_speed_scale, 1.0)
 
+    def test_stereo_subprocess_default_is_on(self) -> None:
+        """默认走独立推理进程：LAS2 的 torch.compile 不能跑在位姿线程所在的进程里。"""
+        self.assertIs(OnlineNavConfig().stereo_subprocess, True)
+        nav = config.PluginConfig.from_mapping({"navmesh": {"stereo_subprocess": False}}).navmesh
+        self.assertIs(OnlineNavConfig.from_plugin(nav).stereo_subprocess, False)
+
     def test_speed_scale_1_is_identity(self) -> None:
         r = hmd_to_base_rotation(np.eye(3))
         a, b = DeadReckoner(S, osc_lag_s=0.1), DeadReckoner(S, osc_lag_s=0.1, speed_scale=1.0)
@@ -1693,7 +1699,7 @@ class StereoHandoffTest(unittest.TestCase):
         self.assertTrue(nav._offer_stereo(_job(None, 1), False))     # noqa: SLF001
         self.assertTrue(nav._offer_stereo(_job(None, 2), False))     # noqa: SLF001
         self.assertEqual(nav._stereo_q.get_nowait()[0], 2, "槽里应是更新鲜的那帧")  # noqa: SLF001
-        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 0, "frame": 0, "replaced": 1})
+        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 0, "frame": 0, "replaced": 1, "busy": 0})
 
     def test_keyframe_replaces_plain_frame(self) -> None:
         nav = self.nav
@@ -1707,7 +1713,7 @@ class StereoHandoffTest(unittest.TestCase):
         self.assertFalse(nav._offer_stereo(_job(None, 2), False))    # noqa: SLF001
         self.assertFalse(nav._offer_stereo(_job("new", 3), True))    # noqa: SLF001
         self.assertEqual(nav._stereo_q.get_nowait()[0], 1)           # noqa: SLF001
-        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 1, "frame": 1, "replaced": 0})
+        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 1, "frame": 1, "replaced": 0, "busy": 0})
 
 
 class _SlowMatcher(_FakeMatcher):

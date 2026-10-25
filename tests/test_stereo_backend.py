@@ -6,6 +6,9 @@ LAS2 本体的数值与编译在 `.venv_las` 里另测（见 LAS2 doc）。
 from __future__ import annotations
 
 import ast
+import os
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import replace
@@ -213,7 +216,8 @@ class PrewarmTest(unittest.TestCase):
             self.assertIsNone(h.nav.prewarm())
             h.nav.cfg = h.nav._cfg_user = replace(h.nav.cfg, decoupled=True)
             self.assertEqual(h.nav.prewarm(), {"state": "loading"})
-        pw.assert_called_once_with((606, 1080))                           # 现行驱动 1080 档的采集尺寸
+        pw.assert_called_once()                                           # 现行驱动 1080 档的采集尺寸
+        self.assertEqual(pw.call_args.args[0], (606, 1080), pw.call_args)  # 形状是第一个位置参数
         self.assertEqual(h.nav.stereo_backend_status()["prewarm"]["state"], "idle")
 
     def test_prewarm_shape_matches_las2_padding_bucket(self) -> None:
@@ -230,5 +234,105 @@ class PrewarmTest(unittest.TestCase):
         nav = config.PluginConfig.from_mapping({"navmesh": {"stereo_prewarm": False}}).navmesh
         self.assertFalse(OnlineNavConfig.from_plugin(nav).stereo_prewarm)
 
+class SubprocessBackendTest(unittest.TestCase):
+    """子进程模式的两条**父进程侧**契约：起不来立刻报错、prewarm 状态走 loading→compiling→ready。
+
+    这里 mock 掉真进程：测的是「状态机与失败面」，不是 IPC 本体
+    （IPC 见 tests/test_stereo_worker_ipc.py，那边真起子进程、假引擎逐像素验）。
+    """
+
+    def setUp(self) -> None:
+        # ⚠️ 子进程适配器是**进程级单例**（stereo_backend._sub）：同形状同引擎会直接复用。
+        # 不先关掉，上一个用例留下的活 worker 会让「起不来」用例根本走不到 spawn。
+        stereo_backend.close_las2()
+        self.addCleanup(stereo_backend.close_las2)
+        self.addCleanup(stereo_backend._warm.clear)
+        self.addCleanup(stereo_backend._warm.update, state="idle")
+        stereo_backend._warm.clear()
+        stereo_backend._warm["state"] = "idle"
+
+    def test_unusable_interpreter_raises_stereo_worker_error(self) -> None:
+        """找不到带 torch 的解释器 ⇒ StereoWorkerError（不是 ModuleNotFoundError 漏出去）。
+
+        release 包装的是没有 torch 的 py3.11；子进程模式必须把「起不来 / 没 torch」
+        统一收敛成 StereoWorkerError，会话才能按一条路径退回 SGBM。
+        这里用 NEKO_LAS_PYTHON 指向当前解释器 + 假的 torch 包来构造该失败面，
+        不依赖本机 .venv_las 装没装 torch。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            # 子进程真的执行 python -m backend.stereo_worker（cwd = 仓库根，模块找得到），
+            # 但 PYTHONPATH 里塞一个抛 ImportError 的假 torch，保证「没有 torch」与宿主机无关。
+            fake = Path(tmp) / "torch"
+            fake.mkdir()
+            (fake / "__init__.py").write_text("raise ImportError('no torch here')\n", encoding="utf-8")
+            env = {"NEKO_LAS_PYTHON": sys.executable, "PYTHONPATH": tmp}
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(RuntimeError) as ctx:
+                    stereo_backend.make_stereo_backend("las2", subprocess=True, shape=(64, 128))
+        self.assertIsInstance(ctx.exception, stereo_backend.StereoWorkerError)
+
+    def test_prewarm_state_runs_loading_compiling_ready(self) -> None:
+        """子进程模式：state 必须被观察到 loading → compiling → ready（父进程轮询的真实序列）。"""
+        seen: list[str] = []
+        released = threading.Event()
+        calls: list[tuple] = []
+
+        class _FakeAdapter:
+            """假 worker 适配器：compute 卡住到用例放行，模拟子进程正在编译。"""
+
+            def compute(self, left, right):
+                calls.append(tuple(left.shape))
+                released.wait(5.0)
+                return np.zeros(left.shape[:2], np.float32)
+
+            def describe(self) -> dict:
+                return {"kind": "las2", "subprocess": True, "alive": True, "compiled": True,
+                        "compile_error": None, "pid": 4242, "frames": 1, "timeouts": 0, "last_ms": 1.0}
+
+            def prewarm_state(self) -> dict:
+                return {"state": "ready", "error": None}
+
+            def close(self) -> None:
+                pass
+
+        def fake_make(kind: str, **kw):
+            self.assertEqual(kind, "las2")
+            self.assertTrue(kw.get("subprocess"), f"子进程模式没传下去：{kw}")
+            return _FakeAdapter()
+
+        def pump() -> dict:
+            st = stereo_backend.las2_prewarm_status()
+            seen.append(st["state"])
+            return st
+
+        with mock.patch.object(stereo_backend, "make_stereo_backend", side_effect=fake_make):
+            first = stereo_backend.las2_prewarm((606, 1080), subprocess=True)
+            seen.append(first["state"])                    # 立即返回：loading（或已跳到 compiling）
+            deadline = time.monotonic() + 5.0
+            st = first
+            while time.monotonic() < deadline and "compiling" not in seen:
+                time.sleep(0.01)
+                st = pump()
+            self.assertIn("compiling", seen, f"没观察到 compiling：{seen}")
+            released.set()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                st = pump()
+                if st["state"] == "ready":
+                    break
+                time.sleep(0.01)
+
+        self.assertEqual(st["state"], "ready", st)
+        self.assertEqual(tuple(st["shape"]), (606, 1080), st)
+        self.assertTrue(calls and calls[0] == (606, 1080, 3), "子进程模式同样喂三通道 RGB")
+        # 序列必须是「先 loading、再 compiling、最后 ready」，不许跳步或回退
+        order = [s for s in seen if s in ("loading", "compiling", "ready")]
+        deduped = [s for i, s in enumerate(order) if i == 0 or s != order[i - 1]]
+        self.assertEqual(deduped[0], "loading", seen)
+        self.assertIn("compiling", deduped, seen)
+        self.assertEqual(deduped[-1], "ready", seen)
+        self.assertLess(deduped.index("compiling"), deduped.index("ready"), seen)
+
 if __name__ == "__main__":
     unittest.main()
+
