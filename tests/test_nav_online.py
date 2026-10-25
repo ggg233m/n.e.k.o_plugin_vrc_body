@@ -479,8 +479,10 @@ class Harness:
         self.stops = 0
         self.sensors = FakeSensors()
         self._osc_ts: float | None = None
+        # 默认后端是 las2：不钉 sgbm 的话没 mock make_stereo_backend 的用例会真去载 LAS2
+        # （.venv 里退回 + 记错误；.venv_las 里首帧编译几分钟）。要测 las2 的用例自己改 cfg。
         cfg = OnlineNavConfig(map_min_interval_s=0.1, stereo_period_s=0.05, kf_max_age_s=0.3,
-                              decoupled=decoupled)
+                              decoupled=decoupled, stereo_backend="sgbm")
         self.nav = OnlineNavigator(
             motion_history=self._motion,
             send_move=lambda f, ms: self.moves.append((f, ms)),
@@ -1420,7 +1422,7 @@ class RecorderTest(unittest.TestCase):
             self.assertTrue(json.loads((out / "meta.json").read_text(encoding="utf-8"))["record_images"])
 
     def test_record_images_keep_the_sensor_colour_space(self) -> None:
-        """存档原图必须跟采集端同一个颜色空间。
+        """存档原图必须跟采集端同一个颜色空间，彩色 PNG 的颜色要对（RGB→BGR 后 imwrite）。
 
         回归点：曾经上游递进来的是 read_stereo() 的灰度
         （3 通道 RGB 就在手边却被丢掉），落盘的永远是 L 型 PNG
@@ -1465,15 +1467,12 @@ class RecorderTest(unittest.TestCase):
                         self.assertEqual(raw.ndim, 3 if has_rgb else 2,
                                          f"{name} {k}_{eye} 颜色空间被改掉了")
                         if has_rgb:
-                            # 只断颜色**真的过来了**（三通道不全等）。
-                            # 不断具体数值：传输路径上可能还有一次 cvtColor，
-                            # 分频道是否颠倒不是本用例要钉的东西（某测试数量级下也分不出）。
-                            # 比**同一个像素的三个通道**，不能比不同像素：
-                            # 测试 stub 里全图同值，拿像素集去重只会得到 1 行，
-                            # 那样不管颜色有没有真的过来都会失败。
-                            px = raw.reshape(-1, raw.shape[-1])[0]
-                            self.assertGreater(len(set(px.tolist())), 1,
-                                               f"{name} {k}_{eye} 三通道同值 = 其实还是灰度")
+                            # 通道顺序也要钉：read_stereo_rgb 给 RGB，imwrite 把数组当 BGR ⇒
+                            # 不转就红蓝互换（20261025_202630 就是这样落盘的）。正确落盘后
+                            # imread（BGR）的像素应是 (13, 11, 7)，转回 RGB 才是传进去的 (7, 11, 13)。
+                            px = raw.reshape(-1, raw.shape[-1])[0].tolist()
+                            want = [13, 11, 7] if eye == "L" else [18, 16, 12]
+                            self.assertEqual(px, want, f"{name} {k}_{eye} 红蓝反了（RGB 没转 BGR 就 imwrite）")
                         else:
                             # 灰度路径不能被我这次改动弄坏。
                             self.assertEqual(set(np.unique(raw).tolist()), {0})

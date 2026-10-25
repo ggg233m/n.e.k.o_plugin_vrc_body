@@ -67,7 +67,7 @@ class ImportIsolationTest(unittest.TestCase):
 
 class ConfigTest(unittest.TestCase):
     def test_default_and_override(self) -> None:
-        self.assertEqual(OnlineNavConfig().stereo_backend, "sgbm")
+        self.assertEqual(OnlineNavConfig().stereo_backend, "las2")
         nav = config.PluginConfig.from_mapping({"navmesh": {"stereo_backend": " LAS2 "}}).navmesh
         self.assertEqual(OnlineNavConfig.from_plugin(nav).stereo_backend, "las2")
 

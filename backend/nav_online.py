@@ -110,11 +110,13 @@ class OnlineNavConfig:
     # ⚠️ 采集（read_stereo）仍留在位姿线程：D3D11 立即上下文不是线程安全的，
     #    OpenVRSensors 的方法只能在感知线程里调（见 OpenVRSensors 文档串）。
     decoupled: bool = True
-    # 视差后端（backend/stereo_backend.py）："sgbm"（CPU，默认）或 "las2"（LAS2-M，XPU）。
-    # las2 载不起来（发行包没有 torch、没有 XPU、缺权重）⇒ errors 里记 stereo_backend、退回 sgbm。
+    # 视差后端（backend/stereo_backend.py）："las2"（LAS2-M，XPU）或 "sgbm"（CPU）。
+    # las2 载不起来（发行包 / `.venv` 没有 torch、没有 XPU、缺权重）⇒ errors 里记 stereo_backend、退回 sgbm。
     # las2 首帧要编译 70–330 s，期间没有双目 ⇒ 控制按 stereo_stale 停车，不会盲走。
-    # 实测（A770，部署块 p50）：720 档 51 vs SGBM 21 ms；1080 档 58.7 vs 64.6 ms。
-    stereo_backend: str = "sgbm"
+    # 实测（A770，部署块 p50）：720 档 51 vs SGBM 21 ms；1080 档 58.7 vs 64.6 ms；
+    # 20261025_202630 真机（VRChat 同跑）SGBM 1080 档 85.9 ms，队列满丢了 16% 关键帧决策。
+    # ⚠️ las2 编译需 MSVC cl + PYTHONUTF8=1（_tc_run314.bat）；纯 `.venv` 启动会退回 sgbm。
+    stereo_backend: str = "las2"
     stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程
     # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级。
     # ⚠️ 实际分辨率由镜像纹理决定：镜像 = AnyaDance 驱动 render × 1.5（SteamVR 滑块不改它）。
@@ -322,8 +324,9 @@ class SessionRecorder:
     "serial"/"model"/"sys"/"ctype"}]}``，``t`` 与 events 里该关键帧的 ``t`` 相同；自身身体/手进点云的离线标注用）、
     ``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
-    ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右原图，采集分辨率、**采集端颜色空间**：
-    采集给的是 RGB 就存 RGB PNG，只有灰度就用灰度）。
+    ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右原图，采集分辨率；彩色按 OpenCV 惯例
+    RGB→BGR 后写，PNG 颜色是对的，``cv2.imread`` 读回 BGR；只有灰度就存灰度。
+    ⚠️ 2026-10-25 修之前的彩色录制（如 20261025_202630）没转，PNG 红蓝互换：``imread`` 的数组直接当 RGB 用）。
 
     感知线程只往内存缓冲里追加（``line``），所有磁盘写都在建图线程（``flush`` / ``keyframe``）里做。
     写失败或超出上限就停录并留痕，不影响导航。
@@ -391,13 +394,14 @@ class SessionRecorder:
                 self.keyframes += 1
                 if images is not None and self.images:
                     # PNG 无损（视差要亚像素，JPEG 的块效应会直接变成深度偏置）；压缩级 1 求快。
-                    # 这里**原样存，不要在写入端 cvtColor**：颜色空间由管道上游决定（有 RGB 就传 RGB，
-                    # 见感知线程那处 `imgs=`）。曾经递进来的一直是 read_stereo() 的灰度，于是落盘全是
-                    # L 型 PNG，下游给点云上色时只能去猜颜色。
+                    # 感知线程传来的是 RGB（OpenVR 镜像纹理格式，`openvr_mirror.py::read_stereo_rgb`），
+                    # 但 ``cv2.imwrite`` 把数组当成 BGR 写 PNG，所以这里**必须转 BGR**——否则落盘红蓝反。
+                    # 下游研究脚本 ``imread`` 读回来又是 BGR（OpenCV 惯例），颜色就对得上。灰度图不受影响。
                     (self.dir / "kf_img").mkdir(exist_ok=True)
                     for eye, img in zip("LR", images):
+                        out = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                         ip = self.dir / "kf_img" / f"{int(k):06d}_{eye}.png"
-                        if not cv2.imwrite(str(ip), img, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+                        if not cv2.imwrite(str(ip), out, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
                             raise OSError(f"imwrite failed: {ip.name}")
                         self.bytes += ip.stat().st_size
             except OSError as exc:

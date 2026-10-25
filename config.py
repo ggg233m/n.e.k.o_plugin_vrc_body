@@ -244,8 +244,8 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     # 驱动 1440×810 ⇒ 1080 = mip1 1080×606 / fx 303.75；驱动 1920×1080 ⇒ 1080 拿到 mip1 1440×810。
     # 深度尺度不随它变；SGBM 视差范围按 fx 自动缩放（nav_mapping.disparity_range_px）。
     "capture_width": (int, 360, 2880),
-    # 双目视差后端，取值见 NAVMESH_CHOICES。"las2" 需 `.venv_las`（torch-xpu + timm）；
-    # 发行包（Py3.11）没有 torch，选了会在会话里报 stereo_backend 错误并退回 sgbm。
+    # 双目视差后端（默认 las2），取值见 NAVMESH_CHOICES。las2 需 `.venv_las`（torch-xpu + timm + cl）；
+    # 发行包（Py3.11）/ 纯 `.venv` 启动没有 torch，会在会话里报 stereo_backend 错误并退回 sgbm。
     "stereo_backend": (str, 0, 0),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
