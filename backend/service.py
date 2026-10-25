@@ -905,6 +905,8 @@ class BackendService:
                     if self.vision_worker.start():
                         self._vision_stop_reason = "running"
                 self.navigator.start()
+                # LAS2 预热放后台：首帧编译 ~80 s（热缓存）起，等到开 navmesh 会话才编就会卡住首帧。
+                self.navmesh.prewarm()
                 self._started = True
                 self._last_error = None
             except Exception as exc:
@@ -2361,6 +2363,8 @@ class BackendService:
             "navigation": self.navigator.snapshot(),
             "turn_trace": self.turn_trace_snapshot(),
             "control_latency": self.control_metrics_snapshot(),
+            # 双目后端 + LAS2 预热进度：总览页要显示「预热中」，不用另开 navmesh 页去查。
+            "stereo_backend": self.navmesh.stereo_backend_status(),
             "backend": {
                 "started": self._started,
                 "dry_run": self.dry_run,

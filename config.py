@@ -247,6 +247,8 @@ NAVMESH_ONLINE_KEYS: dict[str, tuple[type, float, float]] = {
     # 双目视差后端（默认 las2），取值见 NAVMESH_CHOICES。las2 需 `.venv_las`（torch-xpu + timm + cl）；
     # 发行包（Py3.11）/ 纯 `.venv` 启动没有 torch，会在会话里报 stereo_backend 错误并退回 sgbm。
     "stereo_backend": (str, 0, 0),
+    # 后端启动时后台预热 LAS2（默认开）：会话首帧不用再等 ~80 s（热缓存）/ ~5 min（新尺寸冷编译）。
+    "stereo_prewarm": (bool, 0, 1),
     "map_min_interval_s": (float, 0.05, 10.0),
     "kf_dist_m": (float, 0.05, 5.0),
     "kf_turn_deg": (float, 1.0, 180.0),

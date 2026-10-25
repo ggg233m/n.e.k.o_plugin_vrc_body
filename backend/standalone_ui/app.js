@@ -24,6 +24,20 @@ const text = (id, value) => { byId(id).textContent = value == null || value === 
 const number = (value, digits = 1) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "—";
 const boolLabel = (value, yes = "可用", no = "不可用") => value ? yes : no;
 
+// 双目后端 + LAS2 启动预热（`stereo_backend_status`）。预热跑完前开会话，首帧会在适配器锁上等它。
+const WARM_LABEL = {idle: "未预热", loading: "载入模型", compiling: "预热编译中", ready: "已就绪",
+                    eager: "已就绪（未编译，较慢）", failed: "载入失败"};
+function stereoBackendText(sb) {
+  if (!sb || !sb.configured) return {text: "—", cls: "warn"};
+  const active = sb.active ? ` · 当前 ${sb.active}` : "";
+  const w = sb.prewarm;
+  if (sb.configured !== "las2" || !w) return {text: `${sb.configured}${active}`, cls: "ok"};
+  const t = w.elapsed_s == null ? "" : ` ${Math.round(w.elapsed_s)} s`;
+  const err = w.error ? ` · ${w.error}` : "";
+  const cls = w.state === "ready" ? "ok" : (w.state === "failed" || w.state === "eager") ? "bad" : "warn";
+  return {text: `las2 · ${WARM_LABEL[w.state] || w.state}${t}${active}${err}`, cls};
+}
+
 function toast(message, error = false) {
   const element = byId("toast");
   element.textContent = String(message);
@@ -97,6 +111,7 @@ function renderOverview() {
   text("anyadanceFact", `${get(body, "udp.target", "—")} · ${get(body, "udp.connected", "unknown")}`);
   text("oscFact", `${get(snapshot, "vrchat_osc.connection", "unknown")} · ${get(snapshot, "vrchat_osc.send_target", "—")}`);
   text("latencyFact", `${number(get(snapshot, "control_latency.last_latency_ms"), 1)} ms`);
+  text("stereoFact", stereoBackendText(snapshot.stereo_backend).text);
   text("diskFact", `${get(memory, "persistence_write_count", 0)} 次 · 帧不持久化`);
   text("revisionFact", get(world, "status.revision", 0));
   text("entityCountFact", get(world, "status.entity_count", 0));

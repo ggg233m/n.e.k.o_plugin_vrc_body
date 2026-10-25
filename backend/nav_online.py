@@ -32,6 +32,7 @@ import base64
 import json
 import math
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -54,7 +55,7 @@ from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
 from .nav_xsession import XSessionConfig, XSessionTracker, align_into_auto, align_world_tree
 from .nav_mapping import KeyframeGridMapper, MapperConfig, NavSession, stereo_points
 from .pacing import Gate, Pacer, sleep_until
-from .stereo_backend import make_stereo_backend
+from .stereo_backend import las2_prewarm, las2_prewarm_status, make_stereo_backend
 
 # 列 = base 的 x/y/z 轴在 SteamVR 站立系（x 右 y 上 z 后）中的坐标。
 C_BASE = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]])
@@ -117,8 +118,10 @@ class OnlineNavConfig:
     # 20261025_202630 真机（VRChat 同跑）SGBM 1080 档 85.9 ms，队列满丢了 16% 关键帧决策。
     # ⚠️ las2 编译需 MSVC cl + PYTHONUTF8=1（_tc_run314.bat）；纯 `.venv` 启动会退回 sgbm。
     stereo_backend: str = "las2"
-    stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程
-    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级。
+    # 后端启动时在后台线程预热 LAS2（``prewarm``）：热缓存下首帧也要 ~80 s，冷编译 ~5 min。
+    # 预热尺寸按 capture_width 猜（见 ``prewarm_shape``）；猜错档只是会话首帧照旧再编一次。
+    stereo_prewarm: bool = True
+    stereo_min_period_s: float = 0.02    # 解耦线程最小间隔：算得比这快也要让出 CPU 给位姿线程    # 双目采集宽度下限（像素）。走 mip 链：实际输出取仍不小于它的最深一级。
     # ⚠️ 实际分辨率由镜像纹理决定：镜像 = AnyaDance 驱动 render × 1.5（SteamVR 滑块不改它）。
     #   驱动 1440×810（现行）⇒ 镜像 2160×1212 ⇒ 1080 = mip1 1080×606 / fx 303.75；
     #   驱动 1920×1080（旧）⇒ 镜像 2880×1620 ⇒ 1080 拿到 mip1 1440×810 / fx 405、720 = mip2 720×405。
@@ -985,6 +988,8 @@ class OnlineNavigator:
         self._map_updates = 0
         self._map_ms: float | None = None
         self._stereo_ms: float | None = None
+        # 解耦双目每帧分段（ms，墙钟 + 本线程 CPU）：只给诊断用，见 _stage_summary。
+        self._stereo_stages: deque[dict[str, float]] = deque(maxlen=64)
         self._matcher: Any = None
         # 节拍器的实测遥测：声明值旁边必须并排给实测值（见 RateMeter 的教训）。
         # pose / control / stereo / trail 各一份，None 表示那一路还没起过。
@@ -1352,9 +1357,49 @@ class OnlineNavigator:
         self._matcher = m
         return m
 
-    def _stereo_backend_status(self) -> dict[str, Any]:
+    def prewarm_shape(self) -> tuple[int, int]:
+        """按 ``capture_width`` 猜采集尺寸 (H, W)：现行驱动 1440×810 下 1080 档 = 1080×606。
+
+        LAS2 的编译缓存按补到 32 倍数后的尺寸命中，16:9 附近这个猜法和真实尺寸落同一档
+        （720/1080/1440 ⇒ 416×736 / 608×1088 / 832×1440）。真实尺寸是 mip 链上不小于 capture_width 的
+        最深一级（驱动 1920×1080 时 1080 档实际拿到 1440×810），猜不中就由会话首帧再编。
+        """
+        w = int(self._cfg_user.capture_width)
+        return round(w * 606 / 1080), w
+
+    def prewarm(self) -> dict[str, Any] | None:
+        """后端启动时调：配置是 las2（且走解耦路径）就在后台线程预热，立即返回。否则 None。"""
+        c = self._cfg_user
+        if c.stereo_backend != "las2" or not c.decoupled or not c.stereo_prewarm:
+            return None
+        return las2_prewarm(self.prewarm_shape())
+
+    def _stage_summary(self) -> dict[str, Any] | None:
+        """最近 ≤64 帧解耦双目的分段 [中位, p90]（ms；``*_cpu`` 是 [均值, p90]）。
+
+        墙钟 vs ``*_cpu``（本线程 CPU 时间）的差 = 这段里**没在跑**的时间：GIL 等待、
+        GPU 同步（las2_sync）、被别的进程抢核。LAS2 的 disp 再拆成 upload/launch/sync：
+        launch 远大于空载基准而 disp_cpu 不大 ⇒ 等 GIL；sync 大 ⇒ GPU 慢或被抢。
+        """
+        with self._state_lock:
+            rows = list(self._stereo_stages)
+        if not rows:
+            return None
+        out: dict[str, Any] = {"frames": len(rows), "switchinterval_ms": round(sys.getswitchinterval() * 1e3, 3)}
+        for k in rows[-1]:
+            v = np.array([r.get(k, math.nan) for r in rows], float)
+            v = v[np.isfinite(v)]
+            if v.size:
+                # Windows 的 thread_time 是 15.625 ms 一格：*_cpu 的中位只会落在格点上，改给均值。
+                c = float(v.mean()) if k.endswith("_cpu") else float(np.median(v))
+                out[k] = [round(c, 1), round(float(np.percentile(v, 90)), 1)]
+        return out
+
+    def stereo_backend_status(self) -> dict[str, Any]:
         m = self._matcher
         out: dict[str, Any] = {"configured": self.cfg.stereo_backend}
+        if self.cfg.stereo_backend == "las2":
+            out["prewarm"] = las2_prewarm_status()
         if m is None:
             out["active"] = None          # 还没收到第一帧
         else:
@@ -1701,6 +1746,7 @@ class OnlineNavigator:
             (seq, tick, left, right, left_gray, rgb, r_ob,
              fx, cx, cy, baseline_m, kf_kind, T, dist_m) = job
             t0 = time.perf_counter()
+            c0 = time.thread_time()
             try:
                 if matcher is None:
                     matcher = self._make_matcher(fx)
@@ -1709,18 +1755,31 @@ class OnlineNavigator:
                     disp = matcher.compute(rgb[0], rgb[1])
                 else:
                     disp = matcher.compute(left, right)
+                t1, c1 = time.perf_counter(), time.thread_time()
                 if gen != self._gen:
                     return                        # 编译期间会话已换（见 _gen）：这一帧不属于新会话
                 pts = stereo_points(left, right, fx=fx, cx=cx, cy=cy, baseline_m=baseline_m,
                                     disp=disp, max_range_m=c.mapper.range_m)
+                t2, c2 = time.perf_counter(), time.thread_time()
                 near, n = near_obstacle(
                     pts, r_ob, cam_h=self._cam_h, scale=s, ahead_m=c.stop_ahead_m,
                     half_width_m=c.radius_m, ground_tol_m=c.mapper.ground_tol_m,
                     top_m=c.mapper.obst_top_m, min_pts=c.stop_min_pts)
+                t3, c3 = time.perf_counter(), time.thread_time()
+                stage = {"disp": t1 - t0, "points": t2 - t1, "near": t3 - t2, "total": t3 - t0,
+                         "disp_cpu": c1 - c0, "points_cpu": c2 - c1, "near_cpu": c3 - c2,
+                         # tick 之后到这里开算：采集复制 + 排队。只有时钟是 perf_counter 时才可比。
+                         "since_tick": (t0 - tick) if self._clock is time.perf_counter else math.nan}
+                stage = {k: v * 1000.0 for k, v in stage.items()}
+                lt = getattr(matcher, "last_timing", None)
+                if lt:
+                    stage.update({f"las2_{k}": v for k, v in lt.items()})
+                stage["n_pts"] = float(len(pts))
                 with self._state_lock:
                     self._near, self._near_pts = near, n
                     self._stereo_at = tick
-                    self._stereo_ms = (time.perf_counter() - t0) * 1000.0
+                    self._stereo_ms = (t3 - t0) * 1000.0
+                    self._stereo_stages.append(stage)
                 if kf_kind is None:
                     continue
                 feat = None
@@ -2080,7 +2139,8 @@ class OnlineNavigator:
             "map_updates": self._map_updates,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),
-            "stereo_backend": self._stereo_backend_status(),
+            "stereo_stages": self._stage_summary(),
+            "stereo_backend": self.stereo_backend_status(),
             "stereo_age_s": None if stereo_at is None else round(now - stereo_at, 2),
             "rates": self._rate_summary(),
             # cam_h 是**追踪米**（双目单位），而 status 的对外契约是导航系世界米（见模块

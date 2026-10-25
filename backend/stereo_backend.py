@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 import numpy as np
 
 from .nav_mapping import disparity_range_px, make_sgbm, stereo_disparity
 
-__all__ = ("STEREO_BACKENDS", "make_stereo_backend")
+__all__ = ("STEREO_BACKENDS", "las2_prewarm", "las2_prewarm_status", "make_stereo_backend")
 
 STEREO_BACKENDS = ("sgbm", "las2")
 LAS2_CKPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "las_ckpt", "LAS2_M.pth")
@@ -34,6 +35,12 @@ LAS2_CKPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 # 适配器；旧会话的线程若还卡在编译里，新会话的首帧在适配器锁上等它编完，不会并发编两次。
 _las2_lock = threading.Lock()
 _las2: "_LAS2Adapter | None" = None
+
+# 启动预热（``las2_prewarm``）：热缓存下首帧仍要 ~80 s（AOT 反序列化 + 载 Triton 内核），新尺寸
+# 冷编译 ~5 min。挪到后端启动时的后台线程里做，会话首帧就不用等。每进程只成功一次。
+# state：idle 没起过 / loading 载权重 / compiling 跑首帧 / ready 编译版 / eager 编译失败退回 eager / failed 载不起来。
+_warm_lock = threading.Lock()
+_warm: dict[str, Any] = {"state": "idle"}
 
 
 def make_stereo_backend(kind: str = "sgbm", *, fx: float = 202.5) -> Any:
@@ -56,6 +63,55 @@ def make_stereo_backend(kind: str = "sgbm", *, fx: float = 202.5) -> Any:
             return _las2
     raise ValueError(f"unknown stereo backend {kind!r} (expected one of {STEREO_BACKENDS})")
 
+
+
+def las2_prewarm(shape: tuple[int, int]) -> dict[str, Any]:
+    """后台线程载 LAS2 并按 ``shape = (H, W)`` 跑一帧空图，把 torch.compile 的开销挪到启动时。
+
+    编译缓存按**补到 32 倍数后的**尺寸命中（606 → 608），所以 shape 只要落在同一档就有效。
+    预热和会话首帧共用同一个适配器（``make_stereo_backend`` 单例 + 适配器锁）：会话在预热中途开起来，
+    首帧就在锁上等预热编完，不会编两次。重复调用直接返回当前状态；只有 failed 会重试。
+    """
+    h, w = int(shape[0]), int(shape[1])
+    with _warm_lock:
+        if _warm["state"] not in ("idle", "failed"):
+            return _warm_view()
+        _warm.clear()
+        _warm.update(state="loading", shape=[h, w], error=None, started=time.perf_counter())
+    threading.Thread(target=_prewarm_run, args=(h, w), name="las2-prewarm", daemon=True).start()
+    return las2_prewarm_status()
+
+
+def _prewarm_set(**kv: Any) -> None:
+    with _warm_lock:
+        _warm.update(kv)
+
+
+def _prewarm_run(h: int, w: int) -> None:
+    try:
+        m = make_stereo_backend("las2")
+        _prewarm_set(state="compiling")
+        z = np.zeros((h, w, 3), np.uint8)
+        m.compute(z, z)
+        d = m.describe()
+        _prewarm_set(state="ready" if d.get("compiled") else "eager", error=d.get("compile_error"))
+    except Exception as exc:  # noqa: BLE001 - 缺 torch / XPU / 权重：如实报，会话照常退回 SGBM
+        _prewarm_set(state="failed", error=f"{type(exc).__name__}: {exc}"[:300])
+    finally:
+        _prewarm_set(done=time.perf_counter())
+
+
+def _warm_view() -> dict[str, Any]:
+    out = dict(_warm)
+    t0, t1 = out.pop("started", None), out.pop("done", None)
+    out["elapsed_s"] = None if t0 is None else round((t1 if t1 is not None else time.perf_counter()) - t0, 1)
+    return out
+
+
+def las2_prewarm_status() -> dict[str, Any]:
+    """``{"state", "shape", "error", "elapsed_s"}``；elapsed_s 在跑时是已用时，跑完是总耗时。"""
+    with _warm_lock:
+        return _warm_view()
 
 class _SGBMAdapter:
     __slots__ = ("_m",)
@@ -111,7 +167,8 @@ class _LAS2Adapter:
     慢一倍但结果相同，比整条双目断掉好。``compute`` 持锁：编译期与跨会话复用都只有一个线程在跑。
     """
 
-    __slots__ = ("_model", "_dev", "_compiled", "_ok_shapes", "compile_error", "_shape", "_pad", "_lock")
+    __slots__ = ("_model", "_dev", "_compiled", "_ok_shapes", "compile_error", "_shape", "_pad", "_lock",
+                 "last_timing")
 
     def __init__(self, model: Any, device: Any) -> None:
         import torch
@@ -123,6 +180,10 @@ class _LAS2Adapter:
         self._shape: tuple[int, int] | None = None
         self._pad: list[int] = [0, 0, 0, 0]
         self._lock = threading.Lock()
+        # 上一帧分段墙钟（ms）：upload = numpy→XPU+pad；launch = 前向调用返回（XPU 异步，
+        # 这段是 Python 派发，GIL 等待会落在这里）；sync = .cpu() 等 GPU 跑完 + 回传。
+        # 只用 perf_counter，不加任何 XPU 同步/算子。
+        self.last_timing: dict[str, float] | None = None
 
     def _eager(self, a: Any, b: Any) -> Any:
         return self._model(a.half(), b.half())
@@ -147,8 +208,10 @@ class _LAS2Adapter:
             t = t.permute(2, 0, 1)[None].float() if t.ndim == 3 else t[None, None].float().expand(1, 3, -1, -1)
             return F.pad(t, pad, mode="replicate")
 
+        t0 = time.perf_counter()
         with torch.no_grad():
             a, b = to_dev(left_rgb), to_dev(right_rgb)
+            t1 = time.perf_counter()
             if self.compile_error is not None:
                 d = self._eager(a, b)
             elif (H, W) in self._ok_shapes:
@@ -160,8 +223,12 @@ class _LAS2Adapter:
                 except Exception as exc:  # noqa: BLE001 - 只兜编译期
                     self.compile_error = f"{type(exc).__name__}: {exc}"[:300]
                     d = self._eager(a, b)
+            t2 = time.perf_counter()
         d = d[0, 0, pad[2]:pad[2] + H, pad[0]:pad[0] + W]
-        return d.float().cpu().numpy()
+        out = d.float().cpu().numpy()
+        t3 = time.perf_counter()
+        self.last_timing = {"upload": (t1 - t0) * 1e3, "launch": (t2 - t1) * 1e3, "sync": (t3 - t2) * 1e3}
+        return out
 
     def describe(self) -> dict[str, Any]:
         """``compiled``：None = 还没跑过首帧（正在编译或没帧），True = 编译版，False = 退回 eager。"""

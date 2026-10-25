@@ -579,7 +579,13 @@ def main() -> int:
         action="store_true",
         help="disable VMC, VRChat OSC, and driver telemetry for local development",
     )
+    # 诊断用：Windows 上 GIL 交接被定时器量化，多线程同跑时 LAS2 每帧 ~730 次交接会被拖慢。
+    # 缺省不动解释器默认值（5 ms）；对照看 navmesh status 的 stereo_stages。
+    parser.add_argument("--switchinterval-ms", type=float, default=None,
+                        help="diagnostic: sys.setswitchinterval in milliseconds")
     args = parser.parse_args()
+    if args.switchinterval_ms is not None:
+        sys.setswitchinterval(max(1e-6, args.switchinterval_ms / 1000.0))
     try:
         config_dir = Path(args.config_dir).resolve()
         state_dir = Path(args.state_dir).resolve() if args.state_dir else config_dir

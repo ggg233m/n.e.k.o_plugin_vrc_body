@@ -122,6 +122,20 @@ $("estop").onclick = async () => {
 
 function flag(el, text, cls) { el.textContent = text; el.className = `flag ${cls}`; }
 
+// 双目后端 + LAS2 启动预热（`stereo_backend_status`）。预热跑完前开会话，首帧会在适配器锁上等它。
+const WARM_LABEL = {idle: "未预热", loading: "载入模型", compiling: "预热编译中", ready: "已就绪",
+                    eager: "已就绪（未编译，较慢）", failed: "载入失败"};
+function stereoBackendText(sb) {
+  if (!sb || !sb.configured) return {text: "—", cls: "warn"};
+  const active = sb.active ? ` · 当前 ${sb.active}` : "";
+  const w = sb.prewarm;
+  if (sb.configured !== "las2" || !w) return {text: `${sb.configured}${active}`, cls: "ok"};
+  const t = w.elapsed_s == null ? "" : ` ${Math.round(w.elapsed_s)} s`;
+  const err = w.error ? ` · ${w.error}` : "";
+  const cls = w.state === "ready" ? "ok" : (w.state === "failed" || w.state === "eager") ? "bad" : "warn";
+  return {text: `las2 · ${WARM_LABEL[w.state] || w.state}${t}${active}${err}`, cls};
+}
+
 function render(s, auto) {
   const running = !!s.running;
   $("state").textContent = running ? "运行中" : "未运行";
@@ -146,6 +160,8 @@ function render(s, auto) {
     || (ho.max_legit_gap_s || 0) > (ho.zoh_max_s || 2.5) ? "bad" : "ok");
   const sen = s.sensors;
   $("sensors").textContent = sen && sen.size ? `${sen.size[0]}×${sen.size[1]} fx ${num(sen.fx, 1)} 基线 ${num(sen.baseline_m, 3)}` : "未打开";
+  const sbv = stereoBackendText(s.stereo_backend);
+  flag($("stereoBackend"), sbv.text, sbv.cls);
   $("stereo").textContent = `${s.stereo_ms == null ? "—" : num(s.stereo_ms, 0) + " ms"} / ${s.stereo_age_s == null ? "—" : num(s.stereo_age_s, 1) + " s"}`;
   $("kf").textContent = `${s.keyframes ?? 0} / ${s.map_updates ?? 0}`;
   $("mapMs").textContent = s.map_update_ms == null ? "—" : `${num(s.map_update_ms, 0)} ms`;
