@@ -278,6 +278,7 @@ class KeyframePolicy:
         self.at = -math.inf
         self.defer_since: float | None = None
         self.deferred = 0
+        self._prev: tuple | None = None          # 上一次 _take 之前的状态，给 undo 用
 
     def decide(self, t: float, xy: np.ndarray, yaw: float, yaw_rate_dps: float) -> str | None:
         c = self.cfg
@@ -309,8 +310,20 @@ class KeyframePolicy:
         return self._take(t, xy, yaw, kind)
 
     def _take(self, t: float, xy: np.ndarray, yaw: float, kind: str) -> str:
+        self._prev = (self.xy, self.yaw, self.at, self.defer_since)
         self.xy, self.yaw, self.at, self.defer_since = np.asarray(xy[:2], float).copy(), yaw, t, None
         return kind
+
+    def undo(self) -> None:
+        """撤销上一次取帧：这一帧没送到双目线程（解耦队列满），等于没取过。
+
+        不撤的话下一帧要从这个**没落盘**的位置再走满 ``kf_dist_m`` 才判 ⇒ 关键帧间距被拉稀
+        （20261025_202630：丢了的间隔中位 1.16 m vs 0.56 m）。撤了下一拍照常再判。
+        只撤一次：连续两次 undo 没有意义（中间必然有过一次 decide）。
+        """
+        if self._prev is not None:
+            self.xy, self.yaw, self.at, self.defer_since = self._prev
+            self._prev = None
 
 
 class SessionRecorder:
@@ -951,6 +964,9 @@ class OnlineNavigator:
         # 帧序号（仅用于日志/调试）与关键帧编号。解耦线程与位姿线程共享这些计数器，所以取号要在
         # _state_lock 下（否则两边都能分到同一个 kf_id）。
         self._stereo_seq = 0
+        # 交接槽计数（见 _offer_stereo）：kf = 关键帧没送进去（已撤销策略，下一拍重判）；
+        # frame = 普通帧让路给槽里的关键帧；replaced = 槽里的旧普通帧被新帧顶掉。
+        self._stereo_drops = {"kf": 0, "frame": 0, "replaced": 0}
         self._kf_next_id = 0
         #: 最近一个**已入队**的关键帧号（-1 = 还没有）。trail 挂它。
         self._last_committed_kf = -1
@@ -1143,14 +1159,37 @@ class OnlineNavigator:
     def _stop_session(self, timeout_s: float) -> dict[str, Any]:
         self._stop.set()
         self._map_event.set()
-        for t in self._threads:
+        threads, self._threads = self._threads, []
+        for t in threads:
             t.join(timeout=timeout_s)
-        self._threads = []
         self._halt()
         with self._nav_lock:
             self.session.cancel()
-        if self.recorder is not None:
-            self.recorder.close(None if self.loops is None else self.loops.poses())
+        # 停止前把 _pending 里剩下的关键帧写进录制（不过图、不进回环）：建图线程停在两帧之间时
+        # 会把没处理的放回 _pending（见 _mapping_loop）。只写 kf/*.npz + events 行（``unmapped``），
+        # 停止不再被积压拖几十秒，录制也不再在积压起点断掉。
+        rec = self.recorder
+        mapping_alive = any(t.name == "navmesh-mapping" and t.is_alive() for t in threads)
+        if rec is not None and mapping_alive:
+            # join 超时：建图线程还在跑（单帧卡住），这时再碰 loops/录制是竞争 ⇒ 不补写，记一笔。
+            self._fail("record_flush", RuntimeError("mapping thread still running at stop"))
+        elif rec is not None:
+            with self._state_lock:
+                pending, self._pending = self._pending, []
+            for kind, item in pending:
+                if kind == "kf":
+                    k, pts, T, dist, feat, t_kf, refresh, thumb, imgs = item
+                    # T_map 没进位姿图：按最后一个入图关键帧的修正量平移（与逐帧 trail 同口径）。
+                    T_map = T if self.loops is None else self.loops.correct(T)
+                    rec.keyframe(k, pts, T, T_map, dist, feat, images=imgs)
+                    rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist,
+                                        "loops": [], "refresh": refresh, "unmapped": True})
+                elif kind == "trail":
+                    k, T_dr, dist, t_tr = item
+                    rec.line("events", {"kind": "trail", "k": k, "t": t_tr, "dist_m": dist, "T_dr": T_dr})
+            rec.flush()
+        if rec is not None:
+            rec.close(None if self.loops is None else self.loops.poses())
         # 采纳线程要的 session_id **只有这里还取得到**：_end_memory 会把 _mem 置 None。
         # （2026-10-05 live 实测：线程里再读 self._mem 恒为 None ⇒ xsession_align 永远报
         # memory_gone，采纳从未真正跑过——旧测试直接调线程体，绕开了这个顺序。）
@@ -1509,17 +1548,17 @@ class OnlineNavigator:
                                 (t_a, y_a), (t_b, y_b) = yaw_hist[0], yaw_hist[-1]
                                 rate = math.degrees(y_b - y_a) / (t_b - t_a) if t_b > t_a else 0.0
                                 kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
-                                if kf_kind is not None and snap_devices is not None:
-                                    snap_devices = self._record_devices(rec, snap_devices, tick)
                                 self._stereo_seq += 1
                                 job = (self._stereo_seq, tick, pair[0], pair[1],
                                        cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY) if rgb is not None else None,
                                        rgb, r_ob, sensors.fx, sensors.cx, sensors.cy,
                                        sensors.baseline_m, kf_kind, T.copy(), self.dr.dist_m)
-                                try:
-                                    self._stereo_q.put_nowait(job)
-                                except queue.Full:
-                                    pass          # 丢最新：位姿线程绝不因为双目排队变慢
+                                if self._offer_stereo(job, kf_kind is not None):
+                                    # devices 行只给真送进双目线程的关键帧写：被丢的拍不留孤行。
+                                    if kf_kind is not None and snap_devices is not None:
+                                        snap_devices = self._record_devices(rec, snap_devices, tick)
+                                elif kf_kind is not None:
+                                    policy.undo()     # 没送到 ⇒ 当没取过，下一拍再判
                                 self._rate_stereo.mark(tick)
                                 continue
                             if matcher is None:
@@ -1581,7 +1620,8 @@ class OnlineNavigator:
         """写一行 devices.jsonl；``t`` 与该关键帧 events.jsonl 的 ``t`` 逐位相同（同一个 tick），按它配对。
 
         解耦路径的关键帧号要到双目线程才分配，这里拿不到，所以只靠 ``t`` 配对；
-        队列满被丢的那一拍会留下一行没有对应关键帧的记录，离线按 ``t`` 配不上就跳过。
+        只在关键帧**真进了双目队列**之后才写（见 ``_offer_stereo``），所以不再有孤行；
+        2026-10-25 之前的录制（如 20261025_202630）丢帧会留孤行，离线按 ``t`` 配不上就跳过。
         读失败只停这一路（返回 None），不影响导航和其它录制。
         """
         try:
@@ -1612,6 +1652,31 @@ class OnlineNavigator:
             # 永远停在 -1，inline 路径又根本不递增 _kf_next_id）。
             self._last_committed_kf = int(kf_id)
         self._map_event.set()
+
+    def _offer_stereo(self, job: tuple, is_keyframe: bool) -> bool:
+        """非阻塞地把一帧交给双目线程；返回这一帧是否进了队列。
+
+        槽满时按「关键帧优先、其余取最新」处理：槽里是普通帧 ⇒ 换成这一帧（更新鲜，近距判定
+        也更及时）；槽里是关键帧 ⇒ 它不能丢（devices 行已写、策略状态已推进），这一帧让路。
+        只有感知线程一个生产者，所以 get_nowait/put_nowait 之间不会有别人往里放。
+        """
+        try:
+            self._stereo_q.put_nowait(job)
+            return True
+        except queue.Full:
+            pass
+        try:
+            held = self._stereo_q.get_nowait()
+        except queue.Empty:                       # 双目线程刚好取走了
+            self._stereo_q.put_nowait(job)
+            return True
+        if held[11] is not None:                  # 槽里是关键帧：放回去，这一帧丢
+            self._stereo_q.put_nowait(held)
+            self._stereo_drops["kf" if is_keyframe else "frame"] += 1
+            return False
+        self._stereo_q.put_nowait(job)
+        self._stereo_drops["replaced"] += 1
+        return True
 
     # ---- 双目解耦线程 ----
     def _stereo_worker_loop(self) -> None:
@@ -1697,7 +1762,13 @@ class OnlineNavigator:
             try:
                 # mapper / loops 只有本线程写，灌数据和栅格化都不拿 _nav_lock；
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
-                for kind, item in pending:
+                for i, (kind, item) in enumerate(pending):
+                    if self._stop.is_set():
+                        # 停止：没处理的原样放回 _pending 队首，交给 _stop_session 只写录制。
+                        # 积压时一批能有几十帧（20261025_202630 末尾 28 s），整批跑完 join 会超时。
+                        with self._state_lock:
+                            self._pending[:0] = pending[i:]
+                        return
                     if kind == "kf":
                         k, pts, T, dist, feat, t_kf, refresh, thumb, imgs = item
                         dirty = True
@@ -1778,7 +1849,7 @@ class OnlineNavigator:
                         if table is not None:
                             mem.poses(table)
                             self._mem_flushed_at = self._clock()
-                if dirty and len(self.mapper):
+                if dirty and len(self.mapper) and not self._stop.is_set():
                     wait = c.map_min_interval_s - (self._clock() - last_update)
                     if wait > 0.0:
                         # 节流中：不等下一个关键帧，时间一到就补这次更新。
@@ -1933,6 +2004,7 @@ class OnlineNavigator:
             # 关键帧不是周期量（位移/转角/时长三选一触发），所以它没有 target。
             # 它会随走路速度在「卡在 stereo 台阶上」和「原地 3 s 补一帧」之间摆。
             "keyframe_hz": _rnd(self._rate_kf.hz(), 2),
+            "stereo_drops": dict(self._stereo_drops),
             "keyframe_gap_p50_s": _rnd(self._rate_kf.gap_p50_s(), 4),
             "samples": {"pose": self._rate_pose.samples(),
                         "stereo": self._rate_stereo.samples(),

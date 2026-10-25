@@ -407,6 +407,24 @@ class KeyframePolicyTest(unittest.TestCase):
         self.assertIsNone(self.p.decide(0.2, np.array([0.5 / S, 0.0]), 0.0, 60.0))
         self.assertEqual(self.p.decide(0.4, np.array([0.85 / S, 0.0]), 0.0, 60.0), "new")
 
+    def test_undo_makes_the_next_tick_retake(self) -> None:
+        """解耦队列满、关键帧没送出去 ⇒ undo；下一拍还在原地附近就要立刻重取，
+        不能从没落盘的位置再走满 kf_dist_m（20261025_202630：丢帧间隔中位 1.16 m vs 0.56 m）。"""
+        self.assertEqual(self.p.decide(0.5, np.array([0.45 / S, 0.0]), 0.0, 0.0), "new")
+        self.p.undo()
+        self.assertEqual(self.p.decide(0.55, np.array([0.47 / S, 0.0]), 0.0, 0.0), "new")
+        # 不撤的对照：同样的下一拍不取。
+        p = KeyframePolicy(OnlineNavConfig())
+        p.decide(0.0, np.zeros(2), 0.0, 0.0)
+        p.decide(0.5, np.array([0.45 / S, 0.0]), 0.0, 0.0)
+        self.assertIsNone(p.decide(0.55, np.array([0.47 / S, 0.0]), 0.0, 0.0))
+
+    def test_undo_twice_is_a_noop(self) -> None:
+        self.assertEqual(self.p.decide(0.5, np.array([0.45 / S, 0.0]), 0.0, 0.0), "new")
+        self.p.undo()
+        self.p.undo()                      # 不许退回到首帧之前（xy=None 会让下一拍当首帧）
+        self.assertIsNotNone(self.p.xy)
+
 
 class NearObstacleTest(unittest.TestCase):
     def kw(self) -> dict:
@@ -1657,6 +1675,104 @@ class XSessionAlignTest(unittest.TestCase):
         self.assertFalse(nav._align_out["world_tree"]["ok"])
         self.assertIn("boom", nav._align_out["world_tree"]["reason"])
         self.assertTrue(any("xsession_tree" in e for e in nav._errors), nav._errors)
+
+
+def _job(kf_kind: str | None, seq: int = 0) -> tuple:
+    """_stereo_q 的任务元组，只有 [0] seq 和 [11] kf_kind 对交接槽有意义。"""
+    return (seq, 0.0, None, None, None, None, None, 0.0, 0.0, 0.0, 0.0, kf_kind, None, 0.0)
+
+
+class StereoHandoffTest(unittest.TestCase):
+    """解耦交接槽（maxsize=1）：关键帧优先、其余取最新。"""
+
+    def setUp(self) -> None:
+        self.nav = Harness().nav
+
+    def test_frame_replaces_stale_frame(self) -> None:
+        nav = self.nav
+        self.assertTrue(nav._offer_stereo(_job(None, 1), False))     # noqa: SLF001
+        self.assertTrue(nav._offer_stereo(_job(None, 2), False))     # noqa: SLF001
+        self.assertEqual(nav._stereo_q.get_nowait()[0], 2, "槽里应是更新鲜的那帧")  # noqa: SLF001
+        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 0, "frame": 0, "replaced": 1})
+
+    def test_keyframe_replaces_plain_frame(self) -> None:
+        nav = self.nav
+        nav._offer_stereo(_job(None, 1), False)                      # noqa: SLF001
+        self.assertTrue(nav._offer_stereo(_job("new", 2), True))     # noqa: SLF001
+        self.assertEqual(nav._stereo_q.get_nowait()[11], "new")      # noqa: SLF001
+
+    def test_queued_keyframe_is_never_displaced(self) -> None:
+        nav = self.nav
+        nav._offer_stereo(_job("new", 1), True)                      # noqa: SLF001
+        self.assertFalse(nav._offer_stereo(_job(None, 2), False))    # noqa: SLF001
+        self.assertFalse(nav._offer_stereo(_job("new", 3), True))    # noqa: SLF001
+        self.assertEqual(nav._stereo_q.get_nowait()[0], 1)           # noqa: SLF001
+        self.assertEqual(nav.status()["rates"]["stereo_drops"], {"kf": 1, "frame": 1, "replaced": 0})
+
+
+class _SlowMatcher(_FakeMatcher):
+    """视差慢过双目周期：逼出槽满（实机 1080 SGBM ≈ 86 ms/帧）。"""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+
+    def compute(self, left, right):
+        time.sleep(self.delay_s)
+        return super().compute(left, right)
+
+
+class DecoupledDropRecordingTest(unittest.TestCase):
+    def _run(self, root: Path, matcher, until_kf: int, mapping_delay_s: float = 0.0) -> dict:
+        h = Harness(armed=False, vz=0.5, record_root=root)
+        cls = nav_online.KeyframeGridMapper
+        orig = cls.add_keyframe
+
+        def slow_add(self, *a, **kw):             # start() 会 _reset() 换 mapper，只能打在类上
+            time.sleep(mapping_delay_s)
+            return orig(self, *a, **kw)
+
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+                mock.patch.object(nav_online, "make_stereo_backend", return_value=matcher), \
+                mock.patch.object(cls, "add_keyframe", slow_add):
+            h.nav.start(record=True)
+            try:
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and h.nav._kf_next_id < until_kf:  # noqa: SLF001
+                    time.sleep(0.02)
+            finally:
+                t0 = time.monotonic()
+                st = h.nav.stop()
+                st["_stop_s"] = time.monotonic() - t0
+        return st
+
+    @staticmethod
+    def _read(out: Path, name: str) -> list[dict]:
+        p = out / f"{name}.jsonl"
+        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+
+    def test_slow_stereo_leaves_no_orphan_device_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self._run(Path(d), _SlowMatcher(0.12), until_kf=4)
+            out = Path(st["recording"]["dir"])
+            kf_t = {e["t"] for e in self._read(out, "events") if e["kind"] == "kf"}
+            dev_t = [x["t"] for x in self._read(out, "devices")]
+            self.assertTrue(dev_t)
+            self.assertEqual(set(dev_t), kf_t, "devices 行与关键帧必须一一对上：被丢的拍不许留孤行")
+
+    def test_stop_writes_backlog_to_recording_without_mapping_it(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            st = self._run(Path(d), _FakeMatcher(), until_kf=6, mapping_delay_s=0.6)
+            out = Path(st["recording"]["dir"])
+            kfs = [e for e in self._read(out, "events") if e["kind"] == "kf"]
+            unmapped = [e for e in kfs if e.get("unmapped")]
+            self.assertTrue(unmapped, "建图积压时停止，剩下的关键帧应只写录制")
+            self.assertEqual(len(kfs) - len(unmapped), st["keyframes"], "unmapped 的不计入入图数")
+            self.assertEqual(len({e["k"] for e in kfs}), len(kfs))
+            for e in kfs:
+                self.assertTrue((out / "kf" / f"{e['k']:06d}.npz").exists())
+            self.assertLess(st["_stop_s"], 1.5, "停止不能等积压建完")
+            self.assertEqual(st["recording"]["stopped"], "closed")
 
 
 class KeyframeDedupStatusTest(unittest.TestCase):
