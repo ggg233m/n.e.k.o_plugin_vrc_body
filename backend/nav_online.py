@@ -317,7 +317,10 @@ class SessionRecorder:
     目录内容：``meta.json``（配置、传感器）、``hmd.jsonl``（每个位姿周期的 HMD 旋转，base 系）、
     ``osc.jsonl``（新到的 OSC 速度样本）、``vert.jsonl``（OSC VelocityY / Grounded）、
     ``params.jsonl``（内置运动/缩放参数逐条原始值 ``{"t","n","v"}``，含 Upright / AngularY / VelocityMagnitude /
-    ScaleFactor / /avatar/eyeheight 等；开录时的缓存值另在 meta.json ``avatar``）、``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
+    ScaleFactor / /avatar/eyeheight 等；开录时的缓存值另在 meta.json ``avatar``）、
+    ``devices.jsonl``（关键帧拍上全部已连接 OpenVR 设备 ``{"t","d":[{"i","c","r","v","T"(3×4 追踪站立系),
+    "serial"/"model"/"sys"/"ctype"}]}``，``t`` 与 events 里该关键帧的 ``t`` 相同；自身身体/手进点云的离线标注用）、
+    ``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
     ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右原图，采集分辨率、**采集端颜色空间**：
     采集给的是 RGB 就存 RGB PNG，只有灰度就用灰度）。
@@ -701,6 +704,7 @@ class OpenVRSensors:
         self._device = self._context = None
         self._eyes: list[Any] = []
         self._poses: Any = None
+        self._dev_props: dict[int, dict[str, Any]] = {}
         self.fx = self.cx = self.cy = 0.0
         self.baseline_m = 0.0
         self.size = (0, 0)
@@ -733,7 +737,9 @@ class OpenVRSensors:
             src = (self._eyes[0].desc["Width"], self._eyes[0].desc["Height"])
             self.size = self._eyes[0].gpu_size or src
             self.fx, _fy, self.cx, self.cy = projection_intrinsics(self._system, openvr.Eye_Left, self.size, src)
-            self._poses = (openvr.TrackedDevicePose_t * 1)()
+            # 全部 64 个槽位：录制要手柄/追踪器位姿（自身身体进点云的离线标注）。
+            # 原来只开 1 个槽 ⇒ 只拿得到 HMD。多出的只是一次原生 memcpy，每拍照样只读 HMD。
+            self._poses = (openvr.TrackedDevicePose_t * openvr.k_unMaxTrackedDeviceCount)()
         except OSError as exc:                            # 原生崩（空指针/dll 失效）走这里
             self.close()
             raise RuntimeError(_steamvr_failed(exc)) from exc
@@ -766,6 +772,41 @@ class OpenVRSensors:
         if pair is None:
             return None
         return cv2.cvtColor(pair[0], cv2.COLOR_RGB2GRAY), cv2.cvtColor(pair[1], cv2.COLOR_RGB2GRAY)
+
+    def snapshot_devices(self) -> list[dict[str, Any]]:
+        """所有已连接 OpenVR 设备的位姿（追踪站立系，与 HMD 同一拍）+ 类别/角色/型号。
+
+        不再调 ``getDeviceToAbsoluteTrackingPose``：读的是本拍 ``hmd_rotation()`` 刚填好的 ``_poses``，
+        所以手柄/追踪器与 HMD、与紧随其后采的双目帧是**同一时刻**。只在录制的关键帧拍上调。
+        ``T`` 是 3×4（OpenVR 原生 +y 上、−z 前，追踪米），离线用 ``inv(T_hmd) @ T_dev`` 换到头部系。
+        型号等静态属性按 (槽位, 类别) 缓存：每个设备只问一次。
+        """
+        vr, sys_ = self._vr, self._system
+        out = []
+        for i in range(len(self._poses)):
+            if not sys_.isTrackedDeviceConnected(i):
+                continue
+            cls = int(sys_.getTrackedDeviceClass(i))
+            props = self._dev_props.get(i)
+            if props is None or props["c"] != cls:
+                props = {"c": cls}
+                # 不是所有设备都有这些属性：取不到/为空就不记。
+                for p, k in ((vr.Prop_SerialNumber_String, "serial"), (vr.Prop_ModelNumber_String, "model"),
+                             (vr.Prop_TrackingSystemName_String, "sys"), (vr.Prop_ControllerType_String, "ctype")):
+                    try:
+                        v = sys_.getStringTrackedDeviceProperty(i, p)
+                    except Exception:  # noqa: BLE001 - openvr 的属性错误码异常
+                        continue
+                    if v:
+                        props[k] = v
+                self._dev_props[i] = props
+            pose = self._poses[i]
+            m = pose.mDeviceToAbsoluteTracking
+            # 角色每次都读：两只手柄会互换左右。
+            out.append({"i": i, **props, "r": int(sys_.getControllerRoleForTrackedDeviceIndex(i)),
+                        "v": bool(pose.bPoseIsValid),
+                        "T": [[round(float(m[a][b]), 4) for b in range(4)] for a in range(3)]})
+        return out
 
     def close(self) -> None:
         from .wgc_capture import _release
@@ -1338,6 +1379,9 @@ class OnlineNavigator:
                 f"measured {bl['measured_m']} m, expected {bl['expected_m']}±{bl['tol_m']} m "
                 "(SteamVR 注册的 AnyaDance 驱动不是自编版？)"))
         rec = self.recorder
+        # 关键帧拍上的全部设备位姿 → devices.jsonl（只在录制时）。必须在感知线程读：
+        # `_poses` 是本拍 hmd_rotation() 刚填的，与同拍双目帧同一时刻；交给双目线程就晚了。
+        snap_devices = getattr(sensors, "snapshot_devices", None) if rec is not None else None
         if rec is not None:
             rec.line("events", {"kind": "sensors", "t": self._clock(), "info": info, "fx": sensors.fx,
                                 "cx": sensors.cx, "cy": sensors.cy, "baseline_m": sensors.baseline_m})
@@ -1461,6 +1505,8 @@ class OnlineNavigator:
                                 (t_a, y_a), (t_b, y_b) = yaw_hist[0], yaw_hist[-1]
                                 rate = math.degrees(y_b - y_a) / (t_b - t_a) if t_b > t_a else 0.0
                                 kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
+                                if kf_kind is not None and snap_devices is not None:
+                                    snap_devices = self._record_devices(rec, snap_devices, tick)
                                 self._stereo_seq += 1
                                 job = (self._stereo_seq, tick, pair[0], pair[1],
                                        cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY) if rgb is not None else None,
@@ -1492,6 +1538,8 @@ class OnlineNavigator:
                             rate = math.degrees(y_b - y_a) / (t_b - t_a) if t_b > t_a else 0.0
                             kf_kind = policy.decide(tick, T[:2, 3], yaw, rate)
                             new_kf = kf_kind is not None
+                            if new_kf and snap_devices is not None:
+                                snap_devices = self._record_devices(rec, snap_devices, tick)
                             feat = None
                             if new_kf and (self.loops is not None or mem is not None):
                                 # 同一张视差图给 ORB 点深度；只在关键帧上做，约 6 ms。
@@ -1524,6 +1572,20 @@ class OnlineNavigator:
                 sensors.close()
             except Exception as exc:  # noqa: BLE001
                 self._fail("sensors_close", exc)
+
+    def _record_devices(self, rec: "SessionRecorder", snap: Any, tick: float) -> Any:
+        """写一行 devices.jsonl；``t`` 与该关键帧 events.jsonl 的 ``t`` 逐位相同（同一个 tick），按它配对。
+
+        解耦路径的关键帧号要到双目线程才分配，这里拿不到，所以只靠 ``t`` 配对；
+        队列满被丢的那一拍会留下一行没有对应关键帧的记录，离线按 ``t`` 配不上就跳过。
+        读失败只停这一路（返回 None），不影响导航和其它录制。
+        """
+        try:
+            rec.line("devices", {"t": tick, "d": snap()})
+            return snap
+        except Exception as exc:  # noqa: BLE001
+            self._fail("record_devices", exc)
+            return None
 
     def _commit_keyframe(self, kf_id: int, pts: Any, T: np.ndarray, feat: Any, tick: float,
                          kf_kind: str, mem: Any, left_rgb: Any, rgb: Any, pair: Any) -> None:

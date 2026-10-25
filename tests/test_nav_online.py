@@ -461,13 +461,16 @@ class FakeSensors:
         z = np.zeros((4, 4), np.uint8)
         return z, z
 
+    def snapshot_devices(self) -> list:
+        return [{"i": 0, "c": 1, "r": 0, "v": True, "T": [[1, 0, 0, 0], [0, 1, 0, 1.5], [0, 0, 1, 0]]}]
+
     def close(self) -> None:
         self.closed = True
 
 
 class Harness:
     def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None,
-                 frozen_osc: bool = False, avatar: dict | None = None) -> None:
+                 frozen_osc: bool = False, avatar: dict | None = None, decoupled: bool = True) -> None:
         self.armed = armed
         self.vz = vz
         self.frozen_osc = frozen_osc
@@ -476,7 +479,8 @@ class Harness:
         self.stops = 0
         self.sensors = FakeSensors()
         self._osc_ts: float | None = None
-        cfg = OnlineNavConfig(map_min_interval_s=0.1, stereo_period_s=0.05, kf_max_age_s=0.3)
+        cfg = OnlineNavConfig(map_min_interval_s=0.1, stereo_period_s=0.05, kf_max_age_s=0.3,
+                              decoupled=decoupled)
         self.nav = OnlineNavigator(
             motion_history=self._motion,
             send_move=lambda f, ms: self.moves.append((f, ms)),
@@ -650,6 +654,72 @@ class SteamVROpenGuardTest(unittest.TestCase):
             self._open(fake)
         self.assertIn("HmdNotFound", str(raised.exception))
         self.assertEqual(fake.shutdown_calls, 0, "init 抛错时不许 shutdown")
+
+
+class SnapshotDevicesTest(unittest.TestCase):
+    """devices.jsonl 的来源：读本拍 hmd_rotation() 填好的位姿数组，不再另取一次。"""
+
+    class _Pose:
+        def __init__(self, x: float, valid: bool = True) -> None:
+            self.mDeviceToAbsoluteTracking = [[1.0, 0.0, 0.0, x], [0.0, 1.0, 0.0, 1.5], [0.0, 0.0, 1.0, -0.3]]
+            self.bPoseIsValid = valid
+
+    class _System:
+        # 槽位 → (类别, 角色, 序列号)；没列的槽位视为未连接。
+        devs = {0: (1, 0, "HMD-SN"), 1: (2, 1, "LH-SN"), 2: (2, 2, ""), 5: (3, 0, "TRK-SN")}
+
+        def __init__(self) -> None:
+            self.pose_calls = 0
+            self.prop_calls = 0
+
+        def getDeviceToAbsoluteTrackingPose(self, origin, predict, poses):
+            self.pose_calls += 1
+
+        def isTrackedDeviceConnected(self, i):
+            return i in self.devs
+
+        def getTrackedDeviceClass(self, i):
+            return self.devs[i][0]
+
+        def getControllerRoleForTrackedDeviceIndex(self, i):
+            return self.devs[i][1]
+
+        def getStringTrackedDeviceProperty(self, i, prop):
+            self.prop_calls += 1
+            if prop == 7000:
+                raise RuntimeError("TrackedProp_UnknownProperty")
+            return self.devs[i][2] if prop == 1002 else ""
+
+    def _sensors(self):
+        fake_vr = mock.Mock(Prop_SerialNumber_String=1002, Prop_ModelNumber_String=1001,
+                            Prop_TrackingSystemName_String=1000, Prop_ControllerType_String=7000)
+        s = nav_online.OpenVRSensors()
+        s._vr, s._system = fake_vr, self._System()
+        s._poses = [self._Pose(0.1 * i, valid=i != 5) for i in range(8)]
+        return s
+
+    def test_lists_connected_devices_with_pose_and_role(self) -> None:
+        s = self._sensors()
+        d = s.snapshot_devices()
+        self.assertEqual(s._system.pose_calls, 0, "必须复用本拍位姿，不许另取一次（时刻会错开）")
+        self.assertEqual([x["i"] for x in d], [0, 1, 2, 5])
+        self.assertEqual([(x["c"], x["r"]) for x in d], [(1, 0), (2, 1), (2, 2), (3, 0)])
+        self.assertEqual(d[1]["serial"], "LH-SN")
+        self.assertNotIn("serial", d[2], "空属性不记")
+        self.assertNotIn("ctype", d[0], "取不到的属性跳过，不抛")
+        self.assertFalse(d[3]["v"])
+        self.assertEqual(np.array(d[1]["T"]).shape, (3, 4))
+        self.assertAlmostEqual(d[1]["T"][0][3], 0.1)
+        json.dumps(d)                                     # 能直接落 jsonl
+
+    def test_static_props_are_cached_role_is_not(self) -> None:
+        s = self._sensors()
+        s.snapshot_devices()
+        n = s._system.prop_calls
+        s._system.devs = {**s._system.devs, 1: (2, 2, "LH-SN")}     # 两只手柄互换左右
+        d = s.snapshot_devices()
+        self.assertEqual(s._system.prop_calls, n, "型号/序列号每个设备只问一次")
+        self.assertEqual(d[1]["r"], 2)
 
 
 class ThreadsTest(unittest.TestCase):
@@ -1236,8 +1306,9 @@ class ConfigSurfaceTest(unittest.TestCase):
 
 class RecorderTest(unittest.TestCase):
     def run_session(self, root: Path | None, record: bool, frozen_osc: bool = False,
-                    record_images: bool = False, avatar: dict | None = None) -> dict:
-        h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc, avatar=avatar)
+                    record_images: bool = False, avatar: dict | None = None, decoupled: bool = True) -> dict:
+        h = Harness(armed=False, vz=0.5, record_root=root, frozen_osc=frozen_osc, avatar=avatar,
+                    decoupled=decoupled)
         with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)),                 mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
             h.nav.start(record=record, record_images=record_images)
             try:
@@ -1276,6 +1347,11 @@ class RecorderTest(unittest.TestCase):
                 with np.load(out / "kf" / f"{e['k']:06d}.npz") as z:
                     self.assertEqual(z["pts"].shape, ground_and_wall(None).shape)
                     self.assertEqual(z["T_dr"].shape, (4, 4))
+            # 每个关键帧都能按 t 逐位配上一行设备位姿（解耦路径拿不到 k，只靠 t）。
+            dev = [json.loads(x) for x in (out / "devices.jsonl").read_text(encoding="utf-8").splitlines()]
+            dev_t = {x["t"] for x in dev}
+            self.assertTrue(all(e["t"] in dev_t for e in kfs), "有关键帧配不上设备位姿")
+            self.assertEqual(dev[0]["d"], FakeSensors().snapshot_devices())
             hmd = (out / "hmd.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertGreater(len(hmd), len(kfs))
             self.assertEqual(np.array(json.loads(hmd[0])["R"]).shape, (3, 3))
@@ -1302,6 +1378,32 @@ class RecorderTest(unittest.TestCase):
             self.assertFalse(st["avatar_scale"]["changed"])
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
+
+    def test_recording_writes_devices_in_inline_stereo_path(self) -> None:
+        """解耦路径 devices 行用 ``t`` 配对；非解耦路径关键帧号同步，也能配上。"""
+        with tempfile.TemporaryDirectory() as d:
+            st = self.run_session(Path(d), record=True, decoupled=False)
+            out = Path(st["recording"]["dir"])
+            ev = [json.loads(x) for x in (out / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+            kfs = [e for e in ev if e["kind"] == "kf"]
+            dev = [json.loads(x) for x in (out / "devices.jsonl").read_text(encoding="utf-8").splitlines()]
+            dev_t = {x["t"] for x in dev}
+            self.assertTrue(all(e["t"] in dev_t for e in kfs), "有关键帧配不上设备位姿")
+
+    def test_device_snapshot_failure_stops_only_that_stream(self) -> None:
+        calls = []
+
+        def boom(self):
+            calls.append(1)
+            raise OSError("access violation")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(FakeSensors, "snapshot_devices", boom):
+            st = self.run_session(Path(d), record=True)
+            out = Path(st["recording"]["dir"])
+            self.assertGreaterEqual(st["keyframes"], 3, "设备读失败不许拖垮建图")
+            self.assertEqual(len(calls), 1, "失败一次就停这一路，不每拍重试")
+            self.assertFalse((out / "devices.jsonl").exists())
+            self.assertIn("record_devices", json.dumps(st["errors"], ensure_ascii=False))
 
     def test_record_images_writes_keyframe_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as d:
