@@ -139,6 +139,9 @@ class OnlineNavConfig:
     capture_width: int = 1080
     control_hz: float = 10.0
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
+    # 每批最多吃多少个关键帧。见 _mapping_loop 的注释：不设上限时 pending 积压会让单次
+    # rasterize 变成全量重投（418 帧实测 21.9 s、610 帧约 30 s），而且积压越多越慢。
+    map_max_kf_per_batch: int = 1
     kf_dist_m: float = 0.4           # 世界米；< 条带深度，快走也首尾相接
     kf_turn_deg: float = 25.0
     kf_max_age_s: float = 3.0        # 原地不动时也隔这么久补一帧（刷新动态物体、给射线清除新视线）
@@ -1001,6 +1004,8 @@ class OnlineNavigator:
         self._kf_policy: KeyframePolicy | None = None
         self._map_updates = 0
         self._map_ms: float | None = None
+        # 上一次建图的阶段耗时（ms）：rasterize / build / plan / ... 面板与诊断用。
+        self._map_segments: dict[str, float] = {}
         self._stereo_ms: float | None = None
         # 解耦双目每帧分段（ms，墙钟 + 本线程 CPU）：只给诊断用，见 _stage_summary。
         self._stereo_stages: deque[dict[str, float]] = deque(maxlen=64)
@@ -1884,7 +1889,22 @@ class OnlineNavigator:
             try:
                 # mapper / loops 只有本线程写，灌数据和栅格化都不拿 _nav_lock；
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
+                # ⚠️ 每批最多处理 map_max_kf_per_batch 个关键帧，剩下的放回队首下一轮再吃。
+                # 为什么必须限：建图是「一批 pending 全灌进 mapper，然后 rasterize 一次」。
+                # 一旦采集比建图快、pending 积压，下一批就要灌更多帧，单次 rasterize 变成
+                # 全量重投 O(积压数) —— 积压又让它更慢，正反馈。
+                # 2026-10-26 实机就是这个：610 关键帧只建了 76 次图（平均每批 8 帧），
+                # 面板「建图耗时 29551 ms」。实测 418 帧一次性全量 build = 21.9 s，
+                # 610 帧外推 ≈ 32 s，与 29551 吻合。
+                _kf_seen = 0
                 for i, (kind, item) in enumerate(pending):
+                    if kind == "kf":
+                        if _kf_seen >= c.map_max_kf_per_batch:
+                            # 放回队首（保持顺序），本轮到此为止。
+                            with self._state_lock:
+                                self._pending[:0] = pending[i:]
+                            break
+                        _kf_seen += 1
                     if self._stop.is_set():
                         # 停止：没处理的原样放回 _pending 队首，交给 _stop_session 只写录制。
                         # 积压时一批能有几十帧（20261025_202630 末尾 28 s），整批跑完 join 会超时。
@@ -1978,13 +1998,36 @@ class OnlineNavigator:
                         timeout = wait
                     else:
                         t0 = time.perf_counter()
+                        t_lock0 = time.perf_counter()
                         with self._nav_lock:
                             snap = self.session.snapshot()
-                        res = self.session.compute(self._est(), snap)
+                        t_lock1 = time.perf_counter()
+                        # 分段计时：29551 ms 这种量级必须能看出花在哪一步，否则只能猜。
+                        # 只在本线程写，读侧拿 int/float 无竞争。
+                        seg: dict[str, float] = {}
+                        est = self._est()
+                        t_est = time.perf_counter()
+                        res = self.session.compute(est, snap)
+                        # compute 把分段写在 session.last_timing 上（不动方法签名，
+                        # 否则替换 compute 的测试/诊断代码会 TypeError）。
+                        seg.update(getattr(self.session, "last_timing", None) or {})
+                        t_comp = time.perf_counter()
                         with self._nav_lock:
                             self.session.apply(res)
+                        t_apply = time.perf_counter()
+                        # 括号外的等待（GIL / 锁）单独记：rasterize+build 只要 100 ms 量级，
+                        # 若总和远超它，差就出在等锁或等 GIL，不在算法。
+                        _measured = sum(seg.values())      # compute 内部各阶段（rasterize/build/plan…）
+                        seg["wait_snap"] = (t_lock1 - t_lock0) * 1000.0
+                        seg["est"] = (t_est - t_lock1) * 1000.0
+                        seg["apply"] = (t_apply - t_comp) * 1000.0
+                        # 剩下的既不是算法也不是锁：多半是等 GIL（感知线程在抢）。
+                        _total = (t_apply - t0) * 1000.0
+                        seg["unaccounted"] = max(0.0, _total - _measured
+                                                 - seg["wait_snap"] - seg["est"] - seg["apply"])
                         self._cam_h = self.mapper.cam_h
                         self._map_ms = (time.perf_counter() - t0) * 1000.0
+                        self._map_segments = seg
                         self._map_updates += 1
                         last_update = self._clock()
                         dirty = False
@@ -2201,6 +2244,8 @@ class OnlineNavigator:
             "keyframes_deferred": 0 if self._kf_policy is None else self._kf_policy.deferred,
             "map_updates": self._map_updates,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
+            # 分段：哪一段吃掉了 map_update_ms。空字典 = 还没建过图。
+            "map_segments_ms": {k: round(v, 1) for k, v in self._map_segments.items()},
             "stereo_ms": None if stereo_ms is None else round(stereo_ms, 1),
             "stereo_stages": self._stage_summary(),
             "stereo_backend": self.stereo_backend_status(),

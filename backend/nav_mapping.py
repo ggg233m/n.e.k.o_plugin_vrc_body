@@ -66,6 +66,9 @@ class MapperConfig:
     # 末段单次 1.6 s，9 次合计占全程栅格化时间 31%（见 Docs/虚假障碍-根因与分层修复 §九）。
     # 滞回放宽到远大于桶噪声（6 cm），再按当前规模限流一次，末段重算从 1.6 s 降到不再发生。
     cam_h_hyst_m: float = 0.06
+    # cam_h 的标定窗口（关键帧数）。超过就不再更新 —— 每改一次要全量重投，610 帧时单次要 30 s。
+    # 依据：地面判定的容差 ground_tol_m 就有 0.30 m，中后期再纠 1~2 cm 没有收益。
+    cam_h_freeze_n: int = 120
     # 单个关键帧的地面可能整体偏离全局 cam_h（低头/蹲下/HMD 高度抖、视差系统误差）：run6 有 5 帧偏 0.3–0.4 m，
     # 地面被整片判成障碍，正是"走过的地方变障碍、点了不动"的来源。按该帧 1.2 m 外地面的高度众数修正，
     # 限幅 ±ground_offset_max_m；众数不够突出（< 25% 点）就不修。
@@ -692,10 +695,21 @@ class KeyframeGridMapper:
         c = self.cfg
         if abs(est - self.cam_h) <= c.cam_h_hyst_m:
             return
-        # 限流：cam_h 一变就要把**所有**关键帧重算一遍，代价随关键帧数线性涨。估计算得再稳也
-        # 架不住在阈值附近反复触发，所以按"距上次变更至少过了当前规模的 1/8"来限：
-        # 早期（几帧）几乎立刻就能跟上一个正确值，晚期每次重算之间隔得越来越开。
-        # 这样重建次数是 O(log N)、总代价 O(N)，而不是原来那种线性翻转让单次卡到 1.6 s。
+        # ⚠️ 冻结边界：**超过 cam_h_freeze_n 帧之后不再更新 cam_h**。
+        #
+        # 为什么必须硬冻结（2026-10-26 实机）：cam_h 一变就要把**所有**关键帧重投一遍，
+        # 单帧代价随关键帧数线性涨 —— 610 帧规模实测 **29.5 s**（面板「建图耗时 29551 ms」），
+        # 期间建图线程被堵死、导航停摆。
+        #
+        # 原来的 1/8 限流（「距上次变更至少过了当前规模的 1/8」）只把**次数**压到 O(log N)，
+        # 挡不住**单次**代价：610 帧时每 76 帧仍会撞上一次 30 s。而且 cam_h 的唯一消费者是
+        # 地面判定（ground_tol 就有 0.30 m），中后期再纠那 1~2 cm 没有收益。
+        #
+        # 标定窗口取前 120 帧：低头的关键帧基本都在这段里，cam_h 已经收敛；之后冻结。
+        # 想重新标定就新开一个会话（mapper 随之新建）。
+        if len(self._pts) > c.cam_h_freeze_n:
+            return
+        # 窗口内仍按 1/8 限流：早期（几帧）几乎立刻就能跟上正确值，避免每帧都重算。
         # max(0, ...)：drop_points 已把 _cam_h_at 夹回当前规模，这里再加一层防御。
         # 注意方向：d 为负时是**不更新**（冻结 cam_h），不是"放行重算"——别照着
         # "负值 ⇒ 限流失效"的直觉改这里。
@@ -826,6 +840,11 @@ class KeyframeGridMapper:
         """全局累加器只处理 (base, 整格平移) 变了的关键帧：旧贡献负权、新贡献正权，一次 bincount。
         ``keys``：要重查的关键帧；cam_h 变了会清空重建，此时改查全部。返回实际查过的集合（射线同用）。"""
         if self._acc_cam_h != self.cam_h:
+            # ⚠️ cam_h 一变，**所有**关键帧的高度判据都失效（地面/障碍的分界跟着动），
+            # 必须全量重投。610 帧规模下这一遍实测 ~30 s（2026-10-26 实机：面板「建图耗时
+            # 29551 ms」）。根治办法是让 cam_h **别在中后期再变**，见 _update_cam_h；
+            # 这里保持一次性重投（试过分批搬，实测更慢：每批都有与图面积成正比的固定
+            # 开销，4 批 20.0 s vs 1 批 16.7 s）。
             for name in _ACC_NAMES:
                 setattr(self, name, None)
             self._ray_hit = self._ray_mis = None
@@ -1591,6 +1610,8 @@ class NavSession:
         self.follower: Any = None
         self.contract: Any = None
         self.last: dict[str, Any] = {}
+        # 上一次 compute 的分段耗时（毫秒）。rasterize/build/plan/... 面板与诊断用。
+        self.last_timing: dict[str, float] = {}
 
     @property
     def _s(self) -> float:
@@ -1631,8 +1652,20 @@ class NavSession:
 
     def compute(self, est: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
         """重的那半：栅格化 + build + frontier/规划。不改会话字段（mapper 缓存除外），
-        返回交给 ``apply``。mapper 同一时刻只能有一个线程在写/算。"""
+        返回交给 ``apply``。mapper 同一时刻只能有一个线程在写/算。
+
+        分段计时写到 ``self.last_timing``（毫秒）。⚠️ 不用额外参数传：``compute`` 会被
+        测试/诊断代码整体替换（``mock.patch.object(NavSession, "compute", ...)``），
+        签名一改那些替换就 TypeError。状态挂在实例上最省事。
+        """
         from .nav_follow import PathFollower
+
+        _timing: dict[str, float] = {}
+        self.last_timing = _timing
+
+        def _t(name: str, t0: float) -> None:
+            _timing[name] = _timing.get(name, 0.0) + (time.perf_counter() - t0) * 1000.0
+
 
         mode, anchor = snap["mode"], snap["anchor"]
         here = est.get("xy") if est.get("state") == "localized" else None
@@ -1642,15 +1675,21 @@ class NavSession:
         ovl = None if self.prior is None else self.prior()
         if ovl is not None:
             extra = ovl.corners if extra is None else np.vstack([extra, ovl.corners])
+        _t0 = time.perf_counter()
         ng = self.mapper.rasterize(extra)
+        _t("rasterize", _t0)
         # 临时障碍必须在 build() 之前叠：可走区/中心区都是从三态图算的。
         saved = self._stamp_blocks(ng)
         self._blocks_painted = len(saved)
         walked = self.mapper.walked()
         # 脚下 ~1.6 m 双目看不到，身体走过的走廊（OSC 门控）是当前位置可走的唯一证据。
         # 先验必须在 build 之前叠：可走区/中心区都从三态图算，晚一步等于没叠。
+        _t0 = time.perf_counter()
         prior_info = None if ovl is None else ovl.apply_into(ng, walked)
+        _t("prior", _t0)
+        _t0 = time.perf_counter()
         stats = ng.build(radius_m=self.radius_m, walked=walked)
+        _t("build", _t0)
         res: dict[str, Any] = {"gen": snap["gen"], "ng": ng, "mode": mode, "anchor": anchor,
                                "contract": None, "follower": None}
         info: dict[str, Any] = {"mode": mode, "grid": stats,
@@ -1682,7 +1721,9 @@ class NavSession:
             res["mode"] = "idle"
             info["reason"] = "goal_anchor_lost"
             return res
+        _t0 = time.perf_counter()
         c = ng.plan(here, goal)
+        _t("plan", _t0)
         # 临时障碍把目标切断了 ⇒ 撤销它重试一次。
         # 为什么必须撤：卡住时标的块可能正好封住唯一通道，那就从「卡住」变成「彻底走不到」。
         # 撤销后重试一次即可 —— 再失败就说明是真的不通，不该无限重试。

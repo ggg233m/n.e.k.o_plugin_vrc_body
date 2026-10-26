@@ -164,7 +164,18 @@ function render(s, auto) {
   flag($("stereoBackend"), sbv.text, sbv.cls);
   $("stereo").textContent = `${s.stereo_ms == null ? "—" : num(s.stereo_ms, 0) + " ms"} / ${s.stereo_age_s == null ? "—" : num(s.stereo_age_s, 1) + " s"}`;
   $("kf").textContent = `${s.keyframes ?? 0} / ${s.map_updates ?? 0}`;
-  $("mapMs").textContent = s.map_update_ms == null ? "—" : `${num(s.map_update_ms, 0)} ms`;
+  // 建图耗时：总数 + 最贵的那一段。29551 ms 这种量级光看总数不知道卡在哪，
+  // 分段来自 nav_mapping.NavSession.compute 的 _timing 打点。
+  (() => {
+    const total = s.map_update_ms;
+    if (total == null) { $("mapMs").textContent = "—"; return; }
+    const seg = s.map_segments_ms || {};
+    const top = Object.entries(seg).sort((a, b) => b[1] - a[1])[0];
+    $("mapMs").textContent = top
+      ? `${num(total, 0)} ms（${top[0]} ${num(top[1], 0)}）`
+      : `${num(total, 0)} ms`;
+    $("mapMs").title = Object.entries(seg).map(([k, v]) => `${k}: ${num(v, 1)} ms`).join("\n");
+  })();
   // 两个口径都显示：世界米（对外契约，可与房间里那把实物尺直接比）与追踪米（mapper 内部量，
   // 就是事件日志里那个 1.7x）。只给一个数会让人把追踪米当世界米读——C9 的六个 cam_h 值就是这么来的。
   $("camH").textContent = s.camera_height_m == null ? "—"

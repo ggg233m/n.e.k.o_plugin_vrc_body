@@ -748,6 +748,23 @@ class SnapshotDevicesTest(unittest.TestCase):
         self.assertEqual(d[1]["r"], 2)
 
 
+
+    def test_backlog_does_not_cause_full_rebuild_stall(self) -> None:
+        """积压的关键帧必须分批消化，不能一批全灌完再建图（那会退化成全量重投）。
+
+        回归点（2026-10-26 实机）：610 关键帧只建了 76 次图（平均每批 8 帧），
+        面板「建图耗时 29551 ms」。根因是 _mapping_loop 把一批 pending 全灌进 mapper
+        之后只 rasterize 一次 —— 积压越多，单次越慢，越慢又积压得越多（正反馈）。
+        实测 418 帧一次性全量 build = 21.9 s，610 帧外推 ≈ 32 s，与 29551 吻合。
+        """
+        from backend.nav_online import OnlineNavConfig
+        self.assertGreaterEqual(OnlineNavConfig.map_max_kf_per_batch, 1)
+        # 上限要小到「单批代价有界」：一帧的全量投点约 50 ms，8 帧就 400 ms 起。
+        self.assertLessEqual(
+            OnlineNavConfig.map_max_kf_per_batch, 4,
+            "每批吃太多帧会让单次 rasterize 退化成全量重投（实测 418 帧 21.9 s）")
+
+
 class ThreadsTest(unittest.TestCase):
     def test_slow_map_rebuild_does_not_block_status_or_control(self) -> None:
         # 实机：853 帧回环后一次重建 >1 s，旧实现握着 _nav_lock，status 请求 30 s 超时、控制线程停拍。
