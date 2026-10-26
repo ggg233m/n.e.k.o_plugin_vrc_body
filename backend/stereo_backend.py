@@ -42,7 +42,7 @@ from .nav_mapping import disparity_range_px, make_sgbm, stereo_disparity
 from .stereo_worker import (
     CTRL, CTRL_BYTES, H_IX, LAUNCH_MS, LAST_MS, PHASE, PHASE_COMPILING, PHASE_EAGER, PHASE_EXITED,
     PHASE_FAILED, PHASE_LOADING, PHASE_READY, PROTOCOL_VERSION, SEQ_DONE, SEQ_REQ, SYNC_MS, FRAMES,
-    UPLOAD_MS, VERSION_IX, W_IX, WORKER_PID, control, disparity, read_error,
+    HEARTBEAT, UPLOAD_MS, VERSION_IX, W_IX, WORKER_PID, control, disparity, read_error,
 )
 
 __all__ = ("STEREO_BACKENDS", "NamedSemaphore", "StereoBusy", "StereoWorkerError", "close_las2",
@@ -53,7 +53,13 @@ LAS2_CKPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SHAPE = (606, 1080)       # 现行驱动 1440×810 + capture_width=1080 ⇒ mip1
 DEFAULT_TIMEOUT_S = 0.5           # 单帧等子进程的上限；10 Hz 的预算是 100 ms，留足余量
-SPAWN_TIMEOUT_S = 60.0            # 子进程启动 + 载入引擎的上限（torch 冷 import 约 10 s，权重几秒）
+# 握手：判「卡死」用的是心跳，不是总耗时 —— 载入 79 s、冷编译 70–330 s 都超过任何固定超时。
+# STALL = 心跳多久不动就判死（心跳 100 ms 一跳，5 s 不动 = 真的卡住了）。
+# HARD = 绝对上限，防止某种情况下心跳还在动但永远进不了下一相位。
+HANDSHAKE_STALL_S = 60.0
+HANDSHAKE_HARD_TIMEOUT_S = 600.0
+# 命名信号量 open 的重试上限：子进程创建后到父进程 open 之间的空窗（实测 < 1 s）。
+SPAWN_TIMEOUT_S = 60.0
 
 
 class StereoBusy(TimeoutError):
@@ -1020,8 +1026,15 @@ def _spawn_las2(*, shape_hw: tuple[int, int], fx: float, engine: str, timeout_s:
         # 第一帧才知道该退回 SGBM —— 而退回这件事必须在建 matcher 时就决定（见 nav_online）。
         # ②等到的是「模型载入完成」而不是「编译完成」：编译要 70–330 s，那是预热的事，
         # 主进程绝不能在 spawn 里等它（否则后端启动就卡死）。
-        deadline = time.monotonic() + SPAWN_TIMEOUT_S
-        while time.monotonic() < deadline:
+        # ⚠️ 超时判据是 **HEARTBEAT 不动**，不是「总耗时超过 N 秒」。
+        # 为什么：载入权重实测 79 s、冷编译 70–330 s，都比任何固定超时长；用固定超时会把
+        # 「正常的慢」误判成「失败」（2026-10-26 实机：`载入失败 62 s · LAS2 worker 60.0s 内
+        # 没完成握手 {'state': 'loading'}`）。worker 有独立心跳线程，只要它还在动就说明
+        # 进程活着且在干活 —— 那就继续等。真的卡死（死锁/被挂起）心跳会停。
+        hard_deadline = time.monotonic() + HANDSHAKE_HARD_TIMEOUT_S
+        last_beat = float(adapter._ctrl[HEARTBEAT])
+        last_beat_at = time.monotonic()
+        while True:
             if not adapter.alive():
                 raise StereoWorkerError(
                     f"LAS2 worker 起不来（{python}，rc={proc.returncode}）："
@@ -1030,9 +1043,20 @@ def _spawn_las2(*, shape_hw: tuple[int, int], fx: float, engine: str, timeout_s:
             if phase in (PHASE_FAILED, PHASE_COMPILING, PHASE_READY, PHASE_EAGER) and \
                     float(adapter._ctrl[H_IX]) == float(h):
                 break
-            time.sleep(0.02)
-        else:
-            raise StereoWorkerError(f"LAS2 worker {SPAWN_TIMEOUT_S}s 内没完成握手（{adapter.prewarm_state()}）")
+            now = time.monotonic()
+            beat = float(adapter._ctrl[HEARTBEAT])
+            if beat > last_beat:
+                last_beat, last_beat_at = beat, now
+            elif now - last_beat_at > HANDSHAKE_STALL_S:
+                raise StereoWorkerError(
+                    f"LAS2 worker 心跳停了 {HANDSHAKE_STALL_S:.0f}s（判定卡死，"
+                    f"{adapter.prewarm_state()}，最近输出："
+                    f"{' | '.join(list(adapter._log)[-3:]) or '无'}")
+            if now > hard_deadline:
+                raise StereoWorkerError(
+                    f"LAS2 worker {HANDSHAKE_HARD_TIMEOUT_S:.0f}s 仍未载入完成"
+                    f"（{adapter.prewarm_state()}）")
+            time.sleep(0.05)
         # 校验握手：子进程必须回报同一份尺寸与协议版本。
         if float(adapter._ctrl[H_IX]) == float(h) and int(adapter._ctrl[VERSION_IX]) != int(PROTOCOL_VERSION):
             raise StereoWorkerError(f"LAS2 worker 协议版本不符：{adapter._ctrl[VERSION_IX]}"

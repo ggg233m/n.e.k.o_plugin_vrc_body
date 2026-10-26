@@ -56,6 +56,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -184,6 +185,31 @@ class _ParentGone(RuntimeError):
     """父进程没了：别再算，也别留着占 XPU。"""
 
 
+def _start_heartbeat(ctrl: np.ndarray, alive: Any) -> threading.Event:
+    """起一个独立线程持续推心跳，直到 stop 事件被 set。
+
+    为什么必须是独立线程：引擎载入（实测 79 s）和 torch.compile（70–330 s）都是**阻塞调用**，
+    主线程卡在里面没法自己推心跳。父进程看 HEARTBEAT 不动，只能按超时判失败 ——
+    2026-10-26 实机就是这样误报的：``载入失败 62 s · LAS2 worker 60.0s 内没完成握手
+    ({'state': 'loading'})``。心跳一断，「还在载入」和「已经卡死」就分不开了。
+    """
+    stop = threading.Event()
+
+    def beat() -> None:
+        last = time.perf_counter()
+        while not stop.wait(0.0):
+            time.sleep(HEARTBEAT_S)
+            if stop.is_set():
+                return
+            if not alive():
+                return
+            ctrl[HEARTBEAT] = float(ctrl[HEARTBEAT]) + 1.0
+            last = time.perf_counter()
+
+    threading.Thread(target=beat, name="stereo-heartbeat", daemon=True).start()
+    return stop
+
+
 def run(spec: dict[str, Any]) -> int:
     """解析 spec → 建引擎 → 报 PHASE → 循环「收帧 / 推理 / 回写」。"""
     h, w = int(spec["h"]), int(spec["w"])
@@ -213,6 +239,9 @@ def run(spec: dict[str, Any]) -> int:
     def alive() -> bool:
         return parent_pid <= 0 or _parent_alive(parent_pid)
 
+    # 心跳线程从载入一直跑到进程退出：载入 79 s + 编译最长 330 s 都是阻塞调用，
+    # 主线程没法自己推心跳，而父进程正是靠它区分「在忙」和「死了」。
+    beat_stop = _start_heartbeat(ctrl, alive)
     try:
         if engine_name == "echo":
             engine: Any = EchoEngine(delay_s)
@@ -233,11 +262,13 @@ def run(spec: dict[str, Any]) -> int:
         print(f"stereo_worker: ready (engine={engine_name}, {h}x{w}, pid={os.getpid()})",
               file=sys.stderr, flush=True)
     except _ParentGone:
+        beat_stop.set()
         return 0
     except BaseException as exc:  # noqa: BLE001 - 载不起来要如实报给父进程
         ctrl[PHASE] = PHASE_FAILED
         _set_error(shm_disp.buf, f"{type(exc).__name__}: {exc}"[:ERR_BYTES - 1])
         print(f"stereo_worker: 预热失败：{traceback.format_exc()}", file=sys.stderr, flush=True)
+        beat_stop.set()
         return 1
 
     frames = 0

@@ -1016,6 +1016,36 @@ class LeakTest(_WorkerCase):
             pass
         self.assertTrue(_wait_dead(real, 15.0),
                         f"Job Object 没兜住：父进程被强杀后 worker (pid={real}) 还活着")
+
+    def test_handshake_uses_heartbeat_not_wall_clock(self) -> None:
+        """握手必须按「心跳停了多久」判死，不能按「总耗时超过 N 秒」。
+
+        回归点（2026-10-26 实机）：`载入失败 62 s · LAS2 worker 60.0s 内没完成握手
+        ({'state': 'loading'})`。载入权重实测 79 s（冷缓存），而旧实现是固定 60 s 超时 ——
+        慢一点就被判失败，然后整个会话退回 SGBM。心跳在载入期是持续推进的（实测 0→1801），
+        拿它做判据才是「活着 / 卡死」的正确区分。
+        """
+        # 常量本身要有意义：STALL 得比心跳间隔大得多，HARD 得比最慢的真实载入大得多。
+        self.assertGreaterEqual(stereo_backend.HANDSHAKE_STALL_S, 30.0,
+                                "STALL 太短，冷载入（79 s）会被误判")
+        self.assertGreaterEqual(stereo_backend.HANDSHAKE_HARD_TIMEOUT_S, 300.0,
+                                "HARD 应留够 torch 冷载入 + 首个编译相位的余量")
+
+    def test_heartbeat_advances_during_load(self) -> None:
+        """worker 在 PHASE=loading 期间必须持续推心跳（父进程的唯一判活依据）。"""
+        w = RawWorker(self.H, self.W)
+        self.addCleanup(w.close)
+        # 等到它进 COMPILING/READY（或失败），期间采样心跳
+        hb0 = float(w.ctrl[HEARTBEAT])
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if float(w.ctrl[PHASE]) != PHASE_LOADING:
+                break
+            time.sleep(0.1)
+        hb1 = float(w.ctrl[HEARTBEAT])
+        self.assertGreater(hb1, hb0,
+                           "载入期心跳没推进 —— 父进程会把正常载入误判成卡死")
+
     def test_real_pid_points_at_the_working_interpreter(self) -> None:
         """real_pid 必须指向真正干活的那个解释器（worker 写进控制块的 WORKER_PID）。"""
         m = stereo_backend.make_stereo_backend(
