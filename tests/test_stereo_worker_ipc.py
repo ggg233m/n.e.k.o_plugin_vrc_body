@@ -843,5 +843,189 @@ class ContractTest(unittest.TestCase):
         self.assertFalse(issubclass(_require("StereoWorkerError"), TimeoutError))
 
 
+@_skip_no_worker
+class LeakTest(_WorkerCase):
+    """close() 之后不能留下 python 进程 —— 包括 venv 启动器包装层和真实解释器。
+
+    背景：``.venv_las/Scripts/python.exe`` 是 venv 的启动器包装层，它会再起一个真实解释器，
+    两者 argv 相同、是父子关系，所以一个 LAS2 后端在进程表里是 2 个 python.exe。
+    ``adapter.pid`` 报的是包装层，``adapter.real_pid`` 才是真正干活的。看前者看不出后者漏没漏。
+
+    这条用例统计**全机 python 进程的增量**，不按命令行过滤 —— 过滤 ``stereo_worker`` 会漏掉
+    torch inductor 的编译池（argv 是 ``spawn_main ... --multiprocessing-fork``），它们同样是子进程树的一部分。
+    """
+
+    def _pids(self) -> set[int]:
+        """本机所有 python 进程的 pid（不过滤命令行：过滤会漏掉编译池）。"""
+        out: set[int] = set()
+        if os.name != "nt":  # pragma: no cover - 本仓库只跑 Windows
+            return out
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+             "Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=30)
+        for line in ps.stdout.splitlines():
+            if line.strip().isdigit():
+                out.add(int(line.strip()))
+        return out
+
+    def test_close_leaves_no_python_behind(self) -> None:
+        before = self._pids()
+        m = stereo_backend.make_stereo_backend(
+            "las2", subprocess=True, shape=(self.H, self.W), engine="echo", timeout_s=30.0)
+        self.addCleanup(lambda: m.close())
+        self._wait_ready(m)
+        left, right = _pair(self.H, self.W, seed=9)
+        np.testing.assert_array_equal(m.compute(left, right), _echo(left))
+
+        wrapper, real = int(m.pid), int(m.real_pid)
+        during = self._pids()
+        self.assertIn(wrapper, during, "包装层进程应该在跑")
+        self.assertIn(real, during, "真实解释器应该在跑")
+
+        m.close()
+        deadline = time.monotonic() + 10.0
+        leaked: set[int] = set()
+        while time.monotonic() < deadline:
+            leaked = (self._pids() - before) & {wrapper, real}
+            if not leaked:
+                break
+            time.sleep(0.05)
+        self.assertFalse(leaked, f"close() 之后这些 pid 还活着：{sorted(leaked)}"
+                         f"（wrapper={wrapper} real={real}）")
+
+
+    def test_close_during_compile_leaves_no_process(self) -> None:
+        """编译中 close：这才是原缺陷的现场，必须单独覆盖。
+
+        为什么上面那条抓不到：echo 引擎秒进 ready，close 时 ``compiling`` 为假，走的是
+        CTRL=1 优雅退出 —— worker 自己退，包装层跟着退，两条路径都干净。
+        真正的缺陷只发生在 **PHASE=COMPILING**（worker 主循环还没开始，CTRL 没人看）：
+        那时 terminate() 只杀包装层，真实解释器留在原地占着 XPU。
+
+        这里用 echo + ``spec_extra={"delay_s": 5.0}`` 让 _warmup 那帧卡住，
+        spawn 握手会停在 COMPILING 返回 —— 正好是缺陷现场，不必真等 torch 编译 70 s。
+        """
+        before = self._pids()
+        m = stereo_backend.make_stereo_backend(
+            "las2", subprocess=True, shape=(self.H, self.W), engine="echo", timeout_s=30.0,
+            spec_extra={"delay_s": 5.0})
+        try:
+            self.assertEqual(m.prewarm_state()["state"], "compiling",
+                             "没进 COMPILING 就测不到这条缺陷（delay_s 没生效？）")
+            wrapper, real = int(m.pid), int(m.real_pid)
+            during = self._pids()
+            self.assertIn(real, during, "真实解释器应该在跑")
+            m.close()
+            deadline = time.monotonic() + 12.0
+            leaked: set[int] = set()
+            while time.monotonic() < deadline:
+                leaked = (self._pids() - before) & {wrapper, real}
+                if not leaked:
+                    break
+                time.sleep(0.05)
+            self.assertFalse(leaked, f"编译中 close 留下进程：{sorted(leaked)}"
+                             f"（wrapper={wrapper} real={real}）")
+        finally:
+            m.close()
+
+
+    def test_worker_self_exits_when_parent_is_hard_killed(self) -> None:
+        """父进程被 /F 强杀（收不到任何信号）时 worker 必须自己退，不能永久占着 XPU。
+
+        回归点（2026-10-26 实测）：一批进程在父进程被 job_kill 之后整夜挂着（16 个 inductor
+        编译池 + 各自父级）。worker 原来只在**空闲**分支查父进程存活，编译中和每帧推理时都不查。
+
+        做法：用一个「代理父进程」起 worker，再 /F 杀掉代理，观察 worker 是否自行退出。
+        必须用代理——测试进程自己不能死。
+        """
+        proxy_src = os.path.join(tempfile.mkdtemp(prefix="las2_proxy_"), "proxy.py")
+        with open(proxy_src, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, types, os, time\n"
+                f"repo = {str(REPO)!r}\n"
+                "sys.path.insert(0, repo)\n"
+                "pkg = types.ModuleType('neko_anyadance_body'); pkg.__path__ = [repo]\n"
+                "sys.modules['neko_anyadance_body'] = pkg\n"
+                "from neko_anyadance_body.backend import stereo_backend as sb\n"
+                "os.environ.pop('NEKO_LAS_DISABLE', None); sb._DISABLED = False\n"
+                f"m = sb.make_stereo_backend('las2', subprocess=True, shape={(self.H, self.W)!r}, "
+                "engine='echo', timeout_s=30.0)\n"
+                "while m.prewarm_state()['state'] not in ('ready','eager','failed','exited'):\n"
+                "    time.sleep(0.05)\n"
+                "print('REALPID %d' % m.real_pid, flush=True)\n"
+                "time.sleep(300)\n")
+        proc = subprocess.Popen([sys.executable, proxy_src], cwd=str(REPO),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        line = proc.stdout.readline() if proc.stdout else ""
+        if "REALPID" not in line:
+            self.skipTest(f"代理父进程没起来：{line[:200]}")
+        real = int(line.split("REALPID")[1].split()[0])
+        self.assertTrue(_pid_alive(real), "worker 应该在跑")
+
+        # /F 强杀代理父进程：worker 收不到 SIGTERM，也等不到 CTRL，只能靠自己探测。
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/F"], capture_output=True)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        self.assertTrue(_wait_dead(real, 15.0),
+                        f"父进程被强杀后 worker (pid={real}) 还在，会永久占着 XPU")
+
+    def test_parent_hard_kill_takes_the_whole_tree_down(self) -> None:
+        """父进程被 /F 强杀时，Job Object 必须让内核收掉 worker（含它的编译池）。
+
+        回归点（2026-10-26 实测）：一次 job_kill 强杀父进程后，机器上留下 16 个 inductor
+        编译池进程过夜。worker 自己能靠探测父 pid 退出，但**孙进程不会** —— 它们收不到
+        任何信号。KILL_ON_JOB_CLOSE 让内核在父进程句柄表清空时把整个 job 收掉。
+
+        做法：代理父进程起 worker 并报告 real_pid + job 是否建成；/F 杀代理；观察 worker 消失。
+        """
+        proxy_src = os.path.join(tempfile.mkdtemp(prefix="las2_job_"), "proxy.py")
+        with open(proxy_src, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import sys, types, os, time\n"
+                f"repo = {str(REPO)!r}\n"
+                "sys.path.insert(0, repo)\n"
+                "pkg = types.ModuleType('neko_anyadance_body'); pkg.__path__ = [repo]\n"
+                "sys.modules['neko_anyadance_body'] = pkg\n"
+                "from neko_anyadance_body.backend import stereo_backend as sb\n"
+                "os.environ.pop('NEKO_LAS_DISABLE', None); sb._DISABLED = False\n"
+                f"m = sb.make_stereo_backend('las2', subprocess=True, shape={(self.H, self.W)!r}, "
+                "engine='echo', timeout_s=30.0)\n"
+                "while m.prewarm_state()['state'] not in ('ready','eager','failed','exited'):\n"
+                "    time.sleep(0.05)\n"
+                "print('REALPID %d JOB %r' % (m.real_pid, m.job is not None), flush=True)\n"
+                "time.sleep(300)\n")
+        proc = subprocess.Popen([sys.executable, proxy_src], cwd=str(REPO),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        line = proc.stdout.readline() if proc.stdout else ""
+        if "REALPID" not in line:
+            self.skipTest(f"代理父进程没起来：{line[:200]}")
+        real = int(line.split("REALPID")[1].split()[0])
+        if "JOB True" not in line:
+            self.skipTest(f"Job Object 没建成（非 Windows 或权限不足）：{line[:120]}")
+        self.assertTrue(_pid_alive(real))
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/F"], capture_output=True)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        self.assertTrue(_wait_dead(real, 15.0),
+                        f"Job Object 没兜住：父进程被强杀后 worker (pid={real}) 还活着")
+    def test_real_pid_points_at_the_working_interpreter(self) -> None:
+        """real_pid 必须指向真正干活的那个解释器（worker 写进控制块的 WORKER_PID）。"""
+        m = stereo_backend.make_stereo_backend(
+            "las2", subprocess=True, shape=(self.H, self.W), engine="echo", timeout_s=30.0)
+        self.addCleanup(lambda: m.close())
+        self._wait_ready(m)
+        real = int(m.real_pid)
+        self.assertGreater(real, 0, "real_pid 没写进控制块（WORKER_PID）")
+        self.assertTrue(_pid_alive(real), f"real_pid={real} 不活着")
+
+
 if __name__ == "__main__":
     unittest.main()

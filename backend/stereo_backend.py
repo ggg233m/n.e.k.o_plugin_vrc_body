@@ -609,16 +609,20 @@ class _LAS2SubprocessAdapter:
 
     __slots__ = ("shape_hw", "fx", "proc", "shm_left", "shm_right", "shm_disp", "sem_ready",
                  "sem_done", "timeout_s", "engine", "_ctrl", "_disp", "_left", "_right",
-                 "_err_thread", "_log", "_closed", "_lock", "timeouts", "frames", "last_timing")
+                 "_err_thread", "_log", "_closed", "_lock", "timeouts", "frames", "last_timing",
+                 "job")
 
     def __init__(self, shape_hw: tuple[int, int], fx: float, proc: Any, shm_left: Any,
                  shm_right: Any, shm_disp: Any, sem_ready: NamedSemaphore, sem_done: NamedSemaphore,
-                 timeout_s: float, engine: str) -> None:
+                 timeout_s: float, engine: str, job: Any = None) -> None:
         h, w = int(shape_hw[0]), int(shape_hw[1])
         self.shape_hw, self.fx = (h, w), float(fx)
         self.proc, self.shm_left, self.shm_right, self.shm_disp = proc, shm_left, shm_right, shm_disp
         self.sem_ready, self.sem_done = sem_ready, sem_done
         self.timeout_s, self.engine = float(timeout_s), engine
+        # Job Object 句柄：job 内所有进程在句柄关闭时被内核收掉（含 inductor 编译池）。
+        # 本进程被强杀时句柄随之关闭 —— 正是我们要的效果。
+        self.job = job
         self._ctrl = control(shm_disp.buf)
         self._disp = disparity(shm_disp.buf, h, w)
         self._left = np.ndarray((h, w, 3), np.uint8, buffer=shm_left.buf)
@@ -809,6 +813,13 @@ class _LAS2SubprocessAdapter:
             if proc.stderr is not None:
                 with contextlib.suppress(Exception):
                     proc.stderr.close()
+            if self.job is not None:
+                # 关 job 句柄 = 内核杀光 job 内全部进程（KILL_ON_JOB_CLOSE）。
+                # 比 taskkill /T 更彻底：连 multiprocessing 起的孙进程一起收。
+                with contextlib.suppress(Exception):
+                    import ctypes
+                    ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self.job)
+                self.job = None
             for sem in (self.sem_ready, self.sem_done):
                 with contextlib.suppress(Exception):
                     sem.close()
@@ -848,6 +859,72 @@ def _kill_tree(pid: int, *, wait_s: float = 5.0) -> None:
                         capture_output=True, timeout=max(1.0, wait_s))
     except Exception:  # noqa: BLE001 - 收尸失败不能挡住退出
         pass
+
+
+def _job_for_pid(pid: int) -> Any:
+    """把 pid 放进一个「句柄关闭就杀光」的 Job Object，返回句柄（失败返回 None）。
+
+    为什么需要：父进程被 /F 强杀时，worker 和它的 inductor 编译池收不到任何信号。
+    worker 自己会靠探测父 pid 退出，但**编译池进程不会** —— 它们是 multiprocessing 起的
+    孙进程，父被强杀后只会一直挂着（2026-10-26 实测：一次强杀留下 16 个池进程过夜）。
+
+    内核级兜底：KILL_ON_JOB_CLOSE ⇒ 父进程一死，它的 job 句柄表条目随之消失，最后一个句柄
+    关闭时内核把 job 里所有进程（含孙进程）一起收掉。不依赖任何用户态代码。
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    class _IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _BASIC(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _EXT(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BASIC), ("IoInfo", _IO),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _EXT()
+    info.BasicLimitInformation.LimitFlags = 0x00002000     # KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        k32.CloseHandle(job)
+        return None
+    ph = k32.OpenProcess(0x1F0FFF, False, int(pid))
+    if not ph:
+        k32.CloseHandle(job)
+        return None
+    try:
+        if not k32.AssignProcessToJobObject(job, ph):
+            k32.CloseHandle(job)
+            return None
+    finally:
+        k32.CloseHandle(ph)
+    return job
 
 def _las2_subprocess(shape_hw: tuple[int, int], *, fx: float, engine: str | None,
                      timeout_s: float, spec_extra: dict[str, Any] | None) -> _LAS2SubprocessAdapter:
@@ -933,7 +1010,8 @@ def _spawn_las2(*, shape_hw: tuple[int, int], fx: float, engine: str, timeout_s:
         )
         adapter = _LAS2SubprocessAdapter(shape_hw=(h, w), fx=fx, proc=proc, shm_left=shm_left,
                                          shm_right=shm_right, shm_disp=shm_disp, sem_ready=sem_ready,
-                                         sem_done=sem_done, timeout_s=timeout_s, engine=engine)
+                                         sem_done=sem_done, timeout_s=timeout_s, engine=engine,
+                                         job=_job_for_pid(int(proc.pid)))
         # 握手分两段，缺一不可：
         #   ① 等它把 H/协议版本写进控制块（= 共享内存连上了）；② 等它把引擎**载起来**
         #   （PHASE 到 COMPILING/EAGER/READY，或直接 FAILED/退出）。

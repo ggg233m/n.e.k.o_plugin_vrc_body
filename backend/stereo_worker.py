@@ -119,7 +119,14 @@ class EchoEngine:
     compiled = True
     compile_error: str | None = None
 
+    def __init__(self, delay_s: float = 0.0) -> None:
+        # 慢引擎：warmup 与每帧都先 sleep。用来把 worker 停在不同相位上做测试
+        # （尤其是 COMPILING —— 那个窗口里 worker 主循环还没开始，CTRL 没人看）。
+        self.delay_s = max(0.0, float(delay_s))
+
     def compute(self, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+        if self.delay_s:
+            time.sleep(self.delay_s)
         t0 = time.perf_counter()
         out = np.ascontiguousarray(left[..., 0]).astype(np.float32)
         ms = (time.perf_counter() - t0) * 1e3
@@ -208,7 +215,7 @@ def run(spec: dict[str, Any]) -> int:
 
     try:
         if engine_name == "echo":
-            engine: Any = EchoEngine()
+            engine: Any = EchoEngine(delay_s)
         else:
             engine = _load_las2(fx)
 
@@ -265,6 +272,10 @@ def run(spec: dict[str, Any]) -> int:
             ctrl[SEQ_DONE] = float(seq_req)
             sem_done.release()
             continue
+        # 每帧都查一次父进程：父进程被强杀（任务管理器 / job_kill / 崩溃）时，
+        # 子进程收不到任何信号，只能靠主动探测。
+        if not alive():
+            break
         disp[:] = out
         frames += 1
         # 先写结果与序号、再 release：父进程看到 done 时数据已经就绪。
