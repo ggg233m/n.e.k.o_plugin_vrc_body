@@ -23,6 +23,9 @@
         --vox 0.06 --out .tmp/pointcloud/world.html
 
 ``--session`` 与 ``--rec`` 一一对应（录制名与会话 sid 不同名时必须指名，同 offline_fusion）。
+
+``--color`` 时另从 ``kf_img/<k>_L.png`` 给每个体素平均原图颜色（RGB 走**独立**的第二段
+字节流，不改 8 字节主布局 —— 老解析器/回归脚本照常能读主布局）。
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,8 +85,57 @@ def voxelize(xyz: np.ndarray, sid: np.ndarray, vox: float,
     return center, sid_out, ex_out
 
 
-def _voxelize_hits(xyz: np.ndarray, vox: float, extra: np.ndarray, kf: np.ndarray):
-    """体素降采样 + 逐格「被多少个**不同关键帧**看到」（hits）。
+def _sample_rgb(rec_dir: Path, k: int, p: np.ndarray,
+                K: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+    """相机系点 → 该帧左原图颜色（RGB uint8 N×3, 有效掩码 N）。
+
+    投影公式是 ``backend.nav_mapping.stereo_points`` 的**逐项逆**：
+    该函数把光学系 ``(z, x, y)`` 写成 base ``(x, y, z) = (z, −x, −y)``，
+    反解即 ``u = cx − fx·p_y/p_x``、``v = cy − fx·p_z/p_x``。
+    ⚠️ 这里不另立一套正负号：2026-10-26 用 300 帧实测过，地板点（base z≈−1.7）
+    全部落在图像下半部（v 中位 504/606），99.8% 的点在幅面内。
+
+    原图按 OpenCV 惯例落盘（RGB→BGR 后写 PNG），``imread`` 读回仍是 BGR ⇒ 取色后翻成 RGB。
+    没图/没 K/点投出幅面的点给 (0,0,0) 且掩码 False，**不拿黑色冒充真实颜色**。
+    """
+    n = len(p)
+    out = np.zeros((n, 3), np.uint8)
+    if K is None or n == 0:
+        return out, np.zeros(n, bool)
+    img = cv2.imread(str(rec_dir / "kf_img" / f"{int(k):06d}_L.png"), cv2.IMREAD_COLOR)
+    if img is None:
+        return out, np.zeros(n, bool)
+    if img.ndim == 2:
+        img = np.repeat(img[:, :, None], 3, axis=2)
+    else:
+        img = img[:, :, ::-1]
+    h, w = img.shape[:2]
+    fx, cx, cy = float(K[0, 0]), float(K[0, 2]), float(K[1, 2])
+    d = p[:, 0].astype(np.float64)
+    ok = d > 1e-6
+    dd = np.where(ok, d, 1.0)
+    u = np.rint(cx - fx * p[:, 1] / dd).astype(np.int64)
+    v = np.rint(cy - fx * p[:, 2] / dd).astype(np.int64)
+    ok &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    out[ok] = img[v[ok], u[ok]]
+    return out, ok
+
+
+def _avg_color(col: np.ndarray, valid: np.ndarray | None, inv: np.ndarray, n: int) -> np.ndarray:
+    """体素内平均颜色。只用 valid 的点；整格都无效 ⇒ 中性灰（看得出"这格没颜色"）。"""
+    w = np.ones(len(col), np.float64) if valid is None else np.asarray(valid, np.float64)
+    cw = np.bincount(inv, weights=w, minlength=n)
+    out = np.full((n, 3), 128.0)
+    ok = cw > 0
+    for ch in range(3):
+        acc = np.bincount(inv, weights=np.asarray(col[:, ch], np.float64) * w, minlength=n)
+        out[ok, ch] = acc[ok] / cw[ok]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def _voxelize_hits(xyz: np.ndarray, vox: float, extra: np.ndarray, kf: np.ndarray,
+                   col: np.ndarray | None = None, valid: np.ndarray | None = None) -> tuple:
+    """体素降采样 + 逐格「被多少个**不同关键帧**看到」（hits）+ 可选平均颜色。
 
     ⚠️ 必须与 `voxelize` **用同一个体素键和同一套归约规则**，否则返回的
     hits 会与点错位一格 —— 那种错不会报错，只会让颜色配错点，看不出来。
@@ -104,16 +157,20 @@ def _voxelize_hits(xyz: np.ndarray, vox: float, extra: np.ndarray, kf: np.ndarra
     # (体素下标, 帧号) 去重 ⇒ 每个体素被多少**不同帧**看到
     pair = inv.astype(np.int64) * (1 << 20) + kf.astype(np.int64)
     hv = np.bincount(np.unique(pair) // (1 << 20), minlength=n).astype(np.int32)
-    return c, np.zeros(n, np.uint8), ex, hv
+    colv = None if col is None else _avg_color(col, valid, inv, n)
+    return c, np.zeros(n, np.uint8), ex, hv, colv
 
 
-def _merge_hits(P, S, T, H, vox):
+def _merge_hits(P, S, T, H, vox, col: np.ndarray | None = None) -> tuple:
     """跨场/抽稀时的体素合并：几何与 sid/time 取首次出现，**hits 求和**。
 
     ⚠️ 不能直接用 voxelize 处理 hits。voxelize 对 extra 通道是「格内首次出现」，
     那对 time（取一个代表值）是对的，对 hits 是**错的**：同一块体素被 A 场看到 2 次、
     B 场看到 3 次，真实观测次数是 5，取首次只留 2 或 3。
     这个错不会报错，只会让"观测次数"系统性偏低，正好落在最需要它准的地方。
+
+    颜色给 ``col`` 时按格内已有体素的**等权平均**（各子体素已各自平均过，再平均一次
+    不会把某一帧的颜色放大）。没有颜色 ⇒ 返回 None，按钮按"无彩色"处理。
     """
     q = np.floor(P / vox).astype(np.int64)
     key = (q[:, 0] * (1 << 42)) + (q[:, 1] * (1 << 21)) + q[:, 2]
@@ -126,7 +183,12 @@ def _merge_hits(P, S, T, H, vox):
     so = np.zeros(n, np.uint8); so[inv[::-1]] = np.asarray(S, np.uint8)[::-1]
     to = np.zeros(n, np.uint8); to[inv[::-1]] = np.asarray(T, np.uint8)[::-1]
     hv = np.bincount(inv, weights=np.asarray(H, np.float64), minlength=n)
-    return cen, so, to, hv
+    colv = None
+    if col is not None:
+        colv = np.stack([np.bincount(inv, weights=np.asarray(col[:, ch], np.float64),
+                                     minlength=n) / np.maximum(cnt, 1.0) for ch in range(3)], 1)
+        colv = np.clip(np.rint(colv), 0, 255).astype(np.uint8)
+    return cen, so, to, hv, colv
 
 
 def estimate_cam_h(rec_dir: Path, every: int = 10) -> float:
@@ -261,8 +323,9 @@ def pose_table_rigid(world_dir: Path, sid: str) -> tuple[dict, str]:
 
 def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                  z_min: float, z_max: float, every: int, pose_mode: str = "rigid",
-                 range_m: float | None = None, pose_npz: str | None = None):
-    """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, 统计)。"""
+                 range_m: float | None = None, pose_npz: str | None = None,
+                 color: bool = False):
+    """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, color, 统计)。"""
     if pose_npz:
         # 诊断用：直接取录制目录里的位姿表（ids, T），不走世界树 ⇒ 只适合单场看
         pp = ROOT / "navmesh_recordings" / rec / f"{pose_npz}.npz"
@@ -286,8 +349,11 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
     kfs = sorted(rec_dir.glob("kf/*.npz"), key=lambda p: int(p.stem))
     if not kfs:
         raise SystemExit(f"[fail] 录制 {rec} 的 kf/ 是空的")
+    if color and not (rec_dir / "kf_img").is_dir():
+        raise SystemExit(f"[fail] 录制 {rec} 没有 kf_img/（录制时没开 record_images）⇒ 取不到原图颜色")
 
     chunks, sids, tnorm, kfnum, n_pts, n_used = [], [], [], [], 0, 0
+    cchunks, cvalid, n_col_ok = [], [], 0
     n_neg_raw = n_gc_used = n_far_drop = 0
     gc_vals = []
     t0 = time.perf_counter()
@@ -298,12 +364,15 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
         T = pose_of.get(k)
         if T is None:
             continue
+        K = None
         with np.load(kf) as z:
             if "pts" not in z.files:
                 continue
             p = np.asarray(z["pts"], np.float32)
             # 时间进度用累积路程（kf 自带 dist_m），不用帧号：帧间隔随运动快慢不均
             dm = float(np.asarray(z["dist_m"]).reshape(-1)[0]) if "dist_m" in z.files else float(k)
+            if color and "K" in z.files:
+                K = np.asarray(z["K"], np.float64)
         n_pts += len(p)
         # ⚠️ 相机距离闸：mapper 建图只在 range_m(=5.0 m) 内取点，**导出必须同口径**。
         # 实测（2026-10-06）：23–26% 的点落在 5–8 m、另有 2–2.7% 在 8 m 以上。
@@ -342,14 +411,23 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
         # 帧号必须**逐点带下来**：hits 是"这个体素被多少个不同帧看到"，
         # 从点云坐标本身推不出来。用 int32 而不是 uint8 —— 帧数会超 255（本例 470）。
         kfnum.append(np.full(int(sel.sum()), k, np.int32))
+        if color:
+            # 颜色取自**同一帧左原图**：点云本来就是这个左相机算出来的稠密视差点，
+            # 所以不需要遮挡剔除（它们就是那张深度图看得见的表面）。
+            rgb, okc = _sample_rgb(rec_dir, k, p, K)
+            cchunks.append(np.where(okc[sel, None], rgb[sel], 0).astype(np.uint8))
+            cvalid.append(okc[sel])
+            n_col_ok += int(okc[sel].sum())
     if not chunks:
         raise SystemExit(f"[fail] 录制 {rec} 没有可用点（位姿表与 kf 对不上？）")
     allp = np.concatenate(chunks)
     allt = np.concatenate(tnorm)
     allk = np.concatenate(kfnum)
     allt = np.clip(allt / max(float(allt.max()), 1e-6), 0.0, 1.0)   # 归一化到 0..1
-    c, s, t, hits = _voxelize_hits(allp, vox, allt, allk)
-    return c, s, t, hits, dict(rec=rec, sid=sid, n_kf=len(kfs), n_pts_raw=n_pts, n_pts_kept=n_used,
+    allc = np.concatenate(cchunks) if color and cchunks else None
+    allv = np.concatenate(cvalid) if allc is not None else None
+    c, s, t, hits, colv = _voxelize_hits(allp, vox, allt, allk, col=allc, valid=allv)
+    return c, s, t, hits, colv, dict(rec=rec, sid=sid, n_kf=len(kfs), n_pts_raw=n_pts, n_pts_kept=n_used,
                       n_vox=len(c), s=round(time.perf_counter() - t0, 1),
                       pose_src=pose_src, base=str(pose_src).split("base=")[-1],
                       cam_h=round(float(cam_h), 3),
@@ -357,7 +435,9 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                       cam_h_eff=round(float(cam_h - (np.median(gc_vals) if gc_vals else 0.0)), 3),
                       neg_share=round(n_neg_raw / max(n_gc_used, 1), 4),
                       range_m=(float(range_m) if range_m is not None else None),
-                      far_dropped=n_far_drop)
+                      far_dropped=n_far_drop,
+                      color=(color and allc is not None),
+                      color_share=(round(n_col_ok / max(n_used, 1), 4) if color else None))
 
 
 _HTML = """<!doctype html>
@@ -391,7 +471,7 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
   <div class="kv"><span>观测次数</span><b id="hitinfo">–</b></div>
   <div id="legend"></div>
   <div id="keys">
-    <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button><button id="bHit">按观测次数</button>
+    <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button><button id="bHit">按观测次数</button><button id="bC">原图彩色</button>
     <button id="bTop">俯视</button><button id="bSide">侧视</button>
     <button id="bFit">复位</button><br>
     拖拽旋转 · 滚轮缩放 · 右键平移 · <span style="color:__FG__">G</span> 网格
@@ -404,6 +484,7 @@ const buf = new Uint8Array(RAW.length); for (let i=0;i<RAW.length;i++) buf[i]=RA
 // ⚠️ 6 字节时代 session 与 time **共用最后一格**，界面却永远画三个按钮 ⇒ 必有废的。
 // 8 字节是为 hits 单独开的：它是"这块体素被多少帧看到"，**从坐标推不出来**，
 // 必须逐点带下来。它是采集侧的事实，不是下游推断。
+// 颜色走**另一段**字节流（每点 3 字节，RGB），不占主布局 —— 主布局是回归脚本按死格式解的。
 const N = buf.length/8|0;
 const POS = new Float32Array(N*3), SID = new Float32Array(N),
       TIM = new Float32Array(N), HIT = new Float32Array(N);
@@ -418,6 +499,18 @@ for (let i=0;i<N;i++){
   TIM[i]     = buf[o+6];
   // 编码用了 sqrt 压缩，解码要平方还原
   HIT[i]     = HMX>0 ? Math.pow(buf[o+7]/254, 2)*HMX : 0;
+}
+// 原图颜色（可选）：长度 = N×3；没有就隐藏按钮，绝不拿"单色"冒充"彩色"。
+let hasCol = __HASCOL__;
+const COL = new Float32Array(N*3);
+if (hasCol) {
+  const rc = atob("__RGB__");
+  if (rc.length === N*3) {
+    for (let i=0;i<N*3;i++) COL[i] = rc.charCodeAt(i)/255;
+  } else {
+    console.warn('RGB 通道长度不符，彩色按钮禁用：', rc.length, N*3);
+    hasCol = 0;
+  }
 }
 document.getElementById('np').textContent = N.toLocaleString();
 let mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9,mnz=1e9,mxz=-1e9;
@@ -469,7 +562,7 @@ lg.appendChild(tLegend);
 const cv = document.getElementById('cv'), gl = cv.getContext('webgl');
 if(!gl){document.body.innerHTML='<p style="padding:20px">此浏览器不支持 WebGL</p>';}
 const VS = `
-attribute vec3 aP; attribute float aS; attribute float aT; attribute float aH;
+attribute vec3 aP; attribute float aS; attribute float aT; attribute float aH; attribute vec3 aC;
 uniform mat4 uMVP; uniform float uMode; uniform vec3 uPal[8]; uniform float uZ0,uZ1;
 uniform float uHMax;
 varying vec3 vC;
@@ -504,7 +597,10 @@ void main(){
   if(aH >= 3.5)      htc = vec3(0.35,0.78,0.32);         // 4-5
   if(aH >= 5.5)      htc = vec3(0.15,0.50,0.92);         // 6-10
   if(aH >= 10.5)     htc = vec3(0.48,0.22,0.88);         // >=11
-  vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : (uMode < 2.5 ? tc : htc));
+  // uMode 4 = 原图颜色（逐体素平均的 RGB）。数据缺失时顶点色全 0 ⇒ 近黑，
+  // 所以缺颜色的点在本模式**不给假色**，由生成侧把按钮隐藏（见 hasCol）。
+  vec3 cc = aC;
+  vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : (uMode < 2.5 ? tc : (uMode < 3.5 ? htc : cc)));
   gl_PointSize = clamp(240.0/max(gl_Position.w,1.0), 1.5, 5.0);   // 近大远小
 }`;
 const FS = `precision mediump float; varying vec3 vC;
@@ -522,6 +618,10 @@ const bT=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.bufferData(gl.
 const aT=gl.getAttribLocation(P,'aT'); gl.enableVertexAttribArray(aT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
 const bH=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bH); gl.bufferData(gl.ARRAY_BUFFER,HIT,gl.STATIC_DRAW);
 const aH=gl.getAttribLocation(P,'aH'); gl.enableVertexAttribArray(aH); gl.vertexAttribPointer(aH,1,gl.FLOAT,false,0,0);
+// 颜色独立缓冲：hasCol=0 时也给一份全 1（白），shader 在该模式下不会用到它
+const bC=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bC);
+gl.bufferData(gl.ARRAY_BUFFER, hasCol ? COL : new Float32Array(N*3).fill(1), gl.STATIC_DRAW);
+const aC=gl.getAttribLocation(P,'aC'); gl.enableVertexAttribArray(aC); gl.vertexAttribPointer(aC,3,gl.FLOAT,false,0,0);
 const uMVP=gl.getUniformLocation(P,'uMVP'), uMode=gl.getUniformLocation(P,'uMode'),
       uPal=gl.getUniformLocation(P,'uPal'), uZ0=gl.getUniformLocation(P,'uZ0'), uZ1=gl.getUniformLocation(P,'uZ1'),
       uHMax=gl.getUniformLocation(P,'uHMax');
@@ -619,10 +719,11 @@ function draw(){
   gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bH); gl.vertexAttribPointer(aH,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bC); gl.vertexAttribPointer(aC,3,gl.FLOAT,false,0,0);
   gl.drawArrays(gl.POINTS,0,N);
   if(showGrid&&gridN){ gl.bindBuffer(gl.ARRAY_BUFFER,gridB);
     gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0); gl.vertexAttrib1f(aS,0); gl.vertexAttrib1f(aT,0);
-    gl.vertexAttrib1f(aH,0);
+    gl.vertexAttrib1f(aH,0); gl.vertexAttrib3f(aC,1,1,1);
     gl.uniform1f(uMode,0.86); gl.drawArrays(gl.LINES,0,gridN); }
   requestAnimationFrame(draw);
 }
@@ -638,13 +739,15 @@ addEventListener('mousemove',e=>{ if(!drag)return; const dx=e.clientX-lx,dy=e.cl
 cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.6,dist*(1+Math.sign(e.deltaY)*0.12));},{passive:false});
 // ⚠️ 勿用 bS/bH：那是上面的 WebGL buffer 名，重复声明会让整段脚本 SyntaxError（全黑）
 const btnSid=document.getElementById('bSid'), btnH=document.getElementById('bH'),
-      btnT=document.getElementById('bT'), btnHit=document.getElementById('bHit');
+      btnT=document.getElementById('bT'), btnHit=document.getElementById('bHit'),
+      btnC=document.getElementById('bC');
+if(!hasCol) btnC.style.display='none';   // 没采到颜色就不给按钮，避免"点了没变化"
 function setMode(m){mode=m;btnSid.classList.toggle('on',m===0);btnH.classList.toggle('on',m===1);
-  btnT.classList.toggle('on',m===2);btnHit.classList.toggle('on',m===3);
+  btnT.classList.toggle('on',m===2);btnHit.classList.toggle('on',m===3);btnC.classList.toggle('on',m===4);
   if(tLegend) tLegend.style.display = (m===2?'flex':'none');
   if(hLegend) hLegend.style.display = (m===3?'flex':'none');}
 btnSid.onclick=()=>setMode(0); btnH.onclick=()=>setMode(1); btnT.onclick=()=>setMode(2);
-btnHit.onclick=()=>setMode(3);
+btnHit.onclick=()=>setMode(3); btnC.onclick=()=>{ if(hasCol) setMode(4); };
 setMode(__MODE__);
 document.getElementById('bTop').onclick =()=>{pitch=1.45;yaw=0;};   // 不到 1.5，避免 up 与视线平行退化
 document.getElementById('bSide').onclick=()=>{pitch=0.08;yaw=0.7;};
@@ -659,9 +762,13 @@ _PALETTE = ["#4f9cf0", "#f2a33c", "#59c98d", "#e0655f", "#a97ae0",
 
 def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float,
                title: str, default_mode: int = 0, tval: np.ndarray | None = None,
-               hval: np.ndarray | None = None) -> str:
+               hval: np.ndarray | None = None, col: np.ndarray | None = None) -> str:
     """点云 → 自包含 HTML。布局：每点 **8 字节**
     （u16 x, u16 y, u8 z, u8 sid, u8 time, u8 hits）。
+
+    ``col`` 给出时另写一段**独立**的 RGB 字节流（每点 3 字节），不塞进主布局：
+    主布局 8 字节是回归脚本（pointcloud_render_check）按死格式解的，改它就是
+    "修一个按钮、弄坏另一个"。彩色缺失（col=None）⇒ 按钮隐藏，绝不伪造颜色。
 
     ⚠️ 为什么 7 不是 6：以前 session 与 time **共用最后一格**，一个文件只能在
     "按会话"和"按时间"里二选一；但界面永远画三个按钮，于必有一个是死的 —— 🚩 用户实测
@@ -702,9 +809,13 @@ def build_html(points: np.ndarray, sid: np.ndarray, sess: list[dict], vox: float
     arr["x"], arr["y"], arr["z"], arr["s"], arr["t"], arr["h"] = x, y, z, s, t, h
     raw = arr.tobytes()
     b64 = base64.b64encode(raw).decode("ascii")
+    has_col = col is not None and len(col) == len(x)
+    col_b64 = base64.b64encode(np.clip(col, 0, 255).astype(np.uint8).tobytes()).decode("ascii") if has_col else ""
     html = (_HTML
             .replace("__TITLE__", title)
             .replace("__DATA__", b64)
+            .replace("__RGB__", col_b64)
+            .replace("__HASCOL__", "1" if has_col else "0")
             .replace("__VOX__", f"{vox:g}")
             .replace("__SESS__", json.dumps(sess, ensure_ascii=False))
             .replace("__PAL__", json.dumps(_PALETTE))
@@ -747,6 +858,10 @@ def main() -> None:
     ap.add_argument("--color-by", choices=("session", "time"), default="session",
                     help="着色：session=按场次（看跨场对齐）；time=按本场累积路程（看漂移展开，"
                          "同一处若被多次经过而画在不同位置，会呈现不同颜色叠在一起）")
+    ap.add_argument("--color", action="store_true",
+                    help="从 kf_img/<k>_L.png 原图给每个体素采 RGB（默认开彩色视图）。"
+                         "投影按 stereo_points 的逆式，平均只统计投到幅面内的点；"
+                         "没图/没 K 的帧退化为灰，不拿黑色冒充颜色")
     ap.add_argument("--out", default=None, help="输出 HTML（默认 .tmp/pointcloud/<world>.html）")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
@@ -785,19 +900,20 @@ def main() -> None:
 
     vox = float(args.vox)
     by_time = str(args.color_by).strip().lower() == "time"
-    allp, alls, allt, allh, sess, stats = [], [], [], [], [], []
+    allp, alls, allt, allh, allcol, sess, stats = [], [], [], [], [], [], []
     for i, (rec, sid) in enumerate(zip(args.rec, sids)):
-        pts, s, tt, hv, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
+        pts, s, tt, hv, colv, st = load_session(wdir, rec, sid, vox, float(cam_hs[i]),
                                       float(args.z_min), float(args.z_max), max(1, int(args.every)),
                                       pose_mode=str(args.pose),
                                       range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
-                                      pose_npz=args.pose_npz)
+                                      pose_npz=args.pose_npz, color=bool(args.color))
         # 两条通道**分开存**：会话 = 场索引（shader 取调色板）；时间 = 本场累积路程进度 0..254。
         # 以前这里用 `by_time` 二选一，再塞进同一个字节 —— 于是另一个按钮必然废掉。
         allp.append(pts)
         alls.append(np.full(len(pts), i, np.uint8))
         allt.append((tt * 254.0).astype(np.uint8))
         allh.append(hv.astype(np.float64))
+        allcol.append(colv if colv is not None else np.full((len(pts), 3), 128, np.uint8))
         sess.append({"name": f"{sid[-6:]}（{rec[-6:]}）", "n": len(pts), "h": round(float(st["cam_h_eff"]), 3)})
         stats.append(st)
         print(f"[load ] {rec} → {sid}  cam_h={st['cam_h']:.3f} − gc={st['gc_median']:+.3f} "
@@ -805,12 +921,14 @@ def main() -> None:
               f"距离闸丢 {st['far_dropped']:,}（{st['far_dropped']/max(st['n_pts_raw'],1)*100:.1f}%，"
               f"range={st['range_m']} m）  保留 {st['n_pts_kept']:,}  "
               f"(h<0 占 {st['neg_share']*100:.1f}%)  体素后 {st['n_vox']:,}  "
-              f"({st['s']}s)  pose={st['pose_src']}", flush=True)
+              f"({st['s']}s)  pose={st['pose_src']}"
+              + (f"  彩色点 {st['color_share']*100:.1f}%" if st.get("color") else ""), flush=True)
 
     P = np.concatenate(allp)
     S = np.concatenate(alls)
     T = np.concatenate(allt)
     H = np.concatenate(allh)
+    COL = np.concatenate(allcol) if args.color else None
 
     # 🚨 跨场「有效离地高」一致性闸（2026-10-06 新增，起因见本文档 §地面口径）
     # cam_h 是**全局估计**，逐场可以被估偏 0.3 m；gc 会把它补回来，于是 cam_h−gc 才是
@@ -836,9 +954,9 @@ def main() -> None:
     # 同一格被两场各自看到，总观测次数是两者之和，取首次会系统性偏低。
     while len(P) > int(args.max_pts):
         vox *= 1.5
-        P, S, T, H = _merge_hits(P, S, T, H, vox)
+        P, S, T, H, COL = _merge_hits(P, S, T, H, vox, col=COL)
         print(f"[thin ] 超过上限 {int(args.max_pts):,} ⇒ 体素加粗到 {vox:.3f} m（现 {len(P):,} 点）", flush=True)
-    P, S, T, H = _merge_hits(P, S, T, H, vox)
+    P, S, T, H, COL = _merge_hits(P, S, T, H, vox, col=COL)
     print(f"[hits ] 中位 {np.median(H):.0f}  p90 {np.percentile(H, 90):.0f}  max {H.max():.0f}"
           f"   仅 1 帧 {(H < 1.5).mean()*100:.1f}%  ≥2 帧 {(H >= 1.5).mean()*100:.1f}%")
 
@@ -851,8 +969,8 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     title = args.title or f"{wdir.name} · {len(sess)} 场稠密点云"
     out.write_text(build_html(P, S.astype(np.uint8), sess, vox, title,
-                              default_mode=2 if by_time else 0, tval=T.astype(np.uint8),
-                              hval=H),
+                              default_mode=(4 if args.color else (2 if by_time else 0)),
+                              tval=T.astype(np.uint8), hval=H, col=COL),
                    encoding="utf-8")
     print(f"[out  ] {out}  ({out.stat().st_size/1048576:.1f} MB · {len(P):,} 点 · 体素 {vox:.3f} m)")
     print(json.dumps({"sessions": stats, "n_pts": len(P), "vox_m": round(vox, 4)},
