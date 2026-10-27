@@ -993,6 +993,9 @@ class OnlineNavigator:
         self._pending: list[tuple[str, Any]] = []
         self._keyframes = 0
         self._kf_refreshed = 0
+        # 位姿冻结（OSC 静默 > osc_zoh_max_s）期间落盘的关键帧数。见 _pose_gap_s 的文档串：
+        # 这些帧的画面在变、位姿不变 ⇒ 同一个点会被叠上多份点云，且离线看不出差别。
+        self._kf_frozen = 0
         # 落盘的关键帧里**位置不重复**的那些（追踪米下与上一帧同点即视为重复）。
         # 为什么必须外显：`kf_max_age_s` 让原地不动也每 3 s 补一帧，于是**长停顿的会话**
         # 会把同一地点反复计成独立关键帧。实测 20260929_045615 的 3014 帧里 1250 帧
@@ -1206,8 +1209,11 @@ class OnlineNavigator:
                     # T_map 没进位姿图：按最后一个入图关键帧的修正量平移（与逐帧 trail 同口径）。
                     T_map = T if self.loops is None else self.loops.correct(T)
                     rec.keyframe(k, pts, T, T_map, dist, feat, images=imgs)
+                    _gap, _frozen = self._pose_trust(t_kf)
                     rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist,
-                                        "loops": [], "refresh": refresh, "unmapped": True})
+                                        "loops": [], "refresh": refresh, "unmapped": True,
+                                        "pose_gap_s": None if _gap is None else round(_gap, 3),
+                                        "pose_frozen": _frozen})
                 elif kind == "trail":
                     k, T_dr, dist, t_tr = item
                     rec.line("events", {"kind": "trail", "k": k, "t": t_tr, "dist_m": dist, "T_dr": T_dr})
@@ -1756,6 +1762,35 @@ class OnlineNavigator:
             self._last_committed_kf = int(kf_id)
         self._map_event.set()
 
+    def _pose_gap_s(self, t_kf: float) -> float | None:
+        """这一帧采集时，OSC 速度已静默多久（秒）；None = 还没收到过样本。"""
+        at = self.dr.last_sample_at
+        if at is None:
+            return None
+        return max(0.0, float(t_kf) - float(at))
+
+    def _pose_trust(self, t_kf: float) -> tuple[float | None, bool]:
+        """这一帧挂的位姿可不可信：返回 (静默时长 s, `pose_frozen`)。
+
+        ## 为什么「静默超上限」本身**不是**判据（2026-10-28 实测纠正）
+
+        第一版只看 `gap > osc_zoh_max_s`，在本场标出 **35 帧**。逐帧查最后一条 OSC 速度后
+        发现 **35 帧全部是 0.000** —— 玩家真的站住了，OSC 是变化驱动、静止本来就不发包，
+        ZOH 把位姿保持住恰恰是**正确行为**。按「在动却被冻住」重判，本场 **0 帧**。
+
+        ⇒ 正确判据是 `gap > zoh_max_s` **且** 最后一个样本的速度非零：那是「丢掉了停下那个
+        0 包，最后速度被冻住」的情形。它同时是唯一会让位姿与画面错位的情形：
+        画面在动（人真在走）、位姿不动。
+
+        ⚠️ 冻结**不等于**丢帧：帧是真的、点云是真的，只是它挂在一个静止的位姿上。
+        建图该丢，单帧几何分析可以用 —— 所以只标记、不删。
+        """
+        gap = self._pose_gap_s(t_kf)
+        if gap is None:
+            return None, False
+        v = float(np.hypot(*self.dr._v))          # 最后一个样本的速度（世界米/秒）
+        return gap, bool(gap > self.cfg.osc_zoh_max_s and v > 0.1)
+
     def _offer_stereo(self, job: tuple, is_keyframe: bool) -> bool:
         """非阻塞地把一帧交给双目线程；返回这一帧是否进了队列。
 
@@ -1948,8 +1983,15 @@ class OnlineNavigator:
                         if rec is not None:
                             rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat,
                                          images=imgs)
+                            # `pose_gap_s` / `pose_frozen`：这一帧挂的位姿在采集时已静默多久。
+                            # 超过 osc_zoh_max_s ⇒ DeadReckoner 停止积分、位姿冻结，而采集照常出帧
+                            # ⇒ 画面在动、位姿不动，是「位姿与画面错位」的机器可读证据。
+                            # 离线脚本据此能自动剔除，不必再靠 mtime/时间戳肉眼推断。
+                            _gap, _frozen = self._pose_trust(t_kf)
                             rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
-                                                "refresh": refresh})
+                                                "refresh": refresh,
+                                                "pose_gap_s": None if _gap is None else round(_gap, 3),
+                                                "pose_frozen": _frozen})
                         if self.loops is not None:
                             if found:
                                 moved = self.mapper.update_poses(self.loops.poses())
@@ -1964,6 +2006,8 @@ class OnlineNavigator:
                                 self._loop_status = loop_status
                         self._rate_kf.mark(self._clock())
                         self._keyframes += 1
+                        if self._pose_trust(t_kf)[1]:
+                            self._kf_frozen += 1
                     elif kind == "trail":
                         k, T, dist, t_tr = item
                         if rec is not None:
@@ -2225,6 +2269,14 @@ class OnlineNavigator:
                 "max_legit_gap_s": round(self.dr.max_legit_gap_s, 2),
                 "dropped_s": round(self.dr.holdout_s, 1),
                 "dropped_m": round(self.dr.holdout_m, 2),
+                # 当前这一拍位姿**不可信**吗（静默超上限 **且** 最后速度非零）。
+                # ⚠️ 只看静默时长是错的：本场实测 35 个「超上限」全是玩家真静止（速度 0.000），
+                # ZOH 保持位姿恰恰正确；按「在动却被冻住」重判是 0 个。见 _pose_trust。
+                "pose_frozen": (self._pose_trust(now)[1] if self.dr.last_sample_at is not None
+                                else False),
+                # 本次会话里被标 frozen 的关键帧数。它们挂在一个「本该继续走」的静止位姿上，
+                # 建图该丢；但它仍是真实画面，所以只计数、不删。
+                "frozen_keyframes": self._kf_frozen,
             },
             "goal_xy_m": None if goal is None else [round(goal[0], 3), round(goal[1], 3)],
             "keyframes": self._keyframes,

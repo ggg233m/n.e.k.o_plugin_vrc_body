@@ -16,10 +16,16 @@ r"""回访错位：**强制同一批回访对**，跨多个位姿表对比。
         --poses final_poses full joint_poses vo_g6
 
 两列必须都读：「相邻帧失配」与「回访错位」是**两个自由度**，一个变好另一个可以变坏。
+
+⚠️ **用 `--max-normal-deg 15` 强制同一面墙**（2026-10-28 追加）。不给这个参数时，a 帧的
+墙会和 b 帧的**垂直墙**配成一对（法向夹角 80–89°），「偏移」是两片垂直面的假差 ——
+实测同一份数据能跑出 742 cm 这种纯噪声。只有强制同面之后，「回环把跨趟偏移从 174 cm
+压到 55 cm」才是可复现的。
 """
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -48,6 +54,26 @@ def strict_wall(F: dict) -> dict:
         r["pl"] = SE.fit_vertical_plane(r["w"], rng, max_vz=0.06, min_in=600)
     return F
 
+
+def same_wall(ra: dict, rb: dict, Ta: np.ndarray, Tb: np.ndarray,
+              max_deg: float | None) -> bool:
+    """两帧拟合到的**是不是同一面墙**：把 a 的法向转到世界，与 b 的世界法向比夹角。
+
+    为什么必须有（2026-10-28 实测）：`strict_wall` 只保证「严格竖直」，**不保证是同一面**。
+    不加这一步，房间角落处 a 的北墙会和 b 的东墙配对，法向夹角 80–89°，
+    算出来的「偏移」是两片垂直面的假差（实测中位 742 cm，纯属噪声）。
+
+    加上 15° 之后，`20261026_184318` 的跨趟偏移从「无法解读」变成稳定的
+    回环前 173.8 cm / 回环后 55.1 cm。
+    """
+    if max_deg is None:
+        return True
+    na, p0a, _ = ra["pl"]
+    nb, p0b, _ = rb["pl"]
+    nA = Ta[:3, :3] @ na
+    nB = Tb[:3, :3] @ nb
+    ang = math.degrees(math.acos(min(1.0, abs(float(nA @ nB)))))
+    return ang <= max_deg
 
 def wall_shift(PA: np.ndarray, PB: np.ndarray, n: np.ndarray, p0: np.ndarray):
     """两片严格墙面点集沿法向的**带符号**中位差（同 smear_strict.smed 口径）。"""
@@ -89,6 +115,24 @@ def load_pose(rec: Path, name: str) -> dict | None:
     return {int(k): np.asarray(T, float) for k, T in zip(z["ids"], z["T"])}
 
 
+def load_dr(rec: Path) -> dict:
+    """把 ``kf/*.npz`` 里的 ``T_dr`` 拼成一张位姿表（= **无回环**的原始航位推算）。
+
+    为什么要它（2026-10-28）：仓库里没有「T_dr 表」这个东西，但**每份录制都有 T_dr**。
+    没有它就没法回答「回环到底削掉了多少跨趟偏移」——`--poses final_poses` 比的是两张
+    都带同样回环的表，那不是对照。
+
+    ⚠️ 与 `final_poses` 的区别是**实质的**：`20261026_184318` 上两者在 610 帧最大差 5.306 m。
+    别和 `final_poses` vs `final_poses_full` 搞混 —— 那两张在共同帧上逐位相同（差 0.000000 m）。
+    """
+    out: dict[int, np.ndarray] = {}
+    for p in sorted((rec / "kf").glob("*.npz"), key=lambda q: int(q.stem)):
+        with np.load(p) as z:
+            if "T_dr" in z.files:
+                out[int(p.stem)] = np.asarray(z["T_dr"], np.float64)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rec", help="录制目录名（navmesh_recordings/ 下）")
@@ -100,6 +144,10 @@ def main() -> int:
     ap.add_argument("--dt", type=float, default=10.0, help="回访对的最小时间差 s")
     ap.add_argument("--near", type=float, default=2.0, help="回访对的空间距离上限 m")
     ap.add_argument("--max-pairs", type=int, default=120)
+    ap.add_argument("--max-normal-deg", type=float, default=None,
+                    help="两帧墙面法向的最大夹角（度）。不给 = 不筛（旧行为）。")
+    ap.add_argument("--dr", action="store_true",
+                    help="额外加一行 T_dr(无回环)（从 kf/*.npz 拼）。回答「回环到底削掉多少」")
     a = ap.parse_args()
 
     rec = SE.REC_ROOT / a.rec
@@ -118,6 +166,8 @@ def main() -> int:
         print(f"[warn] 没有 {a.ref}.npz，参考位姿退回 kf 自带的 T_dr")
         ref = {k: F[k]["T"] for k in ids}
     srcs["DR(参考)"] = ref
+    if a.dr:
+        srcs["T_dr(无回环)"] = load_dr(rec)
     for nm in a.poses:
         tp = load_pose(rec, nm)
         if tp is None:
@@ -163,6 +213,8 @@ def main() -> int:
             p0 = Ta[:3, :3] @ p0b + Ta[:3, 3]
             if (p0 - Ta[:3, 3]) @ n < 0:
                 n = -n
+            if not same_wall(F[ka], F[kb], Ta, Tb, a.max_normal_deg):
+                continue
             PA = F[ka]["w"] @ Ta[:3, :3].T + Ta[:3, 3]
             PB = F[kb]["w"] @ Tb[:3, :3].T + Tb[:3, 3]
             m = wall_shift(PA, PB, n, p0)

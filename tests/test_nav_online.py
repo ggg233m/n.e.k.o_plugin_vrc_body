@@ -494,10 +494,16 @@ class FakeSensors:
 
 class Harness:
     def __init__(self, armed: bool = True, vz: float = 0.0, record_root: Path | None = None,
-                 frozen_osc: bool = False, avatar: dict | None = None, decoupled: bool = True) -> None:
+                 frozen_osc: bool = False, avatar: dict | None = None, decoupled: bool = True,
+                 osc_dead_after: float | None = None,
+                 osc_zoh_max_s: float = 2.5) -> None:
         self.armed = armed
         self.vz = vz
         self.frozen_osc = frozen_osc
+        # 秒：启动后这么久**彻底停发** OSC 报文，模拟真实丢包/断流（20261026_184318 在
+        # 368.7–403.4 s 断过 34.7 s）。None = 正常持续发。
+        self.osc_dead_after = osc_dead_after
+        self._osc_started: float | None = None
         self.moves: list[tuple[float, int]] = []
         self.turns: list[float] = []
         self.stops = 0
@@ -506,7 +512,8 @@ class Harness:
         # 默认后端是 las2：不钉 sgbm 的话没 mock make_stereo_backend 的用例会真去载 LAS2
         # （.venv 里退回 + 记错误；.venv_las 里首帧编译几分钟）。要测 las2 的用例自己改 cfg。
         cfg = OnlineNavConfig(map_min_interval_s=0.1, stereo_period_s=0.05, kf_max_age_s=0.3,
-                              decoupled=decoupled, stereo_backend="sgbm")
+                              decoupled=decoupled, stereo_backend="sgbm",
+                              osc_zoh_max_s=osc_zoh_max_s)
         self.nav = OnlineNavigator(
             motion_history=self._motion,
             send_move=lambda f, ms: self.moves.append((f, ms)),
@@ -533,6 +540,12 @@ class Harness:
             self._osc_ts = time.monotonic() if self._osc_ts is None else self._osc_ts
         else:
             now = time.monotonic()
+            if self._osc_started is None:
+                self._osc_started = now
+            if self.osc_dead_after is not None and now - self._osc_started > self.osc_dead_after:
+                # 断流：一条都不再报。DeadReckoner 靠最后样本时刻判定静默，超过
+                # osc_zoh_max_s 后停止积分 ⇒ 位姿冻结而采集照常出帧（就是要测那个）。
+                return []
             self._osc_ts = now if self._osc_ts is None else max(self._osc_ts + 1e-6, now)
         return [osc(self._osc_ts, 0.0, self.vz)]
 
@@ -1422,6 +1435,106 @@ class RecorderTest(unittest.TestCase):
             with np.load(out / "final_poses.npz") as final:
                 self.assertEqual(list(final["ids"]), [e["k"] for e in kfs])
 
+    def test_pose_frozen_is_recorded_when_osc_goes_silent(self) -> None:
+        """OSC 断流超过 ``osc_zoh_max_s`` 时，关键帧必须自带 ``pose_frozen``。
+
+        现场依据（2026-10-28）：`20261026_184318` 在 368.7–403.4 s 断流 **34.7 s**，
+        `T_dr` 逐位冻结（k=610..619 完全相同）、`dist_m` 恒为 408.7，但采集照常出帧。
+        那些帧的画面在变、位姿不动 —— 是「位姿与画面错位」的直接证据，而改动前
+        `kf/*.npz` 与 `events.jsonl` **没有任何字段**记录它，离线完全看不出来。
+
+        断言四件事：① 断流后的关键帧被标 `pose_frozen`；② 它们的 `pose_gap_s` 超上限；
+        ③ 断流前的关键帧不被误标（否则等于把整场都丢掉）；④ 被标的帧位姿真的不怎么动。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            # ZOH 缩到 0.3 s：默认 2.5 s 太长，测试要跑 3 s 以上才越过上限。
+            h = Harness(armed=False, vz=0.5, record_root=Path(d), osc_dead_after=0.2,
+                        osc_zoh_max_s=0.3)
+            with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+                    mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
+                h.nav.start(record=True)
+                try:
+                    deadline = time.monotonic() + 8.0
+                    while time.monotonic() < deadline and h.nav.status()["keyframes"] < 8:
+                        time.sleep(0.05)
+                finally:
+                    st = h.nav.stop()
+            out = Path(st["recording"]["dir"])
+            ev = [json.loads(x) for x in (out / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                  if x.strip()]
+            kfs = [e for e in ev if e["kind"] == "kf"]
+
+            # ① / ②：必须有被标记的帧，且它们的静默时长真的超上限
+            frozen = [e for e in kfs if e.get("pose_frozen")]
+            self.assertTrue(frozen, "断流 0.2 s 后仍无 pose_frozen；"
+                                    f"共 {len(kfs)} 帧，gap 样例 "
+                                    f"{[e.get('pose_gap_s') for e in kfs[-3:]]}")
+            zoh = 0.3                       # 与上面 Harness 传的一致
+            for e in frozen:
+                self.assertGreater(e["pose_gap_s"], zoh, "标了 frozen 就必须真超过 zoh 上限")
+
+            # ③：断流刚开始那几帧不许被误标（ZOH 还在有效期内）
+            self.assertTrue(any(not e.get("pose_frozen") for e in kfs),
+                            "全部都标成 frozen ⇒ 标记没有分辨力")
+
+            # 状态里也要当场可见（面板/诊断用），不必等录制落盘
+            self.assertIn("pose_frozen", st["odometry_holdout"])
+            self.assertGreater(st["odometry_holdout"]["frozen_keyframes"], 0)
+
+            # ④：被标的帧位姿必须**明显慢下来**（这才是「冻结」的意思）。
+            #
+            # ⚠️ 不能断言「完全不动」：`pose_frozen` 的判据是 `gap > zoh_max_s`，而
+            # `zoh_max_s` 之后还有 `zoh_fade_s` 的**线性淡出**（DeadReckoner._hold_dt），
+            # 那段速度不为 0、位姿仍在缓慢前移。真正完全静止要等 gap > zoh_max + fade。
+            # 实测（本用例 zoh 0.3 / 默认 fade 1.0）：被标帧的相邻位移 0.11 m，
+            # 而断流前正常帧是 0.5 m/s × 0.3 s ≈ 0.15 m 量级 —— 所以「慢下来」而非「停住」。
+            if len(frozen) >= 2:
+                xs = []
+                for e in frozen:
+                    with np.load(out / "kf" / f"{e['k']:06d}.npz") as z:
+                        xs.append(np.asarray(z["T_dr"], float)[:2, 3])
+                step = max(float(np.linalg.norm(xs[i + 1] - xs[i])) for i in range(len(xs) - 1))
+                self.assertLess(step, 0.3, "标了 frozen 但位姿还在按原速移动 ⇒ 判据不对")
+
+    def test_stationary_player_is_not_flagged_as_frozen(self) -> None:
+        """**真正站住不动**时不许标 `pose_frozen` —— 这是本判据最容易犯的错。
+
+        现场依据（2026-10-28 自我纠正）：第一版判据只看「OSC 静默 > zoh_max_s」，
+        在 `20261026_184318` 上标出 **35 帧**；逐帧查最后一条 OSC 速度后发现
+        **35 帧全部是 0.000** —— 玩家真的站住了。OSC 是变化驱动、静止本来就不发包，
+        ZOH 把位姿保持住恰恰是**正确行为**。按「在动却被冻住」重判，该场是 **0 帧**。
+
+        ⇒ 判据必须是「静默超上限 **且** 最后速度非零」。本用例用 `vz=0`（静止）+ 断流，
+        断言一帧都不许被标；同时 `pose_gap_s` 仍要照实记录（静默是真的）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            # vz=0：玩家不动。断流 0.2 s 后 OSC 彻底静默。
+            h = Harness(armed=False, vz=0.0, record_root=Path(d), osc_dead_after=0.2,
+                        osc_zoh_max_s=0.3)
+            with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+                    mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
+                h.nav.start(record=True)
+                try:
+                    deadline = time.monotonic() + 8.0
+                    while time.monotonic() < deadline and h.nav.status()["keyframes"] < 8:
+                        time.sleep(0.05)
+                finally:
+                    st = h.nav.stop()
+            out = Path(st["recording"]["dir"])
+            ev = [json.loads(x) for x in (out / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                  if x.strip()]
+            kfs = [e for e in ev if e["kind"] == "kf"]
+
+            # 前提真的成立：确实出现了远超上限的静默（否则这个用例什么都没验到）
+            gaps = [e.get("pose_gap_s") for e in kfs if e.get("pose_gap_s") is not None]
+            self.assertTrue(gaps and max(gaps) > 0.3,
+                            f"静默没发生，用例无效：max gap = {max(gaps) if gaps else None}")
+
+            flagged = [e for e in kfs if e.get("pose_frozen")]
+            self.assertEqual(flagged, [],
+                             f"静止玩家被误标 frozen：{[e.get('k') for e in flagged]}")
+            self.assertEqual(st["odometry_holdout"]["frozen_keyframes"], 0)
+            self.assertFalse(st["odometry_holdout"]["pose_frozen"])
     def test_recording_writes_devices_in_inline_stereo_path(self) -> None:
         """解耦路径 devices 行用 ``t`` 配对；非解耦路径关键帧号同步，也能配上。"""
         with tempfile.TemporaryDirectory() as d:
