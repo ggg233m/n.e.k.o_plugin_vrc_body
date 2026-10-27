@@ -18,6 +18,15 @@ r"""把在线回环闭合（``nav_loop.LoopCloser``）接成**离线回放**，�
 实测两场录制的 `max_offset_m = 3.0`，而当前代码默认已是 `6.0` —— 用默认值回放等于
 换了采集条件（与 `mapping_gate.recorded_config` 同一条教训）。录制里没记的键保持当前默认。
 
+⚠️ **帧集口径（2026-10-28 修）**：在线建图**没入图**的关键帧（`events.jsonl` 里
+`"unmapped": true`，见 `nav_online.py:_stop_session`）**从来没进过 `LoopCloser`** —— 它们是
+关机前积压的帧，只写盘、不入图、不查回环。把它们喂进来会凭空多出回环、进而挪动更早的帧。
+默认**跳过**它们（与在线同口径）；`--include-unmapped` 保留旧行为仅用于对照。
+
+这个差别不是细节：`20261026_184318` 上「全部 759 帧」跑出 111 条回环、与 `final_poses.npz`
+差中位 0.561 m；「只用入图的 610 帧」跑出 **19 条**（与录制一致）、差 **0.000 m**（逐位）。
+⇒ 以前把自检失败解读成"逐帧形变"，实际只是**帧集不同**。
+
 ⚠️ **自检优先**：凡是有 `final_poses.npz` 的录制，本工具会逐帧对比并报差异。
 **自检不过就别信缺 final_poses 那场的产物。**
 """
@@ -76,6 +85,9 @@ def main() -> int:
     ap.add_argument("--current-config", action="store_true",
                     help="用当前默认 LoopConfig（只保留 world_scale）而不是录制当时的配置；"
                          "问的是『今天的代码在这份数据上还会不会同样出问题』")
+    ap.add_argument("--include-unmapped", action="store_true",
+                    help="把 events.jsonl 里 unmapped: true 的帧也喂进 LoopCloser。"
+                         "这些帧在线时从未入图，喂进来会凭空多出回环（见模块 docstring）")
     args = ap.parse_args()
 
     rc = 0
@@ -89,9 +101,14 @@ def main() -> int:
         cfg, raw = recorded_loop_config(rec, current=args.current_config)
         events = [json.loads(x) for x in
                   (rec / "events.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
-        kfs = [e for e in events if e.get("kind") == "kf"]
-        print(f"\n=== {name} ===  关键帧事件 {len(kfs)}"
+        kf_all = [e for e in events if e.get("kind") == "kf"]
+        kfs = kf_all if args.include_unmapped else [e for e in kf_all if not e.get("unmapped")]
+        n_skip = len(kf_all) - len(kfs)
+        print(f"\n=== {name} ===  关键帧事件 {len(kf_all)}"
               f"   配置口径：{'**当前默认**' if args.current_config else '录制当时'}")
+        if n_skip:
+            print(f"  ⚠️ 跳过 {n_skip} 个 unmapped 帧（在线时从未入图，见模块 docstring）；"
+                  f"实际喂入 {len(kfs)} 帧", )
         print(f"  loop 配置：max_offset_m={cfg.max_offset_m:g} search_max_m={cfg.search_max_m:g} "
               f"min_path_m={cfg.min_path_m:g} bow_candidates={cfg.bow_candidates}"
               f"（当前默认 max_offset_m={LoopConfig().max_offset_m:g}）")
