@@ -349,6 +349,35 @@ class BowCandidateTest(unittest.TestCase):
             self.assertIn(0, lc._bow_candidates(61, lc._nodes[61]))
 
 
+class SearchRadiusTest(unittest.TestCase):
+    """回环搜索半径的硬上限必须跟得上长录制的漂移。
+
+    回归点（20261029_060258，889 m / 1338 帧）：`search_max_m` 封顶 6.0 m 时，
+    后半段 343 个「物理回访」对只产生 2 条回环 —— 因为位姿漂移 5–19 m，
+    远超 6 m 上限，真对永远进不了候选。图像内容（不依赖位姿）证实
+    kf=1300 与 kf=1 是同一地点（good matches 341），但 T_dr 认为相距 13.6 m。
+    放宽到 20 m 后回环 49→85，后半段 2→38 条，且 4 个「图像证实同地点」对的
+    平均距离 10.07→7.62 m（kf1300↔kf1：13.78→2.35 m）。
+
+    ⚠️ 这个测试锁的是**下界**：封顶不能退回 6。上限本身应按最长录制标定，
+    更长的录制（>1 km）需要继续上抬或改成按路程比例不封顶。
+    """
+
+    def test_search_max_m_covers_long_recording_drift(self) -> None:
+        from backend.nav_loop import LoopConfig
+        cfg = LoopConfig()
+        self.assertGreaterEqual(
+            cfg.search_max_m, 20.0,
+            "889 m 录制实测漂移 5–19 m；封顶退回 6 m 会让后半段回环几乎全灭")
+
+    def test_drift_radius_is_capped_by_search_max_m(self) -> None:
+        from backend.nav_loop import LoopCloser, LoopConfig
+        loops = LoopCloser(LoopConfig())
+        # 半径随路程增长，但被 search_max_m 截断
+        r_short = loops._drift_radius(10.0)
+        r_long = loops._drift_radius(5000.0)
+        self.assertLess(r_short, r_long)
+        self.assertAlmostEqual(r_long, LoopConfig().search_max_m, places=6)
 class LoopGraphTopologyTest(unittest.TestCase):
     """位姿图的**结构性质**：零位移串联边决定「原地长停顿」那一段的形状。
 

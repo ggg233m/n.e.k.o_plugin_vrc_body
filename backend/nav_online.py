@@ -1175,7 +1175,7 @@ class OnlineNavigator:
         # 2026-10-29：节流**自适应**的两个观测（只在建图线程写）。
         # 记住上一轮醒来时队列里还剩多少帧没吃；>0 = 建图跟不上采集。
         # 见 _mapping_loop 里 wait 的算法：有积压时不再死等 map_min_interval_s。
-        self._map_backlog_seen = 0        # 上一轮 'pending' 里没处理完、放回队首的 kf 数
+        self._map_backlog_seen = 0        # 上一轮处理完时队列里还剩的 kf 数（>0 = 采集快于建图）
         self._map_throttle_skips = 0      # 累计跳过节流的次数（诊断：节流是否真在拖后腿）
         self._map_ms: float | None = None
         # 上一次建图的阶段耗时（ms）：rasterize / build / plan / ... 面板与诊断用。
@@ -2127,7 +2127,8 @@ class OnlineNavigator:
             timeout = c.map_min_interval_s
             with self._state_lock:
                 pending, self._pending = self._pending, []
-            # 每轮先清零：若这批没因 map_max_kf_per_batch 上限截断，就说明队列已排空。
+            # 每轮先清零：本轮若把队列处理空了，compute 后的检查会把它设回 0；
+            # 若这时还没 compute 就退出（异常/停止），下一轮不该沿用陈旧值。
             self._map_backlog_seen = 0
             try:
                 # mapper / loops 只有本线程写，灌数据和栅格化都不拿 _nav_lock；
@@ -2145,7 +2146,6 @@ class OnlineNavigator:
                         if _kf_seen >= c.map_max_kf_per_batch:
                             # 放回队首（保持顺序），本轮到此为止。
                             # 同时记下还剩多少 kf 没吃：下一轮据此判断是否跳过节流（自适应）。
-                            self._map_backlog_seen = sum(1 for kd, _it in pending[i:] if kd == "kf")
                             with self._state_lock:
                                 self._pending[:0] = pending[i:]
                             break
@@ -2305,6 +2305,12 @@ class OnlineNavigator:
                         self._map_updates += 1
                         last_update = self._clock()
                         dirty = False
+                        # 2026-10-29 修：判据原来是「因 map_max_kf_per_batch 上限被截断的 kf 数」，
+                        # 而 20261029_060258 实测每批平均只有 3.23 帧 < 上限 4 ⇒ **永不触发**，
+                        # map_throttle_skips 全程 0。真实积压信号是「这一轮处理完后队列里还有」。
+                        # 与批次上限无关：只要有帧在等，节流就没有意义。
+                        with self._state_lock:
+                            self._map_backlog_seen = sum(1 for kd, _it in self._pending if kd == "kf")
                         self._update_coverage(res)
             except Exception as exc:  # noqa: BLE001
                 self._fail("mapping", exc)
