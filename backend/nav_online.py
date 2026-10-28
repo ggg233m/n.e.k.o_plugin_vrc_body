@@ -138,6 +138,15 @@ class OnlineNavConfig:
     # 1080 档部署块 p50：LAS2 58.7 ms、SGBM 64.6 ms（720 档 51 / 21 ms），都在 10 Hz 预算内。
     capture_width: int = 1080
     control_hz: float = 10.0
+    # 竖向里程（2026-10-28）：用 OSC VelocityY 积分出 T_dr[2,3]。
+    # 为什么默认关：① 现有录制里 ``T_dr[2,3]`` 从来是 0，打开会改变位姿图/导出/导航的行为；
+    # ② ``VelocityY`` 只在变化时发包（变化驱动），需要配 ``Grounded`` 做 ResetZ，
+    #    而 Grounded 的可靠性没独立验证过；
+    # ③ ``enable_z``（位姿图）不等于竖向里程 —— 位姿图的 z 边来自 PnP，
+    #    与这里积分的 ``dr_z`` 是**两个独立的竖直信息源**。都打开才能让位姿图的
+    #    z 里程边有非零的初始化（否则回环边在 z 维没有参照）。
+    # 实测（`20261026_184318` 的 ``vert.jsonl``）：11 次台阶事件、每次落差 5–7 cm、净 −0.682 m。
+    enable_vertical: bool = False
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
     # 每批最多吃多少个关键帧。见 _mapping_loop 的注释：不设上限时 pending 积压会让单次
     # rasterize 变成全量重投（418 帧实测 21.9 s、610 帧约 30 s），而且积压越多越慢。
@@ -559,7 +568,10 @@ class DeadReckoner:
 
     def __init__(self, world_scale: float, osc_lag_s: float = 0.18, *,
                  zoh_max_s: float = 2.5, zoh_fade_s: float = 1.0, speed_scale: float = 1.0,
+                 enable_vertical: bool = False,
                  heading_at: Callable[[float], float | None] | None = None) -> None:
+        self.enable_vertical = bool(enable_vertical)
+        self._grounded = True
         self.s = float(world_scale)
         self.k = float(speed_scale)     # OSC 速度 → 实际速度 的系数（见 OnlineNavConfig.osc_speed_scale）
         self.lag = float(osc_lag_s)
@@ -571,6 +583,17 @@ class DeadReckoner:
         self.zoh_fade = max(0.0, float(zoh_fade_s))
         self.xy = np.zeros(2)
         self.dist_m = 0.0            # OSC 路程，世界米
+        # 竖向：VelocityY 的 ZOH 积分（世界米，正 = 上）。**默认恒 0**：
+        #   ``enable_vertical`` 打开才积分。为什么默认关：
+        #   ① ``VelocityY`` 是变化驱动，静止不发包 ⇒ 需要单独的 ZOH 逻辑（与水平不同）；
+        #   ② ``Grounded=True`` 时脚下就是地面，z 必须回 0，否则台阶误差会永久累积；
+        #   ③ 开启后 ``T_dr[2,3]`` 不再恒 0，会改变位姿图与导出的行为（见 nav_loop enable_z）。
+        #   2026-10-28 实测（`20261026_184318`）：11 次台阶事件、每次落差 5–7 cm、
+        #   净位移 −0.682 m —— 这些在 ``T[2,3]`` 里**全部是 0**。
+        self.z_m = 0.0               # 竖向位移（世界米）
+        self.vy = 0.0                # 最后一个 VelocityY 样本（世界米/秒）
+        self.vy_at: float | None = None
+        self._grounded = True        # 来自 OSC Grounded；True 时 z 回 0
         self.holdout_s = 0.0         # 因静默超上限而**没有**积分的时长（秒）
         self.holdout_m = 0.0         # 同上，按最后速度折算的**没算进去**的路程（世界米）
         self._v = (0.0, 0.0)         # (vx 右, vz 前)，世界米/秒
@@ -602,6 +625,16 @@ class DeadReckoner:
             ts = float(item.get("timestamp", -math.inf))
             if ts <= self._last_ts:
                 continue
+            # 竖向：VelocityY 的 ZOH 积分。**与水平共用同一条循环**，因为它们来自
+            # 同一批 OSC 报文 —— 分开扫会多一遍遍历，还会让两者的时刻基准不一致。
+            if self.enable_vertical:
+                vy = item.get("velocity_y")
+                if vy is not None and math.isfinite(float(vy)):
+                    # ZOH：先用**旧速度**积分到新样本时刻，再切到新速度。
+                    # 与水平 `_advance` 的顺序一致 —— 写反了就把整个下落积分成 0。
+                    self._advance_z(max(min(ts, target), self._t))
+                    self.vy = float(vy) * self.k
+                    self.vy_at = ts
             vx, vz = item.get("velocity_x"), item.get("velocity_z")
             if vx is None or vz is None or not (math.isfinite(vx) and math.isfinite(vz)):
                 continue
@@ -615,11 +648,39 @@ class DeadReckoner:
             self._last_ts = ts
             self.samples += 1
         self._advance(target, fwd, right)
+        if self.enable_vertical:
+            self._advance_z(target)
         T = np.eye(4)
         T[:3, :3] = r_ob
         vx, vz = self._v
         T[:2, 3] = self.xy + (vz * fwd + vx * right) * self.lag / self.s
+        if self.enable_vertical:
+            # 🔴 2026-10-28：把竖向位移写进 T[2,3]。之前**恒 0** —— 位姿完全不含
+            # 竖直信息（759 帧 std=0.000），导致位姿图的 z 维没有里程边、
+            # 导出的点云没有竖向基准。见 ``Docs/Z维进图…`` 与 ``enable_z``。
+            #
+            # Grounded=True 时脚下就是地面：z 回 0（台阶误差不能永久累积）。
+            # Grounded=False 时继续积分（跳跃/下落期间 z 仍要动）。
+            if self._grounded:
+                self.z_m = 0.0
+            T[2, 3] = self.z_m / self.s    # 世界米 → 追踪米
         return T
+
+    def _advance_z(self, t_to: float) -> None:
+        """把 [vy_at, t_to] 的竖向位移按当前 ``self.vy`` ZOH 积分进去（世界米）。
+
+        与水平不同的地方：**没有 holdout/fade** —— 竖直运动只发生在跳/落/台阶，
+        持续时间短（实测最长 0.2 s），不会出现「静默 1 小时」这种水平才有的灾难。
+        Grounded=True 时由调用方走 z=0 路径，这里跳过积分。
+        """
+        if self.vy_at is None:
+            self.vy_at = t_to
+            return
+        dt = float(t_to) - float(self.vy_at)
+        if dt <= 0:
+            return
+        self.z_m += self.vy * dt
+        self.vy_at = t_to
 
     def _hold_dt(self, a: float, b: float) -> float:
         """[a,b] 里"有报文支撑"的等效时长：静默 ≤ ``zoh_max_s`` 全给，之后线性淡出到 0。
@@ -961,9 +1022,11 @@ class OnlineNavigator:
         self.mapper = KeyframeGridMapper(c.mapper)
         self.session = NavSession(self.mapper, radius_m=c.radius_m, request_update=self._request_map_update)
         self.heading_track = HeadingTrack()
+        # 2026-10-28：enable_vertical 时把竖向积分接进 DR（见 DeadReckoner 的文档串）。
         self.dr = DeadReckoner(c.world_scale, c.osc_lag_s,
                                zoh_max_s=c.osc_zoh_max_s, zoh_fade_s=c.osc_zoh_fade_s,
-                               speed_scale=c.osc_speed_scale)
+                               speed_scale=c.osc_speed_scale,
+                               enable_vertical=c.enable_vertical)
         self.loops = LoopCloser(c.loop) if c.loop_closure else None
         self._offset = np.zeros(2)          # 回环修正量（追踪米），加在原始航位推算上
         self._last_loop: dict[str, Any] | None = None
@@ -1588,6 +1651,16 @@ class OnlineNavigator:
                                 vert_seen = ts
                                 rec.line("vert", {"t": ts, "src": o.get("source"), "vy": o.get("velocity_y"),
                                                   "g": o.get("grounded")})
+                            # 喂给 DeadReckoner 的竖向积分（enable_vertical 时）
+                            vy = o.get("velocity_y")
+                            gr = o.get("grounded")
+                            if self.dr.enable_vertical and vy is not None and gr is not None:
+                                self.dr._advance_z(max(min(float(ts), self._clock()),
+                                                       self.dr.vy_at or float(ts)),
+                                                   float(vy) * self.dr.k)
+                                self.dr.vy = float(vy) * self.dr.k
+                                self.dr.vy_at = float(ts)
+                                self.dr._grounded = bool(gr)
                         # 同一 bundle 的参数共用接收时刻，按 seq 去重。
                         for o in self._param_history():
                             seq = int(o.get("seq", 0))
