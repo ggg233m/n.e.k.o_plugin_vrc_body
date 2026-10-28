@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 r'''用 mtime 反演建图线程的真实队列：到达/服务/delay 曲线。
 
-为什么不能只看 events.jsonl：那里只有**采集时刻** ``t``，没有建图线程什么时候吃下这一帧。
+为什么不能只看 events.jsonl（旧录制）：那里只有**采集时刻** ``t``，没有建图线程什么时候吃下这一帧。
+2026-10-29 起 kf 行带 ``done_t``（建图线程消费完成时刻，clock 域），有它优先用；旧录制退回 mtime。
 ``kf/<k>.npz`` 的 mtime 就是 ``rec.keyframe()`` 真正跑完的时刻（它在建图线程里同步调用，
 见 nav_online.py:1948），所以 mtime 序列 = 服务完成时刻序列。
 
@@ -20,11 +21,15 @@ def load(rec):
     ev = [json.loads(x) for x in (rec/'events.jsonl').read_text(encoding='utf-8').splitlines() if x.strip()]
     kf = sorted([e for e in ev if e.get('kind')=='kf'], key=lambda e: e['k'])
     out = []
+    # done_t（nav_online 2026-10-29 新增）：建图线程消费完成的时刻（clock 域，与 t 同源）。
+    # 有它就用它（不再受 mtime 被复制/解压改写的影响）；旧录制没有 → 退回 mtime 口径。
+    use_done_t = all('done_t' in e for e in kf) and all(e.get('done_t') is not None for e in kf)
     for e in kf:
         p = rec/'kf'/('%06d.npz' % int(e['k']))
         if not p.exists():
             continue
-        out.append(dict(k=int(e['k']), cap=e['t']-C0, done=p.stat().st_mtime-W0,
+        done = (e['done_t']-C0) if use_done_t else (p.stat().st_mtime-W0)
+        out.append(dict(k=int(e['k']), cap=e['t']-C0, done=done,
                         unmapped=bool(e.get('unmapped')), dist=float(e.get('dist_m', 0.0))))
     return meta, out
 

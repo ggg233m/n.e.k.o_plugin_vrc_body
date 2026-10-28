@@ -1675,13 +1675,18 @@ class RecorderTest(unittest.TestCase):
             r = SessionRecorder(Path(d) / "s", max_bytes=2000, meta={"x": 1})
             for i in range(3):
                 r.keyframe(i, np.zeros((500, 3), np.float32), np.eye(4), np.eye(4), 0.0, None)
+            # 2026-10-29 落盘异步化：写入发生在专职写线程，size_limit 在写线程里触发。
+            # drain() 等「已排队的都写完」，之后护栏状态与落盘结果才是确定的。
+            r.drain()
             self.assertEqual(r.status()["stopped"], "size_limit")
-            self.assertEqual(r.status()["keyframes"], 1)
+            # 排队计数（入队即加）与**实际落盘**数分离：磁盘上只应有第 1 帧。
+            self.assertEqual(r.status()["keyframes"], 3)
+            written = len(list((Path(d) / "s" / "kf").glob("*.npz")))
+            self.assertEqual(written, 1)
             r.line("hmd", {"t": 0.0})
             r.close(None)
             self.assertFalse((Path(d) / "s" / "hmd.jsonl").exists())
             self.assertEqual(r.status()["stopped"], "size_limit")
-
     def test_record_without_root_reports_error(self) -> None:
         st = self.run_session(None, record=True)
         self.assertIsNone(st["recording"])

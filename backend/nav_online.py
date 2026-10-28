@@ -150,7 +150,14 @@ class OnlineNavConfig:
     map_min_interval_s: float = 0.3  # 栅格化已是增量（853 帧 ~50 ms），且不再占着导航锁
     # 每批最多吃多少个关键帧。见 _mapping_loop 的注释：不设上限时 pending 积压会让单次
     # rasterize 变成全量重投（418 帧实测 21.9 s、610 帧约 30 s），而且积压越多越慢。
-    map_max_kf_per_batch: int = 1
+    # 2026-10-29 1→4（饱和文档 §七·②）：固定开销摊薄，610 帧规模每帧省 ≈100 ms；
+    # ρ 1.37→1.21（仅缓解），配合 ④ 落盘移线程才进稳定区。测试上限 ≤4 保持一致。
+    map_max_kf_per_batch: int = 4
+    # kf_img 落盘最大宽度（像素）。0 = 原生分辨率（默认，向后兼容：所有离线立体基准
+    # 都假设 kf_img = 采集分辨率）。>0 时 PNG 等比缩到该宽度再写（npz/K 不动，
+    # 逐帧实际宽度记进 events 的 kf 行 img_w）。720 省 69 ms/帧（§4.2）——
+    # ⚠️ 代价是取色与重算视差的精度，开之前先读饱和文档 §七·③。
+    record_img_max_w: int = 0
     kf_dist_m: float = 0.4           # 世界米；< 条带深度，快走也首尾相接
     kf_turn_deg: float = 25.0
     kf_max_age_s: float = 3.0        # 原地不动时也隔这么久补一帧（刷新动态物体、给射线清除新视线）
@@ -383,6 +390,19 @@ class SessionRecorder:
         self._lock = threading.Lock()
         self._buf: list[tuple[str, str]] = []
         self._files: dict[str, Any] = {}
+
+        # 🔴 2026-10-29 落盘移出建图线程（饱和文档 §七·④）：keyframe() 只把载荷排进本队列
+        # 就返回，np.savez + 2×PNG（实测 146 ms/帧 = 建图线程服务时间的 25%）由**专职写线程**做。
+        # 顺序保证：单写线程按 FIFO 写；events.jsonl（同步写、很便宜）与 kf 文件的先后不影响
+        # 任何读侧逻辑 —— 离线工具按 events 的 k 找文件，不按 mtime/文件先后。
+        # 停止语义：close() 时 join 写线程；写失败照旧走 _halt（录制停、导航照常）。
+        # kf_img 降宽（§七·③）：meta['record_img_max_w']>0 时 PNG 缩到该宽度再写（K/npz 不动，
+        # 逐帧实际宽度记进 events 的 kf 行，取色侧按宽度回算 u,v）。默认 0 = 原生分辨率。
+        self.img_max_w = int(meta.get("record_img_max_w") or 0)
+        self._q: "queue.Queue[tuple[int, dict[str, np.ndarray], list[np.ndarray] | None] | None]" = queue.Queue()
+        self._writer = threading.Thread(target=self._writer_loop, name="navmesh-recorder-writer", daemon=True)
+        self._writer.start()
+
         self._write("meta.json", json.dumps(meta, ensure_ascii=False, indent=1, default=_json_default))
 
     def status(self) -> dict[str, Any]:
@@ -416,37 +436,87 @@ class SessionRecorder:
 
     def keyframe(self, k: int, pts: np.ndarray, T_dr: np.ndarray, T_map: np.ndarray, dist_m: float,
                  feat: Any, images: tuple[np.ndarray, np.ndarray] | None = None) -> None:
+        """排队落盘（2026-10-29 起异步）：本函数在**建图线程**里被调，只做拷贝+入队，
+        np.savez/2×PNG 的 146 ms 全部移交专职写线程（见 __init__ 注释）。
+        停止后仍可安全调用（直接丢弃）——与旧同步行为一致。
+        失败语义：写线程里 OSError → _halt（录制停、导航照常），与旧路径相同。
+        关键帧**计数**（keyframes）在入队时加：size_limit 检查移到写线程，
+        极端情况下会多排几帧才停 —— 上限本就是 MB 级护栏，误差可忽略。
+        """
         arrays: dict[str, np.ndarray] = {"pts": np.asarray(pts, np.float32), "T_dr": np.asarray(T_dr, float),
                                          "T_map": np.asarray(T_map, float), "dist_m": np.array(float(dist_m))}
         if feat is not None:
             arrays.update(uv=feat.uv, des=feat.des, xyz=feat.xyz, des3d=feat.des3d, K=feat.K,
                           size=np.array(feat.size), eye_y=np.array(feat.eye_y))
+        imgs = None
+        if images is not None and self.images:
+            # 拷贝必须在调用线程做：感知线程下一拍就会复用这块缓冲。
+            imgs = [np.array(img, copy=True) for img in images]
         with self._lock:
             if self.stopped is not None:
                 return
-            path = self.dir / "kf" / f"{int(k):06d}.npz"
+            self.keyframes += 1
+        self._q.put((int(k), arrays, imgs))
+
+    def _writer_loop(self) -> None:
+        """专职写线程：FIFO 消费 keyframe 队列；None = 收工（close 发）。"""
+        while True:
+            job = self._q.get()
+            if job is None:
+                return
+            k, arrays, imgs = job
+            with self._lock:
+                if self.stopped is not None:
+                    continue          # 护栏（size_limit / 写失败）已触发：丢弃余下队列（旧同步语义）
             try:
-                np.savez(path, **arrays)   # 不压缩：点云压不了多少，还占建图线程
-                self.bytes += path.stat().st_size
-                self.keyframes += 1
-                if images is not None and self.images:
-                    # PNG 无损（视差要亚像素，JPEG 的块效应会直接变成深度偏置）；压缩级 1 求快。
-                    # 感知线程传来的是 RGB（OpenVR 镜像纹理格式，`openvr_mirror.py::read_stereo_rgb`），
-                    # 但 ``cv2.imwrite`` 把数组当成 BGR 写 PNG，所以这里**必须转 BGR**——否则落盘红蓝反。
-                    # 下游研究脚本 ``imread`` 读回来又是 BGR（OpenCV 惯例），颜色就对得上。灰度图不受影响。
-                    (self.dir / "kf_img").mkdir(exist_ok=True)
-                    for eye, img in zip("LR", images):
-                        out = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                        ip = self.dir / "kf_img" / f"{int(k):06d}_{eye}.png"
-                        if not cv2.imwrite(str(ip), out, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
-                            raise OSError(f"imwrite failed: {ip.name}")
-                        self.bytes += ip.stat().st_size
+                self._write_keyframe(k, arrays, imgs)
             except OSError as exc:
-                self._halt_locked(f"write_failed: {exc}")
+                with self._lock:
+                    if self.stopped is None:
+                        self._halt_locked(f"write_failed: {exc}")
+                return
+
+    def _write_keyframe(self, k: int, arrays: dict[str, np.ndarray],
+                        imgs: list[np.ndarray] | None) -> None:
+        path = self.dir / "kf" / f"{k:06d}.npz"
+        np.savez(path, **arrays)   # 不压缩：点云压不了多少（现在是写线程在占，不占建图线程）
+        with self._lock:
+            self.bytes += path.stat().st_size
             self._check_size_locked()
+        if imgs is not None and self.images:
+            # PNG 无损（视差要亚像素，JPEG 的块效应会直接变成深度偏置）；压缩级 1 求快。
+            # 感知线程传来的是 RGB（OpenVR 镜像纹理格式，`openvr_mirror.py::read_stereo_rgb`），
+            # 但 ``cv2.imwrite`` 把数组当成 BGR 写 PNG，所以这里**必须转 BGR**——否则落盘红蓝反。
+            # 下游研究脚本 ``imread`` 读回来又是 BGR（OpenCV 惯例），颜色就对得上。灰度图不受影响。
+            (self.dir / "kf_img").mkdir(exist_ok=True)
+            for eye, img in zip("LR", imgs):
+                out = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                if self.img_max_w and out.shape[1] > self.img_max_w:
+                    # §七·③：只降 PNG 宽度（等比），K/npz 不动；实际宽度由调用方记进 events。
+                    h2 = max(1, int(round(out.shape[0] * self.img_max_w / out.shape[1])))
+                    out = cv2.resize(out, (self.img_max_w, h2), interpolation=cv2.INTER_AREA)
+                ip = self.dir / "kf_img" / f"{k:06d}_{eye}.png"
+                if not cv2.imwrite(str(ip), out, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+                    raise OSError(f"imwrite failed: {ip.name}")
+                with self._lock:
+                    self.bytes += ip.stat().st_size
+
+    def drain(self, timeout_s: float = 30.0) -> None:
+        """等写线程把手头队列清空（测试与「停录前确认落盘」用）。不停录。"""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and not self._q.empty():
+            time.sleep(0.01)
+        # 队列空 ≠ 当前帧写完：再给写线程一个队头确认窗口。
+        time.sleep(0.05)
 
     def close(self, final_poses: dict[int, np.ndarray] | None) -> None:
         self.flush()
+        # 先排哨兵再 join：写线程把手头队列写**完**才退出（FIFO）⇒ close 返回后
+        # kf/*.npz 与 final_poses.npz 都已落盘，离线工具可以立即整目录使用。
+        # join 超时（30 s > 单帧 146 ms × 任何合理积压）只能发生在磁盘故障时：
+        # 此时写线程多半已经 _halt，录制停、导航照常，与旧失败语义一致。
+        self._q.put(None)
+        self._writer.join(timeout=30.0)
         with self._lock:
             if final_poses and self.stopped is None:
                 ids = sorted(final_poses)
@@ -458,6 +528,23 @@ class SessionRecorder:
             if self.stopped is None:
                 self.stopped = "closed"
             self._close_files_locked()
+
+    def write_meta_tail(self, obj: dict[str, Any]) -> None:
+        """停止时把终态统计并进 meta.json（§六·1：stereo_drops 此前从不落盘）。
+        与 meta 主体分开写：读侧拿 meta.get("final") 判有没有，旧录制天然没有。
+        """
+        try:
+            mp = self.dir / "meta.json"
+            meta: dict[str, Any] = {}
+            if mp.exists():
+                meta = json.loads(mp.read_text(encoding="utf-8"))
+            meta["final"] = obj
+            mp.write_text(json.dumps(meta, ensure_ascii=False, indent=1, default=_json_default),
+                          encoding="utf-8")
+        except (OSError, json.JSONDecodeError) as exc:
+            with self._lock:
+                if self.stopped is None:
+                    self._halt_locked(f"meta_tail_failed: {exc}")
 
     def _write(self, name: str, text: str) -> None:
         (self.dir / name).write_text(text, encoding="utf-8")
@@ -1145,6 +1232,7 @@ class OnlineNavigator:
                         # 哪个时钟，离线分析才能判断能否与自己算出的时刻相减。2026-10-24 之前
                         # 是 monotonic，之后是 perf_counter —— 没这个字段就分不清新旧录制。
                         {"config": asdict(self.cfg), "started_wall": time.time(),
+                         "record_img_max_w": int(self.cfg.record_img_max_w),
                          "started_clock": self._started_at,
                          "clock_domain": self._clock_domain_name(),
                          "record_images": bool(record_images), "avatar": avatar,
@@ -1274,7 +1362,12 @@ class OnlineNavigator:
                     rec.keyframe(k, pts, T, T_map, dist, feat, images=imgs)
                     _gap, _frozen = self._pose_trust(t_kf)
                     rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist,
-                                        "loops": [], "refresh": refresh, "unmapped": True,
+                                        "loops": [], "refresh": refresh, "done_t": None,
+                                        # 原因码（饱和文档 §六·2）：这条路径 = 会话停止时还在 _pending
+                                        # 队列里没被建图线程吃掉 ⇒ backlog（积压）。旧录制是 bool true，
+                                        # 读侧 `not e.get("unmapped")` 对字符串同样成立，向后兼容。
+                                        "unmapped": "backlog",
+                                        "img_w": (int(rec.img_max_w) if rec.images else 0),
                                         "pose_gap_s": None if _gap is None else round(_gap, 3),
                                         "pose_frozen": _frozen})
                 elif kind == "trail":
@@ -1283,6 +1376,21 @@ class OnlineNavigator:
             rec.flush()
         if rec is not None:
             rec.close(None if self.loops is None else self.loops.poses())
+        # 终态统计进 meta.json（饱和文档 §六·1）：stereo_drops 此前只在 status() 内存里，
+        # 从不落盘 —— 掉帧率只能靠回放猜。现在停止时定格写进 meta['final']。
+        if rec is not None:
+            try:
+                rec.write_meta_tail({
+                    "stereo_drops": dict(self._stereo_drops),
+                    "keyframes": int(self._keyframes),
+                    "kf_frozen": int(self._kf_frozen),
+                    "kf_unique": int(self._kf_unique),
+                    "kf_refreshed": int(self._kf_refreshed),
+                    "map_updates": int(self._map_updates),
+                    "stopped_wall": time.time(),
+                })
+            except Exception as exc:  # noqa: BLE001 - 统计落盘失败不能挡停止
+                self._fail("meta_tail", exc)
         # 采纳线程要的 session_id **只有这里还取得到**：_end_memory 会把 _mem 置 None。
         # （2026-10-05 live 实测：线程里再读 self._mem 恒为 None ⇒ xsession_align 永远报
         # memory_gone，采纳从未真正跑过——旧测试直接调线程体，绕开了这个顺序。）
@@ -2056,27 +2164,32 @@ class OnlineNavigator:
                         if rec is not None:
                             rec.keyframe(k, pts, T, T if self.loops is None else self.loops.pose(k), dist, feat,
                                          images=imgs)
+                            # done_t（饱和文档 §六·3）：建图线程**消费**这一帧的时刻。
+                            # 异步落盘后它不再等于「文件写完」，而是「位姿/入图/回环已处理完」——
+                            # 队列延迟 = done_t − t（采集时刻），这才是饱和分析要的量，
+                            # 从此不再依赖 kf 文件 mtime 这种间接证据。
+                            _done_t = self._clock()
                             # `pose_gap_s` / `pose_frozen`：这一帧挂的位姿在采集时已静默多久。
                             # 超过 osc_zoh_max_s ⇒ DeadReckoner 停止积分、位姿冻结，而采集照常出帧
                             # ⇒ 画面在动、位姿不动，是「位姿与画面错位」的机器可读证据。
                             # 离线脚本据此能自动剔除，不必再靠 mtime/时间戳肉眼推断。
                             _gap, _frozen = self._pose_trust(t_kf)
                             rec.line("events", {"kind": "kf", "k": k, "t": t_kf, "dist_m": dist, "loops": found,
-                                                "refresh": refresh,
+                                                "refresh": refresh, "done_t": _done_t,
+                                                "img_w": (int(rec.img_max_w) if rec.images else 0),
                                                 "pose_gap_s": None if _gap is None else round(_gap, 3),
                                                 "pose_frozen": _frozen})
-                        if self.loops is not None:
-                            if found:
-                                moved = self.mapper.update_poses(self.loops.poses())
-                                self._last_loop = {"keyframe": k, "loops": found,
-                                                   "map_shift_m": round(moved * c.world_scale, 3)}
-                                if self._prior is not None:
-                                    # 回环改了全表位姿 ⇒ 会话帧内容变了，先验的 gauge 必须重估。
-                                    self._prior.note_map_moved()
-                            loop_status = self.loops.status()
-                            with self._state_lock:
-                                self._offset = self.loops.offset()
-                                self._loop_status = loop_status
+                        if found:
+                            moved = self.mapper.update_poses(self.loops.poses())
+                            self._last_loop = {"keyframe": k, "loops": found,
+                                               "map_shift_m": round(moved * c.world_scale, 3)}
+                            if self._prior is not None:
+                                # 回环改了全表位姿 ⇒ 会话帧内容变了，先验的 gauge 必须重估。
+                                self._prior.note_map_moved()
+                        loop_status = self.loops.status()
+                        with self._state_lock:
+                            self._offset = self.loops.offset()
+                            self._loop_status = loop_status
                         self._rate_kf.mark(self._clock())
                         self._keyframes += 1
                         if self._pose_trust(t_kf)[1]:
