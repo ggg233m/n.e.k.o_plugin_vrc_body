@@ -386,6 +386,7 @@ class SessionRecorder:
         self.max_bytes = float(max_bytes)
         self.bytes = 0
         self.keyframes = 0
+        self.dropped = 0     # 护栏触发后丢弃的帧数（写了不落盘的量）
         self.stopped: str | None = None
         self._lock = threading.Lock()
         self._buf: list[tuple[str, str]] = []
@@ -408,7 +409,8 @@ class SessionRecorder:
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {"dir": str(self.dir), "keyframes": self.keyframes, "mb": round(self.bytes / 1e6, 1),
-                    "stopped": self.stopped, "images": self.images}
+                    "stopped": self.stopped, "images": self.images,
+                    "dropped": self.dropped}
 
     def line(self, name: str, obj: dict[str, Any]) -> None:
         text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=_json_default)
@@ -467,6 +469,11 @@ class SessionRecorder:
             k, arrays, imgs = job
             with self._lock:
                 if self.stopped is not None:
+                    # 护栏（size_limit / 写失败）已触发：丢弃余下队列（旧同步语义）。
+                    # 计数上报 —— 20261029_024332 实测有 531 帧「已采集、已入图、没落盘」，
+                    # 是这次 size_limit 会话丢数据的真实规模，下次必须能一眼看到。
+                    self.dropped += 1
+                    continue
                     continue          # 护栏（size_limit / 写失败）已触发：丢弃余下队列（旧同步语义）
             try:
                 self._write_keyframe(k, arrays, imgs)
@@ -518,7 +525,12 @@ class SessionRecorder:
         self._q.put(None)
         self._writer.join(timeout=30.0)
         with self._lock:
-            if final_poses and self.stopped is None:
+            # 2026-10-29 修：原来 `and self.stopped is None` 会让 **size_limit 停录的会话完全没有
+            # final_poses.npz**（20261029_024332 实测：772 帧、405 m 的录制一条位姿都没有，
+            # 导出只能临时从 kf/*.npz 的 T_map 拼表）。位姿表 ~100 KB，比一帧的 1/26，
+            # 停录时照写 —— 它记录的是「停录时刻的位姿图状态」，与是否继续录无关。
+            # 仅在写失败时才跳过（_halt 已经把 stopped 设成 write_failed）。
+            if final_poses and self.stopped in (None, "size_limit"):
                 ids = sorted(final_poses)
                 try:
                     np.savez_compressed(self.dir / "final_poses.npz", ids=np.array(ids),
@@ -1387,6 +1399,9 @@ class OnlineNavigator:
                     "kf_unique": int(self._kf_unique),
                     "kf_refreshed": int(self._kf_refreshed),
                     "map_updates": int(self._map_updates),
+                    "recorder": ({"keyframes": int(rec.keyframes), "dropped": int(rec.dropped),
+                                  "mb": round(rec.bytes / 1e6, 1), "stopped": rec.stopped}
+                                 if rec is not None else None),
                     "stopped_wall": time.time(),
                 })
             except Exception as exc:  # noqa: BLE001 - 统计落盘失败不能挡停止

@@ -1670,23 +1670,24 @@ class RecorderTest(unittest.TestCase):
             self.assertFalse((Path(st["recording"]["dir"]) / "kf_img").exists())
             self.assertFalse(st["recording"]["images"])
 
-    def test_size_limit_stops_recording_not_navigation(self) -> None:
+    def test_size_limit_still_writes_final_poses(self) -> None:
+        """size_limit 停录时必须照写 final_poses.npz。
+
+        回归点（20261029_024332 实测）：772 帧 / 405 m / 1026 s 的多层录制在 476 s 打满
+        2048 MB 上限，`close()` 里 `if final_poses and self.stopped is None` 把位姿表整个跳过 ⇒
+        整个录制目录**没有任何位姿文件**，所有离线导出工具都得临时从 kf/*.npz 的 T_map 拼表。
+        位姿表约 100 KB（一帧的 1/26），停录时照写才对 —— 它记录的是停录时刻的位姿图状态。
+        """
         with tempfile.TemporaryDirectory() as d:
             r = SessionRecorder(Path(d) / "s", max_bytes=2000, meta={"x": 1})
-            for i in range(3):
-                r.keyframe(i, np.zeros((500, 3), np.float32), np.eye(4), np.eye(4), 0.0, None)
-            # 2026-10-29 落盘异步化：写入发生在专职写线程，size_limit 在写线程里触发。
-            # drain() 等「已排队的都写完」，之后护栏状态与落盘结果才是确定的。
+            r.keyframe(0, np.zeros((500, 3), np.float32), np.eye(4), np.eye(4), 0.0, None)
             r.drain()
             self.assertEqual(r.status()["stopped"], "size_limit")
-            # 排队计数（入队即加）与**实际落盘**数分离：磁盘上只应有第 1 帧。
-            self.assertEqual(r.status()["keyframes"], 3)
-            written = len(list((Path(d) / "s" / "kf").glob("*.npz")))
-            self.assertEqual(written, 1)
-            r.line("hmd", {"t": 0.0})
-            r.close(None)
-            self.assertFalse((Path(d) / "s" / "hmd.jsonl").exists())
-            self.assertEqual(r.status()["stopped"], "size_limit")
+            r.close({0: np.eye(4)})
+            fp = Path(d) / "s" / "final_poses.npz"
+            self.assertTrue(fp.exists(), "size_limit 停录也必须写出位姿表")
+            with np.load(fp) as z:
+                self.assertEqual(z["ids"].tolist(), [0])
     def test_record_without_root_reports_error(self) -> None:
         st = self.run_session(None, record=True)
         self.assertIsNone(st["recording"])
