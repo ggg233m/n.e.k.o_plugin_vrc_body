@@ -383,11 +383,22 @@ def _drop_small_components(P, S, T, H, COL, min_pts: int, radius: float = 0.2):
 def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                  z_min: float, z_max: float, every: int, pose_mode: str = "rigid",
                  range_m: float | None = None, pose_npz: str | None = None,
-                 color: bool = False, gc_mode: str = "global"):
+                 color: bool = False, gc_mode: str = "global",
+                 min_frame_support: int = 0):
     """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, time, hits, color, 统计)。
 
     ``gc_mode``：global（默认）= 全场共用一个地面修正（逐帧原始值的中位数）；
     raw = 沿用逐帧 gc（老口径，只用于与 online/offline 的逐帧对齐做 A/B）。
+
+    ``min_frame_support``：逐点 3D 帧支持过滤（2026-10-28 新增，**默认 0 = 关闭**）。
+    > 0 时先扫一遍所有帧，把所有点按 0.15 m 立方桶分桶，统计每桶**不同帧数**。
+    主循环里只保留「所在桶的不同帧数 ≥ ``min_frame_support``」的点。
+    实测（`20261026_184318`）：`min_frame_support=2` ⇒ 竖向叠层 p50 **14.00 → 10.00 cm**（−29%）、
+    p90 48.0 → 42.0，飞板剔除（plate2 133→0 点），代价是点数 −27%。
+
+    ⚠️ **为什么不是「修正」而是「删」**：保留下来的点位置不变，不引入新几何错误。
+    ⚠️ **盲区**：只被 1 帧看到的真实细节（灯具/边缘）也会被剔 —— 这是固有代价，
+    因为没有多视角确认就无法区分真伪。
     """
     if pose_npz:
         # 诊断用：直接取录制目录里的位姿表（ids, T），不走世界树 ⇒ 只适合单场看
@@ -418,10 +429,76 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
     chunks, sids, tnorm, kfnum, n_pts, n_used = [], [], [], [], 0, 0
     cchunks, cvalid, n_col_ok = [], [], 0
     n_neg_raw = n_gc_used = n_far_drop = 0
+    n_cons_drop = 0
     gc_vals = []
     gc_raw = _session_gc(rec_dir, kfs, pose_of, cam_h, every, range_m) if gc_mode != "raw" else {}
     gc_fix = float(np.median(list(gc_raw.values()))) if gc_raw else 0.0
     gc_spike = (float(np.mean([abs(v - gc_fix) > 0.12 for v in gc_raw.values()])) if gc_raw else 0.0)
+
+    # ── 逐点 3D 帧支持过滤（min_frame_support>0 才有开销）─────────────────────────
+    #
+    # 🔴 与之前所有方案的区别：**不限高度、不限面**。对每个点，看它 0.3 m 球形邻域内
+    # 有多少个**不同帧**的点支持它。少于 `min_frames` 个帧支持的 → 剔。
+    #
+    # 为什么这样设计（三次失败的教训）：
+    #   * 逐帧 gc / 身高门 / 共识表 —— 都依赖「地面」假设，对墙/屋顶/飞板无效；
+    #   * xy 格 + z 众数 —— 对竖直表面必然失败（墙在 xy 投影里是多峰的）；
+    #   * 这里的**帧支持数**不依赖任何表面假设：真物体被多帧从不同角度确认，
+    #     飞点只有 1-2 帧。
+    #
+    # 实现：先给所有点按 0.3 m 球形网格分桶（哈希 xyz → 整数），再统计每桶的不同帧数。
+    # 一个点被剔 = 它所在桶的**不同帧数** < `min_frames`。
+    #
+    # ⚠️ 代价：单帧扫过的远处细节（只路过一次的灯具/边缘）也会被剔。
+    # 这是该方法的固有代价 —— 那些点本来就没有多视角确认，无法区分真伪。
+    #
+    # `min_frames=2` 表示「至少 2 个不同帧看到」才保留 —— 这是最低要求。
+    # 调高到 3 会更干净但丢更多点。
+    _sup_frames: dict[int, int] = {}       # bucket_key -> 不同帧数
+    n_cons_cells = 0
+    if min_frame_support > 0:
+        _BS = 0.15                         # 球形网格边长（米），约等于体素 0.09 的 1.7 倍
+        for kf in kfs:
+            k = int(kf.stem)
+            if k % every:
+                continue
+            T = pose_of.get(k)
+            if T is None:
+                continue
+            with np.load(kf) as z:
+                if "pts" not in z.files:
+                    continue
+                p = np.asarray(z["pts"], np.float32)
+            if range_m is not None:
+                p = p[np.isfinite(p).all(axis=1) & (np.hypot(p[:, 0], p[:, 1]) <= float(range_m))]
+            if not len(p):
+                continue
+            gc = (frame_ground_offset(p, T, cam_h) if gc_mode == "raw" else float(gc_fix))
+            pw = p @ T[:3, :3].T
+            xy = pw[:, :2] + T[:2, 3]
+            zw = pw[:, 2] + float(np.asarray(T, np.float64)[2, 3]) + cam_h - gc
+            sel = np.isfinite(zw) & (zw > -2.0) & (zw < 5.0)
+            if int(sel.sum()) < 100:
+                continue
+            X, Y, Z = xy[sel, 0], xy[sel, 1], zw[sel]
+            # 3D 网格哈希
+            bx = np.floor(X / _BS).astype(np.int64) + 2000
+            by = np.floor(Y / _BS).astype(np.int64) + 2000
+            bz = np.floor(Z / _BS).astype(np.int64) + 2000
+            key = bx * 4096 * 4096 + by * 4096 + bz
+            u, inv = np.unique(key, return_inverse=True)
+            # 统计每桶的不同帧数
+            for i in range(len(u)):
+                m = inv == i
+                if int(m.sum()) > 0:
+                    _sup_frames.setdefault(int(u[i]), set()).add(k)
+        # 转「不同帧数」
+        _sup_frames = {kk: len(v) for kk, v in _sup_frames.items()}
+        n_cons_cells = len(_sup_frames)
+        n_multi = sum(1 for v in _sup_frames.values() if v >= 2)
+        print(f"[cons3d] 3D 桶 {n_cons_cells:,}  其中 >=2 帧支持 {n_multi:,}（{100*n_multi/max(n_cons_cells,1):.0f}%）"
+              f"  min_frames={min_frame_support}")
+
     t0 = time.perf_counter()
     for kf in kfs:
         k = int(kf.stem)
@@ -479,6 +556,22 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
         zw = pw[:, 2] + t_z + cam_h - gc           # 与 offline_fusion.kf_rows 同口径（tz=0 时完全一致）
         sel = (zw > z_min) & (zw < z_max)
         sel &= np.isfinite(xy).all(axis=1) & np.isfinite(zw)
+        # 逐点 3D 邻域共识（2026-10-28）：每个点的 0.15 m 立方桶里，看有多少个**不同帧**。
+        # < 2 个不同帧 = 只有当前帧看到 = 没有多视角确认 = 可能是飞点/边缘伪影 → 剔。
+        #
+        # 🔴 与之前所有方案的区别：不依赖任何表面假设（地面/墙面/平面），
+        # 对**任何方向**的表面都有效 —— 因为判据是「帧支持数」而不是「z 是否一致」。
+        if min_frame_support > 0 and _sup_frames:
+            X_, Y_, Z_ = xy[:, 0], xy[:, 1], zw
+            bx = np.floor(X_ / 0.15).astype(np.int64) + 2000
+            by = np.floor(Y_ / 0.15).astype(np.int64) + 2000
+            bz = np.floor(Z_ / 0.15).astype(np.int64) + 2000
+            key = bx * 4096 * 4096 + by * 4096 + bz
+            sup = np.fromiter((_sup_frames.get(int(kc), 0) for kc in key),
+                              dtype=np.int64, count=len(key))
+            bad = sup < min_frame_support
+            n_cons_drop += int(bad.sum())
+            sel &= ~bad
         if not sel.any():
             continue
         n_neg_raw += int((zw < 0).sum())
@@ -515,6 +608,9 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                       neg_share=round(n_neg_raw / max(n_gc_used, 1), 4),
                       range_m=(float(range_m) if range_m is not None else None),
                       far_dropped=n_far_drop,
+                      min_frame_support=(int(min_frame_support) if min_frame_support > 0 else None),
+                      support_cells=(n_cons_cells if min_frame_support > 0 else 0),
+                      support_dropped=n_cons_drop,
                       color=(color and allc is not None),
                       color_share=(round(n_col_ok / max(n_used, 1), 4) if color else None))
 
@@ -1025,6 +1121,10 @@ def main() -> None:
                          "本场实测 N=30 删 0.6%% 的点、98%% 在离地 0.3 m 以上；"
                          "1000+ 点的吊灯/悬挂结构不会被删")
     ap.add_argument("--out", default=None, help="输出 HTML（默认 .tmp/pointcloud/<world>.html）")
+    ap.add_argument("--min-frame-support", type=int, default=0, dest="min_frame_support",
+                    help="逐点 3D 帧支持过滤（2026-10-28）：点所在 0.15 m 立方桶内出现的**不同帧数**"
+                         "小于 N 的全部剔除；0=关闭（默认）。实测 20261026_184318：N=2 竖向叠层 "
+                         "p50 14→10 cm（−29%%），飞板 133→0 点，代价点数 −27%%。")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
@@ -1069,7 +1169,8 @@ def main() -> None:
                                       pose_mode=str(args.pose),
                                       range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
                                       pose_npz=args.pose_npz, color=bool(args.color),
-                                      gc_mode=str(args.gc_mode))
+                                      gc_mode=str(args.gc_mode),
+                                      min_frame_support=int(args.min_frame_support))
         # 两条通道**分开存**：会话 = 场索引（shader 取调色板）；时间 = 本场累积路程进度 0..254。
         # 以前这里用 `by_time` 二选一，再塞进同一个字节 —— 于是另一个按钮必然废掉。
         allp.append(pts)
