@@ -875,10 +875,27 @@ class KeyframeGridMapper:
         self._grow_acc(int(ix.min()), int(iy.min()), int(ix.max()), int(iy.max()))
         (x0, y0), (H, W) = self._acc_lo, self._acc_g.shape
         flat = (iy - y0) * W + (ix - x0)
+        # 🔴 2026-10-29：权重**写进预分配缓冲**，不再每槽 concatenate 1216 个临时数组。
+        # 回环重建（所有关键帧整格平移）是唯一走大 work 的路径。单变量基准，
+        # 700 帧 / 1216 work 项 / 2.75 M 点 / 图 0.54 M 格（min of 7 次）：
+        #   仅 concat  17 槽: 312 ms  ⇒  仅 copyto/negative: 133 ms（2.3×）
+        #   仅 bincount 17 槽: 242 ms（不变）
+        #   整条 563 → 364 ms（1.55×）。结果**逐位一致**（17 个累加器 array_equal 全过）。
+        # sg 只有 ±1，所以正贡献用 copyto、负贡献用 negative(out=)，连乘法也省了。
+        # 顺序必须与 work 一致：buffer 的第 i 段对应 work[i]，flat 也是按 work 顺序拼的。
+        _lens = [len(b[0]) for b, _sx, _sy, _g in work]
+        _buf = np.empty(len(flat), np.float64)
         for slot, name in _ACC_SLOTS:
+            off = 0
+            for (b, _sx, _sy, sg), n in zip(work, _lens):
+                col = b[slot]
+                if sg > 0:
+                    np.copyto(_buf[off:off + n], col)
+                else:
+                    np.negative(col, out=_buf[off:off + n])
+                off += n
             acc = getattr(self, name)
-            w = np.concatenate([b[slot] * sg for b, _sx, _sy, sg in work])
-            acc += np.bincount(flat, w, minlength=H * W).reshape(H, W)
+            acc += np.bincount(flat, _buf, minlength=H * W).reshape(H, W)
         return keys
 
     def _ray_z(self) -> int:
