@@ -91,6 +91,17 @@ class LoopConfig:
     loop_sigma_m: float = 0.10
     loop_sigma_frac: float = 0.03     # 回环 σ 随两帧距离增长（远点深度更不准）
     robust_k: float = 3.0
+    # 是否把 **z** 也纳入位姿图（2026-10-28）。
+    #
+    # 默认 **False**（保持既有行为，T[2,3] 恒 0）—— 因为 DR 没有 z 里程：
+    # `T_dr[2,3]` 从来是 0，odometry 边在 z 维上全为「不变」，图在 z 方向只剩回环边，
+    # 除回环节点外全欠定。贸然打开会让 z 只在少数节点上有定义。
+    #
+    # 打开后的正确用法（见 `Docs/`）：先用 `z_edges_only` 探针把回环 z 边**算出来存下来**，
+    # 量它们的自洽性（三元闭合），确认 z 真的可观测，再谈把它当优化变量。
+    # 这条路线来自 VINS-Mono 的先例：「roll/pitch 可观测 ⇒ 只砍 roll/pitch，保留 x,y,z,yaw」；
+    # 我们朝向全由 HMD 给定，却连 z 一起砍了。
+    enable_z: bool = False
     world_scale: float = 0.755        # 由 OnlineNavConfig.world_scale 覆盖，别在这里改
 
 
@@ -180,9 +191,21 @@ def relative_pose(map_kf: KeyframeFeatures, query: KeyframeFeatures, cfg: LoopCo
             "reproj_px": round(err, 2)}, "ok"
 def _solve_laplacian(n: int, I: np.ndarray, J: np.ndarray, Z: np.ndarray, W: np.ndarray,
                      x0: np.ndarray) -> np.ndarray:
-    """min Σ w‖x_j − x_i − z‖²，x_0 = x0 固定 → n×2。边 (I, J, Z, W) 已向量化。"""
-    g = np.zeros((n, 2))
-    for d in range(2):
+    """min Σ w‖x_j − x_i − z‖²，x_0 = x0 固定 → n×D。边 (I, J, Z, W) 已向量化。
+
+    ``D`` 由 ``Z`` 的列数与 ``x0`` 的长度决定（2=只解 xy，3=解 xyz）。
+    法方程是**加权图拉普拉斯**，与维数无关 —— 所以从 2 改到 3 只改这一处循环，
+    LU 分解本身天然支持多个右端项（``splu(...).solve(g)`` 的 g 是 n×D）。
+
+    为什么要支持 3 维（2026-10-28）：原先写死 2 维，把 z 一起砍掉了。
+    但 VINS-Mono 的先例是「roll/pitch 可观测 ⇒ 只砍 roll/pitch，保留 x,y,z,yaw」；
+    我们朝向来自 HMD（连 yaw 都不用估），却连 z 也砍了 ⇒ 位姿表 T[2,3] 恒为 0，
+    任何竖向偏移都被 cam_h/gc 吸收，**地面高度无法成为优化变量**。
+    实测该录制 T[2,3] 的 std = 0.000000（759 帧），见 `Docs/`。
+    """
+    D = int(np.asarray(Z).shape[1])
+    g = np.zeros((n, D))
+    for d in range(D):
         g[:, d] = np.bincount(J, W * Z[:, d], minlength=n) - np.bincount(I, W * Z[:, d], minlength=n)
     rows = np.concatenate([I, J, I, J])
     cols = np.concatenate([I, J, J, I])
@@ -209,16 +232,23 @@ def rotation_angle_deg(R: np.ndarray) -> float:
 @dataclass
 class _Node:
     R: np.ndarray            # 3×3 地图系朝向（来自 HMD，视为真值）
-    dr_xy: np.ndarray        # 航位推算平移（追踪米）
+    dr_xy: np.ndarray        # 航位推算平移（水平，追踪米）
     dist_m: float            # OSC 累计路程（世界米）
     feat: KeyframeFeatures | None
+    # 航位推算的竖直分量（追踪米）。目前 DR 恒给 0（`T_dr[2,3]` 从来是 0），
+    # 所以默认 0 不改变任何既有行为；留这个字段是为了让 z 进位姿图之后
+    # 「odometry 边」能在三维里成立 —— 否则 z 维只有回环边、没有里程边，
+    # 图会退化（除回环节点外全欠定）。
+    dr_z: float = 0.0
 
 
 @dataclass
 class _Loop:
     a: int
     b: int
-    z: np.ndarray            # x_b − x_a，地图系，追踪米
+    # x_b − x_a，地图系，追踪米。**2 或 3 列**：由 `LoopConfig.enable_z` 决定。
+    # PnP 给的相对平移本来就完整三维（`rel["t_ab"]`），原先 `[:2]` 把它丢了。
+    z: np.ndarray
     sigma: float             # 追踪米
     info: dict[str, Any]
     weight: float = 1.0
@@ -299,28 +329,46 @@ class LoopCloser:
         n = self._nodes[k]
         T = np.eye(4)
         T[:3, :3] = n.R
-        T[:2, 3] = self._x[k]
+        x = np.asarray(self._x[k], float).ravel()
+        T[:2, 3] = x[:2]
+        if self.cfg.enable_z and x.size >= 3:
+            # z 只在打开 enable_z 时才非 0。默认路径下 `T[2,3]` 仍然**逐位恒 0**
+            # （既有行为不变：所有消费方都假定它是 0）。
+            T[2, 3] = x[2]
         return T
 
     def poses(self) -> dict[int, np.ndarray]:
         return {k: self.pose(k) for k in self._order}
 
     def offset(self) -> np.ndarray:
-        """最后一个关键帧的修正量（修正后 − 航位推算），追踪米。"""
+        """最后一个关键帧的修正量（修正后 − 航位推算），追踪米。2 或 3 维。"""
         if not self._order:
-            return np.zeros(2)
+            return np.zeros(3 if self.cfg.enable_z else 2)
         k = self._order[-1]
-        return self._x[k] - self._nodes[k].dr_xy
+        x = np.asarray(self._x[k], float).ravel()
+        d = np.asarray(self._nodes[k].dr_xy, float)
+        if not self.cfg.enable_z:
+            return x[:2] - d
+        # ⚠️ z 的「航位推算」是 `dr_z`（默认恒 0），不是 `dr_xy[2]`（不存在）。
+        # 写错会让 offset 的 z 分量变成 −x[2]，把整片点云按两步翻转。
+        return np.array([x[0] - d[0], x[1] - d[1], x[2] - float(self._nodes[k].dr_z)])
 
     def correct_at(self, k: int, T_dr: np.ndarray) -> np.ndarray:
         """按关键帧 k 的修正量平移一个航位推算位姿（k 之后、下一个关键帧之前的逐帧位姿用）。"""
         T = np.array(T_dr, float, copy=True)
-        T[:2, 3] = T[:2, 3] + self._x[k] - self._nodes[k].dr_xy
+        x = np.asarray(self._x[k], float).ravel()
+        d = np.asarray(self._nodes[k].dr_xy, float)
+        T[:2, 3] = T[:2, 3] + x[:2] - d[:2]
+        if self.cfg.enable_z and x.size >= 3:
+            T[2, 3] = T[2, 3] + x[2] - float(self._nodes[k].dr_z)
         return T
 
     def correct(self, T_dr: np.ndarray) -> np.ndarray:
         T = np.array(T_dr, float, copy=True)
-        T[:2, 3] = T[:2, 3] + self.offset()
+        off = self.offset()
+        T[:2, 3] = T[:2, 3] + off[:2]
+        if self.cfg.enable_z and off.size >= 3:
+            T[2, 3] = T[2, 3] + off[2]
         return T
 
     # ---- 建图 ----
@@ -335,12 +383,13 @@ class LoopCloser:
         if self._order and k <= self._order[-1]:
             raise ValueError("关键帧 id 必须递增")
         T_dr = np.asarray(T_dr, float)
-        node = _Node(T_dr[:3, :3].copy(), T_dr[:2, 3].copy(), float(dist_m), feat)
+        node = _Node(T_dr[:3, :3].copy(), T_dr[:2, 3].copy(), float(dist_m), feat,
+                     dr_z=float(T_dr[2, 3]) if self.cfg.enable_z else 0.0)
         if self._order:
             p = self._order[-1]
-            self._x[k] = self._x[p] + (node.dr_xy - self._nodes[p].dr_xy)
+            self._x[k] = self._extend(self._x[p] + self._delta(node, self._nodes[p]))
         else:
-            self._x[k] = node.dr_xy.copy()
+            self._x[k] = self._extend(node.dr_xy.copy())
         self._nodes[k] = node
         self._order.append(k)
         accepted = []
@@ -367,6 +416,22 @@ class LoopCloser:
             self.optimize()
         return accepted
 
+    def _extend(self, v: np.ndarray) -> np.ndarray:
+        """把 2 列向量补成 3 列（`enable_z=False` 的帧 z 恒 0）。"""
+        v = np.asarray(v, float).ravel()
+        if not self.cfg.enable_z:
+            return v[:2].copy() if v.size >= 2 else np.zeros(2)
+        out = np.zeros(3)
+        out[:min(3, v.size)] = v[:3]
+        return out
+    
+    def _delta(self, a: "_Node", b: "_Node") -> np.ndarray:
+        """b − a 的航位推算增量（2 或 3 维）。"""
+        d = np.asarray(a.dr_xy, float) - np.asarray(b.dr_xy, float)
+        if not self.cfg.enable_z:
+            return d[:2]
+        return np.array([d[0], d[1], float(a.dr_z) - float(b.dr_z)])
+
     def _candidates(self, b: int) -> list[int]:
         c, s = self.cfg, self.cfg.world_scale
         nb = self._nodes[b]
@@ -379,7 +444,9 @@ class LoopCloser:
             path = nb.dist_m - na.dist_m
             if path < c.min_path_m or na.feat is None or len(na.feat.des3d) < c.min_inliers:
                 continue
-            gap = float(np.hypot(*(self._x[b] - self._x[a])))
+            # ⚠️ 不能用 `np.hypot(*v)`：三维时它只接受 2 个参数会 TypeError。
+            # 这里只关心**水平**候选半径（DR 漂移是水平量），所以显式取前两维。
+            gap = float(np.linalg.norm((self._x[b] - self._x[a])[:2]))
             if gap * s > self._drift_radius(path) + c.max_offset_m * s:
                 continue
             fa = na.R[:2, 0] / max(1e-9, float(np.hypot(*na.R[:2, 0])))
@@ -447,8 +514,13 @@ class LoopCloser:
         t_ab = rel["t_ab"]
         if float(np.hypot(*t_ab[:2])) > c.max_offset_m:
             return None, "too_far"
-        z = (na.R @ t_ab)[:2]
-        resid = float(np.hypot(*(self._x[b] - self._x[a] - z))) * s
+        # ⚠️ 原先这里是 `(na.R @ t_ab)[:2]` —— PnP 的相对平移本来就有**完整三维**，
+        # `[:2]` 把竖直分量丢掉了。这就是「z 没有观测」的真正原因：不是测不到，是被切片扔了。
+        # 2026-10-28 起改由 `enable_z` 决定：默认仍只取 xy（保持既有行为与既有回环数），
+        # 打开后 z 维进入位姿图。
+        z3 = na.R @ t_ab
+        z = z3 if self.cfg.enable_z else z3[:2]
+        resid = float(np.linalg.norm((self._x[b] - self._x[a]) - z)) * s
         if resid > self._drift_radius(nb.dist_m - na.dist_m):
             return None, "outside_drift_radius"
         sigma = (c.loop_sigma_m + c.loop_sigma_frac * float(np.linalg.norm(t_ab)) * s) / s
@@ -466,22 +538,27 @@ class LoopCloser:
         n = len(self._order)
         if n < 2:
             return 0.0
+        # D = 2（只解 xy，默认）或 3（z 也进图，`enable_z=True`）。
+        # ⚠️ 这里不要写死 2：`.reshape(-1, 2)` 会在 z 维存在时**静默截断**，
+        # 而 `_solve_laplacian` 是按 Z 的列数决定维数的 ⇒ 两者必须一致。
+        D = 3 if c.enable_z else 2
         idx = {k: i for i, k in enumerate(self._order)}
         edges: list[tuple[int, int, np.ndarray, float]] = []
         for p, k in zip(self._order, self._order[1:]):
             path = max(0.0, self._nodes[k].dist_m - self._nodes[p].dist_m)
             sig = (c.odo_sigma0_m + c.odo_sigma_frac * path) / s
-            edges.append((idx[p], idx[k], self._nodes[k].dr_xy - self._nodes[p].dr_xy, sig))
+            edges.append((idx[p], idx[k], self._delta(self._nodes[k], self._nodes[p]), sig))
         old = {k: self._x[k].copy() for k in self._order}
-        x0 = self._nodes[self._order[0]].dr_xy
+        x0 = self._extend(self._nodes[self._order[0]].dr_xy)
         x = np.array([self._x[k] for k in self._order])
         oi = np.array([e[0] for e in edges], int)
         oj = np.array([e[1] for e in edges], int)
-        oz = np.array([e[2] for e in edges], float).reshape(-1, 2)
+        oz = np.array([e[2] for e in edges], float).reshape(-1, D)
         ow = np.array([1.0 / (e[3] * e[3]) for e in edges], float)
         li = np.array([idx[L.a] for L in self.loops], int)
         lj = np.array([idx[L.b] for L in self.loops], int)
-        lz = np.array([L.z for L in self.loops], float).reshape(-1, 2)
+        lz = np.array([np.asarray(L.z, float).ravel()[:D].tolist() for L in self.loops],
+                      float).reshape(-1, D)
         lsig = np.array([L.sigma for L in self.loops], float)
         lw = np.array([L.weight for L in self.loops], float)
         for _ in range(max(1, iterations)):
@@ -492,7 +569,7 @@ class LoopCloser:
             x = _solve_laplacian(n, I, J, Z, W, x0)
             if not self.loops:
                 break
-            r = np.hypot(*(x[lj] - x[li] - lz).T)
+            r = np.linalg.norm(x[lj] - x[li] - lz, axis=1)
             w_new = 1.0 / (1.0 + (r / (c.robust_k * lsig)) ** 2)
             changed = bool(np.any(np.abs(w_new - lw) > 1e-3))
             lw = w_new
@@ -502,7 +579,9 @@ class LoopCloser:
             L.weight = float(w)
         for k, i in idx.items():
             self._x[k] = x[i]
-        return max(float(np.hypot(*(self._x[k] - old[k]))) for k in self._order)
+        # ⚠️ 不能用 `np.hypot(*v)`：它只接受 2 个参数，三维时会 TypeError。
+        # 用 `np.linalg.norm` 对任意维都对（D=2 时与 hypot 逐位同值）。
+        return max(float(np.linalg.norm(self._x[k] - old[k])) for k in self._order)
 
     def status(self) -> dict[str, Any]:
         s = self.cfg.world_scale
@@ -526,7 +605,7 @@ class LoopCloser:
                 "bow_reason": self._bow_reason,
                 "bow_docs": int(self._bow_docs),
                 "bow_candidates": int(self.cfg.bow_candidates),
-                "correction_m": round(float(np.hypot(*self.offset())) * s, 3),
+                "correction_m": round(float(np.linalg.norm(self.offset()[:2])) * s, 3),
                 "rejects": dict(self.rejects),
                 "yaw_checks": [{"b": b, "a": a, "yaw_err_deg": e, "accepted": ok}
                                for b, a, e, ok in list(self.yaw_checks)[-16:]]}

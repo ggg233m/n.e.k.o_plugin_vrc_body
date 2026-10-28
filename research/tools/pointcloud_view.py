@@ -321,11 +321,74 @@ def pose_table_rigid(world_dir: Path, sid: str) -> tuple[dict, str]:
     return out, f"rigid({got.get('source')}, 非刚体残余中位 {resid:.3f} m, base={str(got.get('base_sid'))[-6:]})"
 
 
+def _session_gc(rec_dir: Path, kfs, pose_of: dict, cam_h: float, every: int,
+                range_m: float | None) -> dict[int, float]:
+    """逐帧原始地面修正量（与 ``frame_ground_offset`` 同口径），只用于取全局中位数。
+
+    为什么要单独预扫一遍（2026-10-26 实测）：``gc`` 取的是**视野内主导地面面**的众数，
+    玩家看着桌面/栏杆/下层地板时，众数会跳到那块面上 —— 本场 754 帧里 18.7% 的帧
+    |gc − 全局中位| > 0.12 m，最长连续 7 帧（如 kf 218–224 全是 −0.45）。
+    逐帧套用会把整帧点云上下平移 0.2–0.5 m ⇒ 同一面墙被画成多层竖帘（用户截图里的拖影）。
+    而不跟踪竖直位移时，任何逐帧 gc 变化都没有绝对基准 —— 唯一自洽的做法是**全场一个 gc**。
+    """
+    out: dict[int, float] = {}
+    for kf in kfs:
+        k = int(kf.stem)
+        if k % every:
+            continue
+        T = pose_of.get(k)
+        if T is None:
+            continue
+        with np.load(kf) as z:
+            if "pts" not in z.files:
+                continue
+            p = np.asarray(z["pts"], np.float32)
+        if range_m is not None:
+            p = p[np.isfinite(p).all(axis=1) & (np.hypot(p[:, 0], p[:, 1]) <= float(range_m))]
+        if len(p) < 300:
+            continue
+        out[k] = frame_ground_offset(p, T, cam_h)
+    return out
+
+
+def _drop_small_components(P, S, T, H, COL, min_pts: int, radius: float = 0.2):
+    """删除「连通块内点数 < min_pts」的孤立小簇（空中飞点），四条通道一起过滤。
+
+    ⚠️ 为什么按**连通块**而不是按 hits / 逐点孤立度（2026-10-16 文档的结论）：
+    hits≥2 会删掉 63.7 万真点换 4 万飞点；逐点孤立度（8 邻 >0.15 m）在 9 cm 体素下
+    会扫掉 12% 的点、且孤立点本身压在真实轮廓上。连通块判据只对「**成簇但与主体
+    表面断开的稀疏点**」敏感 —— 实测本场 0.2 m 连接半径下主块占 97.7%，<30 点的小块
+    共 3,800–4,500 点（0.6%），98% 在离地 0.3 m 以上；而 1000+ 点的吊灯/悬挂结构
+    仍在单独的大块里，不会被删。
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    n = len(P)
+    pairs = cKDTree(np.asarray(P, np.float64)).query_pairs(float(radius), output_type="ndarray")
+    g = coo_matrix((np.ones(len(pairs), np.int8), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    _nc, lab = connected_components(g, directed=False)
+    sz = np.bincount(lab)
+    keep = sz[lab] >= int(min_pts)
+    kept = P[keep], S[keep], T[keep], H[keep], (None if COL is None else COL[keep])
+    removed = ~keep
+    stat = {"comps": int(np.count_nonzero(sz < int(min_pts))), "removed": int(removed.sum()),
+            "share": round(float(removed.mean()), 4),
+            "air": (round(float(np.mean(np.asarray(P)[removed, 2] > 0.3)), 4) if removed.any() else None),
+            "main": int(sz.max()), "radius": float(radius), "min_pts": int(min_pts)}
+    return kept + (stat,)
+
+
 def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                  z_min: float, z_max: float, every: int, pose_mode: str = "rigid",
                  range_m: float | None = None, pose_npz: str | None = None,
-                 color: bool = False):
-    """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, color, 统计)。"""
+                 color: bool = False, gc_mode: str = "global"):
+    """一场录制 → 世界系点云（已体素降采样）。返回 (xyz, sid_idx, time, hits, color, 统计)。
+
+    ``gc_mode``：global（默认）= 全场共用一个地面修正（逐帧原始值的中位数）；
+    raw = 沿用逐帧 gc（老口径，只用于与 online/offline 的逐帧对齐做 A/B）。
+    """
     if pose_npz:
         # 诊断用：直接取录制目录里的位姿表（ids, T），不走世界树 ⇒ 只适合单场看
         pp = ROOT / "navmesh_recordings" / rec / f"{pose_npz}.npz"
@@ -356,6 +419,9 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
     cchunks, cvalid, n_col_ok = [], [], 0
     n_neg_raw = n_gc_used = n_far_drop = 0
     gc_vals = []
+    gc_raw = _session_gc(rec_dir, kfs, pose_of, cam_h, every, range_m) if gc_mode != "raw" else {}
+    gc_fix = float(np.median(list(gc_raw.values()))) if gc_raw else 0.0
+    gc_spike = (float(np.mean([abs(v - gc_fix) > 0.12 for v in gc_raw.values()])) if gc_raw else 0.0)
     t0 = time.perf_counter()
     for kf in kfs:
         k = int(kf.stem)
@@ -394,11 +460,23 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
             if len(p) == 0:
                 continue
         # h = (rel_z + cam_h) − gc：cam_h 与 gc 是**一对**，只用 cam_h 会让各场地面差 0.27 m
-        gc = frame_ground_offset(p, T, cam_h)
+        # global 口径下 gc 是全场常数（见 _session_gc）；raw 口径保留逐帧众数用于 A/B。
+        gc = (frame_ground_offset(p, T, cam_h) if gc_mode == "raw" else float(gc_fix))
         gc_vals.append(gc)
         pw = p @ T[:3, :3].T                       # 相机系 → 世界（旋转）
-        xy = pw[:, :2] + T[:2, 3]                  # 平移只取 xy（z 走地面高度口径）
-        zw = pw[:, 2] + cam_h - gc                 # 与 offline_fusion.kf_rows 同口径
+        xy = pw[:, :2] + T[:2, 3]                  # 平移只取 xy（地面高度是单独的口径）
+        # 🔴 2026-10-28 修：原来这里**完全没有 T[2,3]**，注释写的是「z 走地面高度口径」。
+        # 在「位姿图的 T[2,3] 恒为 0」的年代那是自洽的（加不加都一样），
+        # 但 `nav_loop.LoopConfig.enable_z=True` 之后位姿会带真实的 z（实测 −0.10..+0.35 m），
+        # 不加进来等于**把位姿图的竖直优化整个丢掉** —— 导出看着和没开一样（实测面厚 3.39→3.40、
+        # 竖向叠层 14.00→14.00 cm，就是这个原因）。
+        #
+        # ⚠️ 两种口径必须显式区分：
+        #   * `T[2,3]` 非零 ⇒ 位姿自带绝对高度，**加它**，且 `cam_h - gc` 只作残差修正；
+        #   * `T[2,3]` 恒 0   ⇒ 老路径，行为**逐位不变**（下面 `if` 外的情况）。
+        # 用 `t_z` 是否非零来切换，而不是加一个开关 —— 老位姿表全部是 0，天然走原路。
+        t_z = float(np.asarray(T, np.float64)[2, 3])
+        zw = pw[:, 2] + t_z + cam_h - gc           # 与 offline_fusion.kf_rows 同口径（tz=0 时完全一致）
         sel = (zw > z_min) & (zw < z_max)
         sel &= np.isfinite(xy).all(axis=1) & np.isfinite(zw)
         if not sel.any():
@@ -431,6 +509,7 @@ def load_session(world_dir: Path, rec: str, sid: str, vox: float, cam_h: float,
                       n_vox=len(c), s=round(time.perf_counter() - t0, 1),
                       pose_src=pose_src, base=str(pose_src).split("base=")[-1],
                       cam_h=round(float(cam_h), 3),
+                      gc_mode=gc_mode, gc_fix=round(float(gc_fix), 3), gc_spike=round(float(gc_spike), 4),
                       gc_median=round(float(np.median(gc_vals)), 3) if gc_vals else None,
                       cam_h_eff=round(float(cam_h - (np.median(gc_vals) if gc_vals else 0.0)), 3),
                       neg_share=round(n_neg_raw / max(n_gc_used, 1), 4),
@@ -469,11 +548,16 @@ button.on{background:__BTNON__;border-color:__ACCENT__;color:__ACCENT__}
   <div class="kv"><span>近/远裁面</span><b id="nf">–</b></div>
   <div class="kv"><span>深度精度</span><b id="du">–</b></div>
   <div class="kv"><span>观测次数</span><b id="hitinfo">–</b></div>
+ <!-- 点击拾取（2026-10-28）：左键单击画面 → 显示该点世界坐标 + 该处局部统计。
+      为什么必须加：用户报「地面被抬起」只能靠截图指位置，而截图读不出坐标，
+      靠网格目测会差到另一个物体（我据此追错过两次）。 -->
+ <div class="kv"><span>拾取</span><b id="pickinfo">单击画面取坐标</b></div>
   <div id="legend"></div>
   <div id="keys">
     <button id="bSid" class="on">按会话</button><button id="bH">按高度</button><button id="bT">按时间</button><button id="bHit">按观测次数</button><button id="bC">原图彩色</button>
     <button id="bTop">俯视</button><button id="bSide">侧视</button>
     <button id="bFit">复位</button><br>
+    显示门槛 <button id="bF1" class="on">≥1帧</button><button id="bF2">≥2帧</button><button id="bF3">≥3帧</button><button id="bF5">≥5帧</button><br>
     拖拽旋转 · 滚轮缩放 · 右键平移 · <span style="color:__FG__">G</span> 网格
   </div>
 </div>
@@ -547,7 +631,7 @@ hLegend.style.display='none';hLegend.style.flexWrap='wrap';
    hLegend.appendChild(sw);hLegend.appendChild(tx);}
  const note=document.createElement('span');
  note.style.cssText='color:#98a0ac;font-size:11px;';
- note.textContent='（该体素被多少帧看到；不是过滤器）';
+ note.textContent='（该体素被多少帧看到；只是着色，不是过滤器）';
  hLegend.appendChild(note);}
 lg.appendChild(hLegend);
 const tLegend=document.createElement('div');tLegend.className='row';tLegend.style.marginTop='4px';
@@ -564,8 +648,9 @@ if(!gl){document.body.innerHTML='<p style="padding:20px">此浏览器不支持 W
 const VS = `
 attribute vec3 aP; attribute float aS; attribute float aT; attribute float aH; attribute vec3 aC;
 uniform mat4 uMVP; uniform float uMode; uniform vec3 uPal[8]; uniform float uZ0,uZ1;
-uniform float uHMax;
+uniform float uHMax, uVox, uFocal;
 varying vec3 vC;
+varying float vH;
 vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);
   vec3 p=abs(fract(c.xxx+K.xyz)*6.0-K.www);
   return c.z*mix(vec3(1.0),clamp(p-K.xxx,0.0,1.0),c.y); }
@@ -600,11 +685,17 @@ void main(){
   // uMode 4 = 原图颜色（逐体素平均的 RGB）。数据缺失时顶点色全 0 ⇒ 近黑，
   // 所以缺颜色的点在本模式**不给假色**，由生成侧把按钮隐藏（见 hasCol）。
   vec3 cc = aC;
+  vH = aH;    // 只用于「显示门槛」的用户侧过滤，不改数据
   vC = uMode < 0.5 ? sc : (uMode < 1.5 ? hc : (uMode < 2.5 ? tc : (uMode < 3.5 ? htc : cc)));
-  gl_PointSize = clamp(240.0/max(gl_Position.w,1.0), 1.5, 5.0);   // 近大远小
+  // 点大小 = **一个体素在屏幕上的投影尺寸**（×1.25 让相邻格搭上）。
+  // 原来固定 clamp(240/w, 1.5, 5.0)：8 m 处只有 5 px，而 9 cm 体素在 1080p 下占
+  // ~12 px（4K 下 ~23 px）⇒ 表面变成一颗颗离散点，连贯的面看起来就是**虚线拖尾**。
+  // 这是渲染口径，不改几何；但用户看到的"拖影"里有相当一部分来自这个采样空洞。
+  gl_PointSize = clamp(uVox*uFocal*1.25/max(gl_Position.w,1.0), 2.0, 18.0);
 }`;
-const FS = `precision mediump float; varying vec3 vC;
-void main(){ vec2 d=gl_PointCoord-0.5; if(dot(d,d)>0.25) discard; gl_FragColor=vec4(vC,1.0); }`;
+const FS = `precision mediump float; varying vec3 vC; varying float vH; uniform float uMinH;
+void main(){ if(vH + 0.5 < uMinH) discard;
+  vec2 d=gl_PointCoord-0.5; if(dot(d,d)>0.25) discard; gl_FragColor=vec4(vC,1.0); }`;
 function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
   if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o;}
 const P = gl.createProgram();
@@ -624,11 +715,12 @@ gl.bufferData(gl.ARRAY_BUFFER, hasCol ? COL : new Float32Array(N*3).fill(1), gl.
 const aC=gl.getAttribLocation(P,'aC'); gl.enableVertexAttribArray(aC); gl.vertexAttribPointer(aC,3,gl.FLOAT,false,0,0);
 const uMVP=gl.getUniformLocation(P,'uMVP'), uMode=gl.getUniformLocation(P,'uMode'),
       uPal=gl.getUniformLocation(P,'uPal'), uZ0=gl.getUniformLocation(P,'uZ0'), uZ1=gl.getUniformLocation(P,'uZ1'),
-      uHMax=gl.getUniformLocation(P,'uHMax');
+      uHMax=gl.getUniformLocation(P,'uHMax'), uVox=gl.getUniformLocation(P,'uVox'),
+      uFocal=gl.getUniformLocation(P,'uFocal'), uMinH=gl.getUniformLocation(P,'uMinH');
 const pal=[]; for(let i=0;i<8;i++){const c=PAL[i%PAL.length].replace('#','');
   pal.push(parseInt(c.slice(0,2),16)/255, parseInt(c.slice(2,4),16)/255, parseInt(c.slice(4,6),16)/255);}
 gl.uniform3fv(uPal, new Float32Array(pal)); gl.uniform1f(uZ0,mnz); gl.uniform1f(uZ1,mxz);
-gl.uniform1f(uHMax, HMX);
+gl.uniform1f(uHMax, HMX); gl.uniform1f(uVox, __VOX__);
 // 观测次数统计写进 HUD —— 让"哪些地方看够了、哪些只扫过一次"一眼可见
 { let h1=0, h2=0, h3=0, hmx=0;
   for(let i=0;i<N;i++){const h=HIT[i]; if(h<1.5)h1++; else if(h<2.5)h2++; else h3++; if(h>hmx)hmx=h;}
@@ -645,6 +737,7 @@ let gridB=null,gridN=0,showGrid=true;
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.STATIC_DRAW); }
 
 let yaw=0.7, pitch=0.50, dist=0, cx=0, cy=0, cz=0, mode=__MODE__;   // pitch>0 ⇒ 相机在上方俯视
+let minH=1;   // 显示门槛：只画被 ≥minH 帧看到的点（**只看不减数据**，1=全画）
 // 相机到点云的最近/最远距离缓存（键是相机参数；见 draw() 里 near/far 的推导）
 let _camKey='', _dmin=0.1, _dmax=1.0;
 function fit(){ cx=(mnx+mxx)/2; cy=(mny+mxy)/2; cz=(mnz+mxz)/2;
@@ -661,6 +754,9 @@ function depthUnit(near,far,zRef){
   const d01=z=>{const zc=((far+near)/(near-far))*z+(2*far*near/(near-far)); return (zc/(-z)+1)*0.5;};
   return 1.0/65535.0/Math.max(Math.abs(d01(-(zRef+1))-d01(-zRef)),1e-12);
 }
+// 最近一次渲染用的 MVP（列主序）。draw() 每帧写它，点击拾取读它 ——
+// 这样拾取和画面**严格同帧**，不用重算相机矩阵（重算容易和 draw() 里的算式漂移）。
+let M=new Float32Array(16);
 function draw(){
   const ar=cv.width/cv.height;
   const cp=Math.cos(pitch),sp=Math.sin(pitch),cyw=Math.cos(yaw),syw=Math.sin(yaw);
@@ -710,11 +806,14 @@ function draw(){
   if(duEl){ duEl.textContent=(_uWorst*1000).toFixed(1)+' mm @ '+_dmax.toFixed(0)+' m';
     duEl.style.color = _uWorst*1000 > 25 ? '#ff8a7a' : (_uWorst*1000 > 8 ? '#e6c04b' : '#7fd6a0'); }
   const Pm=persp(0.9,ar,near,far);
-  const M=new Float32Array(16);                      // 列主序 M = Pm · V
+  M=new Float32Array(16);                            // 列主序 M = Pm · V（模块级，拾取要用）
   for(let r=0;r<4;r++)for(let c=0;c<4;c++){let s=0;
     for(let k=0;k<4;k++) s+=Pm[r+k*4]*V[k+c*4]; M[r+c*4]=s;}
   gl.clearColor(__CLR__); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   gl.uniformMatrix4fv(uMVP,false,M); gl.uniform1f(uMode,mode);
+  // 焦距（像素）= 画布高度的一半 / tan(竖直 FOV/2)；FOV 与 persp(0.9,…) 必须一致
+  gl.uniform1f(uFocal, 0.5*cv.height/Math.tan(0.45));
+  gl.uniform1f(uMinH, minH);
   gl.bindBuffer(gl.ARRAY_BUFFER,bP); gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bS); gl.vertexAttribPointer(aS,1,gl.FLOAT,false,0,0);
   gl.bindBuffer(gl.ARRAY_BUFFER,bT); gl.vertexAttribPointer(aT,1,gl.FLOAT,false,0,0);
@@ -723,7 +822,7 @@ function draw(){
   gl.drawArrays(gl.POINTS,0,N);
   if(showGrid&&gridN){ gl.bindBuffer(gl.ARRAY_BUFFER,gridB);
     gl.vertexAttribPointer(aP,3,gl.FLOAT,false,0,0); gl.vertexAttrib1f(aS,0); gl.vertexAttrib1f(aT,0);
-    gl.vertexAttrib1f(aH,0); gl.vertexAttrib3f(aC,1,1,1);
+    gl.vertexAttrib1f(aH,999.0); gl.vertexAttrib3f(aC,1,1,1);
     gl.uniform1f(uMode,0.86); gl.drawArrays(gl.LINES,0,gridN); }
   requestAnimationFrame(draw);
 }
@@ -736,6 +835,51 @@ addEventListener('mousemove',e=>{ if(!drag)return; const dx=e.clientX-lx,dy=e.cl
   if(drag===1){ yaw-=dx*0.006;   // 右拖 ⇒ 场景跟手右转（相机绕 z 向左）
     pitch=Math.max(-0.35,Math.min(1.50,pitch+dy*0.006)); }
   else { const s=dist*0.0016; cx-=Math.cos(yaw)*dx*s+Math.sin(yaw)*dy*s; cy-=Math.sin(yaw)*dx*s-Math.cos(yaw)*dy*s; } });
+// ── 点击拾取（2026-10-28）────────────────────────────────────────────────
+// 左键「单击」（不拖动）→ 把当前相机矩阵套到所有点上，找最靠近点击处的那个点，
+// 报它的世界坐标 + 该处 ±0.5 m 内的点云统计。
+//
+// 为什么要它：用户报「某处地面被抬起」时只能给截图，而截图读不出世界坐标；
+// 靠俯视图网格目测会差出好几米 —— 我据此把柱子外壁当成「飞板」追错过两次。
+// 有了坐标就能直接查到「那块具体区域是哪些帧画的」。
+let _downX=0,_downY=0;
+cv.addEventListener('mousedown',e=>{_downX=e.clientX;_downY=e.clientY;});
+cv.addEventListener('mouseup',e=>{
+  if(e.button!==0) return;
+  if(Math.hypot(e.clientX-_downX,e.clientY-_downY)>4) return;   // 拖动 = 旋转，不是拾取
+  const el=document.getElementById('pickinfo');
+  // 复用 draw() 里刚算好的 M（列主序），直接做投影
+  if(!N){ el.textContent='没有点'; return; }
+  const rect=cv.getBoundingClientRect();
+  const px=(e.clientX-rect.left)*(cv.width/rect.width);
+  const py=(e.clientY-rect.top )*(cv.height/rect.height);
+  let best=-1,bestD=1e18,bx=0,by=0;
+  for(let i=0;i<N;i++){
+    const X=POS[i*3],Y=POS[i*3+1],Z=POS[i*3+2];
+    const w=M[3]*X+M[7]*Y+M[11]*Z+M[15];
+    if(w<=1e-6) continue;
+    const sx=(M[0]*X+M[4]*Y+M[8]*Z +M[12])/w;
+    const sy=(M[1]*X+M[5]*Y+M[9]*Z +M[13])/w;
+    const dx=(sx*0.5+0.5)*cv.width-px, dy=(1-(sy*0.5+0.5))*cv.height-py;
+    const d2=dx*dx+dy*dy;
+    if(d2<bestD){bestD=d2;best=i;bx=X;by=Y;}
+  }
+  if(best<0){ el.textContent='没命中'; return; }
+  // 局部统计：±0.5 m 立方内的点数、z 范围、观测次数中位
+  let n=0,zmin=1e9,zmax=-1e9,hs=[];
+  const px0=POS[best*3],py0=POS[best*3+1],pz0=POS[best*3+2];
+  for(let i=0;i<N;i++){
+    const dx=POS[i*3]-px0,dy=POS[i*3+1]-py0,dz=POS[i*3+2]-pz0;
+    if(dx*dx+dy*dy+dz*dz>0.25) continue;   // 0.5 m 半径
+    n++; if(POS[i*3+2]<zmin)zmin=POS[i*3+2]; if(POS[i*3+2]>zmax)zmax=POS[i*3+2];
+    hs.push(HIT[i]);
+  }
+  hs.sort((a,b)=>a-b);
+  const hmed=hs.length?hs[Math.floor(hs.length/2)]:0;
+  el.innerHTML='x '+(+px0).toFixed(2)+'  y '+(+py0).toFixed(2)+'  z '+(+pz0).toFixed(2)+
+    ' ｜ 邻域 '+n+' 点, z '+zmin.toFixed(2)+'..'+zmax.toFixed(2)+', 观测中位 '+hmed;
+  console.log('PICK',{x:+px0.toFixed(3),y:+py0.toFixed(3),z:+pz0.toFixed(3),n,zmin:+zmin.toFixed(3),zmax:+zmax.toFixed(3)});
+});
 cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(0.6,dist*(1+Math.sign(e.deltaY)*0.12));},{passive:false});
 // ⚠️ 勿用 bS/bH：那是上面的 WebGL buffer 名，重复声明会让整段脚本 SyntaxError（全黑）
 const btnSid=document.getElementById('bSid'), btnH=document.getElementById('bH'),
@@ -749,6 +893,16 @@ function setMode(m){mode=m;btnSid.classList.toggle('on',m===0);btnH.classList.to
 btnSid.onclick=()=>setMode(0); btnH.onclick=()=>setMode(1); btnT.onclick=()=>setMode(2);
 btnHit.onclick=()=>setMode(3); btnC.onclick=()=>{ if(hasCol) setMode(4); };
 setMode(__MODE__);
+// 显示门槛：只在**画的时候**丢掉「被 <N 帧看到」的点，数据与 hits 通道不动。
+// 用途：传送门/屏幕 UI/粒子这类没有稳定世界几何的表面，立体匹配每帧结果都不一样，
+// 点会散成低 hits 的碎片；门槛 ≥2/≥3 可以把它们从画面里隐掉，但真实薄结构也会一起变稀。
+const bF1=document.getElementById('bF1'), bF2=document.getElementById('bF2'),
+      bF3=document.getElementById('bF3'), bF5=document.getElementById('bF5');
+function setMinH(v){minH=v;bF1.classList.toggle('on',v<=1);bF2.classList.toggle('on',v===2);
+  bF3.classList.toggle('on',v===3);bF5.classList.toggle('on',v>=5);}
+bF1.onclick=()=>setMinH(1); bF2.onclick=()=>setMinH(2);
+bF3.onclick=()=>setMinH(3); bF5.onclick=()=>setMinH(5);
+setMinH(1);
 document.getElementById('bTop').onclick =()=>{pitch=1.45;yaw=0;};   // 不到 1.5，避免 up 与视线平行退化
 document.getElementById('bSide').onclick=()=>{pitch=0.08;yaw=0.7;};
 document.getElementById('bFit').onclick =()=>{fit();};
@@ -862,6 +1016,14 @@ def main() -> None:
                     help="从 kf_img/<k>_L.png 原图给每个体素采 RGB（默认开彩色视图）。"
                          "投影按 stereo_points 的逆式，平均只统计投到幅面内的点；"
                          "没图/没 K 的帧退化为灰，不拿黑色冒充颜色")
+    ap.add_argument("--gc-mode", choices=("global", "raw"), default="global",
+                    help="地面修正口径：global=全场共用一个（逐帧原始值的中位数，默认）；"
+                         "raw=逐帧众数（老口径；视野被桌面/栏杆/下层地板主导的帧会被平移 0.2–0.5 m，"
+                         "表现为竖帘拖影）")
+    ap.add_argument("--drop-small", type=int, default=0,
+                    help="删除 0.2 m 连通块内点数 < N 的孤立小簇（空中飞点）；0=关闭（默认）。"
+                         "本场实测 N=30 删 0.6%% 的点、98%% 在离地 0.3 m 以上；"
+                         "1000+ 点的吊灯/悬挂结构不会被删")
     ap.add_argument("--out", default=None, help="输出 HTML（默认 .tmp/pointcloud/<world>.html）")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
@@ -906,7 +1068,8 @@ def main() -> None:
                                       float(args.z_min), float(args.z_max), max(1, int(args.every)),
                                       pose_mode=str(args.pose),
                                       range_m=(None if float(args.range_m) <= 0 else float(args.range_m)),
-                                      pose_npz=args.pose_npz, color=bool(args.color))
+                                      pose_npz=args.pose_npz, color=bool(args.color),
+                                      gc_mode=str(args.gc_mode))
         # 两条通道**分开存**：会话 = 场索引（shader 取调色板）；时间 = 本场累积路程进度 0..254。
         # 以前这里用 `by_time` 二选一，再塞进同一个字节 —— 于是另一个按钮必然废掉。
         allp.append(pts)
@@ -921,7 +1084,8 @@ def main() -> None:
               f"距离闸丢 {st['far_dropped']:,}（{st['far_dropped']/max(st['n_pts_raw'],1)*100:.1f}%，"
               f"range={st['range_m']} m）  保留 {st['n_pts_kept']:,}  "
               f"(h<0 占 {st['neg_share']*100:.1f}%)  体素后 {st['n_vox']:,}  "
-              f"({st['s']}s)  pose={st['pose_src']}"
+              f"({st['s']}s)  pose={st['pose_src']}  gc={st['gc_mode']}"
+              + (f"（全场 {st['gc_fix']:+.3f} m，逐帧离群 {st['gc_spike']*100:.0f}%）" if st["gc_mode"] != "raw" else "")
               + (f"  彩色点 {st['color_share']*100:.1f}%" if st.get("color") else ""), flush=True)
 
     P = np.concatenate(allp)
@@ -957,6 +1121,11 @@ def main() -> None:
         P, S, T, H, COL = _merge_hits(P, S, T, H, vox, col=COL)
         print(f"[thin ] 超过上限 {int(args.max_pts):,} ⇒ 体素加粗到 {vox:.3f} m（现 {len(P):,} 点）", flush=True)
     P, S, T, H, COL = _merge_hits(P, S, T, H, vox, col=COL)
+    if int(args.drop_small) > 0:
+        P, S, T, H, COL, cl = _drop_small_components(P, S, T, H, COL, int(args.drop_small))
+        print(f"[clean] 删除 <{cl['min_pts']} 点的孤立块 {cl['comps']} 个 / {cl['removed']:,} 点"
+              f"（{cl['share']*100:.2f}%，其中离地 >0.3 m 占 {cl['air']*100:.1f}%）"
+              f"  连接半径 {cl['radius']:.2f} m  剩 {len(P):,}", flush=True)
     print(f"[hits ] 中位 {np.median(H):.0f}  p90 {np.percentile(H, 90):.0f}  max {H.max():.0f}"
           f"   仅 1 帧 {(H < 1.5).mean()*100:.1f}%  ≥2 帧 {(H >= 1.5).mean()*100:.1f}%")
 
