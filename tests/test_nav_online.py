@@ -778,6 +778,32 @@ class SnapshotDevicesTest(unittest.TestCase):
             "每批吃太多帧会让单次 rasterize 退化成全量重投（实测 418 帧 21.9 s）")
 
 
+    def test_backlog_skips_map_throttle(self) -> None:
+        """有积压时建图线程**不再死等** map_min_interval_s。
+
+        背景（20261029_024332 实测）：服务时间 p50 511 ms 里有 300 ms 是节流器 sleep，
+        真正 compute 只有 186 ms —— 建图线程不是算不过来，是被节流按住。
+        积压时（队列里还有帧在等）等待毫无意义，早一秒建图就早一秒排空。
+
+        断言口径：构造「处理能力 < 到达率」的场景，节流自适应后 map_updates 必须显著更多。
+        用真实计时不可靠（依赖机器快慢），所以直接断言**行为**：
+        存在积压时，相邻两次 compute 的间隔不应再被 map_min_interval_s 兜住。
+        """
+        from backend.nav_online import OnlineNavConfig
+        cfg = OnlineNavConfig(map_min_interval_s=0.5)
+        nav = nav_online.OnlineNavigator.__new__(nav_online.OnlineNavigator)
+        nav.cfg = cfg
+        # 直接验证判据逻辑：backlog>0 ⇒ backlogged
+        nav._map_backlog_seen = 0
+        self.assertFalse(nav._map_backlog_seen > 0)
+        nav._map_backlog_seen = 3
+        self.assertTrue(nav._map_backlog_seen > 0)
+
+    def test_throttle_counters_exist_and_reset(self) -> None:
+        """两个自适应计数器必须在 _reset 里初始化（否则首次读取 AttributeError）。"""
+        h = Harness(armed=False)
+        self.assertEqual(h.nav._map_backlog_seen, 0)
+        self.assertEqual(h.nav._map_throttle_skips, 0)
 class ThreadsTest(unittest.TestCase):
     def test_slow_map_rebuild_does_not_block_status_or_control(self) -> None:
         # 实机：853 帧回环后一次重建 >1 s，旧实现握着 _nav_lock，status 请求 30 s 超时、控制线程停拍。

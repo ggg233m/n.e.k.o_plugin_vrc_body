@@ -1172,6 +1172,11 @@ class OnlineNavigator:
         self._kf_last_xy: np.ndarray | None = None
         self._kf_policy: KeyframePolicy | None = None
         self._map_updates = 0
+        # 2026-10-29：节流**自适应**的两个观测（只在建图线程写）。
+        # 记住上一轮醒来时队列里还剩多少帧没吃；>0 = 建图跟不上采集。
+        # 见 _mapping_loop 里 wait 的算法：有积压时不再死等 map_min_interval_s。
+        self._map_backlog_seen = 0        # 上一轮 'pending' 里没处理完、放回队首的 kf 数
+        self._map_throttle_skips = 0      # 累计跳过节流的次数（诊断：节流是否真在拖后腿）
         self._map_ms: float | None = None
         # 上一次建图的阶段耗时（ms）：rasterize / build / plan / ... 面板与诊断用。
         self._map_segments: dict[str, float] = {}
@@ -1403,6 +1408,7 @@ class OnlineNavigator:
                     "kf_unique": int(self._kf_unique),
                     "kf_refreshed": int(self._kf_refreshed),
                     "map_updates": int(self._map_updates),
+                    "map_throttle_skips": int(self._map_throttle_skips),
                     "recorder": ({"keyframes": int(rec.keyframes), "dropped": int(rec.dropped),
                                   "mb": round(rec.bytes / 1e6, 1), "stopped": rec.stopped}
                                  if rec is not None else None),
@@ -2121,6 +2127,8 @@ class OnlineNavigator:
             timeout = c.map_min_interval_s
             with self._state_lock:
                 pending, self._pending = self._pending, []
+            # 每轮先清零：若这批没因 map_max_kf_per_batch 上限截断，就说明队列已排空。
+            self._map_backlog_seen = 0
             try:
                 # mapper / loops 只有本线程写，灌数据和栅格化都不拿 _nav_lock；
                 # 控制和 status 只在取意图快照、换结果时和这里抢一下锁。
@@ -2136,6 +2144,8 @@ class OnlineNavigator:
                     if kind == "kf":
                         if _kf_seen >= c.map_max_kf_per_batch:
                             # 放回队首（保持顺序），本轮到此为止。
+                            # 同时记下还剩多少 kf 没吃：下一轮据此判断是否跳过节流（自适应）。
+                            self._map_backlog_seen = sum(1 for kd, _it in pending[i:] if kd == "kf")
                             with self._state_lock:
                                 self._pending[:0] = pending[i:]
                             break
@@ -2241,11 +2251,26 @@ class OnlineNavigator:
                             mem.poses(table)
                             self._mem_flushed_at = self._clock()
                 if dirty and len(self.mapper) and not self._stop.is_set():
+                    # 🔴 2026-10-29 节流自适应：**有积压就不等**。
+                    #
+                    # 背景（20261029_024332 实测）：服务时间 p50 511 ms 里有 300 ms 是这里
+                    # 的 `map_min_interval_s` 死等，真正 compute 只有 186 ms —— 建图线程
+                    # **不是算不过来，是被节流器按住**。而积压时（_map_backlog_seen>0）
+                    # 等待毫无意义：队列里已经有帧在等，早一秒建图就早一秒排空。
+                    #
+                    # 判据：上一轮 `pending` 里因为 `map_max_kf_per_batch` 上限被放回队首的
+                    # kf 数 > 0 ⇒ 采集快于建图 ⇒ 跳过本轮节流（直接 compute）。
+                    # 没有积压时行为**逐位不变**（仍然按 map_min_interval_s 节流，省 CPU）。
+                    # 本机 20 逻辑核，写线程占约 0.23 核、LAS2 在子进程，节流省不出什么，
+                    # 但低核机器/单核场景仍需要它 —— 所以是自适应，不是删掉。
+                    backlogged = self._map_backlog_seen > 0
                     wait = c.map_min_interval_s - (self._clock() - last_update)
-                    if wait > 0.0:
+                    if wait > 0.0 and not backlogged:
                         # 节流中：不等下一个关键帧，时间一到就补这次更新。
                         timeout = wait
                     else:
+                        if wait > 0.0:
+                            self._map_throttle_skips += 1
                         t0 = time.perf_counter()
                         t_lock0 = time.perf_counter()
                         with self._nav_lock:
@@ -2500,6 +2525,11 @@ class OnlineNavigator:
                 else "refresh_and_repeat"),
             "keyframes_deferred": 0 if self._kf_policy is None else self._kf_policy.deferred,
             "map_updates": self._map_updates,
+            # 节流自适应（2026-10-29）：跳过节流的次数，与上一轮看到的积压帧数。
+            # 判读：skips>0 且 backlog 经常 >0 = 采集确实快于建图，节流在没有意义地拖后腿
+            # （20261029_024332 实测：511 ms/帧里 300 ms 是这里 sleep，compute 只 186 ms）。
+            "map_throttle_skips": self._map_throttle_skips,
+            "map_backlog_seen": self._map_backlog_seen,
             "map_update_ms": None if self._map_ms is None else round(self._map_ms, 1),
             # 分段：哪一段吃掉了 map_update_ms。空字典 = 还没建过图。
             "map_segments_ms": {k: round(v, 1) for k, v in self._map_segments.items()},
