@@ -191,7 +191,11 @@ class OnlineNavConfig:
     prior: PriorConfig = field(default_factory=PriorConfig)
     loop_closure: bool = True
     loop: LoopConfig = field(default_factory=LoopConfig)
-    record_max_mb: float = 2048.0    # 录制上限（每关键帧约 0.4 MB，20 分钟约 500 MB）；超了停录、导航照常
+    # 录制上限。⚠️ 2026-10-29 由 2048 提到 4096：实测（20261029_024332）1080p 彩色录制每帧
+    # **2.66 MB**（npz 1.03 + 2×PNG 1.62），2048 MB 只够 772 帧 / 476 s，而会话跑了 1026 s
+    # ⇒ 54% 的行程一帧没留。4096 MB ≈ 1540 帧 ≈ 940 s，仍不够一小时级录制，
+    # 那种场合请同时把 record_img_max_w 设 720（PNG 降到约 1/4）。
+    record_max_mb: float = 4096.0
     # 会话末自动**并树**（P0 §洞4 的世界树 pass，跑在采纳线程里、逐对采纳之后）。
     # 为什么需要它：逐对采纳只把本场挂到"它看见最多的那一个"旧会话上，看不到**别的会话之间的桥** ——
     # 实测漏过：`050848→035644` 有 18 条够格约束，但 035644 自己从没被采纳 ⇒ 那 18 条因
