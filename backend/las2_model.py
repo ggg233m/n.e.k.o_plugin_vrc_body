@@ -182,9 +182,20 @@ class AttentionModule(nn.Module):
 
 
 class Aggregation(nn.Module):
-    def __init__(self, backbone_channels):
+    def __init__(self, backbone_channels, size: str = "m"):
+        # size: s/m/l，决定 block 数与 expanse_ratio（见 SIZE_CONFIGS）。
+        # 2026-10-29: 参数化以支持 las_ckpt/ 下的 S/M/H 三档权重。
+        # ⚠️ 默认 "m" 与 backend/stereo_backend.py 的 LAS2_CKPT（las_ckpt/LAS2_M.pth）一致，
+        # 改成别的档必须同时换权重文件 —— 否则 load_state_dict 会大量形状不匹配。
+        # 实测三档（las_ckpt/）：S=6.1M/conv0 1 block，M=10.4M/4 block，H=11.6M/4 block；
+        # 三者 mlp 宽度都是 192（expanse_ratio=4），只有 conv0 block 数不同。
         super().__init__()
-        cfg = SIZE_CONFIGS["m"]
+        if size not in SIZE_CONFIGS:
+            # las_ckpt/ 里的 LAS2_H.pth 是**另一个架构**（多 61 项 spx_gru/spx_2_gru/cnet，
+            # M 里没有），不是改 SIZE_CONFIGS 就能加载的。想支持 H 要先补上游那个模块。
+            raise ValueError(f"LAS2 size must be one of {sorted(SIZE_CONFIGS)}, got {size!r};"
+                             " H 档是不同架构（多 61 项 spx_gru/cnet），本类不支持")
+        cfg = SIZE_CONFIGS[size]
         blocks, r = cfg["blocks"], cfg["expanse_ratio"]
         c = AGG_IN_CHANNELS
         self.conv0 = nn.Sequential(*[FasterNetResidual(c, c, 1, r) for _ in range(blocks[0])])
@@ -212,13 +223,13 @@ class Aggregation(nn.Module):
 
 # ---- liteanystereov2.py ----
 class LiteAnyStereoV2M(nn.Module):
-    def __init__(self):
+    def __init__(self, size: str = "m"):
         super().__init__()
         self.fnet = FeatureNetFasterNet()
         self.fnet_channels = self.fnet.feature_channels
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
-        self.cost_agg = Aggregation(backbone_channels=self.fnet_channels)
+        self.cost_agg = Aggregation(backbone_channels=self.fnet_channels, size=size)
         self.refine_1 = nn.Sequential(
             BasicConv2d(self.fnet_channels[0], self.fnet_channels[0], kernel_size=3, stride=1, padding=1,
                         norm_layer=nn.InstanceNorm2d, act_layer=nn.LeakyReLU),
