@@ -1,6 +1,6 @@
 # VRChat 具身 agent 工程方案 v3（2026-10-27，拓扑 A）
 
-> **状态**：待评审（round 10 已改；round 12 追加 §1.1、§4.3–4.5、§8.3、§10.6、§11.4–11.5 与附录 B，并增补 §8.2、§9.2、§10.3、§11.1、§12；round 13 追加 §1.2、§9.3 与附录 B.6，并增补 §4.2、§5.3、§8.1、§8.2、§10.2、§11.5、§12）。评审更正记录见附录 A，业界同类的先例与差异见附录 B。v2 中本文没有改动的部分（头 A 的主干与输入、头 B 的离线片段库、技能卡格式）继续有效，这里不再重复。动作块长度、丢弃规则和 RTC 的用法本文改了（§1、§9.1、§13）。
+> **状态**：待评审（round 10 已改；round 12 追加 §1.1、§4.3–4.5、§8.3、§10.6、§11.4–11.5 与附录 B，并增补 §8.2、§9.2、§10.3、§11.1、§12；round 13 追加 §1.2、§9.3 与附录 B.6，并增补 §1.1、§4.2、§5.3、§6.1、§8.1、§8.2、§10.2、§10.6、§11.5、§12）。评审更正记录见附录 A，业界同类的先例与差异见附录 B。v2 中本文没有改动的部分（头 A 的主干与输入、头 B 的离线片段库、技能卡格式）继续有效，这里不再重复。动作块长度、丢弃规则和 RTC 的用法本文改了（§1、§9.1、§13）。
 > **依据**：§1 是 2026-10-27 在 A770 上的实测。文中引用的函数、参数和默认值都已对照 `backend/` 源码核对。没核对到或没测过的项标「未测」或「待 M0」。
 > **范围**：只写选型、理由、接口约定和验收门，不含实现代码。
 > **硬约束**（用户原话）：「绝对不能出现误删，点云也不能出错」。本方案新增的模块都不删点，也不改建图路径。唯一会影响建图的是 §3 的头部俯仰，为此单设门 G2。
@@ -91,7 +91,7 @@
   4. **陈旧度**：异步刷新意味着几何可能比当前帧旧 0.2–1 s，刷新要双缓冲、整块替换，不能混两个版本。
 - **两个比 token 数更致命的坑**：
   1. **时间基准**：点云必须取**同一 tick 的深度**（`read_stereo_rgb` 那一拍），不能用建图线程的累积地图。旧几何 + 新画面进同一个序列，策略会学出「看到 A、摸到 B」的安静错误，与 §5.1 的时钟问题同类。
-  2. **坐标系**：极坐标格在机体系、用和 `[wp]` 同一个 yaw（§10.6），单位是追踪米；不混世界米（两套口径差约 25%，§10.4）。
+  2. **坐标系**：极坐标格在机体系、用和 `[wp]` 同一个 yaw（§10.6），单位是**追踪米**——因为它的输入是深度，传感器口径就是追踪米。**`[wp]` 本身是世界米**（§10.6 单位口径），两者共享的只是 yaw，不是单位；两套口径差约 25%（§10.4），写代码时最容易在这里混。
 - **M0–M1 不做几何注入**：只走 veto。理由不是保守，是 M0 没有几何编码器，也没有能训它的数据（§11.4）。
 
 ### 1.2 换小与量化：两条绕过 G1 的路线（round 13 新增）
@@ -101,20 +101,26 @@ G1 的余量只剩 3 个百分点（§1）。业界遇到「大 VLA 跑不进实
 **路线一：蒸馏（M2 起作对照，S-H）**
 
 - 先纠正一个前提：本方案的「文本」只有 `[mode][wp][topo][self]` 四个数字字段（§10.6），**LM 的语言知识在这条链上基本用不上**。真正带预训练收益的是 ViT 与整条映射的动作分布，所以教师信号应取自这两处，而不是「把 LM 的语料知识搬进小模型」：
-  1. **动作软标签**：教师 0.8B 在全部窗口上输出的 12 步 (vx, vz)，与学生自己的真值标签混合做目标（教师权重从 0.5 起，按 G7 调）。
+  1. **动作软标签**：教师 0.8B 在全部窗口上输出的 12 步 (vx, vz)，与学生自己的真值标签混合做目标（教师权重从 0.5 起，按 G7 调）。软标签由**教师（M2 的流匹配头）离线对全部录制帧采样**得到；同一帧多次 ODE 采样的方差记为该样本的**教师不确定度**，高方差样本降权（权重反比于方差，下限 0.3）——单峰行走本来方差就低，方差高的多半是岔路口/卡住帧，不该由学生硬学。
   2. **ViT 不换**：学生复用同一个 ViT，冻结。中间层特征对齐只在换视觉塔时才有意义，本方案不换。
+  3. **侧输入不能省**：蒸馏迁移的是「图像 + 侧输入 → 动作」的**映射**，不是输入本身。学生仍必须把 `[wp]` / `[mode]` / `[self]` 作为显式输入，用一个小 MLP 拼进学生特征。只喂图像的学生一旦离开训练分布就不知道往哪走，这不是蒸馏能补的。
 - 学生会掉到「ViT + 约 10–30M 动作头」。延迟从 189 ms 降到个位数 ms 量级，2 Hz 可提到 **5–10 Hz**；§13 那段「0.8 s 开环盲走 3.2 m」按 5 Hz 缩到 **1.28 m**。
 - **与 §1 降级②的区别**：降级②是**丢弃** LM 直接换小头（应急），蒸馏是**保留**教师的动作分布（有监督的迁移）。
 - 排期：与 S-D 并行，数据同源，算力约 1 h A100；新代码是一个蒸馏脚本 + 学生模型接入。
-- **不作默认**：只有 G1 不过、或明确要 5 Hz 以上时才切主线。切换后 §1.1 的 token 账与 §10.6 的 70 token 上限作废（学生不吃文本预算），必须按 §1 重新走一遍 bench 与 G1。
+- **不作默认**：只有 G1 不过、或明确要 5 Hz 以上时才切主线。切换后 §1.1 的 token 账与 §10.6 的 70 token 上限作废（侧输入走小 MLP，不进 LM 序列，不再占 token），但必须按 §1 重新走一遍 bench 与 G1。
 
 **路线二：量化（M0a 第 1–2 天就做，与 G1 并行）**
 
 - **为什么它比降级更值得先试**：单请求 prefill（batch = 1、119 token）的 GEMM 是瘦矩阵，**瓶颈是权重带宽不是算力**——每次推理都要把 1.59 GiB 权重读一遍（§1）。权重压到 INT8 就是把这条读带宽减半，收益可预期，且不改模型结构。
-- **工具与口径**：OpenVINO / NNCF 的**权重压缩**（`compress_weights`）——只压权重、**激活保持浮点**，所以精度损失比全量化小。官方文档的分级：INT8「内存降幅低、延迟改善中、精度损失低」，INT4「降幅高、改善高、损失高」。本项目**先 INT8**，INT4 只在 INT8 精度不过时评估。
-- **验收三条**：① 转换后按 §6.1 同口径 cos ≥ 0.999（hidden）；② 过 G7 同一批 hold-out；③ 用 §1 的同一套 bench 重测 p50/p95。任一不过就退回 bf16。
+- **运行时口径（前提）**：本项目的运行时是 **PyTorch / torch.compile**，选型上刻意不依赖某个推理框架的独有特性——将来迁 A/N 卡要能平移。所以 INT8 的**主路径是 PyTorch 侧的权重仅量化**（torchao 的 `int8_weight_only` 一类），**XPU 支持未测**；OpenVINO 只作备选（§6.1 已有保底位），不承担主线。
+- **工具与口径**：权重压缩只压权重、**激活保持浮点**，精度损失比全量化小。官方分级：INT8「内存降幅低 / 延迟改善中 / 精度损失低」，INT4「降幅高 / 改善高 / 损失高」。本项目**先 INT8**，INT4 只在 INT8 不过时评估。
+- **验收分两类，不要混**（§6.1 同步）：① **导出等价校验**沿用 cos ≥ 0.999（同代码路径的数值一致性）；② **PTQ 单独设门**——hidden cos ≥ **0.99** **且** 动作级指标不退（G7 的 hold-out MSE / 召回，M1 起加 G10）。INT8 对 bf16 的 hidden cos 典型落在 0.99–0.999，拿 0.999 卡 PTQ 会把任务层面可用的模型拒掉。不过先缩 group size 重试，仍不过退回 bf16。
 - **副作用**：权重 1.59 → 约 0.8 GiB，§1 的 2.0–2.5 GB 预算与 14 GB 总显存都松一截，448² 升档的门（§1 的「升档后总占用 ≤ 85%」）可能因此打开。
-- ⚠️ **未核实**：本轮没找到可引的出处支持「OpenVINO 某版本起在带 XMX 的 GPU 上默认启用动态量化」，按「待查文档」处理，不作设计依据。且当前运行路径是 torch.compile XPU、不是 OpenVINO——INT8 要么走 OpenVINO（§6.1 已有保底位），要么等 torch XPU 的权重压缩支持，两条都要实测。
+- **OpenVINO 侧的免费加成（已核实，2026-10-29）**：官方博客《Dynamic quantization support from GPU with XMX》（2025-06-30）写明 **OpenVINO 2025.2 起，对带 XMX 的 GPU（Alchemist 即 A770、Battlemage）默认启用动态量化**。它以**权重已量化**为前提（原文 "effective when weights are already quantized into int4 or int8"），所以是路线二之上的加成，不是替代品。控制项：`dynamic_quantization_group_size`（默认 per-token）、`OV_GPU_DYNAMIC_QUANTIZATION_THRESHOLD`（默认 64）、`OV_GPU_ASYM_DYNAMIC_QUANTIZATION`；是否生效可 dump exec-graph 查 `dynamic_quantize` 节点，或用 opencl-intercept-layer。
+  - **64 token 阈值**：序列不长于 64 时自动禁用。当前 119 token 在线上，**但学生模型或几何降档一旦跌破 64，这项收益会静默消失**；阈值可用环境变量下调。
+  - **精度**：官方称内部测试可接受，但 "depending on the model and workload, users may observe noticeable accuracy degradation"，补救是关小 group size（如 256）。
+  - **带宽判断得到官方背书**：原文 "shorter inputs tend to be dominated by weight I/O overhead rather than compute cost"，与本条开头的理由一致。
+  - ⚠️ 这一项**只在 OpenVINO 备选路径生效**；主线 PyTorch 拿不到，不要把产品建立在它上面。
 - 排期：M0a 第 1–2 天，成本约一天。
 
 ## 2. 选型、云端计费与许可证门（P1-7）
@@ -376,6 +382,7 @@ SLAM 不是可插拔的记忆模块，它产出三样可持久化的东西，各
 
 - **torch.compile 路径不导出**：XPU 的 AOT inductor 未测，默认 JIT 模式下 Triton 缓存与 `compile` 内部已优化的 kernels 直接绑在 Python 进程里。保持 JIT 运行，由 OpenVINO 的 C++ 保底（如果 OpenVINO 性能在 M3 实测下也够，可退到 OpenVINO）。
 - **输出校验**：训练完每个 LoRA 后，`torch.export` + `export.save`（保存输入/输出张量和权重 sha1），然后载入并跑同一个固定输入，输出 cos ≥ 0.999。
+- **PTQ 与导出校验分开**（round 13）：上面的 0.999 是**同代码路径**的数值一致性，只适用于导出格式转换。INT8 权重量化是另一类变换，单独设门：hidden cos ≥ **0.99** **且** 动作级指标不退（G7，M1 起加 G10）；不过就缩 group size 重试（§1.2），仍不过退回 bf16。**不要拿 0.999 去卡 PTQ**——典型 INT8 落在 0.99–0.999，会把任务层面可用的模型误拒。
 - **预热**：启动时先喂一批固定张量（单次前向），Triton 编译在此时完成。预热期间控制环接「没有策略」分支。
 
 ### 6.2 LAS2
@@ -436,7 +443,7 @@ SLAM 不是可插拔的记忆模块，它产出三样可持久化的东西，各
 | A. 显式接管按钮 | 插件命令 API：POST `/autonomy/disarm`（process.py L414 → autonomy.py L230 `disarm`），或宿主侧 `vrc_autonomy_disarm`（`__init__.py` L3280） | **入口已有**：standalone UI「解除自主授权」（app.js L470）、navmesh 页「解除武装」（navmesh.js L117）。M0 只加控制环一侧：每拍读 `autonomy.snapshot()["armed"]`，为 False 即清空块队列、停发。disarm 后**不自动恢复**，要用户重新 arm | 用户主动接管。手柄按键映射（SteamVR Input 绑定一个 action 调同一 API）M2 可选，未测 |
 | B. 期望/回读速度失配 | 期望速度（已发 `/input` 轴 × 移动速度）与回读 `/avatar/parameters/VelocityX/Z` 夹角 > 60° 或长度比 > 2.0 | M1 实现：回读按 OSC 滞后对齐后再比（见 memory `online-loc-vs-rtabmap-accuracy`），10 Hz 连续 5 拍判接管；触发时控制环本地暂停 5 s（不调 disarm，免得每次误判都要用户重新 arm），暂停中失配仍在则顺延 | 玩家推摇杆、被撞、卡墙 |
 | C. 考场日志（Udon） | `output_log.txt` 写 `[TAKEOVER] <timestamp>` | 离线解析，标注数据集用 | 评估专用 |
-| D. 主动请求（ThriftyDAgger 式，M1 录制时；round 13 新增） | 新颖度 = 当前帧外观描述子到最近地点节点的距离；风险 = `near_obstacle` 计数 + 期望/回读失配 | 只向录制者弹提示（「这里接管一下」），不自建第二个模型：新颖度复用已有 BoW / MegaLoc 描述子，风险复用路径 B 的两个量 | 把人力集中在真正新/危险的状态；比「两个 LoRA 投票」便宜（后者推理要跑两遍） |
+| D. 主动请求（ThriftyDAgger 式，M1 录制时；round 13 新增） | 新颖度 = 当前帧外观描述子到**最近关键帧**的距离（M1 用 BoW 索引；地点图要到 M3，届时换地点节点描述子）；风险 = `near_obstacle` 计数 + 期望/回读失配（路径 B，M1 同时上线） | 只向录制者弹提示（「这里接管一下」），不自建第二个模型。**新颖度的基底按时点分、接口不变**：M1 用现有 `nav_bow` / `nav_xsession` 索引的最近关键帧距离（`save_graph` 与 MegaLoc 都在 M3），M3 换成地点节点描述子距离。风险复用路径 B 的两个量 | 把人力集中在真正新/危险的状态；比「两个 LoRA 投票」便宜（后者推理要跑两遍） |
 
 - **路径 A（显式按钮）在 M0 接入**，B 在 M1 接入。C 只在 M3 离线标注考场数据时用，运行时不读日志。
 - **为什么没有「OSC source 标签」路径**：策略发的 `/input/Horizontal` 和玩家按手柄，VRChat 回读 `/avatar/parameters/VelocityX/Z` 完全同形，在现有信号里根本不可分（osc.py L894 的 `"source": name` 在 `_vertical_history` 分支，`_motion_history` L904 没有 source）。`set_axes()` 发的是 `/input/*`，不写回 `_motion_history`。唯一能用的是路径 B（期望速度 vs 实际速度）或显式接管按钮。
@@ -618,7 +625,9 @@ SLAM 不是可插拔的记忆模块，它产出三样可持久化的东西，各
   ],
   "edges": [
     {"from": "place_001", "to": "place_002", "type": "corridor", "length_m": 3.5, "success_count": 4, "fail_count": 1}
-  ]
+  ],
+  "unit": "tracking_m",
+  "world_scale": 0.755
 }
 ```
 
@@ -691,15 +700,25 @@ SLAM 不是可插拔的记忆模块，它产出三样可持久化的东西，各
 头 A 没有地图输入通道，记忆只能经那 70 token 的文本进来。定长模板、ASCII 标签、固定顺序、固定两位小数：
 
 ```
-[mode] 0 [wp] 0.80 0.00 [topo] 1.20 0.15 2.30 [self] 0.00 1.10
+[mode] 0 [wp] 0.60 0.00 [topo] 1.20 0.15 2.30 [self] 0.00 1.10
 ```
 
-- `[wp]`：0.8 m 前视点，机体系 dx/dz（`PathFollower._point_at(progress + lookahead_m)`，§5.2）。
-- `[topo]`：沿边已走 `prog`、横向偏差 `lateral`（右正）、到下一节点 `remain`，**全是世界米**。
+- `[wp]`：前视点，机体系 dx/dz，**世界米**。`PathFollower._point_at(progress + lookahead_m)` 给的是**追踪米**，进卡前换算（见下「单位口径」）。
+- `[topo]`：沿边已走 `prog`、横向偏差 `lateral`（右正）、到该边终点的 `remain`，**全是世界米**（存储层是追踪米，换算见下）。
 - `[self]`：本体速度，原有内容。
 - **不放节点名、节点 id、`visit_count`**：名字对策略是噪声，且训练时不可能存在。
 - `[mode]`（round 12 追加）：`0=follow` `1=replan` `2=explore` `3=stop`，来自**导航器状态机的确定性结果**，不是语言模型给的。策略不知道目标叫什么，但必须知道自己处在什么模式——否则遮挡或卡住时它会反复做同一个错动作（单帧对 + 当前速度是一阶马尔可夫的）。这是卡里唯一「非几何、但能在 M0 录制里确定性回算」的字段：`follow/replan` 由录制轨迹与重算的 `nav_follow` 路径判定，`stop` 由 osc 零速判定，`explore` 只在 M2 出现（M0–M1 恒为 0）。
 - `[topo]` 与 `[mode]` 合计约 33 token（`[topo]` 30 + `[mode]` 2–3），从 70 里挤得出；`[wp]` 与 `[self]` 仍是原来那部分。四个字段的**顺序固定不动**，任何插入都算格式变更，要重过 G8。
+
+**单位口径（round 13 钉死）**
+
+- **卡里所有距离一律世界米，速度一律世界米/秒**。理由：动作标签就是世界米/秒（osc 的 `VelocityX/Z` 与 Udon 位置都是 VRChat 世界米，§5.2、§9.1），模型学的是「前方还剩 X 米、当前 Y 米/秒」。若把追踪米直接喂进去，会带进一个 `1/0.755 ≈ 1.32` 的系统性偏移——模型只能把它吸收成一个隐常数，而这个常数与图像里的尺度对不上，属于 §5.2「resize 静默精度损失」同一类错误。
+- **存储层仍是追踪米**：地点图的 `pose` / `pose_sid` 在 `T_map` 系，边的 `length_m` 也从位姿算出，全部保持追踪米，**不引入第二套坐标**（§4.3 硬规则 1）。
+- **换算只在读侧、只有一个函数**：`to_world_m(v) = v × world_scale`，调用点只有三处——`build_policy_text()`、慢脑子图序列化、§10.3 的建节点判定（> 2 世界米）。写入与存储一律不换算；导航器内部、路径、栅格、点云一律不动——硬约束是不碰建图。
+- **`world_scale` 随世界走，不写死**：从该 `world_key` 的 meta 读；当前世界实测 **0.755**（§10.4）。录制时把它写进 `meta.json`（与 §9.2 要补的 world 字段同一批）。缺失时 `build_policy_text()` **必须报错**，不许默认 0.755——否则新世界静默错 25%。
+- **`[wp]` 的来源与换算**：`FollowConfig.lookahead_m = 0.8` 是**追踪米**，控制器不改；进卡前换成世界米（0.8 追踪米 ≈ **0.604** 世界米，所以上面的示例写 `0.60`），实际按当世界的 `world_scale` 算。
+- **`[topo]` 三量按「边」不按「节点」**：`prog` 是从当前边起点已走的距离，`lateral` 是相对该边中心线的横向偏差（右正），`remain` 是到该边终点的剩余距离；三者单位都是世界米。没有可用边（图 `stale`、或当前位置不在任何边上）时三项 `0.0`。
+- **记录口径同步**：`length_m` 落盘是追踪米（JSON 里注明 `"unit": "tracking_m"` + `"world_scale"`），慢脑子图里显示的是世界米（§10.6 那段的 `3.5m` 即世界米）。
 
 **缺失值一律写 `0.0`**，不写 NaN、不写 missing：图是 `stale` 或完全没有图时三项全 0，策略自动退回「无记忆基线」。这不是妥协，是让退化路径免费，并且与 §1.1 的空几何槽、§11.4 的 geometry dropout 是同一个契约。
 
@@ -734,6 +753,7 @@ SLAM 不是可插拔的记忆模块，它产出三样可持久化的东西，各
 1. `build_policy_text()` 对同一 fixture，离线与在线输出逐字节相同。
 2. 无图时 `[topo]` 三项确为 `0.0`。
 3. `[mode]` 四种取值各一个 fixture，与导航器状态机逐条一致；M0–M1 的 fixture 里 `explore` 必为 `0`。
+4. **单位一致**：同一 fixture 里 `[wp]` 的模长与 `[topo].remain` 必须能对上同一条边（差 ≤ 0.01，只允许两位小数舍入）；`world_scale` 缺失时 `build_policy_text()` 抛错，不得默认 0.755。
 
 ## 11. LoRA 训练与硬件预算（P2-8 补充）
 
@@ -860,7 +880,7 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 
 | 里程碑 | 核心交付 | 门槛 | 时长估算 | 依赖 |
 |---|---|---|---|---|
-| **M0a** | 管线落地：policy_obs 5 Hz 流 + 标签生成器（含 `[topo]` 离线合成，§10.6）+ `action_timeline` 开启 + 配额管理（含 `pose_sid` 查引）+ `output_log` 世界切换尾随 + `turn_and_look` + 单测 + disarm 接控制环 + 「自主模式下玩家摇杆无效」上 UI + OpenVINO INT8 量化三角（§1.2，1–2 天，不过可退 bf16、不算门） | G0 许可证+隐私 + G1 GPU 预算 + G2 pitch 不破坏建图 + G3 数据冻结 + G4 双运行时 + G5 故障路径 + G6 存储方案 + **G8 记忆卡格式冻结** | 4 周 | 无（G1/G2 先跑，首次 compile 9–10 min × 多次） |
+| **M0a** | 管线落地：policy_obs 5 Hz 流 + 标签生成器（含 `[topo]` 离线合成，§10.6）+ `action_timeline` 开启 + 配额管理（含 `pose_sid` 查引）+ `output_log` 世界切换尾随 + `turn_and_look` + 单测 + disarm 接控制环 + 「自主模式下玩家摇杆无效」上 UI + OpenVINO INT8 量化三角（§1.2，1–2 天；主路径 PyTorch 权重仅量化，OpenVINO 只作备选，不过可退 bf16、不算门） | G0 许可证+隐私 + G1 GPU 预算 + G2 pitch 不破坏建图 + G3 数据冻结 + G4 双运行时 + G5 故障路径 + G6 存储方案 + **G8 记忆卡格式冻结** | 4 周 | 无（G1/G2 先跑，首次 compile 9–10 min × 多次） |
 | **M0b** | 训练：80 min 真人录制（policy_obs + osc + action_timeline）+ 回归头热身 + 考场合成数据可行性一天（§11.5） | G7 防塌缩 | 2 周 | M0a |
 | **M1** | 边跑边录（人操控），微调 + 接管段回流（DAgger，§9.2）；重叠块加权（§9.3）A/B | 新录制按 M0 同口径（osc 12 步 ZOH 标签）过 G3，不需要 Udon，**含 2–3 场多人在场（§5.3）**；接管检测 B 路（期望/回读失配）上线（A 路按钮 M0a 已接）；§8.2 三组基线各跑一次（`nav_follow` / NoMaD / FlowNav，后两者只作参照）；**G10 非反应式闭环回放（§8.3）**；ViT 末尾 LoRA 对照（§11.1）按 G7 同口径比 | 2 周 | M0b + 60 min 新录制 |
 | **M2** | 考场任务对齐 + 头 A 换流匹配头 + 几何编码器（§11.4）+ 自主探索原型 | 换头后按 G1 复测（p95 ≤ 200 ms、p99 ≤ 300 ms 且总占用 < 90%）；Udon 完整标签覆盖率 ≥ 90%，固定起点回归测试（N ≥ 10/场，首批 ≥3 场及格）；frontier 导航能到达未探索区域（覆盖增量 ≥ 20%）；**G9 几何消融（§11.4）** | 2 周 | M1 + 考场世界 + 120 min 考场录制 |
@@ -919,8 +939,9 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 - §8.3（round 12 二批）：非反应式闭环回放门 G10——开环 MSE 与闭环成绩的相关性实测仅 ρ = −0.36（附录 B.5），M1 起必须用闭环护栏。
 - §9.2（round 12 二批）：接管段双用途——既作负例（`sent=False`），也作纠正样本（DAgger，标 `corrected=True`）；纠正段在 G7 单列、只记录。
 - §10.6（round 12 二批）：记忆卡加 `[mode]`（`follow/replan/explore/stop`），来自导航器状态机，不是语言模型；格式顺序冻结，改动即重过 G8。
+- §10.6 单位口径（round 13 钉死）：卡里距离一律**世界米**（× `world_scale`，当前世界 0.755），存储层仍是追踪米；换算只在读侧一个函数、三个调用点；`world_scale` 缺失必须报错；G8 加第 4 条单位一致性（`[wp]` 与 `[topo].remain` 对得上同一条边）。
 - §11.1（round 12 二批）：ViT 末尾 4 个 block 的 LoRA 只在 M1 作对照试验，推理前合并、延迟不变，G7 无改善即撤回。
-- §1.2（round 13）：**换小与降精度**是绕过 G1 的两条路线——INT8 量化在 M0a 就做（三条验收，不过退 bf16）、蒸馏只作 S-H 对照且不默认切主线；切换后 §1.1 的 token 账与 §10.6 的 70 token 上限作废。
+- §1.2（round 13）：**换小与降精度**是绕过 G1 的两条路线——INT8 权重量化在 M0a 就做，**主路径是 PyTorch**（迁 A/N 卡要能平移），PTQ 单独设门（cos ≥ 0.99 + 动作级指标），不套导出的 0.999；OpenVINO 的动态量化只在备选路径生效，且序列 ≤ 64 token 自动失效。蒸馏只作 S-H 对照、不默认切主线；切换后 §1.1 的 token 账与 §10.6 的 70 token 上限作废，但侧输入仍必须显式喂给学生。
 - §9.3（round 13）：重叠块加权替代「新块即替换」，默认开启；G10 变差退回纯替换。RTC 降为第三顺位，排在 SEAM 之后。
 - §11.5 配方（round 13）：光度增强 + 水平翻转（标签同步：`vx` / `[wp].dx` / `[topo].lateral` 取反，两帧同时翻，不进 `kf_img`）；合成数据只做一天可行性。
 - §5.3、§8.1、§8.2（round 13）：M1 必须录 2–3 场多人在场；新增接管路径 D（主动请求，复用描述子与 veto 信号）；回归测试 N ≥ 10 并报 Wilson 区间。
@@ -1094,7 +1115,7 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 - **ThriftyDAgger**（CoRL 2021）：预算感知的「新颖度 + 风险」门控，只在真正新或危险的状态请求人工接管——§8.1 路径 D 的来源。
 - **OpenVINO / NNCF 权重压缩**：`compress_weights` 只压权重、激活保持浮点；官方分级 INT8「内存降幅低 / 延迟改善中 / 精度损失低」、INT4「高 / 高 / 高」——§1.2 路线二的依据。
 - **MASt3R / VGGT**：前馈几何，两图直接出相对位姿与稠密匹配；VGGT 是 CVPR 2025 最佳论文、约 1.2B 参数，MASt3R 一对图约 9 s——只适合离线（§4.2 备手）。
-- ⚠️ **未能核实**：「OpenVINO 某版本起在带 XMX 的 GPU 上默认启用动态量化」在公开文档里没找到出处，本文按「待查」处理，不作设计依据。
+- **OpenVINO 动态量化（已核实，2026-10-29）**：官方博客《Dynamic quantization support from GPU with XMX》（2025-06-30）写明——OpenVINO **2025.2 起，带 XMX 的 GPU（Alchemist 即 A770、Battlemage）默认启用**动态量化；以权重已量化为前提（"effective when weights are already quantized into int4 or int8"）；控制项 `dynamic_quantization_group_size`（默认 per-token）、`OV_GPU_DYNAMIC_QUANTIZATION_THRESHOLD`（默认 64）、`OV_GPU_ASYM_DYNAMIC_QUANTIZATION`；验证可 dump exec-graph 查 `dynamic_quantize` 节点或用 opencl-intercept-layer。原文 "shorter inputs tend to be dominated by weight I/O overhead rather than compute cost" 即 §1.2 的带宽判断。⚠️ 仅在 OpenVINO 路径生效，主线 PyTorch 拿不到（§1.2）。
 
 **来源**：
 - [PointVLA (arXiv 2503.07511)](https://arxiv.org/abs/2503.07511)
@@ -1125,6 +1146,7 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 - [SEAM (arXiv 2607.04609)](https://arxiv.org/pdf/2607.04609)
 - [ThriftyDAgger (arXiv 2109.08273)](https://arxiv.org/pdf/2109.08273)
 - [OpenVINO LLM Weight Compression](https://docs.openvino.ai/2025/openvino-workflow/model-optimization-guide/weight-compression.html)
+- [OpenVINO blog: Dynamic quantization support from GPU with XMX (2025-06-30)](https://blog.openvino.ai/blog-posts/dynamic-quantization-support-from-gpu-with-xmx)
 - [VGGT (CVPR 2025 Best Paper)](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_VGGT_Visual_Geometry_Grounded_Transformer_CVPR_2025_paper.pdf)
 
 **附录结束**。
