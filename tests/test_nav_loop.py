@@ -115,6 +115,48 @@ def square_loop(n_side: int = 8, side_m: float = 4.0):
     return pts
 
 
+class CoverageTest(unittest.TestCase):
+    """回环覆盖统计：末段未锚定路程必须外显。
+
+    回归点（2026-10-29）：`20261029_060258`（890 m / 1496 帧）末段 **423 m（48%）无任何回环**，
+    而 `20261029_024332`（405 m）只有 **1 m** —— 差异巨大却没有任何在线信号，
+    下游（点云导出、导航）无从判断哪段是纯航位推算。
+    """
+
+    def test_empty_closer_reports_no_coverage(self) -> None:
+        from backend.nav_loop import LoopCloser
+        cv = LoopCloser().coverage()
+        self.assertEqual(cv["anchored_kf"], 0)
+        self.assertIsNone(cv["uncovered_m"])
+        self.assertIsNone(cv["uncovered_frac"])
+
+    def test_no_loop_means_everything_uncovered(self) -> None:
+        from backend.nav_loop import LoopCloser, _Node
+        import numpy as np
+        loops = LoopCloser()
+        # 直接塞节点（不跑匹配），模拟「走了一段但一条回环都没有」
+        for i, d in enumerate((0.0, 10.0, 20.0)):
+            loops._nodes[i] = _Node(np.eye(3), np.array([float(i), 0.0]), d, None)
+            loops._order.append(i)
+            loops._x[i] = loops._extend(np.array([float(i), 0.0]))
+        cv = loops.coverage()
+        self.assertEqual(cv["anchored_kf"], 0)
+        self.assertGreater(cv["uncovered_m"], 0.0)
+        self.assertAlmostEqual(cv["uncovered_frac"], 1.0, places=6)
+
+    def test_anchored_tail_leaves_zero_uncovered(self) -> None:
+        from backend.nav_loop import LoopCloser, _Node
+        import numpy as np
+        loops = LoopCloser()
+        for i, d in enumerate((0.0, 10.0, 20.0)):
+            loops._nodes[i] = _Node(np.eye(3), np.array([float(i), 0.0]), d, None)
+            loops._order.append(i)
+            loops._x[i] = loops._extend(np.array([float(i), 0.0]))
+        loops._loop_anchored.update({0, 2})   # 末帧被锚定
+        cv = loops.coverage()
+        self.assertEqual(cv["anchored_kf"], 2)
+        self.assertEqual(cv["uncovered_m"], 0.0)
+
 class LoopCloserTest(unittest.TestCase):
     def test_revisit_pulls_drifted_pose_back(self) -> None:
         pts = square_loop()

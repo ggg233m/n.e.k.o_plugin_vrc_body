@@ -292,6 +292,13 @@ class LoopCloser:
         self._last_loop_kf: int | None = None
         self._last_loop_idx: int | None = None
         self._last_loop_dist_m: float | None = None
+        # 回环覆盖（2026-10-29）：**哪些帧段落没有回环锚定**，不再只能事后翻 events 才知道。
+        # 为什么需要它：20261029_060258（890 m）末段 **423 m（48%）无任何回环**，
+        # 而 20261029_024332（405 m）只有 1 m —— 差异巨大却没有任何在线信号。
+        # 下游（点云导出、导航）必须能知道「这段轨迹是纯航位推算，漂移可能 5–19 m」。
+        # 口径：一个关键帧算「被回环锚定」当且仅当它出现在某条接受回环的 a 或 b 上。
+        # 不用「距上次回环多少米」是因为那只看得见尾部，看不见中间的空洞。
+        self._loop_anchored: set[int] = set()
         # PnP 过了、再比 HMD 朝向的每个候选：(b, a, 带符号 yaw 差°, 是否接受)。VRChat 自己转/传送了人
         # （重生点、传送门）而 HMD 不知道时，这里会出现一串同号的大偏差。
         self.yaw_checks: deque[tuple[int, int, float, bool]] = deque(maxlen=64)
@@ -417,6 +424,9 @@ class LoopCloser:
                 self.rejects[why] = self.rejects.get(why, 0) + 1
                 continue
             self.loops.append(loop)
+            # 覆盖统计：a、b 两个端点都算「被回环锚定」（回环边约束的是这两个位姿）。
+            self._loop_anchored.add(int(a))
+            self._loop_anchored.add(int(k))
             accepted.append({"a": a, "b": k, **loop.info})
         # 索引**必须在 query 之后**才收当前帧：先 add 再 query 会检索到自己，
         # 产生 a==b 的自回环（z≈0、内点≈1000，所有门都过），实测回环数 623→949、覆盖帧 19→36 全是假的。
@@ -601,6 +611,44 @@ class LoopCloser:
         # 用 `np.linalg.norm` 对任意维都对（D=2 时与 hypot 逐位同值）。
         return max(float(np.linalg.norm(self._x[k] - old[k])) for k in self._order)
 
+    def coverage(self) -> dict[str, Any]:
+        """回环锚定情况：哪些帧没被任何回环约束过（> 直接决定该段位姿可信度）。
+
+        背景（2026-10-29）：`20261029_060258`（890 m / 1496 帧）末段 **423 m（48%）无回环**，
+        而 `20261029_024332`（405 m）只有 **1 m**。差异巨大，却没有任何在线信号 ——
+        下游（点云导出、导航）拿到一张图时无从判断哪段是纯航位推算。
+
+        口径：关键帧「被锚定」⟺ 它出现在某条**接受**回环的 a 或 b 上（回环边约束两端位姿）。
+
+        ⚠️ **主指标是 uncovered_m（末段未锚定路程），不是 anchored_frac。**
+        一条回环只约束两个端点，所以实测 anchored_frac 只有 **4–5%**（060258 60/1496、
+        024332 39/772）—— 这是正常的，不是缺陷。anchored_frac 只作「到底有没有回环」的
+        粗略参考，别拿它当覆盖率。
+        """
+        c = self.cfg
+        order = self._order
+        if not order:
+            return {"anchored_kf": 0, "anchored_frac": None,
+                    "uncovered_m": None, "uncovered_frac": None,
+                    "uncovered_since_kf": None}
+        anchored = self._loop_anchored & set(order)
+        total_m = max(0.0, self._nodes[order[-1]].dist_m - self._nodes[order[0]].dist_m)
+        # 尾部无回环：从最后一个被锚定的关键帧量到末尾。一个都没锚定时 = 全片。
+        if anchored:
+            last = max(order.index(k) for k in anchored)   # 取**最后出现**的锚定帧
+            tail_k = order[last]
+            tail_m = max(0.0, self._nodes[order[-1]].dist_m - self._nodes[tail_k].dist_m)
+        else:
+            tail_k = order[0]
+            tail_m = total_m
+        return {
+            "anchored_kf": int(len(anchored)),
+            "anchored_frac": round(len(anchored) / len(order), 4),
+            "uncovered_m": round(tail_m * c.world_scale, 1),
+            "uncovered_frac": round(tail_m / total_m, 4) if total_m > 0 else None,
+            "uncovered_since_kf": tail_k,
+        }
+
     def status(self) -> dict[str, Any]:
         s = self.cfg.world_scale
         # 健康度：还没出过回环时，"距上次回环"= 从起点到现在（一样是单调增长、能报警）。
@@ -625,5 +673,11 @@ class LoopCloser:
                 "bow_candidates": int(self.cfg.bow_candidates),
                 "correction_m": round(float(np.linalg.norm(self.offset()[:2])) * s, 3),
                 "rejects": dict(self.rejects),
+                # 回环覆盖（2026-10-29）：**末段/空洞**的量化。
+                # uncovered_m / uncovered_frac：从「最后一个被锚定的关键帧」到当前末尾的路程。
+                # 20261029_060258 实测 423 m / 48% —— 那段只有纯航位推算，漂移 5–19 m。
+                # ⚠️ 它只量**尾部**。中段空洞要等轨迹走回来才看得见，所以另给
+                # anchored_frac（全片被锚定帧占比）作为补充：两者一起看才完整。
+                **self.coverage(),
                 "yaw_checks": [{"b": b, "a": a, "yaw_err_deg": e, "accepted": ok}
                                for b, a, e, ok in list(self.yaw_checks)[-16:]]}

@@ -1409,9 +1409,14 @@ class OnlineNavigator:
                     "kf_refreshed": int(self._kf_refreshed),
                     "map_updates": int(self._map_updates),
                     "map_throttle_skips": int(self._map_throttle_skips),
-                    "recorder": ({"keyframes": int(rec.keyframes), "dropped": int(rec.dropped),
-                                  "mb": round(rec.bytes / 1e6, 1), "stopped": rec.stopped}
-                                 if rec is not None else None),
+                    # 回环覆盖（2026-10-29）：末段未锚定路程。060258 实测 423 m / 48%
+                    # —— 那段只有纯航位推算，漂移 5–19 m。导出/导航据此判断哪些区域不可信。
+                    "loop_coverage": (None if self._loop_status is None else
+                                      {kk: self._loop_status.get(kk) for kk in
+                                       ("anchored_kf", "uncovered_m", "uncovered_frac",
+                                        "uncovered_since_kf")}),
+                    "recorder": {"keyframes": int(rec.keyframes), "dropped": int(rec.dropped),
+                                 "mb": round(rec.bytes / 1e6, 1), "stopped": rec.stopped},
                     "stopped_wall": time.time(),
                 })
             except Exception as exc:  # noqa: BLE001 - 统计落盘失败不能挡停止
