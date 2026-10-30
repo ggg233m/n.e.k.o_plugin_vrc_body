@@ -787,12 +787,26 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 **训练时长**（M0–M2 总预算 400k 样本，已含 4 epoch，§9.2）：
 - 400k / 120 样本/s ≈ 3,333 s ≈ **0.9 h（56 min）**。M0 单独跑（24k × 4 / 120）≈ 800 s ≈ **13 min**。
 - A100 80G 租用成本（按阿里云抢占式实例，华北2，2026-10 行情）：约 ¥15/h，0.9 h 共 **¥13.5**。
+- 本机 A770 的 LoRA 实测（eager 档）见 §11.3：同一批 96k 样本 4.2–25.6 h，与上表差 19–27 倍。
 
 ### 11.3 A770 vs 云端训练
 
-- **A770 不适合训练**：16 GB 显存只够推理（2.5 GB 权重 + 激活），训练需要优化器状态（AdamW 是参数量的 2 倍）+ 梯度 + batch，至少 40 GB。
-- **A100 租用成本**（按阿里云抢占式实例，华北2，2026-10 行情）：A100 80G 约 ¥15/h，0.9 h 共 ¥13.5（见 §11.2）。
-- **结论**：训练全部上云（A100 或 H100），本地 A770 只跑推理和录制。
+**测法**（2026-10-30）：`.venv_xpu`（Py3.14.9 + torch 2.14.1+xpu + transformers 5.21.0 + peft 0.21.2），Qwen3.5-0.8B 本地权重（`H:\AI\NVidia\checkpoints\Qwen3.5-0.8B`），bf16 主干 + LoRA r=32（12 类线层，21.65M 可训练，与 §11.1 一致），序列 119（49 视觉 + 70 文本），随机 token，eager（不走 compile）。脚本 `.tmp/lora_smoke_xpu.py`（参数 batch / steps / chunk_size）、`.tmp/lora_step_breakdown.py`。首步含算子预热 9–10 s，不计入中位。
+
+| 配置 | 每步中位 | 吞吐 | 显存峰值 | 96k 样本（24k × 4 epoch，§9.2）|
+|---|---|---|---|---|
+| batch 1 / chunk 64 | 966 ms | 1.04 样本/s | 2.93 GiB | 25.6 h |
+| batch 1 / chunk 128 | 947 ms | 1.06 样本/s | 2.97 GiB | 25.1 h |
+| **batch 4 / chunk 128** | **906 ms** | **4.41 样本/s** | **6.31 GiB** | **6.0 h** |
+| batch 8 / chunk 64 | 1,484 ms | 5.39 样本/s | 10.43 GiB | 5.0 h |
+| batch 8 / chunk 128 | 1,263 ms | 6.34 样本/s | 10.73 GiB | 4.2 h |
+
+- **原「至少 40 GB」是全参微调口径**：853M ×（fp32 权重副本 4 B + 梯度 4 B + AdamW 两状态 8 B）≈ 13.6 GB，再叠加全量激活才到 40 GB。本方案是 LoRA、主干冻结，实测峰值 2.93 GiB（batch1）到 10.73 GiB（batch8）。**门槛不是显存，是吞吐。**
+- **chunk_size 只在 batch ≥ 4 时兑现**：默认 64 把 L=119 pad 到 128 后切 2 块、跑跨块顺序扫；128 是单块无顺序扫，单层 fwd+bwd 30.5 → 22.4 ms（与默认 cos 1.000000），18 层折算 548 → 403 ms。整步 batch1 上 966 → 947 ms（噪声量级），batch8 上 1,484 → 1,263 ms（吞吐 +18%）。256 反而变慢——pad 到 256 白算一倍 token。
+- **trisolve 已内置，不必再写**：transformers 5.21 的 `torch_chunk_gated_delta_rule` 直接调 `torch.linalg.solve_triangular(..., unitriangular=True)`（`modeling_qwen3_5.py` L379–390），即 §1 记的「63 次逐行前代 → 一次三角求解」已是现状。
+- **三条加速路在本机全部关闭（复核 2026-10-30）**：① `torch.compile` 与 fla 都依赖 Triton，而 triton-xpu 在本机连 host 助手 `spirv_utils` 都编不出来（缺 SYCL 编译器 `icpx`/`dpclang++`、缺 `ocloc`），内核阶段根本到不了；② `causal_conv1d` 是 CUDA 扩展，XPU 无 kernel；③ transformers 的 hub kernels 按设备类型写死 `cuda`。只剩 eager 档。
+- **本地甜点**：batch 4 + chunk 128，4.41 样本/s、6.31 GiB，给 VR + LAS2 留约 9 GB。
+- **结论**：A770 能跑 LoRA 训练
 
 ### 11.4 几何编码器训练（round 12 新增）
 

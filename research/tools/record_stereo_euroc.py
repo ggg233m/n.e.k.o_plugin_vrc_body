@@ -123,8 +123,10 @@ Viewer.ViewpointF: 500.0
 def _write_telemetry(out: Path, started: float, osc_samples, osc_params, hmd_samples) -> int:
     """按 recorder/run_motion.py 的格式写遥测，让 OscPath / HmdYaw 直接读。
 
-    run_motion 的时间轴是 ``t - obs_start_monotonic``；这里两者都用 perf_counter，
-    锚点取录制起点，于是遥测秒与图像 ns/1e9 同一零点。
+    时间口径：``osc.jsonl`` / ``hmd_frames.jsonl`` 的 ``t`` 一律写 **perf_counter 绝对秒**，
+    不在这里归零；零点 ``started`` 落进 ``run.json`` 的 ``events[].obs_start_monotonic``。
+    与图像对齐用 ``t_telemetry - obs_start_monotonic``，图像侧是 ``ns/1e9``（与 ``started`` 同起点）。
+    (``osc.npy`` 是另一套相对时间轴，由调用方自己减 ``started``。)
     """
     from scipy.spatial.transform import Rotation
 
@@ -319,7 +321,8 @@ def main() -> int:
         "width": out_w, "height": out_h, "mip": eyes[0]._mip,
         "target_width": args.target_width,
         "source": {"width": src_w, "height": src_h, "fx": src_fx, "fy": src_fy},
-        "osc_samples": int(len(osc_arr)), "osc_time_origin": "same as image ns/1e9",
+        "osc_samples": int(len(osc_arr)),
+        "osc_time_origin": "perf_counter 绝对秒（osc.npy 才是已归零的相对秒）；锚点见 run.json events[].obs_start_monotonic",
         "hmd_samples": hmd_count, "hmd_max_gap_s": hmd_gap,
         "hmd_universe": "TrackingUniverseStanding",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
