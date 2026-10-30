@@ -952,6 +952,20 @@ class OpenVRSensors:
         if not pose.bPoseIsValid:
             return None
         m = pose.mDeviceToAbsoluteTracking
+        # 2026-10-30: also keep the TRANSLATION (last column of the 3x4 matrix).
+        #
+        # Why: this is the only channel that gives an absolute POSITION reading.
+        # Every other displacement comes from integrating OSC VelocityX/Z, which
+        # accumulates error (1.14 m left after 890 m, measured on 7 3D-verified
+        # same-place pairs). Four algorithm routes all failed - see
+        # Docs/长会话漂移-四条路线全否与判据修正（2026-10-30）.md.
+        #
+        # A virtual SteamVR driver (AnyaDance) may be able to command HMD position
+        # directly, which would make displacement a measurement instead of an
+        # estimate. But first we must check whether VRChat stick locomotion moves
+        # the HMD in the tracking universe at all (it moves the avatar, not the
+        # play area), so this line only RECORDS; it changes no behaviour.
+        self.last_hmd_position = np.array([m[0][3], m[1][3], m[2][3]], float)
         return np.array([[m[i][j] for j in range(3)] for i in range(3)], float)
 
     def read_stereo_rgb(self) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1805,7 +1819,14 @@ class OnlineNavigator:
                             if seq > param_seen:
                                 param_seen = seq
                                 rec.line("params", {"t": o.get("timestamp"), "n": o.get("name"), "v": o.get("value")})
-                        rec.line("hmd", {"t": tick, "R": np.round(r_ob, 6)})
+                        # 2026-10-30: 同时记录 HMD 在追踪站立系里的**位置**（追踪米）。
+                        # 这是唯一一条「位置直接读数」通道；其余位移全部来自 OSC 速度积分。
+                        # 取不到就不写该字段：老数据没有，解析端必须容忍缺失。
+                        _hmd = {"t": tick, "R": np.round(r_ob, 6)}
+                        _hp = getattr(sensors, "last_hmd_position", None)
+                        if _hp is not None:
+                            _hmd["p"] = np.round(_hp, 6).tolist()
+                        rec.line("hmd", _hmd)
                     # 先喂朝向历史再积分：本帧 yaw 入历史后，区间中点一定能插到值
                     # （否则每帧都会退回"当前朝向"，等于没改）。
                     self.heading_track.push(tick, math.atan2(r_ob[1, 0], r_ob[0, 0]))
