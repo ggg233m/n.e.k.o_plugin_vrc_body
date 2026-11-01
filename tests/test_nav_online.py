@@ -606,6 +606,70 @@ class ControlTickTest(unittest.TestCase):
         self.assertEqual(Harness().nav.goto(1.0, 0.0)["reason"], "navmesh_not_running")
         self.assertFalse(Harness().nav.goto(float("nan"), 0.0)["ok"])
 
+    def test_drive_disabled_delegates_turn_and_moves_nothing(self) -> None:
+        """VLA 接管摇杆时轴不发，但跟随器的转向照发（方案 §9.1 朝向律代管）。"""
+        h = Harness()
+        self.prime(h)
+        h.nav.session.explore()
+        h.nav.drive_enabled = False
+        with mock.patch.object(h.nav.session, "step",
+                               return_value={"state": "following", "forward": 0.6,
+                                             "turn_rate": math.radians(30)}) as step:
+            h.nav._control_tick(time.monotonic())
+        self.assertTrue(step.called)          # progress 仍要推进，航点才有意义
+        self.assertEqual(h.moves, [])         # 摇杆归 VLA
+        self.assertEqual([round(t, 4) for t in h.turns], [3.0])   # 30°/s ÷ 10 Hz
+        self.assertFalse(h.nav.policy_hold)   # following 不按住
+
+    def test_drive_disabled_holds_policy_on_turn_in_place(self) -> None:
+        """跟随器进入原地转（>50°）＝航点在侧向、出训练分布：置 hold 按住策略块。"""
+        h = Harness()
+        self.prime(h)
+        h.nav.session.explore()
+        h.nav.drive_enabled = False
+        with mock.patch.object(h.nav.session, "step",
+                               return_value={"state": "turning", "forward": 0.0,
+                                             "turn_rate": math.radians(45)}):
+            h.nav._control_tick(time.monotonic())
+        self.assertEqual(h.moves, [])
+        self.assertEqual([round(t, 4) for t in h.turns], [4.5])   # 45°/s ÷ 10 Hz
+        self.assertTrue(h.nav.policy_hold)
+        # 下一拍转到位：hold 必须解除，不能残留。
+        with mock.patch.object(h.nav.session, "step",
+                               return_value={"state": "following", "forward": 0.6,
+                                             "turn_rate": 0.0}):
+            h.nav._control_tick(time.monotonic())
+        self.assertFalse(h.nav.policy_hold)
+
+    def test_drive_disabled_zero_turn_sends_nothing(self) -> None:
+        h = Harness()
+        self.prime(h)
+        h.nav.session.explore()
+        h.nav.drive_enabled = False
+        with mock.patch.object(h.nav.session, "step",
+                               return_value={"state": "following", "forward": 0.6,
+                                             "turn_rate": 0.0}):
+            h.nav._control_tick(time.monotonic())
+        self.assertEqual((h.moves, h.turns), ([], []))
+        self.assertFalse(h.nav.policy_hold)
+
+    def test_policy_waypoint_none_without_path(self) -> None:
+        h = Harness()
+        self.prime(h)
+        self.assertIsNone(h.nav.policy_waypoint())
+
+    def test_policy_waypoint_is_body_frame(self) -> None:
+        from neko_anyadance_body.backend.nav_follow import PathFollower
+
+        h = Harness()
+        self.prime(h)
+        with h.nav._nav_lock:
+            h.nav.session.mode = "goto"
+            h.nav.session.follower = PathFollower([[0.0, 0.0], [5.0, 0.0]])
+        dx, dz = h.nav.policy_waypoint()
+        self.assertAlmostEqual(dx, 0.0, places=6)
+        self.assertAlmostEqual(dz, 0.8, places=6)
+
 
 class SteamVROpenGuardTest(unittest.TestCase):
     """打开 SteamVR 的**前置自检**与**原生崩翻译**。
@@ -1765,6 +1829,43 @@ class CoverageViewTest(unittest.TestCase):
         self.assertFalse([k for k in keys if "coverage" in k or k.startswith("cov")])
         view = h.nav.grid_view()                      # PNG 输出契约不变：rows/cols 与主栅格一致
         self.assertEqual((view["rows"], view["cols"]), h.nav.session.ng.grid.shape)
+
+
+class PolicyTapTest(unittest.TestCase):
+    """VLA 头 A 的左目帧出口：只在 policy_frames=True 时采，且必须是左目彩色。"""
+
+    def test_policy_frame_captures_left_rgb(self) -> None:
+        h = Harness(armed=False, vz=0.5)
+        calls: list[int] = []
+
+        def read_rgb():
+            left = np.zeros((4, 4, 3), np.uint8)
+            left[..., 0], left[..., 1], left[..., 2] = 7, 11, 13
+            calls.append(1)
+            return left, left + 5
+
+        h.sensors.read_stereo_rgb = read_rgb
+        h.nav.policy_frames = True
+        with mock.patch.object(nav_online, "stereo_points", return_value=ground_and_wall(None)), \
+             mock.patch.object(nav_online, "make_stereo_backend", return_value=_FakeMatcher()):
+            h.nav.start()
+            try:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and h.nav.policy_frame() is None:
+                    time.sleep(0.02)
+                time.sleep(0.5)       # 攒够 0.4 s 历史，供 policy_frame_before 取
+            finally:
+                h.nav.stop()
+        latest = h.nav.policy_frame()
+        self.assertIsNotNone(latest, "policy_frames=True 时 policy_frame() 必须有帧")
+        rgb, at = latest
+        self.assertTrue(at > 0.0)
+        self.assertEqual(rgb[0, 0].tolist(), [7, 11, 13])     # 左目；右目是 +5
+        older = h.nav.policy_frame_before(0.4)
+        self.assertIsNotNone(older, "历史里必须有 0.4 s 前的帧")
+        self.assertLess(older[1], at - 0.2)
+        self.assertEqual(older[0][0, 0].tolist(), [7, 11, 13])
+        self.assertTrue(calls)
 
 
 class XSessionAlignTest(unittest.TestCase):

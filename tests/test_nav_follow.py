@@ -121,6 +121,17 @@ class FollowerTests(unittest.TestCase):
         out = PathFollower([[0, 0], [5, 0]]).step(self.est(4.85, 0.05, 0.0))
         self.assertEqual(out["state"], "arrived")
 
+    def test_local_goal_is_body_frame(self):
+        # 沿 +x 走、朝向 +x：前视点在正前方 0.8 m，机体系应是 (0, 0.8)。
+        fol = PathFollower([[0, 0], [5, 0]])
+        dx, dz = fol.local_goal((0.0, 0.0), 0.0)
+        self.assertAlmostEqual(dx, 0.0, places=6)
+        self.assertAlmostEqual(dz, 0.8, places=6)
+        # 同一位置转 90°（朝 +y）：前视点变成「右」方向，dz 归零。
+        dx, dz = fol.local_goal((0.0, 0.0), math.pi / 2)
+        self.assertAlmostEqual(dx, 0.8, places=6)
+        self.assertAlmostEqual(dz, 0.0, places=6)
+
     def test_closed_loop_kinematic(self):
         path = [[0, 0], [4, 0], [4, 3], [0, 3]]
         fol = PathFollower(path, FollowConfig())

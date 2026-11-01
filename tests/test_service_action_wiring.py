@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+import math
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from tests import _bootstrap  # noqa: F401
 from neko_anyadance_body.backend.service import BackendService
@@ -154,6 +157,100 @@ class ActionWiringTests(unittest.TestCase):
         self.assertAlmostEqual(row["osc_velocity"]["vx"], 0.5)
         self.assertAlmostEqual(row["osc_velocity"]["vz"], 0.5)
 
+    # ---- VLA 头 A 的三处 provider --------------------------------------
+    def _policy_stub(self, *, osc=None, goal=None, primary: str = "anyadance"):
+        stub = self._stub(osc=osc, primary=primary)
+        stub.autonomy = SimpleNamespace(snapshot=lambda: {"goal": goal})
+        stub._policy_body_last = None
+        stub._policy_body_at = 0.0
+        stub._navigator_send_axes = lambda side, x, y, ms: BackendService._navigator_send_axes(
+            stub, side, x, y, ms)
+        return stub
+
+    def test_policy_body_keeps_last_velocity_when_feedback_goes_quiet(self) -> None:
+        """VelocityX/Z 是变化驱动的：静默期间必须沿用上一份，否则走起来却喂 vx=0。"""
+        stub = self._policy_stub(osc=FakeOsc({"available": True, "velocity_x": 0.5, "velocity_z": 1.2}))
+        self.assertEqual(BackendService._policy_body(stub), (0.5, 1.2))
+        stub.osc = FakeOsc({"available": False})
+        self.assertEqual(BackendService._policy_body(stub), (0.5, 1.2))
+        # 静默超过上限才归零（与 DeadReckoner 的 osc_zoh_max_s 同口径）。
+        stub._policy_body_at = time.perf_counter() - 3.0
+        self.assertEqual(BackendService._policy_body(stub), (0.0, 0.0))
+
+    def test_policy_body_without_osc_is_zero(self) -> None:
+        self.assertEqual(BackendService._policy_body(self._policy_stub(osc=None)), (0.0, 0.0))
+
+    def test_policy_send_axes_uses_left_side(self) -> None:
+        stub = self._policy_stub()
+        self.assertTrue(BackendService._policy_send_axes(stub, 0.2, 0.9, 400))
+        self.assertEqual(stub.scheduler.calls[0],
+                         ("input_axes", {"side": "left", "x": 0.2, "y": 0.9, "duration_ms": 400}))
+
+    def test_policy_send_axes_refuses_while_semantic_goal_is_active(self) -> None:
+        stub = self._policy_stub(goal={"kind": "goto", "text": "去门口"})
+        self.assertFalse(BackendService._policy_send_axes(stub, 0.0, 1.0, 400))
+        self.assertEqual(stub.scheduler.calls, [])
+
+    def test_policy_waypoint_defaults_to_zero_without_path(self) -> None:
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(policy_waypoint=lambda: None)
+        self.assertEqual(BackendService._policy_waypoint(stub), (0.0, 0.0))
+
+    def test_policy_waypoint_passes_through_beyond_wp_min(self) -> None:
+        # 0.8 之外原样透传（这里 |wp| = 1.0），方向与距离都不许动。
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(policy_waypoint=lambda: (0.6, -0.8))
+        with mock.patch.dict(os.environ, {"VRC_POLICY_WP_MIN": "0.8"}):
+            self.assertEqual(BackendService._policy_waypoint(stub), (0.6, -0.8))
+
+    def test_policy_waypoint_raises_short_distance_preserving_bearing(self) -> None:
+        """**距离下限**（§15.20 走停振荡的对策）：|wp| < wp_min 时按比例拉到下限。
+
+        为什么必须有这一条：路径侧向时投影点落在 progress+lookahead 之前，实测 wp
+        恒在 0.5–0.6 m，而训练分布里这个距离对应「人到航点前减速」——模型于是持续
+        输出「减速-停-再起」块。抬到 ≥ lookahead 等价于永远喂「还没到点」的状态。
+
+        **方向必须逐位不变**：它是执行层转向对准的依据，缩放只能改距离。
+        """
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(policy_waypoint=lambda: (0.3, -0.6))
+        with mock.patch.dict(os.environ, {"VRC_POLICY_WP_MIN": "0.8"}):
+            wx, wz = BackendService._policy_waypoint(stub)
+        d0 = math.hypot(0.3, -0.6)
+        d1 = math.hypot(wx, wz)
+        self.assertAlmostEqual(d1, 0.8, places=9)
+        # 同一方向：叉积 ≈ 0 且点积 > 0（不只是"模长对"，方向反了也能骗过模长断言）
+        self.assertAlmostEqual(0.3 * wz - (-0.6) * wx, 0.0, places=9)
+        self.assertGreater(0.3 * wx + (-0.6) * wz, 0.0)
+        self.assertAlmostEqual(wx / wz, 0.3 / -0.6, places=9)
+        self.assertGreater(d1, d0)
+
+    def test_policy_waypoint_wp_min_zero_disables_the_floor(self) -> None:
+        # 关掉开关必须是逐位原样 —— 排障时要能一键回到"不做任何抬平"的行为。
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(policy_waypoint=lambda: (0.3, -0.6))
+        with mock.patch.dict(os.environ, {"VRC_POLICY_WP_MIN": "0"}):
+            self.assertEqual(BackendService._policy_waypoint(stub), (0.3, -0.6))
+
+    def test_policy_waypoint_floor_does_not_touch_exact_zero(self) -> None:
+        # 精确 0 是 runtime 的停车门控信号（|wp| < wp_stop ⇒ 整块置零）。
+        # 若被抬成 0.8，停车门永远打不开 —— 这是 WP_MIN 最容易引入的 bug。
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(policy_waypoint=lambda: (0.0, 0.0))
+        with mock.patch.dict(os.environ, {"VRC_POLICY_WP_MIN": "0.8"}):
+            self.assertEqual(BackendService._policy_waypoint(stub), (0.0, 0.0))
+
+
+    def test_policy_near_obstacle_reads_navmesh_snapshot(self) -> None:
+        """近距障碍判据直接读 navmesh 感知线程的最新值，读不到就当没有。"""
+        stub = self._policy_stub()
+        stub.navmesh = SimpleNamespace(_near=True, _near_pts=57)
+        self.assertEqual(BackendService._policy_near_obstacle(stub), (True, 57))
+        stub.navmesh = SimpleNamespace(_near=False, _near_pts=0)
+        self.assertEqual(BackendService._policy_near_obstacle(stub), (False, 0))
+        # 感知还没跑起来 / 属性缺失：不能把「读不到」当成「有障碍」而让策略停住。
+        stub.navmesh = SimpleNamespace()
+        self.assertEqual(BackendService._policy_near_obstacle(stub), (False, 0))
     # ---- disabled ------------------------------------------------------
     def test_disabled_timeline_hooks_are_noops(self) -> None:
         """没开时间轴时钩子必须照常返回、不抛错、不建文件。"""
