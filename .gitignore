@@ -44,3 +44,16 @@ Docs/assets/
 /_research/
 
 las_ckpt/
+
+# torch.compile / Inductor / Triton 在 CWD 泄漏的随机名缓存目录（未设 *_CACHE_DIR 时生成）
+/torchinductor_*/
+/policy_head_*/
+/.tc_cache/
+
+# VLA 头的运行时落盘：policy_live.jsonl 是**运行日志**（真驱动模式下不写，dry-run 才写），
+# 每次跑都追加，几百 KB 到几 MB。它是排障证据不是源码，不进版本库。
+/policy/
+
+# 世界标识是**本地状态**（用户按自己访问的世界手动设置），跟着机器走不跟着仓库走。
+# 提交它会让他人的 wrld_xxx 覆盖本地设置，且每次切世界都产生假 diff。
+/world_identity.json

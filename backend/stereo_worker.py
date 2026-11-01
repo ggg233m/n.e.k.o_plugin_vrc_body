@@ -309,6 +309,8 @@ def run(spec: dict[str, Any]) -> int:
             break
         disp[:] = out
         frames += 1
+        # 成功帧清掉错误标记：否则父进程分不清「本帧失败」和「历史上失败过」。
+        _set_error(shm_disp.buf, "")
         # 先写结果与序号、再 release：父进程看到 done 时数据已经就绪。
         ctrl[SEQ_DONE] = float(seq_req)
         ctrl[FRAMES] = float(frames)

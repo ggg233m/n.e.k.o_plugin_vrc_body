@@ -113,7 +113,7 @@ $("record").onchange = () => { $("recordImages").disabled = !$("record").checked
 $("stop").onclick = () => act("停止", "/worldmodel/navmesh/stop");
 $("explore").onclick = () => act("探索", "/worldmodel/navmesh/explore");
 $("cancel").onclick = () => act("取消目标", "/worldmodel/navmesh/cancel");
-$("arm").onclick = () => act("武装", "/autonomy/arm", {ttl_s: 300});
+$("arm").onclick = () => act("武装", "/autonomy/arm", {ttl_s: 1800});
 $("disarm").onclick = () => act("解除武装", "/autonomy/disarm", {reason: "navmesh_ui_disarm"});
 $("estop").onclick = async () => {
   await act("急停：取消目标", "/worldmodel/navmesh/cancel");
