@@ -1104,6 +1104,18 @@ class OnlineNavigator:
         self._mem_reason: str | None = "not_started"
         self._record_root = None if record_root is None else Path(record_root)
         self.recorder: SessionRecorder | None = None
+        # 外部控制头（VLA）要不要每拍左目 RGB：置 True 后感知循环多采一路彩色
+        # （与 read_stereo 同一次采集，只差一次 cvtColor）。必须在会话 start 之前设置。
+        self.policy_frames = False
+        # False = 外部控制头接管执行：跟随器照常推进（policy_waypoint 要用 progress），
+        # 摇杆不发，但**转向照发**（方案 §9.1：头 A 无 ω，朝向由控制环代管）。
+        self.drive_enabled = True
+        # drive_enabled=False 时控制环置位：跟随器进入原地转（>50°）就按住 VLA 策略块，
+        # 执行器经 hold_provider 每拍读它，转到位自动解除。bool 单写多读，无锁。
+        self.policy_hold = False
+        # 跟随器本拍本可以给出的前进轴（0..1）。VLA 接管时它不发，但值是真的 ——
+        # 策略的「不许比跟随器差」下限（policy_executor.SafetyGate.floor_frac）读它。
+        self._follower_forward = 0.0
         self._motion_history = motion_history
         # VelocityY / Grounded：目前只录不用（多层/竖直漂移的离线评估数据）。
         self._vertical_history = vertical_history or (lambda: ())
@@ -1152,6 +1164,10 @@ class OnlineNavigator:
         self._pose: np.ndarray | None = None
         self._pose_at: float | None = None
         self._stereo_at: float | None = None
+        # 最近几帧左目 RGB 与采集时刻（policy_frames=True 时由感知线程填）。
+        # 保留 ~0.6 s：训练侧输入是「当前帧 + 0.4 s 前帧」，1 Hz 的 runner 自己
+        # 采不到 0.4 s 的历史（相邻采样差 1 s），必须从这里取。
+        self._policy_hist: deque[tuple[float, np.ndarray]] = deque(maxlen=12)
         self._near = False
         self._near_pts = 0
         # 解耦双目：交接槽（maxsize=1，满则丢最新，绝不阻塞位姿线程）。
@@ -1739,7 +1755,7 @@ class OnlineNavigator:
         # `read_stereo_rgb` 与 `read_stereo` 是**同一次采集**（只差一次 cvtColor），成本差可忽略。
         # 曾经这里只看 mem，于是“没有世界记忆”的会话录下的原图**永远只有灰度**，下游无法上色。
         need_rgb = (mem is not None or (self.recorder is not None and self.recorder.images)
-                    or c.stereo_backend == "las2")
+                    or c.stereo_backend == "las2" or self.policy_frames)
         read_rgb = getattr(sensors, "read_stereo_rgb", None) if need_rgb else None
         if bl["ok"] is False:
             self._fail("baseline_mismatch", RuntimeError(
@@ -1880,6 +1896,9 @@ class OnlineNavigator:
                             left_rgb = None if rgb is None else rgb[0]
                         else:
                             pair = sensors.read_stereo()
+                        if left_rgb is not None:
+                            with self._state_lock:
+                                self._policy_hist.append((tick, left_rgb))
                         if pair is not None:
                             if c.decoupled:
                                 # 只交接，不在这里算视差（见 _stereo_worker_loop）。
@@ -2377,6 +2396,8 @@ class OnlineNavigator:
 
     def _control_tick(self, tick: float) -> None:
         c = self.cfg
+        # 每拍先清：hold 只能由下面的 VLA 分支置位，状态切换（idle/恢复 A*）不能残留。
+        self.policy_hold = False
         with self._nav_lock:
             mode = self.session.mode
         if mode in ("idle", "done"):
@@ -2400,7 +2421,26 @@ class OnlineNavigator:
             return
         with self._nav_lock:
             out = self.session.step(est, local_stop=near)
-        self._last_step = {k: out.get(k) for k in ("state", "reason", "forward", "turn_rate")}
+        self._last_step = {k: out.get(k) for k in
+                           ("state", "reason", "forward", "turn_rate")}
+        # 跟随器**本拍本可以**给出的前进轴（0..1）。VLA 接管时它不发，但值是真的 ——
+        # 策略的「不许比跟随器差」下限（policy_executor.SafetyGate.floor_frac）要用它。
+        # 注意单位：这是 OSC 轴值，不是 m/s；换算在 policy_executor.mps_to_axes 里。
+        self._follower_forward = float(out.get("forward") or 0.0)
+        if not self.drive_enabled:
+            # 外部控制头（VLA 头 A）接管摇杆：跟随器已经推进了 progress（policy_waypoint
+            # 要用），但轴不归这里发 —— 两个发送方同时写同一组摇杆只会互相踩。
+            # **转向代管**（方案 §9.1）：头 A 只输出 (vx, vz)、没有 ω，朝向对准沿用跟随器
+            # 的朝向律。turn 走 scheduler 的 play-space yaw 通道，与 VLA 发的 /input 摇杆
+            # 不同通道，不冲突；correction_deg 相对当前实际 yaw，每拍重发不累加超调。
+            turn_rate = float(out.get("turn_rate") or 0.0)
+            if turn_rate != 0.0:
+                self._send_turn(math.degrees(turn_rate) / c.control_hz)
+            # 原地转门：跟随器转 >50°（turn_in_place_rad）说明航点在侧向，不在头 A 的
+            # 训练分布里（0.8 s 内 HMD 转过 >15° 的窗口仅 2.2%）——置 hold 把策略块按住，
+            # 转到位（state 离开 turning）后下拍自动解除。wait_localization 的慢扫不置位。
+            self.policy_hold = out.get("state") == "turning"
+            return
         forward = float(out.get("forward") or 0.0)
         turn_rate = float(out.get("turn_rate") or 0.0)
         if forward <= 0.0 and turn_rate == 0.0:
@@ -2439,6 +2479,50 @@ class OnlineNavigator:
             self.session.cancel()
         self._halt()
         return {"ok": True, "mode": "idle"}
+
+    # ---- 外部控制头（VLA 头 A）的输入口 ----
+    def policy_frame(self) -> tuple[np.ndarray, float] | None:
+        """最近一帧左目 RGB 及采集时刻（perf_counter 域）；需要 ``policy_frames``。"""
+        with self._state_lock:
+            last = self._policy_hist[-1] if self._policy_hist else None
+        if last is None:
+            return None
+        return last[1], float(last[0])
+
+    def policy_frame_before(self, seconds: float = 0.4) -> tuple[np.ndarray, float] | None:
+        """距今 ``seconds`` 秒最近的一帧左目 RGB（0.4 s = 训练侧两帧的间距）。"""
+        with self._state_lock:
+            hist = list(self._policy_hist)
+        if not hist:
+            return None
+        target = self._clock() - float(seconds)
+        at, rgb = min(hist, key=lambda item: abs(item[0] - target))
+        return rgb, float(at)
+
+    def policy_waypoint(self, lookahead_m: float | None = None) -> tuple[float, float] | None:
+        """机体系 ``(dx 右, dz 前)`` 米；没有可走的路径（idle/done/未定位）返回 None。"""
+        est = self._est()
+        if est.get("state") != "localized":
+            return None
+        with self._nav_lock:
+            follower, mode = self.session.follower, self.session.mode
+        if follower is None or mode in ("idle", "done"):
+            return None
+        return follower.local_goal(est["xy"], float(est["theta"]), lookahead_m)
+
+    def policy_path_ahead(self, steps: int = 3, step_m: float = 0.8) -> list[tuple[float, float]] | None:
+        """沿路径前进的 k 个机体系点，给 VLA 看路径形状（不只一个前视点）。
+
+        与 policy_waypoint 同源同坐标；拿不到路径时返回 None（调用方退回单点）。
+        """
+        est = self._est()
+        if est.get("state") != "localized":
+            return None
+        with self._nav_lock:
+            follower, mode = self.session.follower, self.session.mode
+        if follower is None or mode in ("idle", "done"):
+            return None
+        return follower.path_ahead(est["xy"], float(est["theta"]), steps, step_m)
 
     def _rate_summary(self) -> dict[str, Any]:
         """实测频率 —— 与配置值**并排**报，缺口自己会说话。
@@ -2578,6 +2662,7 @@ class OnlineNavigator:
             "near_obstacle": {"stop": near, "points": near_pts, "ahead_m": self.cfg.stop_ahead_m},
             "drive_block": self._drive_block,
             "last_step": dict(self._last_step),
+            "policy_hold": bool(self.policy_hold),
             "last_plan": last,
             "sensors": info,
             "baseline_check": baseline_check,

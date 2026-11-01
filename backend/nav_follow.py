@@ -190,6 +190,38 @@ class PathFollower:
         t = 0.0 if L <= 0 else (s - self._cum[i]) / L
         return self.path[i] + t * (self.path[i + 1] - self.path[i])
 
+    def local_goal(self, xy: Sequence[float], theta: float,
+                   lookahead_m: float | None = None) -> tuple[float, float]:
+        """当前进度前视点，转到机体系 ``(dx 右, dz 前)`` 米。
+
+        与训练侧 ``build_policy_dataset.waypoint_body`` 同口径：目标取在弧长
+        ``progress + lookahead`` 处，再减去当前位置投影到「右/前」两轴。
+        """
+        la = self.cfg.lookahead_m if lookahead_m is None else float(lookahead_m)
+        d = self._point_at(self._progress + la) - np.asarray(xy, float)
+        fx, fy = math.cos(theta), math.sin(theta)
+        return float(d[0] * fy - d[1] * fx), float(d[0] * fx + d[1] * fy)
+
+    def path_ahead(self, xy: Sequence[str] | Sequence[float], theta: float,
+                   steps: int = 3, step_m: float = 0.8) -> list[tuple[float, float]]:
+        """沿路径前进 ``k*step_m``（k=1..steps）的机体系点列，给 VLA 看**路径形状**。
+
+        为什么需要（2026-11-02）：VLA 目前只拿到 ``local_goal`` 一个前视点，与 pure-pursuit
+        用的是**同一行代码**（见 local_goal 的 docstring）。于是「前面要左拐」「左边有墙」
+        这类信息在交接时全部丢失 —— 策略轨迹必然是 A* 的时间重参数化，「不会绕障」是
+        输出空间缺转向的直接推论（剖析 §15.17）。给 k 个点，至少要让它看见弯。
+
+        方向与 yaw 约定同 ``local_goal``：返回 (dx 右, dz 前)，米。
+        路径比 k*step_m 短时，后面的点钳到终点（不重复填充错误方向）。
+        """
+        p = np.asarray(xy, float)
+        fx, fy = math.cos(theta), math.sin(theta)
+        out: list[tuple[float, float]] = []
+        for k in range(1, int(steps) + 1):
+            d = self._point_at(self._progress + k * float(step_m)) - p
+            out.append((float(d[0] * fy - d[1] * fx), float(d[0] * fx + d[1] * fy)))
+        return out
+
     def step(self, est: dict[str, Any], *, local_stop: bool = False) -> dict[str, Any]:
         cfg = self.cfg
         if local_stop:

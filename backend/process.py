@@ -294,6 +294,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/autonomy":
             self._json(200, self.server.service.autonomy_snapshot())
             return
+        if path == "/policy/state":
+            self._json(200, self.server.service.policy_state())
+            return
         if path == "/world/delta":
             query = parse_qs(urlsplit(self.path).query)
             def query_int(name: str, default: int) -> int:
