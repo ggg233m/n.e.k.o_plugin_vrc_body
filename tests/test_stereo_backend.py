@@ -333,6 +333,42 @@ class SubprocessBackendTest(unittest.TestCase):
         self.assertEqual(deduped[-1], "ready", seen)
         self.assertLess(deduped.index("compiling"), deduped.index("ready"), seen)
 
+class ChildEnvIsolationTest(unittest.TestCase):
+    """LAS2 子进程不许继承「策略进程专属」的 XPU 运行时变量。
+
+    背景（2026-11-02）：`_las2_env()` 原本是 `dict(os.environ)` 整份复制，而
+    `PolicyRuntime(graph=True)` 会把 `SYCL_UR_USE_LEVEL_ZERO_V2=1` 写进父进程的
+    os.environ（research/tools/policy_runtime.py）。子进程于是也切到 Level-Zero V2
+    适配器 —— 它根本没有 capture 需求，却是同一块 A770 上的第二个 XPU 客户端。
+
+    这条不是洁癖：V2 适配器 + LAS2 同卡并发是 DEVICE_LOST 高频模式的触发条件
+    （Docs/CPU派发开销剖析-2026-11-01.md §15.16/§15.19）。**父进程怎么设都行，
+    子进程这一侧必须干净** —— 这就是本用例要钉住的不变量。
+    """
+
+    def test_policy_only_vars_are_stripped(self) -> None:
+        poisoned = {k: "1" for k in stereo_backend._XPU_POLICY_ONLY_ENV}
+        with mock.patch.dict(os.environ, poisoned, clear=False):
+            env = stereo_backend._las2_env()
+        leaked = [k for k in stereo_backend._XPU_POLICY_ONLY_ENV if k in env]
+        self.assertEqual(leaked, [], f"这些策略进程变量漏进了 LAS2 子进程：{leaked}")
+
+    def test_strip_does_not_mutate_parent_environ(self) -> None:
+        # 剔除只能作用于**副本**。若改成原地 pop(os.environ)，policy 侧的 V2 会被
+        # 顺手关掉 —— 那会把"修崩溃"变成"悄悄禁掉图优化"。
+        key = "SYCL_UR_USE_LEVEL_ZERO_V2"
+        with mock.patch.dict(os.environ, {key: "1"}, clear=False):
+            stereo_backend._las2_env()
+            self.assertEqual(os.environ.get(key), "1", "父进程的 V2 开关被误删了")
+
+    def test_unrelated_vars_still_pass_through(self) -> None:
+        # 白名单不能写成黑名单之外的一刀切：子进程仍要拿到 PATH/PYTHONUTF8 这些。
+        with mock.patch.dict(os.environ, {"NEKO_TEST_PASSTHROUGH": "keep"}, clear=False):
+            env = stereo_backend._las2_env()
+        self.assertEqual(env.get("NEKO_TEST_PASSTHROUGH"), "keep")
+        self.assertEqual(env.get("PYTHONUTF8"), "1")
+
+
 if __name__ == "__main__":
     unittest.main()
 

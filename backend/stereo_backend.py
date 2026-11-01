@@ -272,9 +272,36 @@ def _las2_python() -> str:
     return sys.executable
 
 
+# 只该作用在**策略进程**的 XPU 运行时变量，绝不能漏进 LAS2 子进程。
+#
+# 为什么要有这张表（2026-11-02，剖析 §15.19 的修正）：`_las2_env()` 原本是
+# `dict(os.environ)` 整份复制，而 `PolicyRuntime(graph=True)` 会把
+# `SYCL_UR_USE_LEVEL_ZERO_V2=1` 写进**本进程**的 os.environ（policy_runtime.py:90）。
+# 于是 LAS2 worker 也跟着切到 Level-Zero **V2 适配器**。
+#
+# 触发链不是"每次"，而是一条确定能命中的路径：prewarm 的尺寸是**猜**的
+# （nav_online.py prewarm_shape），猜不中就由会话首帧重建子进程
+# （stereo_backend.py:_make_sub）——那次重建 100% 发生在 policy 初始化之后，
+# 所以 V2 必然进去。这解释了"不是每次都崩，但一开图就频繁崩"。
+#
+# LAS2 没有任何理由用 V2：它不建图、不 capture，只需要 V1 的单算子派发。
+_XPU_POLICY_ONLY_ENV = (
+    "SYCL_UR_USE_LEVEL_ZERO_V2",       # 切 V2 适配器的开关（graph 的唯一前提）
+    "UR_LOADER_USE_LEVEL_ZERO_V2",     # 上者的官方别名
+    "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS",   # 只对 capture 期的分配限额有意义
+    "UR_L0_USE_RELAXED_ALLOCATION_LIMITS",
+)
+
+
 def _las2_env() -> dict[str, str]:
-    """子进程环境：当前环境 + inductor/triton 那套（与 `_tc_run314.bat` 同一份缓存目录）。"""
+    """子进程环境：当前环境 + inductor/triton 那套（与 `_tc_run314.bat` 同一份缓存目录）。
+
+    **策略进程专属的 XPU 变量在复制后被剔除**（见 `_XPU_POLICY_ONLY_ENV`）：
+    子进程是一整块 A770 上的第二个 XPU 客户端，它不该继承父进程的适配器选择。
+    """
     env = dict(os.environ)
+    for key in _XPU_POLICY_ONLY_ENV:
+        env.pop(key, None)
     env["PYTHONUTF8"] = "1"                      # inductor 用 gbk 解 cl 输出会 UnicodeDecodeError
     env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "16")
     # 🔴 Windows 上只有 spawn 走得通（2026-10-26 实测两条死路）：
@@ -780,6 +807,12 @@ class _LAS2SubprocessAdapter:
         self.frames += 1
         self.last_timing = {"upload": float(self._ctrl[UPLOAD_MS]), "launch": float(self._ctrl[LAUNCH_MS]),
                             "sync": float(self._ctrl[SYNC_MS])}
+        # 本帧失败（worker 单帧异常不带走进程）：error 非空说明 disp 里不是有效视差。
+        # 不检查就会把残帧当真 —— 2026-11-01 LAS2 崩溃前的那批垃圾深度就是这么进的建图，
+        # cam_h 被标歪 0.3m、整个地面变成"假障碍"。宁可丢帧，不可喂垃圾。
+        err = read_error(self.shm_disp.buf)
+        if err:
+            raise StereoWorkerError(f"LAS2 frame failed: {err}")
         return self._disp.copy()
 
     # -- 收尾 --
