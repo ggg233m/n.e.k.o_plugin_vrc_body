@@ -96,11 +96,31 @@ def build_index(dataset: Path, sessions: list[str] | None) -> list[dict]:
 
 
 class PolicyDataset(Dataset):
-    def __init__(self, samples: list[dict], processor, min_pixels: int, max_pixels: int):
+    """训练期的两条捷径切断（2026-11-02 视觉消融 + 方差分解之后新增）。
+
+    背景：训出来的模型换图后动作块 cos=0.983（几乎不看图），但同一批视觉特征
+    能让线性探针的误差降 56%（2.87 -> 1.27），留出整个世界时增益更大（1.45）。
+    所以不是图里没信息，是训练停在了「抄 body」的局部最优上 —— body 单独就有
+    mse 3.92，而模型最终只做到 1.72。
+
+    两个 dropout 分别切一条捷径，只在 training=True 时生效：
+      * body_dropout   —— 把 body 置 0，逼模型不能只靠上一拍速度；
+      * vision_dropout —— 把两帧置黑，逼模型别把「视觉特征恒定」当基线，
+        同时充当方案 §11.4 的 geometry dropout 契约（缺失时退化为无视觉）。
+    """
+
+    def __init__(self, samples: list[dict], processor, min_pixels: int, max_pixels: int,
+                 training: bool = False, vision_dropout: float = 0.0,
+                 body_dropout: float = 0.0, seed: int = 0):
         self.s = samples
         self.processor = processor
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.training = bool(training)
+        self.vision_dropout = float(vision_dropout) if training else 0.0
+        self.body_dropout = float(body_dropout) if training else 0.0
+        self.seed = int(seed)
+        self.epoch = 0
 
     def __len__(self) -> int:
         return len(self.s)
@@ -110,9 +130,17 @@ class PolicyDataset(Dataset):
         cur = np.asarray(Image.open(s["img"]).convert("RGB"))
         prev = np.asarray(Image.open(s["prev_img"]).convert("RGB"))
         video = np.stack([prev, cur])  # (T=2, H, W, 3)，T 沿 temporal_patch_size 打成一个 patch
+        body = s["body"]
+        if self.body_dropout > 0.0 or self.vision_dropout > 0.0:
+            # 每个 epoch 用不同随机流，否则同一张图永远被同一路 dropout 命中
+            rng = np.random.default_rng((self.seed * 1000003 + self.epoch) * 7919 + i)
+            if self.vision_dropout > 0.0 and rng.random() < self.vision_dropout:
+                video = np.zeros_like(video)
+            if self.body_dropout > 0.0 and rng.random() < self.body_dropout:
+                body = (0.0, 0.0)
         text = ("Body velocity vx=%.2f vz=%.2f m/s. Local goal dx=%.2f dz=%.2f m. "
                 "Predict the next 12 body velocities at 0.1 s steps."
-                % (s["body"][0], s["body"][1], s["wp"][0], s["wp"][1]))
+                % (body[0], body[1], s["wp"][0], s["wp"][1]))
         # 必须走 chat template，否则输入里没有 <|video_pad|>，视觉特征对不上任何 token
         text = self.processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": text}]}],
@@ -141,18 +169,109 @@ def make_collate(processor, min_pixels: int, max_pixels: int):
 
 
 # ---------------------------------------------------------------- 模型
-class ActionHead(nn.Module):
-    def __init__(self, hidden: int, out: int = K_STEPS * 2):
+# ---------------------------------------------------------------- 视觉注入
+class VisualInjector(nn.Module):
+    """把视觉塔输出**绕开 LM** 直接接进动作头（2026-11-02，policy-designer 评审后）。
+
+    为什么要绕开：ViT LoRA 实验已证伪「解冻 ViT」这条路（视觉敏感度 1-cos
+    从 0.017 掉到 0.006，且 shuffle 反而比 black 扰动小，退化成存在性检测器）。
+    policy-designer 的判断是通路瓶颈 —— 112 个视觉 token 必须经 22 层线性注意力
+    汇总到末位 token 才能到输出头。这里直接把视觉特征接到 head 输入。
+
+    **不用 global mean**：112 个 token 是 8x14 空间网格，全局平均等于又做一次
+    112->1 的漏斗，把「哪边有东西」抹平 —— 而那正是避障要的量。改成 2x2 分块
+    均值（每块 4x7 个 token）保留粗空间分布，再各过一个共享 Linear 压到 proj 维。
+
+    参数量：1024xproj + proj*4，proj=256 时约 290k。
+    """
+
+    def __init__(self, dim: int, grid=(8, 14), blocks: int = 2, proj: int = 256):
         super().__init__()
-        self.fc = nn.Linear(hidden, out)
+        self.dim = int(dim)
+        self.grid_h, self.grid_w = int(grid[0]), int(grid[1])
+        self.blocks = int(blocks)
+        self.proj = nn.Linear(self.dim, int(proj))
+        n = self.blocks * self.blocks
+        self.out_dim = n * int(proj)
+
+    def forward(self, vis: torch.Tensor) -> torch.Tensor:
+        """vis: (B, N, D) 或 (B*N, D)。返回 (B, out_dim)。"""
+        if vis.dim() == 2:
+            b = self._batch if self._batch else 1
+            vis = vis.view(b, -1, vis.shape[-1])
+        b, n, d = vis.shape
+        gh, gw = self.grid_h, self.grid_w
+        if n != gh * gw:
+            # 形状对不上就退回全局均值（保持可跑，并在日志里能看出来）
+            return self.proj(vis.mean(1)).repeat(1, self.blocks * self.blocks)
+        x = vis.view(b, gh, gw, d).permute(0, 3, 1, 2)      # (B, D, gh, gw)
+        k = self.blocks
+        x = x.view(b, d, k, gh // k, k, gw // k).mean(dim=(3, 5))  # (B, D, k, k)
+        x = x.permute(0, 2, 3, 1).reshape(b, k * k, d)      # (B, k*k, D)
+        return self.proj(x).reshape(b, -1)
+
+
+class ActionHead(nn.Module):
+    """``extra > 0`` 时接受「文本池化 + 视觉注入」拼接后的输入。"""
+
+    def __init__(self, hidden: int, out: int = K_STEPS * 2, extra: int = 0):
+        super().__init__()
+        self.in_dim = int(hidden) + int(extra)
+        self.fc = nn.Linear(self.in_dim, out)
         nn.init.normal_(self.fc.weight, std=0.02)
         nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor, vis: torch.Tensor | None = None) -> torch.Tensor:
+        if vis is not None:
+            x = torch.cat([x, vis], dim=-1)
+        return self.fc(x)
+
+
+class EventHead(nn.Module):
+    """事件头：预测未来 1.2 s 内会不会发生 go / stop（policy-designer 的 P3）。
+
+    为什么要它：加容量不产生压力，反而给坍缩提供自由度 —— ViT LoRA 让视觉特征
+    更容易被忽略就是这个机制。事件是 **body 预测不了的**：你在走多快，和「接下来
+    会不会起步/停下」是两件事（实测 body 单独 AUC 0.63，图像统计 0.69，满速带 0.77）。
+    标签零成本，从 act/mask 推。
+    """
+
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.fc = nn.Linear(int(in_dim), 2)   # [go, stop]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
 
 
-def load_model(model_dir: str, chunk: int, device: str):
+def event_labels(act: torch.Tensor, mask: torch.Tensor,
+                 still_mps: float = 0.1) -> torch.Tensor:
+    """(B, K, 2) + (B, K) -> (B, 2) 的 [go, stop] 二值标签。"""
+    spd = act.norm(dim=-1)                       # (B, K)
+    valid = mask > 0
+    moving = (spd > still_mps) & valid
+    # ⚠️ first 是 (B,)，rest 是 (B,K-1)；直接 & 会按最后一维对齐（2 vs 11）报错，
+    # 必须显式补一维。
+    first = moving[:, 0:1]                       # (B, 1)
+    rest = moving[:, 1:]                         # (B, K-1)
+    rest_valid = valid[:, 1:]
+    go = ((~first) & rest & rest_valid).any(dim=1)
+    stop = (first & (~rest) & rest_valid).any(dim=1)
+    return torch.stack([go, stop], dim=-1).float()
+
+
+def load_model(model_dir: str, chunk: int, device: str, vit_lora_blocks: int = 0,
+               vit_lora_r: int = 16):
+    """``vit_lora_blocks > 0`` 时给视觉塔**末尾 N 个 block** 加 LoRA（方案 §11.1 的 M1 试验）。
+
+    为什么必须加（2026-11-02）：实测可训练参数 21,645,312 全部在 LM，视觉塔占 0.00%，
+    TARGET_MODULES 在视觉塔一个都没命中（视觉塔的 Linear 叶名是 qkv / proj /
+    linear_fc1 / linear_fc2）。也就是说 **ViT 从来没有被这个任务训练过**。
+    而方差分解显示它的特征里含有能让误差降 56% 的信息 —— 需要给它梯度通道。
+
+    只挂末尾 N 个 block（不动前面），理由与方案 §11.1 一致：目标差异在高层语义，
+    且参数量可控（每 block 约 0.3M）。
+    """
     from transformers import AutoModelForImageTextToText
     from peft import LoraConfig, get_peft_model
 
@@ -165,16 +284,137 @@ def load_model(model_dir: str, chunk: int, device: str):
     model = AutoModelForImageTextToText.from_pretrained(model_dir, dtype=torch.bfloat16)
     model.to(device)
     model.requires_grad_(False)
+    # ---- 视觉塔 LoRA：只挂末尾 N 个 block 的 attn.qkv / attn.proj ----
+    # 视觉塔的 Linear 叶名与 LM 不同（qkv / proj / linear_fc1 / linear_fc2），
+    # 所以 TARGET_MODULES 覆盖不到它。
+    #
+    # ⚠️ 必须和 LM 的 LoRA **一次性注入**：早先是先 get_peft_model(LM) 再
+    # get_peft_model(visual)，结果层级变成 PeftModel>LoraModel>PeftModel>LoraModel，
+    # forward_batch 里 `base_model.model` 拿到的是 LoraModel 而不是
+    # Qwen3_5ForConditionalGeneration，前向直接 AttributeError。
+    vit_targets: list[str] = []
+    vit_desc = ""
+    if vit_lora_blocks > 0:
+        import re as _re
+        visual = model.model.visual
+        n_blocks = len(visual.blocks)
+        start = max(0, n_blocks - int(vit_lora_blocks))
+        for name, _mod in visual.named_modules():
+            m = _re.match(r"blocks\.(\d+)\.attn\.(qkv|proj)$", name)
+            if m and int(m.group(1)) >= start:
+                vit_targets.append("model.visual." + name)
+        if not vit_targets:
+            raise RuntimeError("ViT LoRA: 没匹配到任何视觉模块，检查命名")
+        vit_desc = "blocks %d..%d, %d 个模块" % (start, n_blocks - 1, len(vit_targets))
+
     model = get_peft_model(model, LoraConfig(
         r=32, lora_alpha=64, lora_dropout=0.05, bias="none",
-        target_modules=TARGET_MODULES, task_type="CAUSAL_LM"))
+        target_modules=list(TARGET_MODULES) + vit_targets, task_type="CAUSAL_LM"))
+    if vit_targets:
+        n_vit = sum(p.numel() for n, p in model.named_parameters()
+                    if p.requires_grad and "visual" in n.lower())
+        print("[vit-lora] %s, 可训练 %d" % (vit_desc, n_vit), flush=True)
+
     hidden = model.config.text_config.hidden_size
     head = ActionHead(hidden).to(device)
     return model, head, hidden
 
 
-def forward_batch(model, head, inputs, device: str):
-    """绕过 LM head：直接取 Qwen3_5Model 的 last_hidden_state（省 248k 词表的 logits）。"""
+def build_extra_heads(hidden: int, device, inject_visual: bool, visual_proj: int,
+                      visual_grid, event_head: bool, event_weight: float):
+    """按开关造注入器/事件头，并返回 (injector, event_head, extra_dim, params)。"""
+    injector = None
+    extra = 0
+    params = []
+    if inject_visual:
+        injector = VisualInjector(hidden, grid=tuple(visual_grid), proj=visual_proj).to(device)
+        extra = injector.out_dim
+        params += list(injector.parameters())
+    ev = None
+    if event_head:
+        ev = EventHead(hidden + extra).to(device)
+        params += list(ev.parameters())
+    return injector, ev, extra, params
+
+
+def _pname_of(model, target):
+    for n, p in model.named_parameters():
+        if p is target:
+            return n
+    return ""
+
+
+def _extract_visual_feat(out, batch: int):
+    """从视觉塔返回值里取出 (B, N, D) 的 token 特征。
+
+    ⚠️ 实测形状（2026-11-02，Qwen3.5-0.8B，grid [1,16,28]）：
+        out.last_hidden_state = (B*N_img, 768)      <- 不是我们要的
+        out.pooler_output    = ((112,1024), (112,1024), ...)  <- **每样本一个张量的 tuple**
+    早先按「pooler_output 是单个张量」写，会拿到 tuple 里的第一个样本，
+    然后按 batch 去 view，报 "shape [2,-1,1024] invalid for input of size 50176"。
+    也试过递归找「第一个 >=2 维张量」，结果抓到 last_hidden_state (896,768)，
+    维度不对（768 不是 1024），同样会错。所以这里按语义精确取。
+    """
+    po = getattr(out, "pooler_output", None)
+    if po is None:
+        return None
+    if torch.is_tensor(po):
+        if po.dim() == 3:
+            return po
+        if po.dim() == 2 and batch > 0 and po.shape[0] % batch == 0:
+            return po.view(batch, -1, po.shape[-1])
+        return None
+    if isinstance(po, (tuple, list)):
+        parts = [x for x in po if torch.is_tensor(x) and x.dim() == 2]
+        if len(parts) == batch and len(parts) > 0:
+            if len({tuple(x.shape) for x in parts}) == 1:
+                return torch.stack(parts, 0)
+        if len(parts) == 1 and parts[0].shape[0] % max(batch, 1) == 0:
+            return parts[0].view(batch, -1, parts[0].shape[-1])
+    return None
+
+
+def _find_visual_tensor(obj, depth: int = 0):
+    """从视觉塔的返回值里挖出 token 特征张量。
+
+    ⚠️ 实测 `Qwen3_5VisionModel` 返回的是 `BaseModelOutputWithPooling`，而它的
+    `pooler_output` 字段**本身又是一个 tuple**（不是张量）。所以不能只试一层：
+    早先按 `feat.pooler_output` 直接当张量用，shape 报 AttributeError，
+    注入静默失效（head 输入 1024 而权重是 2048，报 mat1/mat2 不匹配）。
+    这里递归找第一个二维以上、最后一维等于 hidden 的张量。
+    """
+    if depth > 4:
+        return None
+    if torch.is_tensor(obj):
+        return obj if obj.dim() >= 2 else None
+    for name in ("pooler_output", "last_hidden_state"):
+        v = getattr(obj, name, None)
+        if v is not None:
+            r = _find_visual_tensor(v, depth + 1)
+            if r is not None:
+                return r
+    if isinstance(obj, (tuple, list)):
+        for x in obj:
+            r = _find_visual_tensor(x, depth + 1)
+            if r is not None:
+                return r
+    if hasattr(obj, "__dict__"):
+        for v in vars(obj).values():
+            if v is None or isinstance(v, (str, int, float, bool)):
+                continue
+            r = _find_visual_tensor(v, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def forward_batch(model, head, inputs, device: str, injector=None, event_head=None):
+    """绕过 LM head，取 last_hidden_state 的末位 token 池化 —— 视需要再接视觉注入。
+
+    ``injector`` 非 None 时：在同一次前向里用 forward hook 取视觉塔输出，
+    绕开 LM 直接拼进动作头。**必须复用这一次前向的视觉输出**，不能另跑一次
+    visual（p95 会从 164 ms 翻上去，G1 直接挂 —— policy-designer 的 P4）。
+    """
     base = model.base_model.model  # PeftModel -> LoraModel -> Qwen3_5ForConditionalGeneration
     inner = base.model             # Qwen3_5Model（视觉塔 + LM），LoRA 已注入
     kw = {}
@@ -183,11 +423,39 @@ def forward_batch(model, head, inputs, device: str):
         v = inputs.get(k, None)
         if v is not None:
             kw[k] = v.to(device)
-    out = inner(**kw, use_cache=False)
+
+    vis_cap = {}
+    handle = None
+    if injector is not None:
+        visual = getattr(inner, "visual", None)
+        if visual is not None:
+            def _hook(module, args, kwargs, output):
+                vis_cap["feat"] = output
+            handle = visual.register_forward_hook(_hook, with_kwargs=True)
+
+    try:
+        out = inner(**kw, use_cache=False)
+    finally:
+        if handle is not None:
+            handle.remove()
+
     h = out.last_hidden_state
     idx = kw["attention_mask"].sum(-1) - 1
-    pooled = h[torch.arange(h.shape[0], device=h.device), idx]
-    return head(pooled.float()).view(-1, K_STEPS, 2)
+    ar = torch.arange(h.shape[0], device=h.device)
+    pooled = h[ar, idx].float()
+
+    vis = None
+    if injector is not None:
+        feat = _extract_visual_feat(vis_cap.get("feat"), h.shape[0])
+        if feat is not None:
+            injector._batch = h.shape[0]
+            vis = injector(feat.float())
+
+    pred = head(pooled, vis).view(-1, K_STEPS, 2)
+    if event_head is not None:
+        ev_in = torch.cat([pooled, vis], -1) if vis is not None else pooled
+        return pred, event_head(ev_in)
+    return pred
 
 
 def masked_mse(pred: torch.Tensor, act: torch.Tensor, mask: torch.Tensor,
@@ -200,11 +468,19 @@ def masked_mse(pred: torch.Tensor, act: torch.Tensor, mask: torch.Tensor,
 
 # ---------------------------------------------------------------- 验证
 @torch.no_grad()
-def evaluate(model, head, loader, device: str) -> dict:
+def evaluate(model, head, loader, device: str, injector=None, event_head=None) -> dict:
     model.eval()
     preds, acts, masks, clss = [], [], [], []
+    ev_logits, ev_true = [], []
     for batch in loader:
-        pred = forward_batch(model, head, batch["inputs"], device)
+        r = forward_batch(model, head, batch["inputs"], device,
+                          injector=injector, event_head=event_head)
+        if isinstance(r, tuple):
+            pred, ev = r
+            ev_logits.append(ev.float().cpu())
+            ev_true.append(event_labels(batch["act"], batch["mask"]))
+        else:
+            pred = r
         preds.append(pred.float().cpu())
         acts.append(batch["act"])
         masks.append(batch["mask"])
@@ -239,6 +515,25 @@ def evaluate(model, head, loader, device: str) -> dict:
             ok = m[:, :8].sum(-1) > 0
             out[c]["start_recall"] = float((((first8 > V_STILL) & (m[:, :8] > 0)).any(-1) & ok).sum() /
                                            ok.sum().clamp_min(1))
+
+    # 事件头 AUC：go / stop 两类分别报。body 单独 0.63、图像统计 0.69 是外部参照线。
+    if ev_logits:
+        lg = torch.cat(ev_logits)
+        tr = torch.cat(ev_true)
+        out["event"] = {}
+        for j, nm in enumerate(("go", "stop")):
+            y, s = tr[:, j].numpy(), lg[:, j].numpy()
+            pos, neg = s[y > 0.5], s[y <= 0.5]
+            if pos.size and neg.size:
+                # AUC = P(正样本分数 > 负样本分数)，用秩公式避免 sklearn 依赖
+                allv = np.concatenate([pos, neg])
+                order = np.argsort(allv, kind="mergesort")
+                ranks = np.empty_like(order, dtype=np.float64)
+                ranks[order] = np.arange(1, allv.size + 1)
+                rp = ranks[:pos.size].sum()
+                auc = (rp - pos.size * (pos.size + 1) / 2.0) / (pos.size * neg.size)
+                out["event"][nm] = dict(n_pos=int(pos.size), n_neg=int(neg.size),
+                                        auc=float(auc))
     model.train()
     return out
 
@@ -263,6 +558,23 @@ def main(argv=None) -> int:
     ap.add_argument("--max-val", type=int, default=0, help=">0 只评这么多验证样本（冒烟）")
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    # ---- 视觉承重相关的配方（2026-11-02 方差分解之后新增，默认全关=旧行为）----
+    ap.add_argument("--vit-lora-blocks", type=int, default=0,
+                    help="视觉塔末尾 N 个 block 加 LoRA；0=全冻结（旧行为）")
+    ap.add_argument("--vit-lora-r", type=int, default=16)
+    ap.add_argument("--vision-dropout", type=float, default=0.0,
+                    help="两帧置黑的概率（训练期），逼模型不把视觉当恒定输入")
+    ap.add_argument("--body-dropout", type=float, default=0.0,
+                    help="body 置 0 的概率（训练期）。已被证伪（+4.6~5.7%%），默认关")
+    ap.add_argument("--inject-visual", action="store_true",
+                    help="把视觉塔输出绕开 LM 直接接进动作头（2x2 分块池化）")
+    ap.add_argument("--visual-proj", type=int, default=256)
+    ap.add_argument("--visual-grid", nargs=2, type=int, default=[8, 14])
+    ap.add_argument("--event-head", action="store_true",
+                    help="挂事件头（未来 1.2 s 是否 go/stop），给视觉加压")
+    ap.add_argument("--event-weight", type=float, default=0.3)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile 内层模型。CPU 派发是训练瓶颈（见 CPU派发开销剖析 §2）")
     ap.add_argument("--no-resample", action="store_true", help="关掉 2:1:1 重采样")
     ap.add_argument("--device", default="auto")
     a = ap.parse_args(argv)
@@ -289,8 +601,10 @@ def main(argv=None) -> int:
         val = val[: a.max_val]
     print(f"[data] train={len(train)} val={len(val)} cls={dict(Counter(s['cls'] for s in train))}", flush=True)
 
-    ds_train = PolicyDataset(train, processor, min_px, max_px)
-    ds_val = PolicyDataset(val, processor, min_px, max_px)
+    ds_train = PolicyDataset(train, processor, min_px, max_px, training=True,
+                             vision_dropout=a.vision_dropout,
+                             body_dropout=a.body_dropout, seed=a.seed)
+    ds_val = PolicyDataset(val, processor, min_px, max_px)  # 验证集永不做 dropout
     collate = make_collate(processor, min_px, max_px)
 
     if a.no_resample:
@@ -310,17 +624,80 @@ def main(argv=None) -> int:
                         num_workers=a.num_workers, collate_fn=collate,
                         persistent_workers=a.num_workers > 0)
 
-    model, head, hidden = load_model(a.model, a.chunk, device)
+    model, head, hidden = load_model(a.model, a.chunk, device,
+                                     vit_lora_blocks=a.vit_lora_blocks,
+                                     vit_lora_r=a.vit_lora_r)
+    injector, ev_head, extra_dim, extra_params = build_extra_heads(
+        hidden, device, a.inject_visual, a.visual_proj, a.visual_grid,
+        a.event_head, a.event_weight)
+    if a.inject_visual:
+        # 注入维度变了，head 必须重建（旧 head.pt 形状对不上）
+        head = ActionHead(hidden, extra=extra_dim).to(device)
+
+    # ---- torch.compile 内层模型 ----
+    # 为什么：训练每步 1174 ms，而数据准备只占 27 ms、GPU 占用只有 50%。
+    # Docs/CPU派发开销剖析-2026-11-01.md §2 实测 eager 前向 110,644 个 kernel / 388 ms，
+    # compile 后 48,454 / 179 ms —— 派发时间几乎严格正比于 kernel 数。
+    # 训练 ≈ 前向 + 反传 ≈ 3x 前向 kernel，388x3 ≈ 1.16 s，与实测 1174 ms 吻合。
+    # 所以瓶颈是 CPU 提交 kernel，不是显卡算力。
+    if a.compile:
+        # ⚠️ 必须先把 oneAPI 工具链塞进环境，否则 Inductor 报
+        # "Failed to find C compiler. Please specify via CC environment variable"。
+        # policy_runtime.setup_oneapi() 做的就是这件事，但本模块不能顶层 import 它
+        # （policy_runtime 反过来 import 本模块，会循环），所以在这里惰性复制一遍。
+        _bin = r"D:\Program Files (x86)\Intel\oneAPI\2026.0\bin"
+        import os as _os
+        if _os.path.isdir(_bin):
+            _os.environ["PATH"] = _bin + _os.pathsep + _os.environ.get("PATH", "")
+            _os.environ.setdefault("ONEAPI_ROOT", r"D:\Program Files (x86)\Intel\oneAPI")
+            _os.environ.setdefault("CC", "icpx")
+            _os.environ.setdefault("CXX", "icpx")
+            print("[compile] oneAPI 工具链已入 PATH (CC=%s)" % _os.environ["CC"], flush=True)
+        else:
+            print("[compile] 警告：oneAPI bin 不存在，编译大概率失败", flush=True)
+        # 编译缓存默认落在 %TEMP%\torchinductor_<user>（实测一次 293 MB / 6235 个文件），
+        # 而本脚本没走 policy_runtime.setup_oneapi()，所以不会自动指到仓库 .tc_cache。
+        _cache = Path(__file__).resolve().parents[2] / ".tc_cache" / "inductor"
+        _cache.mkdir(parents=True, exist_ok=True)
+        _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache))
+
+        # Triton autotune 是**串行**的：一个 Python 线程逐个配置在 GPU 上试跑，
+        # 所以 CPU 只有 1 核多、GPU 只有 18%，两边看着都「空闲」。实测 30 min 走不完，
+        # 而训练本身只跑几十步。关掉 autotune 换编译时间。
+        try:
+            import torch._inductor.config as _ic
+            _ic.max_autotune = False
+            _ic.max_autotune_gemm = False
+            _ic.coordinate_descent_tuning = False
+            print("[compile] autotune 已关闭（编译时间优先）", flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print("[compile] 关 autotune 失败：%r" % (_e,), flush=True)
+        print("[compile] torch.compile inner model …", flush=True)
+        # model = PeftModel > base_model = LoraModel > model = Qwen3_5ForConditionalGeneration
+        #                                              > model = Qwen3_5Model（要编译的是它）
+        # ⚠️ 早先写成 model.base_model.model.model.model，多下了一层，
+        # 拿到 None 就「跳过」了 —— A/B 两组都是未编译，白跑。
+        _inner = model.base_model.model
+        _lm = getattr(_inner, "model", None)
+        if _lm is not None:
+            _inner.model = torch.compile(_lm)
+        else:
+            print("[compile] 找不到内层 Qwen3_5Model，跳过", flush=True)
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_lora = sum(p.numel() for p in trainable)
     n_head = sum(p.numel() for p in head.parameters())
+    if extra_params:
+        print("[inject] visual=%s event=%s extra_dim=%d extra_params=%d"
+              % (a.inject_visual, a.event_head, extra_dim,
+                 sum(p.numel() for p in extra_params)), flush=True)
     print(f"[model] hidden={hidden} lora={n_lora/1e6:.2f}M head={n_head/1e3:.1f}k "
           f"peak_alloc={torch.xpu.memory_allocated()/2**30:.2f} GiB" if device == "xpu" else
           f"[model] hidden={hidden} lora={n_lora/1e6:.2f}M head={n_head/1e3:.1f}k", flush=True)
 
     opt = torch.optim.AdamW([
         {"params": trainable, "lr": a.lr_lora, "weight_decay": a.weight_decay},
-        {"params": list(head.parameters()), "lr": a.lr_head, "weight_decay": 0.0},
+        {"params": list(head.parameters()) + extra_params, "lr": a.lr_head,
+         "weight_decay": 0.0},
     ])
 
     out = Path(a.out)
@@ -334,6 +711,10 @@ def main(argv=None) -> int:
         (d / "adapter").mkdir(parents=True, exist_ok=True)
         model.save_pretrained(d / "adapter")
         torch.save(head.state_dict(), d / "head.pt")
+        if injector is not None:
+            torch.save(injector.state_dict(), d / "injector.pt")
+        if ev_head is not None:
+            torch.save(ev_head.state_dict(), d / "event_head.pt")
         (d / "meta.json").write_text(json.dumps(
             {"hidden": hidden, "steps": K_STEPS, "model": a.model, "tag": tag}, indent=1), encoding="utf-8")
 
@@ -341,6 +722,8 @@ def main(argv=None) -> int:
     step = 0
     model.train()
     for epoch in range(a.epochs):
+        # dropout 的随机流按 epoch 变，否则同一张图每个 epoch 都被同一路命中
+        ds_train.epoch = epoch
         t_ep = time.perf_counter()
         for batch in dl_train:
             t_step = time.perf_counter()
@@ -349,10 +732,26 @@ def main(argv=None) -> int:
                     {k: (list(v.shape) if torch.is_tensor(v) else str(type(v).__name__))
                      for k, v in batch["inputs"].items()}, ensure_ascii=False)
                     + " grid=" + str(batch["inputs"].get("video_grid_thw", None)), flush=True)
-            pred = forward_batch(model, head, batch["inputs"], device)
-            loss = masked_mse(pred, batch["act"].to(device), batch["mask"].to(device))
+            r = forward_batch(model, head, batch["inputs"], device,
+                              injector=injector, event_head=ev_head)
+            if isinstance(r, tuple):
+                pred, ev_logit = r
+            else:
+                pred, ev_logit = r, None
+            act_d = batch["act"].to(device)
+            mask_d = batch["mask"].to(device)
+            loss = masked_mse(pred, act_d, mask_d)
+            if ev_logit is not None:
+                # 事件头 loss：给视觉加压（body 预测不了 go/stop）。只对 mask 有效的块算。
+                ev_y = event_labels(act_d, mask_d)
+                valid_blk = mask_d[:, :8].sum(-1) > 0
+                if bool(valid_blk.any()):
+                    l_ev = torch.nn.functional.binary_cross_entropy_with_logits(
+                        ev_logit[valid_blk], ev_y[valid_blk])
+                    loss = loss + a.event_weight * l_ev
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable + list(head.parameters()), a.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                trainable + list(head.parameters()) + extra_params, a.grad_clip)
             opt.step()
             opt.zero_grad(set_to_none=True)
             step += 1
@@ -366,7 +765,8 @@ def main(argv=None) -> int:
             log_f.flush()
             if a.max_steps and step >= a.max_steps:
                 break
-        val_metrics = evaluate(model, head, dl_val, device)
+        val_metrics = evaluate(model, head, dl_val, device,
+                               injector=injector, event_head=ev_head)
         val_metrics["ep"] = epoch
         print(f"[val] ep={epoch} {json.dumps(val_metrics, ensure_ascii=False)}", flush=True)
         log_f.write(json.dumps(val_metrics, ensure_ascii=False) + "\n")
