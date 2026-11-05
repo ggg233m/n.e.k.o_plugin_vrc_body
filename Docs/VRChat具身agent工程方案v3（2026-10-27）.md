@@ -805,6 +805,22 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 - **chunk_size 只在 batch ≥ 4 时兑现**：默认 64 把 L=119 pad 到 128 后切 2 块、跑跨块顺序扫；128 是单块无顺序扫，单层 fwd+bwd 30.5 → 22.4 ms（与默认 cos 1.000000），18 层折算 548 → 403 ms。整步 batch1 上 966 → 947 ms（噪声量级），batch8 上 1,484 → 1,263 ms（吞吐 +18%）。256 反而变慢——pad 到 256 白算一倍 token。
 - **trisolve 已内置，不必再写**：transformers 5.21 的 `torch_chunk_gated_delta_rule` 直接调 `torch.linalg.solve_triangular(..., unitriangular=True)`（`modeling_qwen3_5.py` L379–390），即 §1 记的「63 次逐行前代 → 一次三角求解」已是现状。
 - **三条加速路在本机全部关闭（复核 2026-10-30）**：① `torch.compile` 与 fla 都依赖 Triton，而 triton-xpu 在本机连 host 助手 `spirv_utils` 都编不出来（缺 SYCL 编译器 `icpx`/`dpclang++`、缺 `ocloc`），内核阶段根本到不了；② `causal_conv1d` 是 CUDA 扩展，XPU 无 kernel；③ transformers 的 hub kernels 按设备类型写死 `cuda`。只剩 eager 档。
+  - **更正（2026-11-02 实测）**：`spirv_utils` 那道坎**已经过了** —— 把 oneAPI 塞进 `PATH` 并设
+    `CC=icpx` / `CXX=icpx`（`train_policy_lora.py` 的 `--compile` 分支就是这么做的），
+    Triton 的 host 助手能编，训练侧 `--compile` 实测 **1.94×**（早期一轮 1207 → 623 ms/step）；
+    **2026-11-03 干净 A/B 复测得 2.16×**（1319.8 → 611.0 ms/step，见
+    `Docs/回归头与主干实测汇总-2026-11-03.md` §1.2），引用时以 **2.16×** 为准。
+    失败点**后移**到 IGC 的模块构建：decode 形状的融合图报
+    `ZE_RESULT_ERROR_MODULE_BUILD_FAILURE`（`main.cpp:339`）/ `No valid triton configs`。
+    **2026-11-03 再次更正（更彻底）**：decode 那个 fp64 报错**也已解决** ——
+    根因是 Python float（`attention_factor = 1.0`、`rms_norm_eps`）被 Inductor 当作
+    运行期标量参数塞进 kernel，而 A770 `has_fp64=False`。设
+    `torch._dynamo.config.specialize_float = True`（把 Python float 折成常量）并把
+    rope 的缩放换成 fp32 张量后，**decode 图编译成功**：算子 6258 → 1824（−71%）、
+    wall 338 → 132 ms（2.6×）。
+    ⇒ **Triton 融合在本机可用且已生效**。剩下的问题是「融合不够彻底」（理想 150–300 个
+    kernel，实际 1824/8995），**不是不可用**。不要把 `fla` 那个库的 5.4× 退化
+    推广成「GatedDeltaNet 没有快实现」或「Triton 编不过」。
 - **本地甜点**：batch 4 + chunk 128，4.41 样本/s、6.31 GiB，给 VR + LAS2 留约 9 GB。
 - **结论**：A770 能跑 LoRA 训练
 
@@ -964,6 +980,185 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 **未来扩展方向**（不在 M0–M6 范围内）：
 - 社交反射与人物追踪（需 Re-ID 改闭集 + 名牌，见 memory `research-2026-09-28`）。
 - 多模态输入（语音、手势识别）。
+
+---
+
+## 15. 2026-11-02 实测更正（追加章节，不改上文）
+
+> **本节是追加内容，§0–§13 与附录 A/B 一字未动**；与上文冲突处一律以本节为准。
+> 编号按任务约定取 §15（正文 §13 之后没有 §14，不是漏段、不是删段）。
+> 每条格式：**原文写的 → 实测是多少 → 证据（可复跑）**。凡我没能在代码或产物里核实的，
+> 明写「未核实」并**保留原文**，不凭印象改。核对人：doc-fixer（task-8），2026-11-02。
+
+### 15.1 §9.1 L525–526「录制里没有可用的转向标签」是坐标约定错误导致的伪结论
+
+**原文（L525–526）**：转向不在动作块里（M0–M1）……不学 ω 的原因是「录制里没有可用的转向标签。
+4 场 params.jsonl 有 `AngularY`，取值到 1024、和 HMD 偏航角速度的相关 **|r| ≤ 0.07**，不是角速度」，
+并写「M2 有 Udon 胶囊体 yaw 后再评估加 ω 输出」。
+
+**实测**：`AngularY` **就是偏航角速度的量化回读（符号为负）**，可以直接当 omega 标签。
+
+1. **正确的 yaw 公式下相关很高**。navmesh 录制的 `hmd.jsonl` 里 R 是 **Z-up**：det 全 **1.0000**；
+   R 的**第二列 z 分量恒为 0（std = 0.0000）**——相机「上」轴永远水平；**第三列均值 ≈ +Z（0.961–0.985，6 场）**。
+   用 `atan2(R[1][0], R[0][0])` 解 yaw、降到 10 Hz 网格中心差分，与 `params.jsonl` 的 `AngularY` 相关：
+   **−0.698 … −0.791**（6 场）；同一批数据换成 Y-up 公式 `atan2(R[0][2], R[2][2])` 只有 **−0.11 … +0.13**
+   —— 那就是「|r| ≤ 0.07」的来源（Y-up 公式测的是 R[0][2] ≈ −0.05 这个近似常量，不是偏航）。
+   （`Docs/像人的VLA-数据采集协议.md:28` 把这个证据写成「第三列方差 0.0048 约等于常数」：
+   0.0048 是第三列 **z 分量**的方差上限，不是整列——措辞偏松，结论对。）
+2. **10 场 policy 录制（四元数）同样成立**：四元数解 yaw（这批四元数 Y 轴是上轴：旋转矩阵第二列均值
+   (0.02, 0.98, 0.01)）→ 10 Hz 网格 → 与 `avatar_params.jsonl` 的 `AngularY`（ZOH 对齐）相关
+   **−0.649 … −0.778（10 场，均值 −0.719）**。
+3. **符号一致**：限定 `|ω| ≥ 5 °/s 且 |AngularY| ≥ 8` 时，「AngularY 与 ω 符号相反」的比例
+   **95.2–99.8%**（10 场）。⚠️ **这个数对阈值敏感**：不设阈值时只有 41–59%，因为近半样本落在
+   0/±8 的量化死区。以后引用这条指标**必须连阈值一起写**。
+4. **量化与削顶（全 10 场 93,570 条）**：取值恒为 **8 的整数倍**（合计 257 个不同值）；
+   **±1024 削顶率 1.055%**；中位 `|v| = 40`；`|v| == 0` 占 10.98%。⇒ 当回归标签够用，不需要削顶。
+
+⇒ **结论：omega 标签不需要 Udon、不需要重录，93,570 条已在盘上**（配 5 Hz 窗口约 23,082 条）。
+
+**证据**：
+- `research/tools/probe_angulary_quant.py` → `.venv_xpu/runs/angulary_quant/angulary_quant.json`
+  （`total.n = 93570`、`clip_pct = 1.055`、`step_mode = 8`、`p50_abs = 40`、`distinct = 257`）；
+- 本次独立复算（2026-11-02）：navmesh 6 场逐场 corr = −0.791 / −0.773 / −0.698 / −0.722 / −0.715 / −0.704；
+  policy 10 场逐场 corr = −0.737 / −0.659 / −0.722 / −0.778 / −0.745 / −0.754 / −0.751 / −0.718 / −0.678 / −0.649
+  （合计 93,570 条 AngularY，符号相反率 95.2–99.8%，回归 K = 2.44–3.93）；脚本已存 `research/../.tmp/_verify_angulary_20261102.py`，见本节末「复跑口径」；
+- `Docs/像人的VLA-数据采集协议.md` §0.1（L13–60）给出同一结论的逐场表（其 navmesh 列 −0.705…−0.798，
+  与我的 −0.698…−0.791 吻合）。
+
+**（2026-11-03 复跑已收口，取代上面这条「未核实」）**：
+- 用 1 s 窗做「AngularY 积分 vs HMD 转角」直接对齐（`research/tools/probe_angulary_unit.py`，6 场、2,322 个窗）：
+  **K = −0.008953 rad/unit（R² 0.787–0.959）** ⇒ 1 单位 = **0.513 °/s**、8 单位 ≈ **4.10 °/s**、
+  满量程 ±1024 ≈ **±525 °/s**；换算成「unit / (°/s)」是 **K = 1.59–2.43（均值 ≈1.99）**。
+- 上面那个 **K = 2.44–3.93 是网格差商回归**，被 ZOH/量化放大；**1.243–1.697 是差商口径的低估**。
+  ⇒ 三套数不是同一个量，**以积分口径的 −0.008953 rad/unit 为准**；旧值不得再用于训练标签。
+- 我的 policy 场逐场 corr 与协议文档（−0.697…−0.826）不完全一致：文档没写平滑窗与网格，我的口径是
+  「10 Hz 网格 + 中心差分」。结论同向同量级，但**数值不能混引**。
+
+### 15.2 §1 的降级顺序在同一份文件里有**三处互不相同**的写法
+
+**原文（三处并列，互相冲突）**：
+
+| 位置 | 预登记的降级顺序 |
+|---|---|
+| L62（G1 门） | ① 1 Hz → ② 回 224² 重训 |
+| L70（不过门时的降级顺序） | ① 1 Hz → ② 只留 ViT + 约 10M 小头 → ③ 拓扑 B |
+| L1087（附录 A R14-2） | ① 1 Hz → ② 双图重放常态化 → ③ 回 224² 重训 |
+
+另外 L108（「降级②是丢弃 LM 直接换小头」）与 L927（「1 Hz + 几何控制器 / 小动作头 / 加 N 卡」）
+沿用 L70 那一套。⇒ 是**三套互不相同的顺序**，「②」在三处各指不同的东西（22⁴ 重训 / 小动作头 / 双图重放）。
+
+**实测**：图重放 p95 **123.4 ms**（离线、GPU 空闲）/ **175.8 ms**（LAS2 + VRChat 并发）；不开图（compile 无图）
+**293.0 ms**，p95 门 ≤ 200 ms 不合格。⇒ 图重放不是「应急降级」，它比 1 Hz 的门还宽；
+**重放应当是默认，1 Hz 只在图捕获失败时兜底**。
+
+**证据**：`Docs/G1实测-图重放通过-2026-11-02.md` 第一、三节；`.venv_xpu/runs/g1_graph.json`
+（`act_ms.p95 = 123.387`）、`.venv_xpu/runs/g1_compile.json`（`act_ms.p95 = 293.047`）、
+`.venv_xpu/runs/g1_concurrent_graph.json`（`act_ms.p95 = 175.811`，`hz = 1.0`、`seconds = 180`）；
+脚本 `research/tools/bench_policy_g1.py`、`research/tools/bench_g1_concurrent.py`。
+
+**未核实（保留原文）**：**2 Hz 没有实跑**（两份 json 都是 1 Hz 节拍：并发那份 `hz: 1.0`，离线那份只有逐次延迟）、
+**没有连跑 10 min**（实跑 180 拍 = 3 min）、**GPU 总占用口径不可用**（见 G1 文档第四节：Windows 计数器按
+「进程 × 引擎」报，实测 109%/113.6%，不能与「整卡 < 90%」同口径比）。「重放提为默认」是实测支持的**建议**；
+降级顺序本身怎么改属于设计判断，**本节不代改**。
+
+### 15.3 §1.2 L103「整条映射的动作分布可迁移」这个前提不成立
+
+**原文（L103）**：「真正带预训练收益的是 ViT 与**整条映射的动作分布**，所以教师信号应取自这两处」。
+
+**实测/原文核对**：GameScaling 官方 Key findings 02 的原文是「**Interface phase, then world phase** —
+Early training brings broad cross-world gains **as the model learns the keyboard–mouse interface**.
+Later gains narrow to in-corpus and related worlds.」
+⇒ CPT 的早期跨世界收益来自**学键鼠接口**这一层；收窄发生在后期。本项目的接口是 **OSC 双轴指令**，
+不是键鼠；能迁移的是 **ViT 表示**与「看图 → 决定一个化身动作」这段回路，**不是接口层到动作分布的整条映射**。
+
+**证据**：<https://gamescaling.github.io/> 的「Key findings」第 02 条（2026-11-02 取）。
+旁证：`Docs/方案审计-安排问题（2026-11-02）.md:109–111` 已按同一段原文写过一遍。
+
+**二读补充（2026-11-02，结论不变、只是钉死）**：官方把四个评测按迁移距离分层——`in-corpus`（MCU / ViZDoom）、
+`unseen · related`（OmniGameArena，原文 `whose actions have counterparts in training`）、
+`unseen · distant`（GameWorld，原文 `a different view and control regime`）。⇒ **迁移挂靠的是「接口/动作在新环境里有对应物」**；
+我们的接口是 OSC 双轴、对键鼠是**不同控制体制**，正落在最远那一档，本节更正方向不变。
+五项原文与逐条判定见 `Docs/GameScaling官方页要点-2026-11-02.md`。
+
+**未核实（保留原文）**：官方只写「早期 / 后期」的阶段划分，**没有**给出「学到了接口的哪一层中间表示」的分解。
+本节只纠正「整条映射可迁移」这一句的事实前提，不推断可迁移的具体层，也不改 §1.2 的蒸馏设计。
+
+### 15.4 §5.2 L321 / §9.2 的 wp 单位口径：训练侧与在线侧差一个 `world_scale`
+
+**原文（§5.2 L321）**：标签单位是 VelocityX/Z 原值（m/s，角色局部系，k = 1.0）。
+§10.6 L715 另写「卡里一律世界米，`1/0.755 ≈ 1.32` 的系统性偏移」。两处都只在**卡**上说得清楚，
+没写**训练侧 wp 是怎么造出来的**。
+
+**实测**：
+- 训练 wp 来自 `build_dr_path` 对 **OSC 速度的积分**（`research/tools/build_policy_dataset.py` L179–209：
+  逐段按朝向积成世界轨迹，再取 lookahead 0.8 的点）——单位是**世界米**；
+- 在线 wp 来自 `PathFollower` 的**网格弧长**（追踪米）；两者差 1/0.755 ≈ **1.32 倍**；
+- 同一录制里「∫|OSC 速度| dt / Σ|SLAM 位姿增量|」：**9 场 0.725–0.754**、**5 场 0.836–0.968**、
+  **3 场短程 1.055–1.092**（这几场路程只有 8–25 m，噪声主导）。
+  ⇒ 「OSC 速度是世界米/秒、SLAM 位姿是追踪米」这个**方向**成立；但比值**不是单一常数**。
+- 17 行输出里含 `20261010_033237_f_mv` 这个离线重处理副本（与 `033237` 数字逐行相同），
+  **独立会话是 16 场**，不是 17 场。
+
+**已修（代码，不是本方案原文）**：`backend/service.py` L2979 `_policy_world_scale()`（读
+`navmesh.cfg.world_scale`，拿不到返回 0 = 调用方跳过换算），调用点 L2945（`_policy_path_ahead`）与
+L3015（`_policy_waypoint`）。**注意**：拿不到时是「静默不换算」，与 §10.6 L718「缺失必须报错」相反。
+
+**证据**：本次复跑 `research/tools/probe_osc_vs_slam_length.py`（`--root navmesh_recordings`），输出见本节末
+「复跑口径」；`Docs/像人的VLA-数据采集协议.md` 有同向记录。
+
+**未核实（保留原文）**：`service.py` L2985 的注释与相关文档都写「长程场次稳定在 0.73–0.75」——**偏强**：
+实测有 5 场落在 0.836–0.968。拿 0.755 当**默认常量**没问题，但别当逐场真值。
+5 场比值偏高的原因（SLAM 漂移 / 眼高未补偿 / 场地尺度）**未测**。
+
+### 15.5 §10.6 L718 的 `world_scale` 前置条件，对现有 10 场录制无法满足
+
+**原文（L718）**：「`world_scale` 随世界走，不写死：从该 `world_key` 的 meta 读……录制时把它写进 `meta.json`」
+「**缺失时 `build_policy_text()` 必须报错，不许默认 0.755**」；G8 第 4 条（L756）同款。
+
+**实测**：
+- 10 场 **policy_obs** 录制（`G:/vrc_recording/2026*`）的 `meta.json` **没有 `world_scale` 字段**。
+  实际键只有：`source, world_key, world_label, frames, elapsed_s, rate_hz, size, source_size, mip, fx, fy, cx, cy,
+  baseline_tracking_m, grab_ms_median, dropped_blank, dropped_queue, encoder, hmd_samples, hmd_max_gap_s,
+  osc_samples, clock, selftest, started_monotonic, started_source, time_base`。
+- 它们的 `avatar_params.jsonl` **只有两个 name：`AngularY`、`VelocityMagnitude`**（没有 `ScaleFactor`，
+  也没有 `EyeHeightAsMeters`）。
+- 对照：`navmesh_recordings` 的 `meta.json` **有** `config.world_scale = 0.75500692132263`（抽查 3 场一致）。
+
+⇒ 三条后果：(a) 按原文「缺失必须报错」执行，**现有 10 场会全部触发报错**；
+(b) 现有 10 场的 `[topo]` / `[wp]` 只能用文档化常量 **0.755** 近似，这本身就是「默认 0.755」，
+与 L718 的禁令相反；(c) 要满足原文的契约，得先让录制把 `world_scale`（或 `ScaleFactor`）写进 `meta.json`。
+
+**为什么没有 ScaleFactor**：`ROADMAP.md` L265–269 记着「该参数**目前没有被 VRChat 发出**（2026-10-05 实测：
+`avatar_params.jsonl` 里只有 `VelocityMagnitude`）」，现状的 `world_scale` 唯一真值源是配置文件
+`navmesh.world_scale`（手改）。⇒ **不是录制脚本漏写，是上游没发**。
+
+**证据**：本次直接读文件（命令见本节末）；`ROADMAP.md` L265–269；`Docs/FACTS.md` L39–45。
+
+**未核实（保留原文）**：`research/tools/record_policy_obs.py` L29 的 docstring 仍写
+「`<out>/avatar_params.jsonl  EyeHeightAsMeters / ScaleFactor 等`」，与实际产物不符——**代码未改**（本次不动代码），
+但那段注释是错的，建议另开任务修。另外 `build_policy_text()` 本身是否已按「缺失即抛错」实现，本次**未逐行核**
+（只在方案与 `research/tools/check_g8_policy_text.py` 里见到契约描述）。
+
+### 15.6 复跑口径（给下一个人核）
+
+- **AngularY 相关**：脚本 `.tmp/_verify_angulary_20261102.py`（A 段 navmesh、B 段 policy，一次跑完）。做法：读 `hmd_frames.jsonl`（policy，四元数）或 `hmd.jsonl`（navmesh，R 矩阵）→ 解 yaw →
+  `np.unwrap` → 插值到 **10 Hz 网格** → `np.gradient(yaw, 0.1)` 得角速度 → 与 `avatar_params.jsonl` /
+  `params.jsonl` 的 `AngularY` 做 **ZOH** 对齐 → Pearson。**别用逐样本差商**：HMD 是 213 Hz 采样，
+  逐样本差商被抖动主导，相关会掉到 −0.05…−0.16（我第一次就是这么错的）。
+- **OSC vs SLAM 路程**：`.venv_xpu\Scripts\python.exe research\tools\probe_osc_vs_slam_length.py --root navmesh_recordings`。
+- **AngularY 量化/削顶**：`.venv_xpu\Scripts\python.exe research\tools\probe_angulary_quant.py --root G:/vrc_recording --out .venv_xpu/runs/angulary_quant`。
+- **meta.json 字段**：`Get-Content <session>/meta.json -Raw | ConvertFrom-Json).PSObject.Properties.Name`。
+
+### 15.7 本节没能在代码/产物里核实、因此**原文一字未改**的条目汇总
+
+| # | 条目 | 状态 |
+|---|---|---|
+| 1 | `AngularY` 的绝对标定：K = 1.243–1.697、8 单位 ≈ 5.75 °/s、全量程 ≈ 737 °/s | **已核实（2026-11-03 积分口径）**：K = −0.008953 rad/unit（R² 0.787–0.959）⇒ 8 单位 ≈ 4.10 °/s、全量程 ≈ ±525 °/s。旧值作废 |
+| 2 | G1 的 2 Hz / 连跑 10 min / GPU 总占用 < 90% / 块丢弃率 ≤ 1% | **未验**（只有 1 Hz × 3 min 的延迟两条） |
+| 3 | 「17 场有 SLAM 位姿的录制」 | **口径修正**：17 行输出含 1 个副本，独立会话 **16 场** |
+| 4 | 「长程场次稳定 0.73–0.75」 | **偏强**：实测 9 场 0.725–0.754、5 场 0.836–0.968 |
+| 5 | 「4 场 params.jsonl 有 AngularY」（L525） | **口径修正**：navmesh 里有 `params.jsonl` 且含 AngularY 的是 **6 场**（2026-11-02 实测） |
+| 6 | §9.2 的「15 场 / 125.1 min / 24k 帧」等数量 | **本次未复核**（不在 task-8 范围） |
 
 ---
 
@@ -1173,3 +1368,97 @@ Qwen3.5 语言模型（853M 总参数）有 12 种线性层：`q_proj`, `k_proj`
 - [VGGT (CVPR 2025 Best Paper)](https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_VGGT_Visual_Geometry_Grounded_Transformer_CVPR_2025_paper.pdf)
 
 **附录结束**。
+
+---
+
+## 附录 C. 本次改动清单（2026-11-02 校对，doc-fixer / task-8）
+
+> 只做「追加更正」，**正文（§0–§13）与附录 A/B 一个字节没改**。本节列清单，便于复核与回滚。
+> 新增章节在正文末尾：**§15「2026-11-02 实测更正」**（在「方案 v3 结束」之前）。
+
+| 文件 | 位置 | 改了什么 | 依据 |
+|---|---|---|---|
+| 本文件 | 正文 §13 之后、『方案 v3 结束』之前（新增 §15，约 130 行） | 追加 §15：15.1 omega 标签伪结论被推翻；15.2 降级顺序三套写法；15.3「整条映射可迁移」前提不成立；15.4 wp 双单位口径；15.5 `world_scale` 前置条件对现有 10 场无法满足；15.6 复跑口径；15.7 未核实汇总 | 见 §15 各条的证据指针（`.venv_xpu/runs/angulary_quant/`、`g1_*.json`、`probe_osc_vs_slam_length.py` 复跑、`G:/vrc_recording/*/meta.json` 与 `avatar_params.jsonl` 直读、GameScaling 官方 findings 02） |
+| 本文件 | 文末（本附录） | 只加这份清单 | — |
+
+**本次核到与原任务描述不一致、按实测写的三处**（避免下游再传错）：
+
+1. **降级顺序不是「四个版本」，是「三套顺序」**（L62 / L70 / L1087），另有 L108、L927 沿用 L70。
+2. **「17 场有 SLAM 位姿」含 1 个副本**（`20261010_033237_f_mv`），独立会话 **16 场**；
+   且「长程场次稳定 0.73–0.75」偏强，实测有 5 场 0.836–0.968。
+3. **「录制 meta.json 里没有 world_scale」只对 policy_obs 的 10 场成立**；
+   `navmesh_recordings` 的 `meta.json` 是有 `config.world_scale = 0.7550069…` 的。
+
+**没有动的东西**：任何代码；`Docs/方案审计-安排问题（2026-11-02）.md`；`Docs/像人的VLA-数据采集协议.md`
+（核对后确认它已自我更正，无需再改）；§1 的降级顺序、§9.1 的 M0–M1 设计判断（只给事实更正，不代改结论）。
+
+---
+
+## 16. 频率口径实测更正（2026-11-05 追加，不改上文）
+
+> 本节只**追加事实**，不改 §1 / §5 / §9.1 的任何一句。与上文冲突处以本节为准。
+> 详细实测见 `Docs/VLA工程落地与阻塞-2026-11-05.md` §10。
+
+### 16.1 为什么必须单列一节
+
+§9.1 与 §1 的「2 Hz」「3 Hz」「10 Hz」指的是**不同层的频率**，此前从未在同一处并列过，
+导致多次沟通把「原始 30 Hz 录制」与「训练用 30 Hz」混为一谈。
+
+### 16.2 五层频率（实测值）
+
+| 层 | 值 | 出处 |
+|---|---|---|
+| **原始录制（视频帧）** | **30.01 Hz**，dt 中位 33.32 ms（p05 31.07 / p95 35.53） | `.tmp/freq_probe.py` 实测 020757 场 |
+| 原始 HMD 采样 | **211.27 Hz**，dt 中位 4.73 ms | 同上 |
+| 原始 OSC 速度流 | **51.61 Hz**（事件驱动，不规则，静默段为 0） | 同上 |
+| **视觉观测** | **5 Hz**，每 0.2 s 一个观测；每样本 prev + cur 两帧，**间隔 0.4 s** | `build_policy_dataset.GRID_S = 0.2`；§1 第 39 行 |
+| **动作标签** | **10 Hz**：12 步 × 0.1 s = 1.2 s | `build_policy_dataset.K_STEPS=12, STEP_S=0.1`；§9.1 |
+| **在线推理** | **约 2 Hz**（2 Hz 下用前 8 步 = 0.8 s） | §1 第 18 行、第 55 行 |
+| **执行** | **10 Hz**（控制环按 `(now − t_obs)/0.1` 取步） | §1 第 55 行；`policy_executor.STEP_S = 0.1` |
+
+**一句话：「30 Hz 原始」不等于「训练用 30 Hz」。训练实际是 5 Hz 观测 + 10 Hz 标签。**
+
+### 16.3 5 Hz 观测的实测代价
+
+按 `|ω| > 0.3 rad/s` 的**独立连续段**计事件，参考网格 30 Hz，10 场：
+
+| 频率 | 事件检出率 | 峰值保留 | 事件时长 |
+|---:|---:|---:|---:|
+| 30 Hz | 100.0% | 100.0% | 0.17 s |
+| 15 Hz | 72.0% | 100.0% | 0.23 s |
+| 10 Hz | 58.1% | 100.0% | 0.29 s |
+| **5 Hz（当前）** | **35.2%** | 100.0% | **0.46 s** |
+
+**当前 5 Hz 只保留 35.2% 的转向事件，且把 0.17 s 的事件抹成 0.46 s。**
+峰值不削 —— 这正是为什么以 mse8 为唯一指标的实验一直没发现它。
+
+另有视觉帧间隔的独立损失：当前 **0.4 s** 的 prev+cur 间隔下，
+**26.9%** 的转向格子两端标签都是 0（0.2 s 间隔下是 17.8%）。
+
+> ⚠️ **速度标签的「无损」结论有保留**（2026-11-05 审计修正）：
+> 本轮测到的 MAE=0.0000 是 **ZOH 对 ZOH** 的构造性恒等（两边取自同一条 OSC 事件流），
+> **不能**推出「5 Hz 对速度标签无损」。要判这一点必须做 `[t, t+0.1)` **区间积分**对照，
+> 而 `像人的VLA-数据采集协议:90-98` 已实测 ZOH→积分会改变横移占比（4.43%→4.49%）。
+> 本节不主张速度无损。
+
+### 16.4 对 §9.1 / §5.2 的补充约束（新增，不推翻原文）
+
+| 项 | 原方案 | 本节追加 |
+|---|---|---|
+| 视觉观测频率 | 5 Hz（由 `GRID_S=0.2` 决定，未单独论证） | **建议提到 10 Hz**；至少把 prev+cur 间隔从 0.4 s 改到 0.2 s |
+| 动作标签频率 | 10 Hz（12 步 × 0.1 s） | **ω 标签单独提到 30 Hz**，平移标签保持 10 Hz |
+| 是否需要 30 Hz 观测 | 未讨论 | **不需要**。15 Hz→10 Hz 只多 14 个百分点，成本翻倍 |
+
+**推荐顺序（成本从低到高）：**
+
+1. **prev+cur 间隔 0.4 s → 0.2 s**（改一个索引，零额外存储）：漏检 26.9% → 17.8%
+2. **ω 标签提到 30 Hz**（只改标签生成，不动图像）：不再把 0.17 s 事件抹成 0.46 s
+3. **视觉观测 5 Hz → 10 Hz**（图像翻倍）：事件检出 35.2% → 58.1%
+
+**这三条都不需要补录**——全部是离线重采样或改标签生成。
+
+### 16.5 与既有结论的关系
+
+§9.1 的「2 Hz 推理 + 10 Hz 执行」**不受影响**（那是推理与执行层，与观测采样无关）。
+受影响的是**观测频率与转向标签频率**这两层 —— 它们此前从未被实测过。
+
