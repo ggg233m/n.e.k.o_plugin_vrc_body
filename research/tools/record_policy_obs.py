@@ -29,6 +29,7 @@ AV1 gq16：33.8 KB/帧、``av1_qsv`` 33–57 fps、90 min 约 9.3 GB；对 LAS2 
     <out>/avatar_params.jsonl EyeHeightAsMeters / ScaleFactor 等（世界米↔追踪米真值）
     <out>/hmd_frames.jsonl    HMD 位姿（每个采集节拍采一次；t 是 perf_counter 绝对秒）
     <out>/run.json、meta.json
+    <out>/astar_guidance.jsonl  （传 --guidance-url 时，与 perf_counter 同域的 A* 软引导）
     <out>/ffmpeg_{L,R}.log    编码器 stderr，失败时先看这里
 
 三条口径
@@ -52,6 +53,17 @@ AV1 gq16：33.8 KB/帧、``av1_qsv`` 33–57 fps、90 min 约 9.3 GB；对 LAS2 
   # 验编码管线、不需要 SteamVR：
   .venv/Scripts/python.exe research/tools/record_policy_obs.py --selftest --seconds 5 \
       --out .tmp/pobs_selftest
+
+  # 录制时同时采样 backend 的 A* 软引导（只读，不接管动作）：
+  .venv/Scripts/python.exe research/tools/record_policy_obs.py --seconds 480 \
+      --out navmesh_recordings/20261106_hybrid \
+      --control-mode memory_revisit --target-ref kitchen_door \
+      --guidance-url http://127.0.0.1:48912/policy/state --guidance-token dev
+
+  # 自由探索/局部命令不带 A*：
+  .venv/Scripts/python.exe research/tools/record_policy_obs.py --seconds 480 \
+      --out navmesh_recordings/20261106_explore \
+      --control-mode explore --intent-text free_explore
 """
 from __future__ import annotations
 
@@ -64,6 +76,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -129,6 +142,53 @@ def _pump(enc_l: _Encoder, enc_r: _Encoder, q: "queue.Queue", errors: list[str])
             return
 
 
+class _GuidancePoller:
+    """可选地从运行中的 backend 采样 A* 软引导，不参与动作控制。"""
+
+    def __init__(self, url: str, token: str, out: Path, hz: float = 10.0) -> None:
+        self.url = str(url)
+        self.token = str(token or "")
+        self.out = Path(out)
+        self.period = 1.0 / max(1.0, float(hz))
+        self.rows: list[dict] = []
+        self.errors = 0
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, name="astar-guidance-poller", daemon=True)
+
+    def start(self) -> None:
+        self._th.start()
+
+    def _loop(self) -> None:
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            if now < next_t:
+                self._stop.wait(min(0.05, next_t - now))
+                continue
+            next_t = max(next_t + self.period, now)
+            try:
+                req = urllib.request.Request(self.url, headers={
+                    "X-Neko-Backend-Token": self.token,
+                    "Accept": "application/json",
+                })
+                with urllib.request.urlopen(req, timeout=min(1.0, self.period * 0.8 + 0.2)) as resp:
+                    state = json.loads(resp.read().decode("utf-8"))
+                g = state.get("astar_guidance") if isinstance(state, dict) else None
+                if not isinstance(g, dict):
+                    continue
+                row = dict(g)
+                row["t"] = float(g.get("t") or now)
+                self.rows.append(row)
+            except Exception:
+                self.errors += 1
+
+    def close(self) -> None:
+        self._stop.set()
+        self._th.join(timeout=2.0)
+        self.out.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in self.rows),
+                           encoding="utf-8")
+
+
 def _synthetic(size: tuple[int, int], i: int) -> np.ndarray:
     """自测用的合成图：横向渐变 + 平移竖条，保证两路编码器有真实内容可编。"""
     w, h = size
@@ -172,8 +232,25 @@ def main() -> int:
     # 归类与远程停止：给录制 UI（research/tools/record_ui.py）用的三个口子。
     ap.add_argument("--world-key", default="", help="世界标识（VRChat 世界或自定义名），写进 meta.json")
     ap.add_argument("--world-label", default="", help="世界显示名（可留空，默认同 world-key）")
+    ap.add_argument("--control-mode", choices=["explore", "prompt_local", "memory_revisit"],
+                    default="explore",
+                    help="本场控制模式；只有 memory_revisit 才允许采集 A* 引导")
+    ap.add_argument("--intent-text", default="",
+                    help="主 LLM 给 VLA 的局部命令或重访说明，写入 meta.json")
+    ap.add_argument("--target-ref", default="",
+                    help="memory_revisit 的固定地点锚点标识，写入 meta.json")
     ap.add_argument("--stop-file", default="", help="该文件出现即正常收尾（给 UI 的「停止」用，不用杀进程）")
+    ap.add_argument("--guidance-url", default=os.environ.get(
+        "VRC_POLICY_GUIDANCE_URL", ""),
+                    help="可选 backend /policy/state 地址；启用后落盘 astar_guidance.jsonl")
+    ap.add_argument("--guidance-token", default=os.environ.get("VRC_BACKEND_TOKEN", "dev"),
+                    help="backend token；只用于读取软引导状态")
+    ap.add_argument("--guidance-hz", type=float, default=10.0)
     args = ap.parse_args()
+
+    if args.guidance_url and args.control_mode != "memory_revisit":
+        print("拒绝把 A* 引导接入 explore/prompt_local 录制；请改用 --control-mode memory_revisit")
+        return 2
 
     ff = args.ffmpeg or shutil.which("ffmpeg") or ""
     if not ff:
@@ -199,6 +276,7 @@ def main() -> int:
     eyes: list[MirrorEye] = []
     encoders: list[_Encoder] = []
     writer = None
+    guidance_poller = None
     started = time.perf_counter()
 
     try:
@@ -239,6 +317,11 @@ def main() -> int:
         writer = threading.Thread(target=_pump, args=(encoders[0], encoders[1], q, write_errors),
                                   name="av1-writer", daemon=True)
         writer.start()
+        if args.guidance_url and not args.selftest:
+            guidance_poller = _GuidancePoller(
+                args.guidance_url, args.guidance_token, out / "astar_guidance.jsonl",
+                hz=args.guidance_hz)
+            guidance_poller.start()
 
         frames_path = out / "frames.jsonl"
         fh = frames_path.open("w", encoding="utf-8")
@@ -311,6 +394,8 @@ def main() -> int:
         q.put(None)
         if writer is not None:
             writer.join(timeout=30.0)
+        if guidance_poller is not None:
+            guidance_poller.close()
         codes = [e.close() for e in encoders]
         if osc is not None:
             osc.close()
@@ -351,6 +436,9 @@ def main() -> int:
     meta = {
         "source": "research/tools/record_policy_obs.py",
         "world_key": args.world_key, "world_label": args.world_label or args.world_key,
+        "control_mode": args.control_mode,
+        "intent_text": args.intent_text,
+        "target_ref": args.target_ref or None,
         "frames": len(frames_written), "elapsed_s": round(elapsed, 2), "rate_hz": round(rate, 3),
         "size": list(size), "source_size": list(src), "mip": int(mip),
         "fx": round(intr[0], 4), "fy": round(intr[1], 4),
@@ -368,6 +456,11 @@ def main() -> int:
         "osc_samples": 0 if osc is None else len(osc.samples),
         "clock": "perf_counter",
         "selftest": bool(args.selftest),
+        "astar_guidance": (None if guidance_poller is None else {
+            "file": "astar_guidance.jsonl", "samples": len(guidance_poller.rows),
+            "errors": int(guidance_poller.errors), "hz": float(args.guidance_hz),
+            "url": args.guidance_url,
+        }),
     }
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
     # _write_telemetry 已写 run.json（含 events[].obs_start_monotonic，是 frames/hmd/osc 的唯一锚点），
@@ -376,6 +469,8 @@ def main() -> int:
     run = json.loads(run_path.read_text(encoding="utf-8")) if run_path.exists() else {}
     run.update({"source": meta["source"], "clock": "time.perf_counter", "frames": len(frames_written),
                 "world_key": args.world_key, "world_label": meta["world_label"],
+                "control_mode": args.control_mode, "intent_text": args.intent_text,
+                "target_ref": args.target_ref or None,
                 "encoder": meta["encoder"]})
     run_path.write_text(json.dumps(run, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -387,6 +482,7 @@ def main() -> int:
         "out": str(out), "frames": len(frames_written), "rate": round(rate, 2),
         "mb": round(mb, 2), "dropped_blank": dropped_blank, "dropped_queue": dropped_queue,
         "world_key": args.world_key, "world_label": meta["world_label"],
+        "control_mode": args.control_mode,
     }), flush=True)
     return 0
 

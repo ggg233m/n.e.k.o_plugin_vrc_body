@@ -87,6 +87,37 @@ $env:VRC_VLM_API_KEY="你的接口密钥" # 也可使用 OPENAI_API_KEY
 URL fragment 中，不会作为 HTTP 请求参数发送；页面只把它保存在当前浏览器会话，
 所有状态和控制 API 仍要求 `X-Neko-Backend-Token`。
 
+### 在控制台配置 VLA
+
+独立控制台的“配置”页包含“VLA 局部控制”区块。填写基础模型目录和策略 run/checkpoint
+目录，勾选“启用 VLA 策略头”，先保持“只记录，不实际控制（dry-run）”，点击保存后重启
+独立后端。首次加载会启动 `.venv_xpu` worker，`/policy/state` 会显示模型、帧、A* 引导质量、动作块
+和启动错误。
+
+VLA 目前不是任务规划器。默认输入仍是当前画面、历史画面、身体速度和可失效的 A* 局部软引导，
+独立输出短时前进/横移/转向动作。调试阶段可以通过 `/policy/prompt` 追加一条场次级自然语言
+提示，观察旧 checkpoint 是否出现零样本泛化；这条提示没有参与训练，不能把有效行为当成已训练能力。
+A*、PathFollower 不得直接发送
+移动或转向，也不得作为速度下限或到点停车门；双目/近距感知仍可作为安全否决层。持久化地图、
+回环和全局路径仍由 navmesh 负责，VLA 通过视觉学局部避障，并在引导失效时继续局部控制。
+
+提示词会持续作用到下一次清除，长度限制为 96 个字符。后端启动后可用：
+
+```powershell
+$h = @{ "X-Neko-Backend-Token" = "dev" }
+Invoke-RestMethod http://127.0.0.1:48912/policy/prompt `
+  -Headers $h -Method Post -ContentType "application/json" `
+  -Body '{"text":"自由探索这个房间，看到障碍物就绕开"}'
+
+# 清除提示，恢复旧 checkpoint 的原始输入
+Invoke-RestMethod http://127.0.0.1:48912/policy/prompt `
+  -Headers $h -Method Post -ContentType "application/json" `
+  -Body '{"text":""}'
+```
+
+只有离线回放和 dry-run 结果满足预期后，才取消 dry-run 并重启；真实控制还要求 AnyaDance、
+OSC、导航会话和自主授权全部可用。
+
 控制台分为总览、视觉与语义、自主控制和配置四页，支持：
 
 - 显示 OpenVINO 实际设备、语义 worker、内存候选缓存和 revision journal；

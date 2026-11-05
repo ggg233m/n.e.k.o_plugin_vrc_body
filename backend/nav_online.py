@@ -49,6 +49,13 @@ import numpy as np
 # Pacer 用绝对截止点 + time.sleep（高精度 waitable timer，不受 tick 影响）+ 1.5 ms
 # 自旋收尾，实测 |err|p99 = 0.014 ms、spin_frac 2.32%。详见 backend/pacing.py。
 from .nav_grid import FREE, OCC, UNK
+
+# 视觉历史帧间隔唯一真源（research/tools 是训练/推理共用目录）。
+# 直接 import 而不是重复字面量：训练侧改 0.2 → 这里自动跟随，避免两边漂移。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "research" / "tools"))
+from policy_histframe import HISTORY_FRAME_S  # noqa: E402
+from policy_modes import (decide_localization, from_follower_axes,  # noqa: E402
+                          from_session_mode)
 from .nav_loop import LoopCloser, LoopConfig, extract_features
 from .nav_memory import NavMemoryStore, SessionWriter, make_thumbnail
 from .nav_prior import L_FREE, L_OCC, PriorConfig, PriorConsumer
@@ -371,6 +378,7 @@ class SessionRecorder:
     ``devices.jsonl``（关键帧拍上全部已连接 OpenVR 设备 ``{"t","d":[{"i","c","r","v","T"(3×4 追踪站立系),
     "serial"/"model"/"sys"/"ctype"}]}``，``t`` 与 events 里该关键帧的 ``t`` 相同；自身身体/手进点云的离线标注用）、
     ``events.jsonl``（关键帧/trail/回环，按建图线程处理顺序）、
+    ``astar_guidance.jsonl``（与策略图像同一 tick 的 A* 局部路径、置信度和失效原因）、
     ``kf/<id>.npz``（点云 + 航位推算位姿 + 入图位姿 + ORB 特征）、``final_poses.npz``（停止时的回环位姿）；
     ``images=True`` 时另有 ``kf_img/<id>_{L,R}.png``（关键帧左右原图，采集分辨率；彩色按 OpenCV 惯例
     RGB→BGR 后写，PNG 颜色是对的，``cv2.imread`` 读回 BGR；只有灰度就存灰度。
@@ -1107,15 +1115,20 @@ class OnlineNavigator:
         # 外部控制头（VLA）要不要每拍左目 RGB：置 True 后感知循环多采一路彩色
         # （与 read_stereo 同一次采集，只差一次 cvtColor）。必须在会话 start 之前设置。
         self.policy_frames = False
-        # False = 外部控制头接管执行：跟随器照常推进（policy_waypoint 要用 progress），
-        # 摇杆不发，但**转向照发**（方案 §9.1：头 A 无 ω，朝向由控制环代管）。
+        # False = 外部 VLA 独立接管执行：本线程只继续提供感知/近距安全数据，
+        # 不运行 PathFollower，也不发送移动或转向。
         self.drive_enabled = True
-        # drive_enabled=False 时控制环置位：跟随器进入原地转（>50°）就按住 VLA 策略块，
-        # 执行器经 hold_provider 每拍读它，转到位自动解除。bool 单写多读，无锁。
+        # 保留字段用于状态兼容；独立 VLA 不再使用 policy_hold。
         self.policy_hold = False
-        # 跟随器本拍本可以给出的前进轴（0..1）。VLA 接管时它不发，但值是真的 ——
-        # 策略的「不许比跟随器差」下限（policy_executor.SafetyGate.floor_frac）读它。
+        # 兼容旧状态字段；独立 VLA 不读取跟随器速度下限。
         self._follower_forward = 0.0
+        # 跟随器本拍的运动学提示："hold" / "turn" / "drive"。
+        # ⚠️ 2026-11-06：这个值**曾经**叫 `_policy_mode`（写成 0/3），与记忆卡
+        # [mode] 的数字撞车但语义完全不同（「跟随器没输出」≠「导航状态=stop」）。
+        # 现已改名并降级为诊断字段；记忆卡 [mode] 只由 policy_mode() 从 NavSession.mode
+        # 单向映射（policy_modes.from_session_mode），两条链路不再共用 `mode` 字段。
+        self._follower_motion_mode = "hold"
+        # 保留字段用于状态兼容；独立 VLA 不再使用 policy_hold。
         self._motion_history = motion_history
         # VelocityY / Grounded：目前只录不用（多层/竖直漂移的离线评估数据）。
         self._vertical_history = vertical_history or (lambda: ())
@@ -1165,8 +1178,9 @@ class OnlineNavigator:
         self._pose_at: float | None = None
         self._stereo_at: float | None = None
         # 最近几帧左目 RGB 与采集时刻（policy_frames=True 时由感知线程填）。
-        # 保留 ~0.6 s：训练侧输入是「当前帧 + 0.4 s 前帧」，1 Hz 的 runner 自己
-        # 采不到 0.4 s 的历史（相邻采样差 1 s），必须从这里取。
+        # 保留 ~0.6 s：训练侧输入是「当前帧 + 0.2 s 前帧」（policy_histframe.HISTORY_FRAME_S），
+        # 1 Hz 的 runner 自己采不到 0.2 s 的历史（相邻采样差 1 s），必须从这里取。
+        # maxlen=12 在 7.9–10 Hz 采集下约 1.2–1.5 s，远大于 0.2 s 需求，无需改。
         self._policy_hist: deque[tuple[float, np.ndarray]] = deque(maxlen=12)
         self._near = False
         self._near_pts = 0
@@ -1899,6 +1913,31 @@ class OnlineNavigator:
                         if left_rgb is not None:
                             with self._state_lock:
                                 self._policy_hist.append((tick, left_rgb))
+                            # 训练混合 VLA 时必须知道“当时 A* 给了什么先验”，不能在
+                            # 离线阶段用未来真实轨迹倒推一条看似正确的路径。和图像共用
+                            # 同一个 tick，且把无定位/过期状态也落盘，供训练做失效增强。
+                            if rec is not None:
+                                try:
+                                    _guide = self.policy_guidance(steps=3, step_m=0.8)
+                                    _path = _guide.get("path")
+                                    rec.line("astar_guidance", {
+                                        "t": tick,
+                                        "requested": bool(_guide.get("requested", False)),
+                                        "control_mode": _guide.get("control_mode", "unknown"),
+                                        "valid": bool(_guide.get("valid", False)),
+                                        "waypoint": list(_guide.get("waypoint") or (0.0, 0.0)),
+                                        "path": (None if _path is None else [
+                                            [float(p[0]), float(p[1])] for p in _path
+                                            if isinstance(p, (list, tuple)) and len(p) >= 2]),
+                                        "mode": int(_guide.get("mode", 0) or 0),
+                                        "confidence": _guide.get("confidence"),
+                                        "pose_age_s": _guide.get("pose_age_s"),
+                                        "sigma_m": _guide.get("sigma_m"),
+                                        "reason": _guide.get("reason"),
+                                        "source": _guide.get("source", "astar_navmesh"),
+                                    })
+                                except Exception as exc:  # noqa: BLE001 - 录制不能拖垮感知
+                                    self._fail("record_astar_guidance", exc)
                         if pair is not None:
                             if c.decoupled:
                                 # 只交接，不在这里算视差（见 _stereo_worker_loop）。
@@ -2400,6 +2439,21 @@ class OnlineNavigator:
         self.policy_hold = False
         with self._nav_lock:
             mode = self.session.mode
+        # VLA 是独立控制器时，navmesh 只保留感知/近距安全数据，不执行 A*、
+        # PathFollower、turn_rate 或 policy_hold。否则 A* 会从另一条线程继续发转向，
+        # 形成两个控制源互相覆盖。
+        if not self.drive_enabled:
+            self._drive_block = None
+            self._last_step = {
+                "state": "external_policy",
+                "reason": "external_policy_owner",
+                "forward": 0.0,
+                "turn_rate": 0.0,
+            }
+            self._follower_forward = 0.0
+            self._follower_motion_mode = "hold"
+            self.policy_hold = False
+            return
         if mode in ("idle", "done"):
             self._drive_block = None
             self._halt()
@@ -2427,20 +2481,11 @@ class OnlineNavigator:
         # 策略的「不许比跟随器差」下限（policy_executor.SafetyGate.floor_frac）要用它。
         # 注意单位：这是 OSC 轴值，不是 m/s；换算在 policy_executor.mps_to_axes 里。
         self._follower_forward = float(out.get("forward") or 0.0)
-        if not self.drive_enabled:
-            # 外部控制头（VLA 头 A）接管摇杆：跟随器已经推进了 progress（policy_waypoint
-            # 要用），但轴不归这里发 —— 两个发送方同时写同一组摇杆只会互相踩。
-            # **转向代管**（方案 §9.1）：头 A 只输出 (vx, vz)、没有 ω，朝向对准沿用跟随器
-            # 的朝向律。turn 走 scheduler 的 play-space yaw 通道，与 VLA 发的 /input 摇杆
-            # 不同通道，不冲突；correction_deg 相对当前实际 yaw，每拍重发不累加超调。
-            turn_rate = float(out.get("turn_rate") or 0.0)
-            if turn_rate != 0.0:
-                self._send_turn(math.degrees(turn_rate) / c.control_hz)
-            # 原地转门：跟随器转 >50°（turn_in_place_rad）说明航点在侧向，不在头 A 的
-            # 训练分布里（0.8 s 内 HMD 转过 >15° 的窗口仅 2.2%）——置 hold 把策略块按住，
-            # 转到位（state 离开 turning）后下拍自动解除。wait_localization 的慢扫不置位。
-            self.policy_hold = out.get("state") == "turning"
-            return
+        # 跟随器本拍的**运动学提示**（诊断用，不是记忆卡 [mode]）。
+        # 记忆卡 [mode] 只由 policy_mode() 从 NavSession.mode 映射，两者不再混用。
+        fwd_ax = float(out.get("forward") or 0.0)
+        turn_ax = float(out.get("turn_rate") or 0.0)
+        self._follower_motion_mode = from_follower_axes(fwd_ax, turn_ax)
         forward = float(out.get("forward") or 0.0)
         turn_rate = float(out.get("turn_rate") or 0.0)
         if forward <= 0.0 and turn_rate == 0.0:
@@ -2489,8 +2534,12 @@ class OnlineNavigator:
             return None
         return last[1], float(last[0])
 
-    def policy_frame_before(self, seconds: float = 0.4) -> tuple[np.ndarray, float] | None:
-        """距今 ``seconds`` 秒最近的一帧左目 RGB（0.4 s = 训练侧两帧的间距）。"""
+    def policy_frame_before(self, seconds: float = HISTORY_FRAME_S) -> tuple[np.ndarray, float] | None:
+        """距今 ``seconds`` 秒最近的一帧左目 RGB。
+
+        默认取训练侧两帧间距（policy_histframe.HISTORY_FRAME_S，当前 0.2 s）。
+        缺帧时返回最近的旧帧或 None —— 调用方负责回退到当前帧，本函数不改该行为。
+        """
         with self._state_lock:
             hist = list(self._policy_hist)
         if not hist:
@@ -2498,6 +2547,113 @@ class OnlineNavigator:
         target = self._clock() - float(seconds)
         at, rgb = min(hist, key=lambda item: abs(item[0] - target))
         return rgb, float(at)
+
+    def policy_mode(self) -> int:
+        """记忆卡 [mode]：NavSession.mode → 0=follow 1=replan 2=explore 3=stop。
+
+        唯一映射在 `policy_modes.from_session_mode`（单向、单一定义）。这里不再
+        按跟随器轴推导 —— 那个值已改名 `_follower_motion_mode`，只是诊断字段。
+
+        刻意**不拿** ``_nav_lock``：2 Hz 策略循环每拍都会读它，而 ``_nav_lock``
+        在建图重建时可能被占住几百毫秒。``session`` 是对象引用、``mode`` 是字符串，
+        无锁读到的要么是旧值要么是新值，都合法。
+        """
+        try:
+            session_mode = self.session.mode
+        except AttributeError:
+            session_mode = None
+        return int(from_session_mode(session_mode))
+
+    def policy_guidance(self, steps: int = 3, step_m: float = 0.8) -> dict[str, Any]:
+        """给 VLA 的 A* 软引导快照。
+
+        A* 只提供低频的方向先验，不能在这里拥有动作出口。``valid`` 只表示
+        当前位姿和跟随路径能否组成一个可用先验；调用方必须把它当作可丢弃的
+        输入，而不是停车条件。位姿过期、未定位或没有路径时，返回无引导状态。
+        """
+        now = self._clock()
+        with self._state_lock:
+            pose_at = self._pose_at
+        est = self._est()
+        age_s = None if pose_at is None else max(0.0, now - float(pose_at))
+        with self._nav_lock:
+            session_mode = self.session.mode
+        # A* 只服务固定记忆点重访（goto）。自由探索以及主 LLM 下达的局部
+        # 提示词任务由 VLA 自己决定动作，不能把 frontier/旧路径伪装成软引导。
+        astar_requested = session_mode == "goto"
+        control_mode = (
+            "memory_revisit" if session_mode == "goto"
+            else "explore" if session_mode == "explore"
+            else "idle"
+        )
+        # 记忆卡 [mode] 与停止归因都从**同一个** NavSession.mode 单向映射，
+        # 不再依赖控制线程写 _policy_mode：VLA 接管时控制线程会主动跳过 A* step。
+        mode_hint = from_session_mode(session_mode)
+        # 定位安全门（2026-11-06）：与 wp / nav mode **完全独立**的判定。
+        # 输入只有定位状态、位姿年龄、定位侧 reason；sigma_m 是 NavConfig 常量，
+        # 不是逐帧质量，所以 quality_max 保持 None（占位，见 policy_modes）。
+        loc = decide_localization(est.get("state"), age_s,
+                                  state_reason=est.get("reason"),
+                                  pose_stale_s=float(self.cfg.pose_stale_s))
+        base: dict[str, Any] = {
+            "valid": False,
+            "requested": astar_requested,
+            "control_mode": control_mode,
+            # 显式导航状态原样带出（字符串）。VLA 只拿它做停止判定，
+            # 不把它当成 privileged 动作输入喂给模型。
+            "nav_state": session_mode,
+            # 定位安全门：ok=False 时 VLA 必须停（stop_source=safety_gate_unlocalized），
+            # 与「有没有路径先验」无关。本地化不可用（无 navmesh）时为 None，不适用。
+            "localization_ok": bool(loc["ok"]),
+            "localization_reason": loc["reason"],
+            "localization_state": loc["detail"]["state"],
+            "localization_state_reason": loc["detail"]["state_reason"],
+            "localization_quality": loc["detail"]["quality"],
+            "localization_quality_max": loc["detail"]["quality_max"],
+            "waypoint": (0.0, 0.0),
+            "path": None,
+            "mode": mode_hint,
+            "pose_age_s": age_s,
+            "sigma_m": None,
+            "confidence": 0.0,
+            "source": "astar_navmesh",
+        }
+        if not astar_requested:
+            base["reason"] = "astar_not_requested" if session_mode == "explore" else "no_memory_revisit"
+            return base
+        if est.get("state") != "localized":
+            base["reason"] = est.get("reason", "not_localized")
+            return base
+        sigma_m = float(est.get("sigma_m") or 0.0)
+        base["sigma_m"] = sigma_m
+        if age_s is None or age_s > float(self.cfg.pose_stale_s):
+            base["reason"] = "pose_stale"
+            return base
+        with self._nav_lock:
+            follower, mode = self.session.follower, self.session.mode
+        if follower is None or mode in ("idle", "done"):
+            base["reason"] = "no_active_path"
+            return base
+        try:
+            waypoint = follower.local_goal(est["xy"], float(est["theta"]), None)
+            path = follower.path_ahead(est["xy"], float(est["theta"]), steps, step_m)
+        except Exception as exc:  # noqa: BLE001 - 引导不可用不能拖垮 VLA
+            base["reason"] = f"path_error:{type(exc).__name__}"
+            return base
+        if waypoint is None:
+            base["reason"] = "no_local_goal"
+            return base
+        # 置信度只用于训练记录和未来的软融合，不作为动作安全判据。
+        confidence = 1.0 / (1.0 + max(0.0, sigma_m))
+        base.update({
+            "valid": True,
+            "waypoint": (float(waypoint[0]), float(waypoint[1])),
+            "path": None if path is None else [(float(a), float(b)) for a, b in path],
+            "mode": mode_hint,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": "ok",
+        })
+        return base
 
     def policy_waypoint(self, lookahead_m: float | None = None) -> tuple[float, float] | None:
         """机体系 ``(dx 右, dz 前)`` 米；没有可走的路径（idle/done/未定位）返回 None。"""

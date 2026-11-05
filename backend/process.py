@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import signal
 import site
+import socket
 import sys
 import threading
 import time
@@ -93,6 +94,21 @@ load_settings_file = webui_module.load_settings_file
 nav_online_module = importlib.import_module(f"{PACKAGE_NAME}.backend.nav_online")  # noqa: E402
 _GRID_LAYERS = nav_online_module._GRID_LAYERS
 
+# 空闲 keep-alive 连接的读超时。控制面板会留下几条不再发请求的长连接，没有这个
+# 上界，请求线程就一直阻塞在 rfile.readline() 上——见 BackendHttpServer 里
+# block_on_close 的注释：它们曾经把整条退出路径挂死。
+_KEEPALIVE_TIMEOUT_S = 10.0
+# 从「收到停机请求」到「进程必须消失」的硬上限。拆卸链路里有第三方库的 join、
+# 子进程 wait 和若干把锁，任何一个失手都不该让用户只能去任务管理器杀进程。
+_SHUTDOWN_HARD_LIMIT_S = 20.0
+# 信号编号 → 日志里的短名。Windows 上 SIGBREAK 是 Ctrl+Break / 关控制台窗口，
+# 语义与 Ctrl+C 不同，但在这里都只表示同一件事：请求一次优雅停机。
+_SIGNAL_NAMES = {
+    getattr(signal, name): name
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK")
+    if hasattr(signal, name)
+}
+
 
 def _json_safe(value: Any) -> Any:
     """递归把非有限浮点数转换为 JSON 标准允许的 null。"""
@@ -103,6 +119,98 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _log_event(event: str, **fields: Any) -> None:
+    """退出路径上的结构化事件日志。
+
+    刻意直接写 stderr 而不是走 logging：拆卸途中 handler 可能已经被关掉、配置也
+    可能被改坏；「进程为什么没退」这类证据不能依赖任何会失效的机制。stdout 留给
+    将来可能的管道协议，这里一律走 stderr，与 ready 那一行同一个通道。
+    """
+    try:
+        print(
+            json.dumps({"event": event, **fields}, ensure_ascii=False),
+            file=sys.stderr,
+            flush=True,
+        )
+    except (OSError, ValueError, TypeError):
+        # 连 stderr 都写不进去时没有第二选择：退出路径不能因为日志抛异常。
+        pass
+
+
+def _force_exit(code: int, *, reason: str) -> None:
+    """不再等拆卸，直接结束进程（先尽力带走 LAS2 子进程）。"""
+    _log_event("forced_exit", reason=reason)
+    try:
+        stereo = importlib.import_module(f"{PACKAGE_NAME}.backend.stereo_backend")
+        closer = getattr(stereo, "close_las2", None)
+        if callable(closer):
+            worker = threading.Thread(target=closer, name="backend-las2-close", daemon=True)
+            worker.start()
+            # 硬退路径只给它很短的时间：超时就带着子进程一起走。stereo_worker 自己
+            # 有心跳看门狗（父进程消失后自行退出），所以这里不值得再拖。
+            worker.join(timeout=2.0)
+    except Exception:  # noqa: BLE001 - 退出路径不能因为清理失败卡住
+        pass
+    os._exit(code)
+
+
+def _exit_process(code: int) -> None:
+    """拆卸完成后强制结束解释器。
+
+    为什么不能靠 return / sys.exit：解释器关闭时会 join 所有 **非 daemon** 线程，
+    而 concurrent.futures 的 ThreadPoolExecutor 正是这一类（双目、推理、捕获链路里
+    的第三方库常用它）。2026-11-05 实测：拆卸已经全部完成、backend_exited 都打出来
+    了，进程还要再挂 14 s，最后是被看门狗带走的 —— 用户看到的就是「点了关停，
+    进程还在」。os._exit 跳过这段等待：该刷的在上面都用 flush=True 打完了，
+    LAS2 子进程由 job 句柄（KILL_ON_JOB_CLOSE）在内核里一并带走。
+    """
+    alive = [thread.name for thread in threading.enumerate() if thread is not threading.main_thread()]
+    _log_event("exiting", code=code, threads=alive[:12], thread_count=len(alive))
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)
+
+
+def _arm_shutdown_watchdog(limit_s: float) -> None:
+    """起一条看门狗：limit_s 秒后进程还在，就硬退。
+
+    为什么必须是 os._exit 而不是等正常返回：用户按下「关停后端」之后进程还赖在
+    那儿，比少一行日志难受得多。宁可以 0 退出码硬退并留一条 forced_exit 记录，
+    也不能让「关不掉」重新变成一个需要去任务管理器的事件。
+    """
+    def run() -> None:
+        time.sleep(max(0.5, float(limit_s)))
+        _force_exit(0, reason="shutdown_watchdog")
+
+    threading.Thread(target=run, name="backend-shutdown-watchdog", daemon=True).start()
+
+
+def _install_shutdown_signals(server: "BackendHttpServer") -> None:
+    """把 Ctrl+C / Ctrl+Break / SIGTERM 统一收成一次优雅停机。
+
+    Windows 上 SIGINT 默认会在主线程抛 KeyboardInterrupt，而 serve_forever 的
+    finally 里正等着拆卸——那条路 2026-11-05 实测会卡死，所以这里自己接管：
+    信号只负责「请求停机」，真正的拆卸顺序仍然留在主线程的 finally 里。
+    第二次按 Ctrl+C 不再等，直接硬退：连按两次时用户想表达的就是「立刻」。
+    """
+    def handler(signum: int, _frame: Any) -> None:
+        name = _SIGNAL_NAMES.get(signum, str(signum))
+        if server.shutting_down.is_set():
+            _force_exit(0, reason=f"second_signal:{name}")
+            return
+        server.request_stop(f"signal:{name}")
+
+    for signum in _SIGNAL_NAMES:
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError, RuntimeError):
+            # 不在主线程 / 平台不支持：跳过，KeyboardInterrupt 分支仍是退路。
+            continue
 
 
 _UI_ASSETS = {
@@ -129,6 +237,24 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
     server: "BackendHttpServer"
     # 保持回环控制连接，避免重复的 OSC/动作调用每次都进行 TCP 握手。
     protocol_version = "HTTP/1.1"
+    # 空闲 keep-alive 的读超时（StreamRequestHandler.setup 会把它设到 socket 上）。
+    # 这是「请求线程为什么能自己结束」的前提：没有它，readline() 会一直等下一行
+    # 请求头，面板留下的一条空连接就能把线程钉到进程退出为止。
+    timeout = _KEEPALIVE_TIMEOUT_S
+
+    def setup(self) -> None:
+        super().setup()
+        # 登记到 server：停机时要主动掐断，不能指望每条连接都自己读到 EOF 再走。
+        self.server.register_connection(self.connection)
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        except OSError:
+            # 客户端先走一步是常态；这里再抛只会让拆卸路径多一个失败源。
+            pass
+        finally:
+            self.server.unregister_connection(self.connection)
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -151,7 +277,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
-            while True:
+            # 这条流是按 FPS 无限推送的，只有客户端断连才会抛 OSError 退出；停机时
+            # 客户端往往还连着，所以必须自查停止位，否则请求线程会一直被
+            # server_close() 等待（见 BackendHttpServer.block_on_close 的注释）。
+            while not self.server.shutting_down.is_set():
                 result = self.server.service.vision.latest_frame(max_age_ms=1000, overlay=False)
                 data = result.get("data") if isinstance(result, dict) else None
                 if isinstance(result, dict) and result.get("available") and isinstance(data, bytes):
@@ -165,6 +294,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 time.sleep(1.0 / 30.0)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
+        # multipart 响应已经在头里声明了 Connection: close，这里补上同一个意图，
+        # 让 handle_one_request 的循环不再进入下一条请求。
+        self.close_connection = True
 
     def _json(self, status: int, payload: Mapping[str, Any]) -> None:
         # JSON 标准不允许 NaN/Infinity；深度模型在“没有非地面点”时可能产生
@@ -236,7 +368,13 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             self._mjpeg()
             return
         if path == "/health":
-            self._json(200, {"ok": True, "pid": os.getpid()})
+            # stopping 让探测方（插件侧 BackendClient、测试、运维）能分清
+            # 「还没起来」和「正在关闭」——这两者的重试策略正好相反。
+            self._json(200, {
+                "ok": True,
+                "pid": os.getpid(),
+                "stopping": self.server.shutting_down.is_set(),
+            })
             return
         if path == "/worldmodel/status":
             self._json(200, self.server.service.world_model_status())
@@ -344,6 +482,10 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         # 放 finally 里清掉：ThreadingHTTPServer 每请求一线程，串扰窗口极小，
         # 但导航器路径读到陈旧地址会污染账本，宁可清。
         self.server.service._http_client_addr = "%s:%s" % self.client_address[:2]
+        # 停机请求只在这里登记，等响应写完之后才动手：request_stop() 会主动掐断
+        # 所有在途连接，先关的话正在回话的这一条也一起断，客户端只会看到
+        # RemoteDisconnected——分不清「已经停了」和「崩了」。
+        shutdown_reason: str | None = None
         try:
             value = self._read_json()
             if self.path == "/config":
@@ -499,9 +641,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 result = self.server.service.plan(value)
             elif self.path == "/cognition/feedback":
                 result = self.server.service.cognition_feedback(value)
+            elif self.path == "/policy/prompt":
+                result = self.server.service.policy_prompt(value.get("text"))
             elif self.path == "/shutdown":
-                result = {"accepted": True}
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                result = {"accepted": True, "stopping": True}
+                shutdown_reason = "http:/shutdown"
             else:
                 self._json(404, {"error": "unknown endpoint"})
                 return
@@ -517,6 +661,11 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     result = dict(result)
                     result["dispatch_latency_ms"] = dispatch_latency_ms
             self._json(200, result)
+            if shutdown_reason is not None:
+                # 响应已落到内核缓冲区，这条连接让它按 finish() 正常关闭，
+                # 停机逻辑自己不碰它。
+                self.close_connection = True
+                self.server.request_stop(shutdown_reason, exclude=self.connection)
         except Exception as exc:
             self._json(400, {"error": f"{type(exc).__name__}: {exc}"[:500]})
         finally:
@@ -525,6 +674,15 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
 
 class BackendHttpServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    # 请求线程全是 daemon，进程退出不靠它们。
+    daemon_threads = True
+    # Python 3.12 的 ThreadingMixIn 默认 block_on_close=True：server_close() 末尾会
+    # self._threads.join()，等待【每一个】请求线程结束。而面板留下的空闲 keep-alive
+    # 连接（阻塞在 rfile.readline）和永不结束的 /vision/mjpeg 流都不会自己结束 ——
+    # 2026-11-05 实测：POST /shutdown 之后监听端口已经关闭、进程却永远活着，
+    # Ctrl+C 走同一条 finally 也一样卡死。所以这里明确不 join：礼貌关连接由
+    # request_stop() 主动掐 socket 负责，进程退出由看门狗兜底。
+    block_on_close = False
 
     def __init__(
         self,
@@ -538,6 +696,69 @@ class BackendHttpServer(ThreadingHTTPServer):
         self.token = token
         self.service = service
         self.config_store = config_store
+        # 停机意图的唯一真值：handler（MJPEG / 健康检查）、信号处理、看门狗都看它。
+        self.shutting_down = threading.Event()
+        self._connections: set[Any] = set()
+        self._connections_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+
+    @property
+    def bound_port(self) -> int:
+        """实际绑定端口。配合 --port=0 让测试和并发实例不必抢固定端口。"""
+        return int(self.server_address[1])
+
+    def register_connection(self, connection: Any) -> None:
+        with self._connections_lock:
+            self._connections.add(connection)
+
+    def unregister_connection(self, connection: Any) -> None:
+        with self._connections_lock:
+            self._connections.discard(connection)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # 停机时我们主动掐断连接，请求线程里的 BrokenPipe / OSError 全是预期噪声；
+        # 打到 stderr 只会掩盖真正的拆卸错误。
+        if self.shutting_down.is_set():
+            return
+        super().handle_error(request, client_address)
+
+    def request_stop(self, reason: str = "unspecified", *, exclude: Any = None) -> bool:
+        """幂等地请求停机；返回 True 表示这次调用真正发起了停机。
+
+        只负责「叫停」：掐断在途连接 + 让 serve_forever 返回。真正的拆卸顺序留在
+        main() 的 finally 里，那里才看得到 service、也才能保证只拆一次。
+        """
+        with self._stop_lock:
+            if self.shutting_down.is_set():
+                return False
+            self.shutting_down.set()
+            with self._connections_lock:
+                connections = list(self._connections)
+                self._connections.clear()
+            for connection in connections:
+                if connection is exclude:
+                    # 正在回话的那条（比如 /shutdown 自己）要让它把响应写完，
+                    # 由 finish() 正常关闭。
+                    continue
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            _log_event("shutdown_requested", reason=reason)
+            threading.Thread(
+                target=self._stop_serving,
+                name="backend-http-stop",
+                daemon=True,
+            ).start()
+            return True
+
+    def _stop_serving(self) -> None:
+        try:
+            # shutdown() 会等 serve_forever 的循环退出（poll_interval=0.1），
+            # 它必须在另一条线程里调用，否则会自己等自己。
+            self.shutdown()
+        except Exception as exc:  # noqa: BLE001 - 停机失败只留痕，不能挡住退出
+            _log_event("shutdown_serve_failed", error=f"{type(exc).__name__}: {exc}"[:240])
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -652,13 +873,16 @@ def main() -> int:
                 config_store=config_store,
             )
             service.start()
-            ui_url = f"http://127.0.0.1:{args.port}/#token={token}"
+            # --port=0 时实际端口由内核分配；报出去的必须是真端口，否则控制台打不开、
+            # 测试也找不到它。
+            port = server.bound_port
+            ui_url = f"http://127.0.0.1:{port}/#token={token}"
             print(
                 json.dumps(
                     {
                         "ready": True,
                         "host": args.host,
-                        "port": args.port,
+                        "port": port,
                         "token": token,
                         "pid": os.getpid(),
                         "offline": offline,
@@ -674,21 +898,43 @@ def main() -> int:
                 import webbrowser
                 threading.Thread(target=webbrowser.open, args=(ui_url,), daemon=True).start()
 
-            def stop(*_: Any) -> None:
-                if server is not None:
-                    threading.Thread(target=server.shutdown, daemon=True).start()
+            _install_shutdown_signals(server)
 
-            signal.signal(signal.SIGTERM, stop)
-            if hasattr(signal, "SIGBREAK"):
-                signal.signal(signal.SIGBREAK, stop)
-            server.serve_forever(poll_interval=0.1)
+            try:
+                server.serve_forever(poll_interval=0.1)
+            except KeyboardInterrupt:
+                # 信号处理器没装上（或装好之前就按了 Ctrl+C）时的退路：仍然走同一条
+                # 优雅停机路径，而不是让 KeyboardInterrupt 冲掉 finally。
+                server.request_stop("keyboard_interrupt")
+            _log_event("serving_stopped")
         finally:
             if server is not None:
-                server.server_close()
-            service.stop()
+                # 无论怎么走到这里（正常停机、启动失败、异常），先武装看门狗再拆：
+                # 拆卸链路卡住时，它是唯一还保证进程会消失的东西。
+                server.request_stop("teardown")
+                _arm_shutdown_watchdog(_SHUTDOWN_HARD_LIMIT_S)
+                try:
+                    server.server_close()
+                except Exception as exc:  # noqa: BLE001 - 关监听套接字失败不该挡住退出
+                    _log_event("server_close_failed", error=f"{type(exc).__name__}: {exc}"[:240])
+            started_at = time.perf_counter()
+            try:
+                service.stop()
+            except Exception as exc:  # noqa: BLE001 - 拆卸失败只留痕，进程必须退出
+                _log_event(
+                    "service_stop_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:240],
+                    elapsed_s=round(time.perf_counter() - started_at, 2),
+                )
+            else:
+                _log_event("service_stopped", elapsed_s=round(time.perf_counter() - started_at, 2))
+        _log_event("backend_exited")
+        # 正常收工也必须走硬退出：解释器自己的线程 join 没有上界（见 _exit_process）。
+        _exit_process(0)
         return 0
     except Exception as exc:
         print(f"backend startup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        _exit_process(1)
         return 1
 
 

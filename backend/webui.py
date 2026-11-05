@@ -55,6 +55,10 @@ _EDITABLE_FIELDS = {
         "detector_accelerator_interval_ms", "lifecycle_watermark_limit",
         "window_title", "window_track_interval_ms",
     }),
+    "policy": frozenset({
+        "enabled", "model_path", "run_path", "dry_run", "hz", "v_max",
+        "stale_s", "floor_frac", "graph", "path_in", "max_len",
+    }),
 }
 
 
@@ -99,6 +103,7 @@ def _canonical_config(config: PluginConfig) -> dict[str, Any]:
         "autonomy": asdict(config.autonomy),
         "world_memory": asdict(config.world_memory),
         "vision": asdict(config.vision),
+        "policy": asdict(config.policy),
     }
 
 

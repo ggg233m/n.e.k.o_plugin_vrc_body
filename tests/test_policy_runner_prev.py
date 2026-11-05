@@ -16,6 +16,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'research' / 'tools'))
 
+from policy_histframe import HISTORY_FRAME_S  # noqa: E402
 from policy_runner import PolicyRunner  # noqa: E402
 
 
@@ -24,9 +25,34 @@ class _FakeRuntime:
 
     def __init__(self):
         self.calls = []
+        self.act_dim = 2
 
     def act(self, cur, prev, wp, body, preprocessed=False):
         self.calls.append({'cur': cur, 'prev': prev, 'wp': wp, 'body': body})
+        return dict(block=[[0.0, 0.0]] * 12, gated=False, obs_t=0.0, latency_ms=1.0)
+
+
+class _SlowThreeChannelRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.act_dim = 3
+
+    def act(self, cur, prev, wp, body, preprocessed=False):
+        self.calls.append({'cur': cur, 'prev': prev, 'wp': wp, 'body': body})
+        return dict(block=[[0.1, 0.2, 0.3]] * 12, gated=False, obs_t=0.0,
+                    latency_ms=1000.0)
+
+
+class _GuidanceRuntime(_FakeRuntime):
+    def act(self, cur, prev, wp, body, mode=0, path=None, **_kwargs):
+        self.calls.append({"cur": cur, "prev": prev, "wp": wp, "body": body,
+                           "mode": mode, "path": path})
+        return dict(block=[[0.0, 0.0]] * 12, gated=False, obs_t=0.0, latency_ms=1.0)
+
+
+class _PromptRuntime(_GuidanceRuntime):
+    def act(self, cur, prev, wp, body, mode=0, path=None, task_prompt=None, **kwargs):
+        self.calls.append({"task_prompt": task_prompt})
         return dict(block=[[0.0, 0.0]] * 12, gated=False, obs_t=0.0, latency_ms=1.0)
 
 
@@ -67,13 +93,19 @@ class PolicyRunnerPrevFrameTests(unittest.TestCase):
         self.assertIs(rt.calls[0]['prev'], rt.calls[0]['cur'])
 
     def test_buffer_history_is_preferred_over_current_frame(self) -> None:
-        """缓冲里已有距今 0.4 s 的帧时，应该用它而不是复制当前帧。"""
+        """缓冲里已有距今 HISTORY_FRAME_S 的帧时，应该用它而不是复制当前帧。
+
+        2026-11-05 更新：历史帧间隔由 0.4 s 改为 0.2 s（policy_histframe）。
+        本用例原来硬编码 0.4，改口径后 0.4 s 的帧落在 0.15 s 容差之外，
+        会走到「回退当前帧」分支 —— 那是**旧口径的正确行为**，不是回归。
+        现在改为从共享常量取，随口径自动跟随。
+        """
         rt = _FakeRuntime()
         old = _frame(7)
         runner = PolicyRunner(rt, lambda: _frame(1), lambda: (0.0, 0.8), lambda: (0.0, 0.0),
                               dry_run=True, hz=50.0)
-        # 手动塞一个「距今 0.4 s」的历史帧
-        runner._push(time.perf_counter() - 0.4, old)
+        # 手动塞一个「距今 HISTORY_FRAME_S」的历史帧（不写字面量，避免再次漂移）
+        runner._push(time.perf_counter() - HISTORY_FRAME_S, old)
         runner.start()
         deadline = time.time() + 2.0
         while not rt.calls and time.time() < deadline:
@@ -81,6 +113,69 @@ class PolicyRunnerPrevFrameTests(unittest.TestCase):
         runner.stop()
         self.assertTrue(rt.calls)
         self.assertIs(rt.calls[0]['prev'], old)
+
+    def test_stale_three_channel_block_keeps_action_dimension(self) -> None:
+        """三通道 B3 过期时也必须生成 [vx, vz, omega] 零块。"""
+        rt = _SlowThreeChannelRuntime()
+        blocks = []
+        runner = PolicyRunner(
+            rt, lambda: _frame(1), lambda: (0.0, 0.0), lambda: (0.0, 0.0),
+            on_block=lambda block, _t, _meta: blocks.append(block),
+            dry_run=False, hz=50.0, stale_s=0.01,
+        )
+        runner.start()
+        deadline = time.time() + 2.0
+        while not blocks and time.time() < deadline:
+            time.sleep(0.01)
+        runner.stop()
+        self.assertTrue(blocks, 'runner 没有产出过期动作块')
+        self.assertTrue(all(len(row) == 3 for row in blocks[0]))
+        self.assertTrue(all(value == 0.0 for row in blocks[0] for value in row))
+
+    def test_guidance_provider_is_soft_input_and_is_logged(self) -> None:
+        rt = _GuidanceRuntime()
+        frames = []
+        runner = PolicyRunner(
+            rt, lambda: _frame(1), lambda: (9.0, 9.0), lambda: (0.0, 0.0),
+            guidance_provider=lambda: {
+                "valid": True,
+                "waypoint": (0.2, 0.8),
+                "path": [(0.2, 0.8), (0.4, 1.4)],
+                "mode": 0,
+                "confidence": 0.7,
+                "pose_age_s": 0.1,
+                "sigma_m": 0.3,
+                "reason": "ok",
+                "source": "astar_navmesh",
+            },
+            on_block=lambda _block, _t, meta: frames.append(meta),
+            dry_run=False, hz=50.0,
+        )
+        runner.start()
+        deadline = time.time() + 2.0
+        while not rt.calls and time.time() < deadline:
+            time.sleep(0.01)
+        runner.stop()
+        self.assertTrue(rt.calls)
+        self.assertEqual(rt.calls[0]["wp"], (0.2, 0.8))
+        self.assertEqual(rt.calls[0]["path"], [(0.2, 0.8), (0.4, 1.4)])
+        self.assertTrue(frames)
+        self.assertEqual(frames[0]["guide_confidence"], 0.7)
+
+    def test_task_prompt_is_forwarded_as_scene_level_input(self) -> None:
+        rt = _PromptRuntime()
+        runner = PolicyRunner(
+            rt, lambda: _frame(1), lambda: (0.0, 0.8), lambda: (0.0, 0.0),
+            prompt_provider=lambda: "自由探索这个房间，看到障碍物就绕开",
+            dry_run=True, hz=50.0,
+        )
+        runner.start()
+        deadline = time.time() + 2.0
+        while not rt.calls and time.time() < deadline:
+            time.sleep(0.01)
+        runner.stop()
+        self.assertTrue(rt.calls)
+        self.assertEqual(rt.calls[0]["task_prompt"], "自由探索这个房间，看到障碍物就绕开")
 
 
 if __name__ == '__main__':

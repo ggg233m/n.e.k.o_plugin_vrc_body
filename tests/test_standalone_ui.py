@@ -257,6 +257,18 @@ class UiAssetSyntaxTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0,
                              f"{js.name} 语法错误：{proc.stderr.strip()[:300]}")
 
+    def test_main_page_exposes_vla_prompt_controls(self) -> None:
+        """独立 WebUI 必须能直接设置场次提示词，不能只在宿主面板里提供入口。"""
+        ui = Path(__file__).resolve().parents[1] / "backend" / "standalone_ui"
+        html = (ui / "index.html").read_text(encoding="utf-8")
+        app = (ui / "app.js").read_text(encoding="utf-8")
+        for el_id in ("policyPrompt", "setPolicyPrompt", "clearPolicyPrompt", "policyPromptFact"):
+            self.assertIn(f'id="{el_id}"', html, f"index.html 少了 {el_id}")
+            if el_id != "policyPromptFact":
+                self.assertIn(f'byId("{el_id}")', app, f"app.js 没绑定 {el_id}")
+        self.assertIn('"/policy/prompt"', app)
+        self.assertIn("提示词入口只用于测试当前模型的零样本泛化", html)
+
     def test_navmesh_panel_exposes_every_status_block_it_renders(self) -> None:
         """面板行是**固定行**：`status()` 新加的字段没人往 HTML/JS 里写，就永远不会显示。
 

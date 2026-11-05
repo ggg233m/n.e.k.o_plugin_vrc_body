@@ -606,8 +606,8 @@ class ControlTickTest(unittest.TestCase):
         self.assertEqual(Harness().nav.goto(1.0, 0.0)["reason"], "navmesh_not_running")
         self.assertFalse(Harness().nav.goto(float("nan"), 0.0)["ok"])
 
-    def test_drive_disabled_delegates_turn_and_moves_nothing(self) -> None:
-        """VLA 接管摇杆时轴不发，但跟随器的转向照发（方案 §9.1 朝向律代管）。"""
+    def test_drive_disabled_removes_astar_from_control_tick(self) -> None:
+        """VLA 独立接管后，A* 控制环不再执行路径、移动或转向。"""
         h = Harness()
         self.prime(h)
         h.nav.session.explore()
@@ -616,13 +616,14 @@ class ControlTickTest(unittest.TestCase):
                                return_value={"state": "following", "forward": 0.6,
                                              "turn_rate": math.radians(30)}) as step:
             h.nav._control_tick(time.monotonic())
-        self.assertTrue(step.called)          # progress 仍要推进，航点才有意义
-        self.assertEqual(h.moves, [])         # 摇杆归 VLA
-        self.assertEqual([round(t, 4) for t in h.turns], [3.0])   # 30°/s ÷ 10 Hz
-        self.assertFalse(h.nav.policy_hold)   # following 不按住
+        self.assertFalse(step.called)
+        self.assertEqual(h.moves, [])
+        self.assertEqual(h.turns, [])
+        self.assertFalse(h.nav.policy_hold)
+        self.assertEqual(h.nav._last_step["state"], "external_policy")
 
-    def test_drive_disabled_holds_policy_on_turn_in_place(self) -> None:
-        """跟随器进入原地转（>50°）＝航点在侧向、出训练分布：置 hold 按住策略块。"""
+    def test_drive_disabled_does_not_hold_policy_on_astar_turn(self) -> None:
+        """A* 原地转不再设置 VLA hold；转向完全由 VLA 动作块负责。"""
         h = Harness()
         self.prime(h)
         h.nav.session.explore()
@@ -632,13 +633,7 @@ class ControlTickTest(unittest.TestCase):
                                              "turn_rate": math.radians(45)}):
             h.nav._control_tick(time.monotonic())
         self.assertEqual(h.moves, [])
-        self.assertEqual([round(t, 4) for t in h.turns], [4.5])   # 45°/s ÷ 10 Hz
-        self.assertTrue(h.nav.policy_hold)
-        # 下一拍转到位：hold 必须解除，不能残留。
-        with mock.patch.object(h.nav.session, "step",
-                               return_value={"state": "following", "forward": 0.6,
-                                             "turn_rate": 0.0}):
-            h.nav._control_tick(time.monotonic())
+        self.assertEqual(h.turns, [])
         self.assertFalse(h.nav.policy_hold)
 
     def test_drive_disabled_zero_turn_sends_nothing(self) -> None:
@@ -669,6 +664,56 @@ class ControlTickTest(unittest.TestCase):
         dx, dz = h.nav.policy_waypoint()
         self.assertAlmostEqual(dx, 0.0, places=6)
         self.assertAlmostEqual(dz, 0.8, places=6)
+
+    def test_policy_guidance_is_soft_and_reports_quality(self) -> None:
+        """A* 只提供可丢弃的先验，快照必须带质量字段。"""
+        from neko_anyadance_body.backend.nav_follow import PathFollower
+
+        h = Harness()
+        self.prime(h)
+        with h.nav._nav_lock:
+            h.nav.session.mode = "goto"
+            h.nav.session.follower = PathFollower([[0.0, 0.0], [5.0, 0.0]])
+        h.nav.drive_enabled = False
+        guide = h.nav.policy_guidance()
+        self.assertTrue(guide["valid"])
+        self.assertEqual(guide["source"], "astar_navmesh")
+        self.assertGreaterEqual(guide["confidence"], 0.0)
+        self.assertIsInstance(guide["path"], list)
+        # A* 已被摘出动作出口，但不应因此消失为输入先验。
+        self.assertEqual(h.moves, [])
+        self.assertEqual(h.turns, [])
+
+    def test_policy_guidance_is_absent_during_explore(self) -> None:
+        """自由探索不请求 A*；VLA 只能依据画面和任务提示词行动。"""
+        from neko_anyadance_body.backend.nav_follow import PathFollower
+
+        h = Harness()
+        self.prime(h)
+        with h.nav._nav_lock:
+            h.nav.session.mode = "explore"
+            # 即使 frontier 规划器已经算出 follower，也不能泄漏给 VLA。
+            h.nav.session.follower = PathFollower([[0.0, 0.0], [5.0, 0.0]])
+        guide = h.nav.policy_guidance()
+        self.assertFalse(guide["requested"])
+        self.assertEqual(guide["control_mode"], "explore")
+        self.assertFalse(guide["valid"])
+        self.assertEqual(guide["reason"], "astar_not_requested")
+        self.assertIsNone(guide["path"])
+
+    def test_policy_guidance_drops_on_stale_pose(self) -> None:
+        from neko_anyadance_body.backend.nav_follow import PathFollower
+
+        h = Harness()
+        self.prime(h)
+        h.nav._pose_at -= 5.0
+        with h.nav._nav_lock:
+            h.nav.session.mode = "goto"
+            h.nav.session.follower = PathFollower([[0.0, 0.0], [5.0, 0.0]])
+        guide = h.nav.policy_guidance()
+        self.assertFalse(guide["valid"])
+        self.assertEqual(guide["reason"], "pose_stale")
+        self.assertEqual(guide["confidence"], 0.0)
 
 
 class SteamVROpenGuardTest(unittest.TestCase):

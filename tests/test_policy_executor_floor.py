@@ -25,7 +25,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "research" / "tools"))
 
-from policy_executor import K_STEPS, PolicyExecutor, SafetyGate  # noqa: E402
+from policy_executor import (K_STEPS, PolicyExecutor, SafetyGate, omega_to_delta_deg,
+                             omega_to_turn)  # noqa: E402
 from policy_runner import PolicyRunner  # noqa: E402
 
 
@@ -34,6 +35,13 @@ def _block(vz: float, vx: float = 0.0):
 
 
 class SafetyGateFloorTests(unittest.TestCase):
+    def test_omega_positive_is_normalized_as_right_turn(self) -> None:
+        self.assertAlmostEqual(omega_to_turn(1.57, 1.57), 1.0)
+        self.assertAlmostEqual(omega_to_turn(-1.57, 1.57), -1.0)
+        # scheduler 的 correction_deg 正值是左转，因此右正标签必须发负角度。
+        self.assertAlmostEqual(omega_to_delta_deg(1.57, 1.57, 100), -9.0, places=2)
+        self.assertAlmostEqual(omega_to_delta_deg(-1.57, 1.57, 100), 9.0, places=2)
+
     def test_floor_zero_is_bitwise_old_behaviour(self) -> None:
         block = [[0.1 * i, 0.05 * i] for i in range(K_STEPS)]
         gate = SafetyGate(v_max=99.0, dv_max=99.0)

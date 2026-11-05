@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from collections import deque
+import json
 import math
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -16,6 +18,7 @@ _RESEARCH_TOOLS = str(Path(__file__).resolve().parents[1] / "research" / "tools"
 if _RESEARCH_TOOLS not in _sys_for_policy.path:
     _sys_for_policy.path.insert(0, _RESEARCH_TOOLS)
 from policy_body import body_feedback  # noqa: E402  （纯函数：OSC 静默时的 body 策略）
+from policy_histframe import HISTORY_FRAME_S  # noqa: E402  （视觉历史帧间隔唯一真源）
 
 from .adapters import (
     ActionTimeline,
@@ -89,6 +92,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_event(event: str, **fields: Any) -> None:
+    """拆卸/退出路径的结构化事件日志（stderr，JSON 一行）。
+
+    为什么不走 self.logger：standalone 模式（backend/process.py）根本不注入 logger，
+    那里 self.logger 恒为 None —— 2880 行那条注释记的正是同一类事故（警告彻底消失）。
+    而「关机为什么慢、卡在哪一步」只有这条路径能说清楚，不能依赖一个可能为 None 的
+    对象，也不能依赖还没配置的 logging。
+    """
+    try:
+        print(
+            json.dumps({"event": event, **fields}, ensure_ascii=False),
+            file=sys.stderr,
+            flush=True,
+        )
+    except (OSError, ValueError, TypeError):
+        pass
 
 # OSC 前进轴满轴对应的实际移动速度（m/s）。方案 v3 §9.1 的速度平台实测：
 # 前进/后退众数 4.0-4.1、p99 4.00，所以满轴推杆就是 4.0 m/s。
@@ -427,9 +448,14 @@ class BackendService:
         self.osc: VrchatOscBridge | None = None
         # VLA 头 A（M0 policy）。默认 None：只有 VRC_POLICY_HEAD=1 才构造。
         self.policy_head = None
+        # UI 保存的 [policy] 段优先于旧环境变量；没有该段时保持历史启动方式。
+        self._policy_configured = isinstance(config_data.get("policy"), Mapping)
         # 策略头装配失败的原因。为 None 且 policy_head 也是 None 时，说明开关没打开。
         # 由 /policy/state 外显 —— 静默失败查一次要 5 分钟（2026-11-02）。
         self._policy_start_error: str | None = None
+        # 当前 VLA 的场次级测试提示。它只改变推理输入，不改变导航器或动作安全门；
+        # 空字符串表示回到旧 checkpoint 的原始输入分布。
+        self._policy_prompt_text = ""
         self._policy_body_last: tuple[float, float] | None = None
         self._policy_body_at = 0.0
         self.driver_log: DriverLogListener | None = None
@@ -510,7 +536,7 @@ class BackendService:
         )
         # policy 头要左目 RGB 才让感知循环多采一路彩色。必须在 navmesh 会话 start 之前
         # 设置（need_rgb 在感知循环入口算一次）。
-        self.navmesh.policy_frames = _env_flag("VRC_POLICY_HEAD")
+        self.navmesh.policy_frames = self._policy_enabled()
         self._control_metrics_lock = threading.Lock()
         self._control_metrics = {
             "count": 0,
@@ -1110,7 +1136,20 @@ class BackendService:
             guard=action_is_current,
         )
 
+    # LAS2 收尾（按真实 pid 收整棵树 + 等子进程退出 + 释放共享内存）在子进程正忙着
+    # 编译时实测要 16.7 s（2026-11-05，--offline 冷启也是这个数），空闲已就绪时 ~1 s。
+    # 退出路径上不值得为「编译中」这种情况等十几秒：taskkill /T /F 与 job 的
+    # KILL_ON_JOB_CLOSE 已经保证子进程活不下来，等不到就继续拆其余资源。
+    _STOP_NAVMESH_SHUTDOWN_BUDGET_S = 3.0
+
     def stop(self) -> None:
+        """按依赖顺序拆掉全部运行时资源。
+
+        每一步都单独计时并吞异常：拆卸是「尽力做完」而不是「做对」，任何一步失败都
+        不该让后面的资源泄漏，更不该让进程退不出去。最后打一行 service_stop_steps，
+        把「关机为什么慢」变成可直接读到的数字（以前它只表现为「关不掉」）。
+        """
+        timings: dict[str, float] = {}
         # 先停 VLA 头：它 10 Hz 写摇杆，必须早于 scheduler 拆除，也不能让它在 navmesh
         # 收帧之后继续拿旧帧。
         stop_flag = getattr(self, "_policy_body_watchdog_stop", None)
@@ -1119,44 +1158,45 @@ class BackendService:
         head = self.policy_head
         self.policy_head = None
         if head is not None:
-            try:
-                head.stop()
-            except Exception:
-                pass
+            self._run_stop_step(timings, "policy_head", head.stop)
         self.navmesh.drive_enabled = True
         # 先停 navmesh 控制环（它会在 OSC/scheduler 拆除前发一次停车）。
-        try:
-            self.navmesh.stop()
-        except Exception:
-            pass
+        self._run_stop_step(timings, "navmesh_stop", self.navmesh.stop)
         # 会话 stop 不关 LAS2 子进程（已编译的进程要跨会话复用），只有后端收工才释放它。
-        try:
-            self.navmesh.shutdown()
-        except Exception:
-            pass
+        self._run_stop_step(
+            timings,
+            "navmesh_shutdown",
+            self.navmesh.shutdown,
+            budget_s=self._STOP_NAVMESH_SHUTDOWN_BUDGET_S,
+        )
         with self._lock:
             # 先解除授权，释放虚拟控制器叠加层和 OSC 回退，再拆除 worker/套接字。
-            try:
-                self._pending_semantic_intent = None
-                self.autonomy.disarm("backend_stopped")
-            except Exception:
-                pass
-            self.navigator.stop()
-            self._stop_vmc_calibration()
-            self._stop_vision_worker_locked(reason="backend_stopped")
-            self.vision.close()
+            self._pending_semantic_intent = None
+            self._run_stop_step(
+                timings,
+                "autonomy_disarm",
+                lambda: self.autonomy.disarm("backend_stopped"),
+            )
+            self._run_stop_step(timings, "navigator_stop", self.navigator.stop)
+            self._run_stop_step(timings, "vmc_calibration", self._stop_vmc_calibration)
+            self._run_stop_step(
+                timings,
+                "vision_worker",
+                lambda: self._stop_vision_worker_locked(reason="backend_stopped"),
+            )
+            self._run_stop_step(timings, "vision_close", self.vision.close)
             if self.driver_log:
-                self.driver_log.stop()
+                self._run_stop_step(timings, "driver_log", self.driver_log.stop)
             if self.action_timeline:
-                self.action_timeline.close()
+                self._run_stop_step(timings, "action_timeline", self.action_timeline.close)
             if self.osc:
-                self.osc.stop()
+                self._run_stop_step(timings, "osc", self.osc.stop)
             if self.scheduler:
-                self.scheduler.shutdown()
+                self._run_stop_step(timings, "scheduler", self.scheduler.shutdown)
             if self.host_vmc:
-                self.host_vmc.stop()
+                self._run_stop_step(timings, "host_vmc", self.host_vmc.stop)
             if self.vmc_idle:
-                self.vmc_idle.stop()
+                self._run_stop_step(timings, "vmc_idle", self.vmc_idle.stop)
             self.driver_log = None
             self.action_timeline = None
             self.osc = None
@@ -1164,6 +1204,51 @@ class BackendService:
             self.host_vmc = None
             self.vmc_idle = None
             self._started = False
+        _emit_event(
+            "service_stop_steps",
+            total_s=round(sum(timings.values()), 2),
+            steps=timings,
+        )
+
+    def _run_stop_step(
+        self,
+        timings: dict[str, float],
+        name: str,
+        action: Callable[[], Any],
+        *,
+        budget_s: float | None = None,
+    ) -> None:
+        """执行一步拆卸：计时、吞异常；给了 budget_s 就限时，超时后让它在后台收尾。
+
+        限时步骤必须放到后台线程：它多半卡在子进程 wait 或第三方库的 join 上，主线程
+        不能陪着等——退出路径的总时长由调用方（后端进程的看门狗）兜底。
+        """
+        started = time.perf_counter()
+        try:
+            if budget_s is None:
+                action()
+            else:
+                worker = threading.Thread(
+                    target=action,
+                    name=f"backend-stop-{name}",
+                    daemon=True,
+                )
+                worker.start()
+                worker.join(timeout=budget_s)
+                if worker.is_alive():
+                    _emit_event(
+                        "stop_step_budget_exceeded",
+                        step=name,
+                        budget_s=budget_s,
+                    )
+        except Exception as exc:  # noqa: BLE001 - 拆卸失败只留痕，不能挡住退出
+            _emit_event(
+                "stop_step_failed",
+                step=name,
+                error=f"{type(exc).__name__}: {exc}"[:240],
+            )
+        finally:
+            timings[name] = round(time.perf_counter() - started, 2)
 
     def _release_all_inputs(self) -> None:
         """用于自主控制和关闭路径的尽力急停释放。"""
@@ -2768,35 +2853,56 @@ class BackendService:
             scheduler.submit("input_release", {"side": side})
 
     # ------------------------------------------------------------ VLA 头 A（M0）
-    def _start_policy_head(self) -> None:
-        """按环境变量挂 M0 VLA 头 A；默认不启动。
+    def _policy_enabled(self) -> bool:
+        """读取 VLA 开关；正式配置存在时不再依赖进程环境变量。"""
+        if bool(getattr(self, "_policy_configured", False)):
+            return bool(self.config.policy.enabled)
+        return _env_flag("VRC_POLICY_HEAD")
 
-        ``VRC_POLICY_HEAD=1`` 打开，``VRC_POLICY_MODEL`` / ``VRC_POLICY_RUN`` 给权重与
-        检查点目录。``VRC_POLICY_DRYRUN`` 默认 1：只写 ``state_dir/policy/policy_live.jsonl``，
+    def _policy_value(self, field: str, env_name: str, default: Any) -> Any:
+        """读取策略参数，兼容旧的环境变量部署清单。"""
+        if bool(getattr(self, "_policy_configured", False)):
+            return getattr(self.config.policy, field)
+        raw = os.getenv(env_name)
+        if raw is None or raw == "":
+            return default
+        return raw
+
+    def _start_policy_head(self) -> None:
+        """按正式配置或兼容环境变量挂 M0 VLA 头 A；默认不启动。
+
+        UI 的 ``[policy]`` 段优先；没有该段时使用 ``VRC_POLICY_*`` 环境变量。
+        ``dry_run`` 默认 true：只写 ``state_dir/policy/policy_live.jsonl``，
         不发轴；设 0 才真正驱动，这时 navmesh 自带控制环让位（``drive_enabled=False``）。
 
         首次装配要加载权重并 torch.compile，会阻塞本进程数十秒 —— 这是显式开关，
         不接受这个代价就不要打开。依赖缺失（默认 .venv 没有 torch）只记一条警告。
         """
-        if not _env_flag("VRC_POLICY_HEAD"):
+        if not self._policy_enabled():
             # 开关没打开是**正常默认**，不刷屏；但把「为什么没起」记下来给 /policy/state，
             # 因为「静默不启动」比「启动失败」更难查（2026-11-02 花了 20 分钟）。
             self._policy_start_error = (
-                "VRC_POLICY_HEAD not set (got %r)" % os.getenv("VRC_POLICY_HEAD"))
+                "VLA policy disabled (set policy.enabled=true or VRC_POLICY_HEAD=1)")
             return
-        model_dir = str(os.getenv("VRC_POLICY_MODEL") or "").strip()
-        run_dir = str(os.getenv("VRC_POLICY_RUN") or "").strip()
+        model_dir = str(self._policy_value("model_path", "VRC_POLICY_MODEL", "") or "").strip()
+        run_dir = str(self._policy_value("run_path", "VRC_POLICY_RUN", "") or "").strip()
         if not model_dir or not run_dir:
             if self.logger:
                 self.logger.warning("policy head skipped: set VRC_POLICY_MODEL and VRC_POLICY_RUN")
             return
-        dry_run = _env_flag("VRC_POLICY_DRYRUN", default=True)
+        dry_run_raw = self._policy_value("dry_run", "VRC_POLICY_DRYRUN", True)
+        dry_run = bool(dry_run_raw) if isinstance(dry_run_raw, bool) else _env_flag(
+            "VRC_POLICY_DRYRUN", default=True
+        )
         # 图重放：需要 Level-Zero V2 适配器（由 PolicyRuntime 内部切）。
         # 默认关闭 —— V2 的单算子派发比 V1 慢，只有确实要吃图才开。
-        graph = _env_flag("VRC_POLICY_GRAPH")
+        graph_raw = self._policy_value("graph", "VRC_POLICY_GRAPH", False)
+        graph = bool(graph_raw) if isinstance(graph_raw, bool) else _env_flag(
+            "VRC_POLICY_GRAPH", default=False
+        )
         try:
-            hz = float(os.getenv("VRC_POLICY_HZ") or 1.0)
-            v_max = float(os.getenv("VRC_POLICY_VMAX") or 1.2)
+            hz = float(self._policy_value("hz", "VRC_POLICY_HZ", 1.0))
+            v_max = float(self._policy_value("v_max", "VRC_POLICY_VMAX", 1.2))
         except ValueError:
             hz, v_max = 1.0, 1.2
         # 块丢弃阈值跟着节拍走（方案 §1：2 Hz → 0.8 s，1 Hz → 1.3 s）。写死 1.3 的
@@ -2804,13 +2910,13 @@ class BackendService:
         # 的节律（2026-11-02 在线实测 halts/s ≈ sends/s）。可用 VRC_POLICY_STALE 覆盖。
         stale_s = 0.8 if hz >= 1.5 else 1.3
         try:
-            stale_s = float(os.getenv("VRC_POLICY_STALE") or stale_s)
+            stale_s = float(self._policy_value("stale_s", "VRC_POLICY_STALE", stale_s))
         except ValueError:
             pass
         # 「不许比跟随器差」的下限系数。默认 0.6（比跟随器慢也不至于慢 16 倍）；
         # 设 0 关闭，逐位回到旧行为。
         try:
-            floor_frac = float(os.getenv("VRC_POLICY_FLOOR") or 0.6)
+            floor_frac = float(self._policy_value("floor_frac", "VRC_POLICY_FLOOR", 0.6))
         except ValueError:
             floor_frac = 0.6
         try:
@@ -2823,9 +2929,19 @@ class BackendService:
                 frame_source=self._policy_frame_source,
                 prev_frame_source=self._policy_prev_frame,
                 captured_at_source=self._policy_frame_captured_at,
-                wp_provider=self._policy_waypoint,
+                # A* 只作为软引导输入；动作出口仍完全归 VLA。
+                # 当前 checkpoint 若 schema.drop_wp=true，会自动忽略航点；新训练的
+                # hybrid checkpoint 可按 schema 消费引导点/路径。两者都不允许用引导
+                # 触发硬停车、速度下限或 A* 转向。
+                wp_provider=None,
+                guidance_provider=self._policy_guidance,
+                mode_provider=None,
                 body_provider=self._policy_body,
                 send_axes=self._policy_send_axes,
+                # ⚠️ 转向必须走独立通道：VRChat 摇杆只有 x/y 两轴，
+                # 早期把 turn 用关键字塞进 send_axes，_policy_send_axes 签名接不住，
+                # except TypeError 兜底后 turn 被静默丢弃 —— 模型输出的 ω 从未进入闭环。
+                send_turn=self._policy_send_turn,
                 log_dir=str(self.state_dir / "policy"),
                 dry_run=dry_run,
                 hz=hz,
@@ -2833,15 +2949,15 @@ class BackendService:
                 stale_s=stale_s,
                 graph=graph,
                 near_obstacle=self._policy_near_obstacle,
-                hold_provider=lambda: bool(getattr(self.navmesh, "policy_hold", False)),
-                # 路径形状输入（默认关）：给模型 k 个沿路径的点，让它看见「前面要左拐」。
-                # 训练集里没有这些 token，所以只在 VRC_POLICY_PATH_IN=1 时启用做 A/B。
-                path_source=(self._policy_path_ahead
-                             if _env_flag("VRC_POLICY_PATH_IN") else None),
-                # 「不许比跟随器差」：策略的 vz 不低于跟随器本可以给出的 floor_frac 倍。
-                # VRC_POLICY_FLOOR=0 关闭（逐位回到旧行为）。
-                floor_provider=self._policy_follower_forward_mps,
-                floor_frac=floor_frac,
+                # A* 不代管原地转，也不给 VLA 速度下限；路径只作为模型输入先验。
+                hold_provider=None,
+                path_source=None,
+                floor_provider=None,
+                floor_frac=0.0,
+                # 引导点不是停车条件；失去定位时由 guidance_provider 返回无效状态。
+                wp_stop=0.0,
+                max_len=int(self._policy_value("max_len", "VRC_POLICY_MAXLEN", 192)),
+                prompt_provider=self._policy_prompt,
                 logger=self.logger,
             )
         except Exception as exc:  # noqa: BLE001 - 可选件装不上不能拖垮 backend
@@ -2858,7 +2974,8 @@ class BackendService:
             return
         self.policy_head = head
         if not dry_run:
-            # 同一组摇杆只能有一个发送方：真实驱动时 navmesh 只留跟随器/航点。
+            # 同一组摇杆只能有一个发送方：真实驱动时 navmesh 只保留建图/引导，
+            # 移动和转向全部由 VLA 动作块发送。
             self.navmesh.drive_enabled = False
             # 调度器 body 输出默认 disabled（只发转向帧、不发摇杆 overlay，见
             # scheduler.py 主发送分支的 _enabled 门）。不 enable 的话轴提交"成功"
@@ -2898,15 +3015,9 @@ class BackendService:
         return rgb
 
     def _policy_follower_forward_mps(self) -> float:
-        """跟随器本拍本可以给出的前进速度（**m/s**），给策略下限用。
+        """兼容旧诊断：跟随器本拍本可以给出的前进速度（**m/s**）。
 
-        为什么需要（2026-11-02）：VLA 接管后 A* 的摇杆被静音，但跟随器的 forward
-        仍在同一拍算出来、只是没发。于是「策略比几何跟随器更差」在结构上没有兜底 ——
-        实测策略稳态 0.25-0.5 m/s，而跟随器是同一条路径的满轴 4.0 m/s。
-
-        单位换算：nav_follow 的 forward 是 OSC 轴值（0..1），满轴 = 4.0 m/s
-        （方案 v3 §9.1 的速度平台实测）。这里换算成 m/s 与策略输出同量纲。
-        跟随器不走（到点/未定位/原地转）时返回 0 = 不设下限。
+        该值不再进入 VLA 的 SafetyGate；保留它只为兼容旧状态和离线诊断。
         """
         try:
             axis = float(getattr(self.navmesh, "_follower_forward", 0.0) or 0.0)
@@ -2915,6 +3026,58 @@ class BackendService:
         if axis <= 0.0:
             return 0.0
         return axis * _OSC_FULL_AXIS_MPS
+
+    def _policy_guidance(self) -> dict[str, Any]:
+        """读取 A* 软引导快照；任何失败都退化为无引导，不影响 VLA 推理。
+
+        2026-11-06：定位安全门是**独立**字段 ``localization_ok``。这里两个兜底
+        都写 ``None``（= 没有定位信息，不适用），因为「引导读取失败」不等于
+        「定位坏了」—— 拿不到就停会让独立 VLA（无 navmesh）永久不动。
+        """
+        try:
+            getter = getattr(self.navmesh, "policy_guidance", None)
+            if callable(getter):
+                value = getter(steps=3, step_m=0.8)
+                if isinstance(value, Mapping):
+                    return dict(value)
+        except Exception as exc:  # noqa: BLE001 - 软引导不可用不能阻断控制
+            return {
+                "valid": False,
+                "waypoint": (0.0, 0.0),
+                "path": None,
+                "mode": 0,
+                "confidence": 0.0,
+                "localization_ok": None,
+                "localization_reason": "guidance_unavailable",
+                "reason": f"guidance_error:{type(exc).__name__}",
+                "source": "astar_navmesh",
+            }
+        return {
+            "valid": False,
+            "waypoint": (0.0, 0.0),
+            "path": None,
+            "mode": 0,
+            "confidence": 0.0,
+            "localization_ok": None,
+            "localization_reason": "guidance_unavailable",
+            "reason": "guidance_unavailable",
+            "source": "astar_navmesh",
+        }
+
+    def _policy_standalone_waypoint(self) -> tuple[float, float]:
+        """旧接线兼容：无导航先验时的零引导点。生产链路使用 _policy_guidance。"""
+        return (0.0, 0.0)
+
+    def _policy_standalone_mode(self) -> int:
+        """旧接线兼容：无导航先验时固定 follow 模式。"""
+        return 0
+
+    def _policy_mode(self) -> int:
+        """记忆卡 [mode]：0=follow 3=stop。来自 navmesh 的状态机（确定性，非模型）。"""
+        try:
+            return int(self.navmesh.policy_mode())
+        except Exception:  # noqa: BLE001 - 读不到按 follow，不能因此停车
+            return 0
 
     def _policy_path_ahead(self):
         """沿路径前进的 k 个机体系点，给 VLA 看路径形状。
@@ -2927,9 +3090,22 @@ class BackendService:
         except ValueError:
             steps = 3
         try:
-            return self.navmesh.policy_path_ahead(steps=steps)
+            pts = self.navmesh.policy_path_ahead(steps=steps)
         except Exception:  # noqa: BLE001 - 拿不到就退回单点
             return None
+        if not pts:
+            return pts
+        # 与 _policy_waypoint 同一口径：追踪米 → 世界米。两处必须一起改，
+        # 否则「单点」和「路径形状」会差 1/0.755 倍，模型看到互相矛盾的尺度。
+        # 轻量测试桩/旧注入对象可能没有这个可选换算钩子；缺失时保持原追踪米。
+        scale_fn = getattr(self, "_policy_world_scale", None)
+        try:
+            ws = float(scale_fn()) if callable(scale_fn) else 0.0
+        except Exception:  # noqa: BLE001 - 尺度拿不到不能阻断策略输入
+            ws = 0.0
+        if ws > 0.0:
+            pts = [(float(a) * ws, float(b) * ws) for a, b in pts]
+        return pts
 
     def _policy_frame_captured_at(self):
         """最近一帧左目的**采集时刻**（perf_counter 域）。
@@ -2948,9 +3124,12 @@ class BackendService:
         return float(captured_at)
 
     def _policy_prev_frame(self):
-        """距今 0.4 s 的左目 RGB；1 Hz 的 runner 自己采不到这个间隔。"""
+        """距今 HISTORY_FRAME_S（当前 0.2 s）的左目 RGB；1 Hz 的 runner 自己采不到这个间隔。
+
+        缺帧仍返回 None，由 PolicyRunner 回退成「当前帧复制一份」——该回退行为不变。
+        """
         try:
-            older = self.navmesh.policy_frame_before(0.4)
+            older = self.navmesh.policy_frame_before(HISTORY_FRAME_S)
         except Exception:
             return None
         if older is None:
@@ -2960,8 +3139,26 @@ class BackendService:
             return None
         return rgb
 
+    def _policy_world_scale(self) -> float:
+        """追踪米 → 世界米的比例。拿不到就返回 0 = 调用方跳过换算。
+
+        **为什么必须有这一步**（2026-11-02 实测）：训练集的 wp 来自
+        `build_policy_dataset.build_dr_path`，它积分的是 **OSC VelocityX/Z**；
+        用 17 场有 SLAM 位姿的录制交叉验证，「OSC 积分路程 / SLAM 位姿路程」
+        在长程场次稳定在 0.73–0.75，正等于 world_scale —— 也就是
+        **OSC 速度是世界米/秒，SLAM 位姿是追踪米**。
+        而 `PathFollower.local_goal` 用的是网格弧长（追踪米），
+        所以这里不换算的话，喂给模型的 |wp| 会比训练分布小约 25%，
+        模型读到「我更近了」于是减速。
+        """
+        try:
+            s = float(getattr(getattr(self.navmesh, "cfg", None), "world_scale", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return s if 0.1 < s < 10.0 else 0.0
+
     def _policy_waypoint(self) -> tuple[float, float]:
-        """机体系航点 (dx 右, dz 前) 米；没有路径时 (0,0) 触发 runtime 的停车门控。
+        """机体系航点 (dx 右, dz 前)，**世界米**；没有路径时 (0,0) 触发停车门控。
 
         **wp 距离下限（2026-11-02 走停振荡的对策）**：路径侧向时投影点落在
         progress+lookahead 之前，实测 wp 恒在 0.5–0.6 m —— 训练数据里这个距离
@@ -2977,6 +3174,15 @@ class BackendService:
             return (0.0, 0.0)
         if wp is None:
             return (0.0, 0.0)
+        # 追踪米 → 世界米（训练口径）。见 _policy_world_scale 的注释。
+        # 轻量测试桩/旧注入对象可能没有这个可选换算钩子；缺失时保持原追踪米。
+        scale_fn = getattr(self, "_policy_world_scale", None)
+        try:
+            ws = float(scale_fn()) if callable(scale_fn) else 0.0
+        except Exception:  # noqa: BLE001 - 尺度拿不到不能阻断策略输入
+            ws = 0.0
+        if ws > 0.0:
+            wp = (wp[0] * ws, wp[1] * ws)
         try:
             wp_min = float(os.getenv("VRC_POLICY_WP_MIN") or 0.8)
         except ValueError:
@@ -3012,12 +3218,40 @@ class BackendService:
                     self._policy_body_at = time.perf_counter()
         last = self._policy_body_last
         osc_body = last if last is not None and time.perf_counter() - self._policy_body_at <= _POLICY_BODY_ZOH_S else None
-        try:
-            wp = self._policy_waypoint()
-        except Exception:
-            wp = None
-        nudged = _env_flag("VRC_POLICY_BODY_NUDGE", default=True)
-        return body_feedback(osc_body, wp, nudged=nudged)
+        # 混合 VLA 不把 A* 航点伪造成身体速度；只喂真实 OSC 反馈，
+        # A* 先验走 guidance_provider 的独立输入口。
+        return body_feedback(osc_body, None, nudged=False)
+
+    def _policy_prompt(self) -> str | None:
+        """返回当前场次提示；读取失败时退化成无提示输入。"""
+        with self._lock:
+            value = self._policy_prompt_text
+        return value or None
+
+    def policy_prompt(self, text: Any = "") -> dict[str, Any]:
+        """设置或清除 VLA 的场次级测试提示。"""
+        if text is None:
+            normalized = ""
+        elif isinstance(text, (dict, list, tuple, set)):
+            return {"accepted": False, "reason": "text must be a string", "prompt": self._policy_prompt_text}
+        else:
+            normalized = " ".join(str(text).replace("\x00", " ").split())
+        if len(normalized) > 96:
+            return {
+                "accepted": False,
+                "reason": "text must be at most 96 characters",
+                "prompt": self._policy_prompt_text,
+            }
+        with self._lock:
+            self._policy_prompt_text = normalized
+        return {
+            "accepted": True,
+            "prompt": normalized,
+            "active": bool(normalized),
+            "scope": "persistent_until_cleared",
+            "trained": False,
+            "reason": "inference_only_prompt_experiment",
+        }
 
     def policy_state(self) -> dict[str, Any]:
         """policy 头 A 的可观测性快照（调试端点 /policy/state）。
@@ -3026,9 +3260,31 @@ class BackendService:
         2026-11-01 在线首跑时"角色不动"查了半小时就是缺这一环。只读，不改状态。
         """
         head = self.policy_head
+        configured = self._policy_configured
+        policy_cfg = self.config.policy
+        config_view = {
+            "configured": configured,
+            "enabled": self._policy_enabled(),
+            "model_path": policy_cfg.model_path if configured else bool(os.getenv("VRC_POLICY_MODEL")),
+            "run_path": policy_cfg.run_path if configured else bool(os.getenv("VRC_POLICY_RUN")),
+            "dry_run": policy_cfg.dry_run if configured else _env_flag("VRC_POLICY_DRYRUN", default=True),
+            "hz": policy_cfg.hz if configured else float(os.getenv("VRC_POLICY_HZ") or 1.0),
+            "v_max": policy_cfg.v_max if configured else float(os.getenv("VRC_POLICY_VMAX") or 1.2),
+            "stale_s": policy_cfg.stale_s if configured else None,
+            "floor_frac": policy_cfg.floor_frac if configured else None,
+        }
         if head is None:
             err = getattr(self, "_policy_start_error", None)
+            with self._lock:
+                prompt_text = self._policy_prompt_text
             return {"present": False,
+                    "task_prompt": {
+                        "text": prompt_text,
+                        "active": bool(prompt_text),
+                        "scope": "persistent_until_cleared",
+                        "trained": False,
+                    },
+                    "config": config_view,
                     "reason": err or "policy head not started (VRC_POLICY_HEAD off?)",
                     "start_error": err}
         runner = getattr(head, "runner", None)
@@ -3048,16 +3304,87 @@ class BackendService:
         except Exception as exc:  # noqa: BLE001
             nav_frame = {"error": repr(exc)[:120]}
         try:
-            wp = self._policy_waypoint()
+            guidance = self._policy_guidance()
         except Exception as exc:  # noqa: BLE001
-            wp = ("error", repr(exc)[:120])
+            guidance = {"valid": False, "reason": repr(exc)[:120]}
         try:
             near = self._policy_near_obstacle()
         except Exception as exc:  # noqa: BLE001
             near = ("error", repr(exc)[:120])
+
+        def _block_view(value: Any, limit: int | None = None) -> list[list[float | None]]:
+            """把任意维度的动作块转换成可序列化的诊断数据。"""
+            if value is None:
+                return []
+            try:
+                rows = list(value)
+            except TypeError:
+                rows = [value]
+            if limit is not None:
+                rows = rows[:limit]
+
+            result: list[list[float | None]] = []
+            for row in rows:
+                if isinstance(row, (str, bytes)):
+                    values = [row]
+                else:
+                    try:
+                        values = list(row)
+                    except TypeError:
+                        values = [row]
+                normalized: list[float | None] = []
+                for value_item in values:
+                    try:
+                        number = float(value_item)
+                    except (TypeError, ValueError):
+                        normalized.append(None)
+                        continue
+                    normalized.append(round(number, 3) if math.isfinite(number) else None)
+                result.append(normalized)
+            return result
+
+        consumes_wp = not bool(getattr(rt, "drop_wp", False))
+        consumes_path = bool(getattr(rt, "path_in", False))
+        with self._lock:
+            prompt_text = self._policy_prompt_text
         return {
             "present": True,
+            "task_prompt": {
+                "text": prompt_text,
+                "active": bool(prompt_text),
+                "scope": "persistent_until_cleared",
+                "trained": False,
+            },
+            "config": config_view,
             "dry_run": bool(getattr(head, "dry_run", None)),
+            "control_owner": "dry_run" if bool(getattr(head, "dry_run", None)) else "vla",
+            # 兼容旧 UI：这个字段描述 A* 是否还能直接发动作；软引导不计入其中。
+            "astar_control_enabled": bool(getattr(self.navmesh, "drive_enabled", True)),
+            "astar_guidance": {
+                "valid": bool(guidance.get("valid", False)),
+                "requested": bool(guidance.get("requested", False)),
+                "control_mode": guidance.get("control_mode", "unknown"),
+                "t": time.perf_counter(),
+                "waypoint": (list(guidance.get("waypoint"))
+                              if isinstance(guidance.get("waypoint"), (tuple, list)) else [0.0, 0.0]),
+                "path": (list(guidance.get("path"))
+                          if isinstance(guidance.get("path"), (tuple, list)) else None),
+                "confidence": guidance.get("confidence"),
+                "pose_age_s": guidance.get("pose_age_s"),
+                "sigma_m": guidance.get("sigma_m"),
+                "reason": guidance.get("reason"),
+                "source": guidance.get("source", "astar_navmesh"),
+            },
+            "input_contract": {
+                "waypoint": consumes_wp,
+                "path_shape": consumes_path,
+                "path_available": bool(guidance.get("path")),
+                "guidance_is_soft": True,
+                "guidance_requested_only_for_memory_revisit": True,
+                "guidance_confidence": True,
+                "follower_speed_floor": False,
+                "turn_owner": "vla",
+            },
             "graph_enabled": bool(getattr(rt, "graph_enabled", None)),
             "graph_ready": bool(getattr(rt, "graph_ready", None)),
             "runner_alive": bool(getattr(getattr(runner, "_th", None), "is_alive", lambda: False)()),
@@ -3066,18 +3393,20 @@ class BackendService:
             "frame_buffer_n": len(buf),
             "last_frame_age_s": round(last_frame_age, 3) if last_frame_age is not None else None,
             "nav_frame": nav_frame,
-            "wp_now": list(wp) if isinstance(wp, tuple) else wp,
+            "guide_waypoint_now": (
+                list(guidance.get("waypoint"))
+                if isinstance(guidance.get("waypoint"), (tuple, list)) else None),
             "body_now": list(self._policy_body()),
             "runner_block_last": (
-                [[round(float(a), 3), round(float(b), 3)] for a, b in getattr(runner, "_last_block", [])[:2]]
+                _block_view(getattr(runner, "_last_block", None), 2)
                 if runner is not None else None),
             "runner_meta_last": getattr(runner, "_last_meta", None),
             "runner_block_all": (
-                [[round(float(a), 3), round(float(b), 3)] for a, b in getattr(runner, "_last_block", [])]
+                _block_view(getattr(runner, "_last_block", None))
                 if runner is not None else None),
             "near_obstacle": {"stop": near[0], "points": near[1]} if isinstance(near, tuple) else near,
             "executor_block_last": (
-                [[round(float(a), 3), round(float(b), 3)] for a, b in getattr(executor, "_block", [])[:2]]
+                _block_view(getattr(executor, "_block", None), 2)
                 if executor is not None else None),
             "executor_obs_age_s": round(time.perf_counter() - float(getattr(executor, "_obs_t", 0)), 3)
                                   if executor is not None else None,
@@ -3155,10 +3484,30 @@ class BackendService:
                 if self.logger:
                     self.logger.warning("policy watchdog error: %s", exc)
 
+    def _policy_send_turn(self, delta_deg: float) -> bool:
+        """policy 执行环的转向出口。单位**度**，走 scheduler 的 turn 通道。
+
+        为什么不能走摇杆：VRChat 的 move 轴只有 Horizontal/Forward 两维，
+        转向由独立的 Look/转身通道承担（见 _navigator_send_turn）。
+        """
+        try:
+            autonomy = self.autonomy.snapshot()
+            if not autonomy.get("armed"):
+                return False
+            if bool(autonomy.get("goal")):
+                # 与 _policy_send_axes 同一条互斥：LocalNavigator 正在发转向。
+                return False
+            return bool(self._navigator_send_turn(float(delta_deg)))
+        except Exception:  # noqa: BLE001 - 转向失败不能拖垮运动出口
+            return False
+
     def _policy_send_axes(self, x: float, y: float, duration_ms: int) -> bool:
         """policy 执行环出口：只走 AnyaDance 主通道（左摇杆），绝不回退 OSC。"""
         try:
-            if bool(self.autonomy.snapshot().get("goal")):
+            autonomy = self.autonomy.snapshot()
+            if not autonomy.get("armed"):
+                return False
+            if bool(autonomy.get("goal")):
                 # LocalNavigator 正为语义目标发轴：同一组摇杆不能有两个发送方。
                 return False
         except Exception:

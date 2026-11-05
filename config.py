@@ -540,6 +540,24 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class PolicyConfig:
+    """VLA 策略头配置；模型只负责局部运动，不负责选择游戏目标。"""
+
+    enabled: bool = False
+    model_path: str = ""
+    run_path: str = ""
+    dry_run: bool = True
+    hz: float = 2.0
+    v_max: float = 1.2
+    stale_s: float = 0.8
+    # 兼容旧配置字段；独立 VLA 控制链不再接入跟随器速度下限。
+    floor_frac: float = 0.0
+    graph: bool = False
+    path_in: bool = False
+    max_len: int = 192
+
+
+@dataclass(frozen=True)
 class PluginConfig:
     host: str = "127.0.0.1"
     port: int = 39570
@@ -561,6 +579,7 @@ class PluginConfig:
     world_model: WorldModelConfig = WorldModelConfig()
     navmesh: NavmeshConfig = NavmeshConfig()
     vision: VisionConfig = VisionConfig()
+    policy: PolicyConfig = PolicyConfig()
     profile: BodyProfile = BodyProfile()
     safety: SafetyConfig = SafetyConfig()
 
@@ -581,6 +600,7 @@ class PluginConfig:
         world_memory = _section(root, "world_memory")
         world_model = _section(root, "world_model")
         vision = _section(root, "vision")
+        policy = _section(root, "policy")
         safety = _section(root, "safety")
 
         host = str(anyadance.get("host", "127.0.0.1")).strip()
@@ -1041,6 +1061,27 @@ class PluginConfig:
                 name="vision.window_track_interval_ms",
             ),
         )
+
+        def policy_text(name: str) -> str:
+            value = str(policy.get(name, "") or "").strip()
+            if len(value) > 2048 or "\x00" in value:
+                raise ValueError(f"policy.{name} is too long or contains NUL")
+            return value
+
+        policy_config = PolicyConfig(
+            enabled=_boolean(policy.get("enabled"), False, name="policy.enabled"),
+            model_path=policy_text("model_path"),
+            run_path=policy_text("run_path"),
+            # 只记录是默认值；解除 dry-run 必须由用户显式操作。
+            dry_run=_boolean(policy.get("dry_run"), True, name="policy.dry_run"),
+            hz=_finite_float(policy.get("hz"), 2.0, minimum=0.2, maximum=10.0, name="policy.hz"),
+            v_max=_finite_float(policy.get("v_max"), 1.2, minimum=0.05, maximum=4.0, name="policy.v_max"),
+            stale_s=_finite_float(policy.get("stale_s"), 0.8, minimum=0.1, maximum=10.0, name="policy.stale_s"),
+            floor_frac=_finite_float(policy.get("floor_frac"), 0.0, minimum=0.0, maximum=1.0, name="policy.floor_frac"),
+            graph=_boolean(policy.get("graph"), False, name="policy.graph"),
+            path_in=_boolean(policy.get("path_in"), False, name="policy.path_in"),
+            max_len=_bounded_int(policy.get("max_len"), 192, minimum=32, maximum=512, name="policy.max_len"),
+        )
         behavior_config = BehaviorConfig(
             default_crossfade_ms=_bounded_int(
                 behavior.get("default_crossfade_ms"),
@@ -1141,6 +1182,7 @@ class PluginConfig:
             world_model=world_model_config,
             navmesh=navmesh_config,
             vision=vision_config,
+            policy=policy_config,
             profile=body_profile,
             safety=safety_config,
         )

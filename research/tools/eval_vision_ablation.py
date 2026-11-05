@@ -12,7 +12,7 @@
 **做法**：固定 (wp, body) 与文本不变，只替换视频张量，看动作块怎么变。
 四个条件都跑同一批样本：
 
-* base      —— 真实两帧（当前 + 0.4 s 前）
+* base      —— 真实两帧（当前 + 0.2 s 前）
 * black     —— 两帧全黑（保留形状与 token 数，视觉特征恒定）
 * shuffle   —— 换成**别的样本**的图像（场景内容全错，但仍是自然图像）
 * same      —— 两帧都用当前帧（抹掉时间差分）
@@ -77,14 +77,38 @@ class AblateDataset(Dataset):
 
 
 @torch.no_grad()
-def predict(model, head, loader, device, injector=None):
-    out = []
+def predict(model, head, loader, device, injector=None, want_labels=False):
+    """返回预测块；want_labels 时连 (act, mask) 一起返回，用于算真 mse。
+
+    ⚠️ 只比 cos 是不够的：cos 低只说明「对图像敏感」，不说明「读对了」。
+    判据必须是对标签的误差：mse8(real) 应当显著小于 mse8(shuffle)。
+    """
+    out, acts, masks = [], [], []
     for batch in loader:
         r = forward_batch(model, head, batch["inputs"], device, injector=injector)
         if isinstance(r, tuple):
             r = r[0]
         out.append(r.float().cpu().numpy())
-    return np.concatenate(out)
+        if want_labels:
+            acts.append(batch["act"].numpy())
+            masks.append(batch["mask"].numpy())
+    pred = np.concatenate(out)
+    if want_labels:
+        return pred, np.concatenate(acts), np.concatenate(masks)
+    return pred
+
+
+def mse8_of(pred, act, mask, steps=8):
+    """**只取速度两维**，与 train_policy_lora.masked_mse 的 mse8 口径对齐。
+
+    ⚠️ 2026-11-04 修正：此前写成 pred[:, :steps, :]，把 ω 也算了进去。
+    ω 是 rad/s（std=1.58），量级与速度（±4）不同但远大于「静止样本」的 0，
+    会把 mse8 从 2.12 拉到 19.11（差 9 倍），导致本工具的数和训练日志对不上。
+    训练日志里的 mse8 一律是 p[..., :2] 与 a[..., :2]。
+    """
+    err = ((pred[:, :steps, :2] - act[:, :steps, :2]) ** 2).sum(-1)
+    m = mask[:, :steps]
+    return float((err * m).sum() / max(m.sum(), 1.0))
 
 
 def compare(base: np.ndarray, other: np.ndarray) -> dict:
@@ -130,15 +154,32 @@ def main(argv=None) -> int:
     samples = build_index(Path(a.dataset), None)
     val = [s for s in samples if s["split"] == "val"]
     print("[data] val=%d, 用前 %d 条" % (len(val), a.n), flush=True)
-    ds = PolicyDataset(val, processor, min_px, max_px)
+    ds = PolicyDataset(val, processor, min_px, max_px)   # 占位；每个 run 另行按格式重建
     collate = make_collate(processor, min_px, max_px)
 
     modes = ["base", "black", "shuffle", "same"]
-    loaders = {
-        m: DataLoader(AblateDataset(ds, a.n, m), batch_size=a.batch, shuffle=False,
-                      num_workers=0, collate_fn=collate)
-        for m in modes
-    }
+
+    def make_loaders(dataset):
+        return {m: DataLoader(AblateDataset(dataset, a.n, m), batch_size=a.batch,
+                              shuffle=False, num_workers=0, collate_fn=collate)
+                for m in modes}
+
+    def run_prompt_format(run: Path) -> str:
+        """按 run 的 meta.json 判定该模型训练时用的 prompt 格式。
+
+        2026-11-02 换了记忆卡格式之后，用新格式评旧 checkpoint 会得出错误的绝对误差
+        （同一模型 real mse8 从 1.2467 涨到 1.9644）。旧 run 的 meta.json 里没有
+        这个字段，据此回落 legacy。
+        """
+        mp = run / "meta.json"
+        if mp.exists():
+            try:
+                fmt = json.loads(mp.read_text(encoding="utf-8")).get("prompt_format")
+                if fmt in ("card", "legacy"):
+                    return fmt
+            except Exception:  # noqa: BLE001
+                pass
+        return "legacy"
 
     out_dir = Path(a.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -146,9 +187,23 @@ def main(argv=None) -> int:
     for run in a.runs:
         run = Path(run)
         print("[load] %s" % run, flush=True)
-        model, head, hidden = load_model(a.model, 128, device)
-        model.load_adapter(str(run / "adapter"), adapter_name="trained", is_trainable=False)
-        model.set_adapter("trained")
+        # ⚠️ act_dim 必须从 checkpoint 反推，不能默认 2。
+        # 训练侧 2026-11-03 起是 act_dim=3（vx, vz, ω）× K_STEPS=12 = 36 维；
+        # 默认 act_dim=2 → head 是 24 维，load_state_dict 直接 size mismatch。
+        _sd0 = torch.load(Path(run) / "head.pt", map_location="cpu")
+        _out = int(_sd0["fc.weight"].shape[0])
+        _act_dim = 3 if (_out % 12 == 0 and _out // 12 == 3) else 2
+        model, head, hidden = load_model(a.model, 128, device, act_dim=_act_dim)
+        # ⚠️ 必须用 compat 版。训练侧对**内层模型**做了 torch.compile，
+        # save_pretrained 存下的 372 条 LoRA 键全部带 `._orig_mod.` 前缀，
+        # 而这里 load_model() 不编译 → 键名对不上 → PEFT 静默跳过。
+        # 结果是「载入成功但权重没进去」，等于在评测一个完全没训练的 adapter。
+        # 实测后果：mse8 从 ~2.1 变成 14.79（差 7 倍）。
+        from peft_compat import load_adapter_compat
+        _st = load_adapter_compat(model, run / "adapter", name="trained")
+        print("[adapter] total=%d stripped=%d loaded=%d"
+              % (_st["total"], _st["stripped"], _st["loaded"]), flush=True)
+        assert _st["loaded"] == _st["total"], "adapter 键没全部写入"
 
         # 视觉注入模型：run 目录里有 injector.pt 就必须重建注入器，并把 head 换成
         # 加宽后的形状。否则 head.pt 是 (2048,24)、head 是 (1024,24)，load 直接报
@@ -178,10 +233,46 @@ def main(argv=None) -> int:
         head.load_state_dict(head_sd)
         model.eval()
 
+        fmt = run_prompt_format(run)
+        # ⚠️ 必须从 run 的 args.json 回放输入口径。2026-11-04 踩到：
+        # r8_nowp 训练时 --drop-wp（输入里 wp 恒 0），但这里默认 drop_wp=False，
+        # 等于在评测时喂了模型**训练中从未见过**的 wp，bench 数字全部作废。
+        _run_args = {}
+        _ap = run.parent / "args.json"
+        if _ap.exists():
+            _run_args = json.loads(_ap.read_text(encoding="utf-8"))
+        ds_run = PolicyDataset(val, processor, min_px, max_px, prompt_format=fmt,
+                               drop_wp=bool(_run_args.get("drop_wp", False)),
+                               quad_feats=bool(_run_args.get("quad_feats", False)))
+        print("[caliber] drop_wp=%s quad_feats=%s"
+              % (_run_args.get("drop_wp", False), _run_args.get("quad_feats", False)),
+              flush=True)
+        loaders = make_loaders(ds_run)
+        print("[prompt] format=%s" % fmt, flush=True)
+
         preds = {}
+        label_mse = {}
         for m in modes:
-            preds[m] = predict(model, head, loaders[m], device, injector=injector)
-            print("  [%s] done" % m, flush=True)
+            preds[m], act_l, mask_l = predict(model, head, loaders[m], device,
+                                              injector=injector, want_labels=True)
+            label_mse[m] = mse8_of(preds[m], act_l, mask_l)
+            print("  [%s] done  mse8=%.4f" % (m, label_mse[m]), flush=True)
+
+        # 关键判据：对**标签**的误差。base 是真实图，理应最好。
+        base_mse = label_mse["base"]
+        vision_helps = {
+            "mse_real": base_mse,
+            "mse_black": label_mse["black"],
+            "mse_shuffle": label_mse["shuffle"],
+            "gain_vs_black": label_mse["black"] - base_mse,
+            "gain_vs_shuffle": label_mse["shuffle"] - base_mse,
+            "reads_content": bool(label_mse["shuffle"] > base_mse),
+        }
+        print("  >>> mse8 real=%.4f black=%.4f shuffle=%.4f | "
+              "real 比 black 好 %.4f, 比 shuffle 好 %.4f, 读内容=%s"
+              % (base_mse, label_mse["black"], label_mse["shuffle"],
+                 vision_helps["gain_vs_black"], vision_helps["gain_vs_shuffle"],
+                 vision_helps["reads_content"]), flush=True)
 
         base = preds["base"]
         rows = {}
@@ -199,6 +290,8 @@ def main(argv=None) -> int:
             step0_speed_p95=float(np.percentile(np.linalg.norm(base[:, 0, :], axis=-1), 95)),
             block_std_across_samples=float(base.reshape(len(base), -1).std(axis=0).mean()),
         )
+        rows["label_mse"] = label_mse
+        rows["vision_helps"] = vision_helps
         result["runs"][str(run)] = rows
     (out_dir / "vision_ablation.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")

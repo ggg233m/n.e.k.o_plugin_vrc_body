@@ -62,7 +62,7 @@ id = "panel_command"
 name = "AnyaDance 能力开关（仅调试台）"
 description = "只有用户能操作的能力开关：身体输出、急停与急停授权、自主授权、视觉采集、聊天框转发、VMC 重新校准。Agent 不可分派。"
 metadata = { agent_auto = false }
-input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_reset", "body_freeze", "llm_freeze_allow", "llm_freeze_deny", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_start", "vrc_vision_stop", "body_chatbox_relay_enable", "body_chatbox_relay_disable", "vmc_recalibrate"] }, arguments = { type = "object", default = {} } } }
+input_schema = { type = "object", required = ["command"], properties = { command = { type = "string", enum = ["body_enable", "body_disable", "body_reset", "body_freeze", "llm_freeze_allow", "llm_freeze_deny", "vrc_autonomy_arm", "vrc_autonomy_disarm", "vrc_vision_start", "vrc_vision_stop", "vrc_policy_prompt", "body_chatbox_relay_enable", "body_chatbox_relay_disable", "vmc_recalibrate"] }, arguments = { type = "object", default = {} } } }
 
 [[plugin.entries]]
 id = "debug_command"

@@ -160,7 +160,7 @@ class ActionWiringTests(unittest.TestCase):
     # ---- VLA 头 A 的三处 provider --------------------------------------
     def _policy_stub(self, *, osc=None, goal=None, primary: str = "anyadance"):
         stub = self._stub(osc=osc, primary=primary)
-        stub.autonomy = SimpleNamespace(snapshot=lambda: {"goal": goal})
+        stub.autonomy = SimpleNamespace(snapshot=lambda: {"armed": True, "goal": goal})
         stub._policy_body_last = None
         stub._policy_body_at = 0.0
         stub._navigator_send_axes = lambda side, x, y, ms: BackendService._navigator_send_axes(
@@ -188,6 +188,12 @@ class ActionWiringTests(unittest.TestCase):
 
     def test_policy_send_axes_refuses_while_semantic_goal_is_active(self) -> None:
         stub = self._policy_stub(goal={"kind": "goto", "text": "去门口"})
+        self.assertFalse(BackendService._policy_send_axes(stub, 0.0, 1.0, 400))
+        self.assertEqual(stub.scheduler.calls, [])
+
+    def test_policy_send_axes_refuses_when_disarmed(self) -> None:
+        stub = self._policy_stub()
+        stub.autonomy = SimpleNamespace(snapshot=lambda: {"armed": False, "goal": None})
         self.assertFalse(BackendService._policy_send_axes(stub, 0.0, 1.0, 400))
         self.assertEqual(stub.scheduler.calls, [])
 

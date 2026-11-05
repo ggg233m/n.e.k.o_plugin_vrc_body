@@ -56,6 +56,7 @@ class HostedUiTests(unittest.TestCase):
                 "vrc_autonomy_disarm",
                 "vrc_vision_start",
                 "vrc_vision_stop",
+                "vrc_policy_prompt",
                 "body_chatbox_relay_enable",
                 "body_chatbox_relay_disable",
                 "vmc_recalibrate",

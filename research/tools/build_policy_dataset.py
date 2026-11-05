@@ -26,7 +26,7 @@
 
     <out>/<sid>/images/<frame_i>_L.jpg      左目 JPEG q90（默认 448×256，按帧号去重）
     <out>/<sid>/policy_obs.jsonl            {"t","t_rel","i","img_L"}
-    <out>/<sid>/policy_labels.jsonl         {"t","act":[[vx,vz]×12],"mask":[...],"cls","wp":[dx,dz]}
+    <out>/<sid>/policy_labels.jsonl         {"t","act":[[vx,vz,omega]×12],"mask":[...],"cls","wp","path","guide"}
     <out>/<sid>/stats.json                  本场统计（含 G3 口径）
     <out>/manifest.json                    汇总
 
@@ -34,6 +34,9 @@
 
     .venv/Scripts/python.exe research/tools/build_policy_dataset.py \
         --root G:\\vrc_recording --out H:\\vrc_policy_m0
+    # 使用录制时的 A* 软引导（每场需有 astar_guidance.jsonl）：
+    .venv/Scripts/python.exe research/tools/build_policy_dataset.py \
+        --root G:\\vrc_recording --out H:\\vrc_policy_hybrid --astar-guidance
     # 只验标签、不抽帧（很快）：
     .venv/Scripts/python.exe research/tools/build_policy_dataset.py \
         --root G:\\vrc_recording --out .tmp/policy_ds --no-images --sessions 20261031_020757
@@ -50,10 +53,53 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from policy_text import MODE_FOLLOW, MODE_STOP  # noqa: E402
+from policy_causal import causal_topo  # noqa: E402  因果 topo（只用历史轨迹）
+
 K_STEPS = 12
 STEP_S = 0.1
 GRID_S = 0.2
 V_STILL = 0.1
+
+# ---- ω（转向）标签 与 [wp] 去泄漏（2026-11-03）----
+# ω 用 VRChat 上报的 AngularY：构念上它测的是**身体/胶囊体**，与 VelocityX/Z 同族；
+# 不用 HMD 四元数（那是头的朝向，六点追踪下可以转头而不转身体，实测高频能量比 3.76-6.48）。
+# 换算：probe_omega_source.py 实测 AngularY ≈ -K·(HMD 偏航角速度)，K 均值 1.434 单位/(度/秒)。
+# 符号约定：**ω 正 = 右转**，与 vx（右正）一致；AngularY 与 Y-up 偏航率负相关，故取负。
+# ⚠️ 单位不是 deg/s！2026-11-03 用「∫AngularY dt vs HMD 偏航角变化量」实测：
+#   K = -0.008953 rad/unit（R² 0.79–0.96，6 个会话一致）
+#   即 1 unit = 0.513 度/秒；满量程 ±1024 unit ≈ ±525 度/秒。
+# 若单位是 deg/s，K 应为 π/180 = 0.017453 —— 实测只有它的一半。
+# 官方文档只写「Angular velocity on the Y axis」，没给单位，所以这一条只能靠实测。
+# 负号：AngularY 增大对应 HMD 向左转（Y-up 偏航角减小）。
+# 我们要的是「ω 正 = 右转」，所以取负。
+ANGULARY_RAD_PER_UNIT = -0.008953
+
+# ω 标签的**源采样频率**（Hz）。与视觉观测 5 Hz、动作标签 10 Hz 是三件不同的事：
+#   视觉观测 5 Hz   —— 每 0.2 s 一个关键帧（GRID_S）
+#   动作标签 10 Hz  —— 每 0.1 s 一个 (vx, vz, ω) 三元组（K_STEPS x STEP_S）
+#   ω 源频率 30 Hz  —— **只是计算 ω 时用的角速度子网格**，不改变上面两者
+# 为什么是 30：AngularY 实测 32~50 Hz（10/10 场 >= 30 Hz），
+# 而 5 Hz 单点 ZOH 只保留 35.2% 转向事件（.tmp/freq_events_probe.py）。
+OMEGA_SOURCE_HZ = 30
+
+# ω 标签的窗口聚合方式：
+#   "mean" —— 窗口内 |AngularY| 的均值 × 方向（符号取带符号均值的符号）
+#   "peak" —— 窗口内**绝对值最大**的那个采样，保留其自身符号
+# 两者都用 30 Hz 子网格 + 因果窗口 [t0, t1)，不读未来。
+OMEGA_AGG_MEAN = "mean"
+OMEGA_AGG_PEAK = "peak"
+OMEGA_AGG_MODES = (OMEGA_AGG_MEAN, OMEGA_AGG_PEAK)
+OMEGA_AGG = OMEGA_AGG_MEAN
+# 满量程约 1024 unit ≈ 9.17 rad/s；留一点余量，超出视为真正的坏帧。
+ANGULARY_FULLSCALE_RAD = 1024 * abs(ANGULARY_RAD_PER_UNIT)
+WP_MODE_NEAR = "near"   # 现状：1.2 s 行程内的点 —— 模长等于「未来走多远」，泄漏速度
+WP_MODE_FAR = "far"     # 去泄漏：沿轨迹固定 WP_FAR_M 的目标，方向仍给、模长不再等于答案
+WP_FAR_M = 4.0
+# 因果模式（2026-11-05）：wp 恒 (0,0)，topo 换成只依赖历史的 past_prog/past_lateral。
+# 这是部署时真正可得的输入形状 —— 旧 near/far 两个模式都由示教未来轨迹生成。
+WP_MODE_CAUSAL = "causal"
 GAP_SUSPECT_S = 2.5
 IDLE_SILENCE_S = 30.0
 HMD_STILL_S = 10.0
@@ -107,6 +153,67 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def load_astar_guidance(sess: Path) -> list[dict]:
+    """读取录制时保存的 A* 软引导；旧录制没有该文件时返回空表。"""
+    for name in ("astar_guidance.jsonl", "policy_guidance.jsonl"):
+        path = sess / name
+        if path.exists():
+            rows = read_jsonl(path)
+            return sorted(
+                [row for row in rows if isinstance(row, dict) and row.get("t") is not None],
+                key=lambda row: float(row["t"]),
+            )
+    return []
+
+
+def guidance_at(rows: list[dict], t: float, max_age_s: float = 0.5) -> dict | None:
+    """按 ZOH 取 t 时刻最近的规划引导。
+
+    无效/过期引导也保留成 ``valid=false`` 的样本，而不是直接丢掉。混合 VLA
+    必须见过“没有可靠 A*”的画面，才能在定位漂移时退回视觉避障；只有完全没有
+    任何历史行（或尚未到第一行）才返回 ``None``。
+    """
+    if not rows:
+        return None
+    times = np.asarray([float(row["t"]) for row in rows], dtype=np.float64)
+    j = int(np.searchsorted(times, float(t), side="right") - 1)
+    if j < 0:
+        return None
+    row = rows[j]
+    age = float(t) - float(times[j])
+    waypoint = row.get("waypoint", row.get("wp"))
+    if not isinstance(waypoint, (list, tuple)) or len(waypoint) < 2:
+        waypoint = (0.0, 0.0)
+    path = row.get("path")
+    if isinstance(path, list):
+        path = [[float(point[0]), float(point[1])] for point in path
+                if isinstance(point, (list, tuple)) and len(point) >= 2]
+    else:
+        path = []
+    valid = bool(row.get("valid", True)) and age <= float(max_age_s)
+    reason = str(row.get("reason", "ok"))
+    if age > float(max_age_s):
+        reason = "guidance_stale"
+    elif not bool(row.get("valid", True)):
+        reason = reason if reason != "ok" else "guidance_invalid"
+    elif not path:
+        reason = "path_missing"
+    return {
+        "requested": bool(row.get("requested", True)),
+        "control_mode": str(row.get("control_mode", "memory_revisit")),
+        "valid": valid,
+        "waypoint": [float(waypoint[0]), float(waypoint[1])] if valid else [0.0, 0.0],
+        "path": path if valid else [],
+        "mode": int(row.get("mode", 0) or 0),
+        "confidence": float(row.get("confidence", 1.0) or 0.0),
+        "pose_age_s": row.get("pose_age_s"),
+        "sigma_m": row.get("sigma_m"),
+        "source": str(row.get("source", "astar_navmesh")),
+        "reason": reason,
+        "age_s": max(0.0, age),
+    }
+
+
 def load_anchor(sess: Path) -> tuple[float, str]:
     run_path = sess / "run.json"
     if run_path.exists():
@@ -133,14 +240,27 @@ def load_streams(sess: Path):
     quat = np.array([r["hmd"]["rotation_xyzw"] for r in hmd], dtype=np.float64)
 
     vx_t, vx_v, vz_t, vz_v = [], [], [], []
+    ay_t, ay_v = [], []
     for r in osc:
         val = float(r["args"][0])
         if r["addr"].endswith("VelocityX"):
             vx_t.append(r["t"]); vx_v.append(val)
         elif r["addr"].endswith("VelocityZ"):
             vz_t.append(r["t"]); vz_v.append(val)
+        # ⚠️ AngularY **不在 osc.jsonl 里**（那里只有 VelocityX/Z）；
+        # 它在 avatar_params.jsonl 里，字段是 {t, name, value}。见下方单独读取。
     vx_t = np.array(vx_t); vx_v = np.array(vx_v)
     vz_t = np.array(vz_t); vz_v = np.array(vz_v)
+    # ω 标签的来源：avatar_params.jsonl 的 AngularY（构念上是身体/胶囊体角速度）
+    ap_path = sess / "avatar_params.jsonl"
+    if ap_path.exists():
+        for r in read_jsonl(ap_path):
+            if r.get("name") == "AngularY":
+                ay_t.append(r["t"]); ay_v.append(float(r["value"]))
+    ay_t = np.array(ay_t) if ay_t else np.zeros(0)
+    ay_v = np.array(ay_v) if ay_v else np.zeros(0)
+    if len(ay_t) == 0:
+        print("⚠ %s: 没有 AngularY，ω 标签将全为 0" % sess.name, flush=True)
 
     # 合并成「任一路报文」的事件序列，两个轴的 ZOH 在同一时刻取样
     t_m = np.unique(np.concatenate([vx_t, vz_t]))
@@ -150,7 +270,8 @@ def load_streams(sess: Path):
     vz_m = vz_v[np.clip(iz, 0, len(vz_v) - 1)]
     return dict(f_t=f_t, f_i=f_i, h_t=h_t, quat=quat,
                 t_m=t_m, vx_m=vx_m, vz_m=vz_m,
-                vx_t=vx_t, vx_v=vx_v, vz_t=vz_t, vz_v=vz_v)
+                vx_t=vx_t, vx_v=vx_v, vz_t=vz_t, vz_v=vz_v,
+                ay_t=ay_t, ay_v=ay_v)
 
 
 # ---------------------------------------------------------------- 姿态与轨迹
@@ -244,6 +365,94 @@ def zoh(streams: dict, tq: float):
             float(tq - streams["t_m"][idx]))
 
 
+def omega_rad_s_interval(streams: dict, t0: float, t1: float,
+                        src_hz: int = OMEGA_SOURCE_HZ,
+                        stale_s: float = 5.0,
+                        agg: str = OMEGA_AGG_MEAN):
+    """窗口 [t0, t1) 内的平均角速度（**rad/s，右转为正**），**只用过去信息**。
+
+    为什么需要它（2026-11-05）：
+      旧的 ``omega_rad_s_at`` 在 t_obs+k*0.1 处取**单个 ZOH 点**。
+      实测（.tmp/freq_events_probe.py）5 Hz 观测下单个 ZOH 点只保留 35.2% 的转向事件，
+      原因不是源数据不够——AngularY 实测 32~50 Hz（10/10 场 >= 30 Hz），
+      而是**取点方式**把中间的事件跳过了。
+
+    本函数改成：在窗口内按 ``src_hz`` 建 30 Hz 子网格，对每个子点做 ZOH，
+    再取**绝对值加权平均**（保留方向：用带符号均值会正负抵消，把「先左后右」抹成 0）。
+
+    因果性保证：
+      * 窗口是 [t0, t1)，t1 是当前动作步的时刻，不含未来；
+      * 每个子点的 ZOH 只回溯 ``t <= tq`` 的最后一条 AngularY，**不读未来**；
+      * ``t1`` 由调用方给成 ``q + STEP_S``，即**当前步结束时刻**——动作步本身是
+        「接下来 0.1 s 要执行什么」，所以用 [q, q+0.1) 是对标签的正当聚合，
+        不是对未来决策的偷看。
+
+    返回 None 表示该窗口完全没有 AngularY（调用方按契约写 0.0）。
+    """
+    ta, va = streams.get("ay_t"), streams.get("ay_v")
+    if ta is None or len(ta) == 0:
+        return None
+    if t1 <= t0:
+        return None
+    n = max(1, int(round((t1 - t0) * float(src_hz))))
+    edges = np.linspace(t0, t1, n + 1)
+    mids = 0.5 * (edges[:-1] + edges[1:])
+
+    # 先把窗口内每个子网格点的 ZOH 原始值收齐（单位：AngularY 原始计数，非 rad/s）。
+    # 一次遍历同时服务 mean 与 peak 两种聚合，避免两次查询引入分歧。
+    vals = []
+    for tq in mids:
+        idx = int(np.searchsorted(ta, tq, side="right") - 1)
+        if idx < 0 or idx >= len(ta):
+            continue
+        if tq - float(ta[idx]) > float(stale_s):
+            continue
+        vals.append(float(va[idx]))
+    if not vals:
+        return None
+
+    unit_sign = -1.0 if ANGULARY_RAD_PER_UNIT < 0 else 1.0
+
+    if agg == OMEGA_AGG_PEAK:
+        # peak：取窗口内**绝对值最大**的那个采样，并**保留它自己的符号**。
+        # 为什么不是「取最大值」：AngularY 左右转符号相反，取 max 会永远偏向一侧。
+        # 为什么不把正负相加：那样「先急左再急右」会互相抵消，与 mean 的病一样。
+        # 方向语义：保留峰值时刻的真实转向方向，这正是「这一窗里最剧烈的转向」。
+        k = max(range(len(vals)), key=lambda i: abs(vals[i]))
+        raw_peak = vals[k]
+        return float(raw_peak * ANGULARY_RAD_PER_UNIT)
+
+    # mean（默认，保持历史行为）：|AngularY| 均值 × 带符号均值的符号 × 单位符号
+    acc = sum(abs(v) for v in vals)
+    mag = acc / len(vals) * abs(ANGULARY_RAD_PER_UNIT)
+    sacc = sum(vals)
+    sgn = -1.0 if sacc < 0 else 1.0
+    return float(sgn * unit_sign * mag)
+
+
+def omega_rad_s_at(streams: dict, tq: float, stale_s: float = 5.0):
+    """t 时刻的转向角速度（**弧度/秒，右转为正**），由 AngularY ZOH 换算。
+
+    ⚠️ 单位必须 rad/s 而不是 deg/s：deg/s 是 ±120 量级、速度是 ±4，平方后差 3 个
+    数量级，总损失会被 ω 独占（实测 mse_all=913 vs 速度口径 10）。
+
+    ⚠️ AngularY 是**状态量**：VRChat 只在它变化时发事件，所以「很久没更新」
+    **不等于缺失**——静止/匀速转时本来就不发。`stale_s` 太小会把「一直在转」
+    误判成缺失，而缺失又按契约写成 0.0，等于教模型「没在转」。
+    实测：0.5 s 容忍度下有 13.8%~25.8% 被判缺失；放宽到 2.0 s 后与 HMD 右转率
+    的相关系数更高（见 probe 记录）。只有会话根本没录 AngularY 才返回 None。
+    """
+    ta, va = streams.get("ay_t"), streams.get("ay_v")
+    if ta is None or len(ta) == 0:
+        return None
+    idx = int(np.searchsorted(ta, tq, side="right") - 1)
+    if idx < 0 or idx >= len(ta):
+        return None
+    if tq - float(ta[idx]) > float(stale_s):   # 见 docstring：状态量，容忍度要宽
+        return None
+    return float(va[idx]) * ANGULARY_RAD_PER_UNIT
+
+
 def hmd_static(tq: float, streams: dict) -> bool:
     h_t, quat = streams["h_t"], streams["quat"]
     lo = int(np.searchsorted(h_t, tq - HMD_STILL_S))
@@ -257,17 +466,41 @@ def hmd_static(tq: float, streams: dict) -> bool:
     return max_deg < HMD_STILL_DEG
 
 
+def topo_at(tq: float, path: dict, topo_xyz: np.ndarray) -> tuple[float, float, float]:
+    """tq 时刻的 (prog, lateral, remain)，世界米。取最近采样点（ZOH）。"""
+    t = path["t"]
+    if len(t) == 0:
+        return (0.0, 0.0, 0.0)
+    j = int(np.searchsorted(t, tq, side="right") - 1)
+    j = max(0, min(j, len(t) - 1))
+    return (float(topo_xyz[j, 0]), float(topo_xyz[j, 1]), float(topo_xyz[j, 2]))
+
+
 def build_labels(streams: dict, frame_abs: np.ndarray, path: dict,
-                 lag_s: float, lookahead_m: float, elapsed_s: float):
+                 lag_s: float, lookahead_m: float, elapsed_s: float,
+                 wp_mode: str = WP_MODE_NEAR,
+                 omega_src_hz: int = OMEGA_SOURCE_HZ,
+                 omega_agg: str = OMEGA_AGG,
+                 guidance_rows: list[dict] | None = None,
+                 use_astar_guidance: bool = False):
+    """``omega_src_hz > 0`` 时用 30 Hz 源子网格聚合 ω；0 = 旧行为（单点 ZOH）。
+
+    ``omega_agg`` 决定窗口内怎么聚：mean（默认）/ peak（取 |·| 最大的采样，保留符号）。
+    """
     t_m = streams["t_m"]
     last_hmd = float(streams["h_t"][-1])
     grid = np.arange(frame_abs[0] + 0.5, frame_abs[-1] + 1e-9, GRID_S)
     vx_t0 = float(min(streams["vx_t"][0], streams["vz_t"][0]))
     fwd_m = yaw_at(grid, streams["h_t"], streams["fwd"])
 
+    # [topo] 的离线合成：整条 DR 轨迹先算一遍，之后按 t 取（ZOH）。
+    from policy_text import synthesize_topo
+    topo_xyz = synthesize_topo(path["p"], path["s"])
+
     out = []
     stats = dict(grid=int(len(grid)), dropped_preosc=0, dropped_idle=0,
-                 partial_mask=0, mask_all0=0, mask_all1=0)
+                 partial_mask=0, mask_all0=0, mask_all1=0,
+                 guidance_available=0, guidance_invalid=0, guidance_missing=0)
     for n, t_obs in enumerate(grid):
         q0 = t_obs + lag_s
         if q0 < vx_t0:
@@ -283,26 +516,87 @@ def build_labels(streams: dict, frame_abs: np.ndarray, path: dict,
             q = q0 + k * STEP_S
             z = zoh(streams, q)
             if q > last_hmd or z is None or (z[2] > GAP_SUSPECT_S and np.hypot(z[0], z[1]) > V_STILL):
-                act.append([0.0, 0.0]); mask.append(0)
+                act.append([0.0, 0.0, 0.0]); mask.append(0)
             else:
-                act.append([round(z[0], 4), round(z[1], 4)]); mask.append(1)
+                if omega_src_hz and omega_src_hz > 0:
+                    # 30 Hz 源子网格 + 因果窗口聚合（2026-11-05）
+                    # 窗口 [q, q+STEP_S)：q 是当前动作步的起点，q+0.1 是该步结束。
+                    # 动作步的语义是「接下来 0.1 s 执行什么」，所以在这 0.1 s 内
+                    # 做聚合是对标签的正当统计，不是偷看未来决策。
+                    w = omega_rad_s_interval(streams, q, q + STEP_S,
+                                             src_hz=omega_src_hz, agg=omega_agg)
+                else:
+                    w = omega_rad_s_at(streams, q)
+                act.append([round(z[0], 4), round(z[1], 4),
+                            0.0 if w is None else round(float(w), 2)])
+                mask.append(1)
 
         valid = [k for k in range(K_STEPS) if mask[k]]
         if not valid:
             cls = "none"
-        elif np.hypot(*act[0]) > V_STILL and mask[0]:
+        elif np.hypot(*act[0][:2]) > V_STILL and mask[0]:
             cls = "move"
-        elif all(np.hypot(*act[k]) <= V_STILL for k in valid):
+        elif all(np.hypot(*act[k][:2]) <= V_STILL for k in valid):
             cls = "idle"
         else:
             cls = "trans"
 
-        wp = waypoint_body(t_obs, path, fwd_m[n], lookahead_m)
+        guide = guidance_at(guidance_rows or [], t_obs) if use_astar_guidance else None
+        if use_astar_guidance:
+            if guide is None:
+                wp = [0.0, 0.0]
+                stats["guidance_missing"] += 1
+            else:
+                wp = guide["waypoint"] if guide.get("valid") else [0.0, 0.0]
+                if guide.get("valid"):
+                    stats["guidance_available"] += 1
+                else:
+                    stats["guidance_invalid"] += 1
+        elif wp_mode == WP_MODE_CAUSAL:
+            # 因果口径：不留 wp（部署时没有未来轨迹，留 0 才是真相），
+            # topo 换成只依赖历史的 (past_prog, past_lateral, 0)。
+            # 见 policy_causal 模块头注释。
+            wp = [0.0, 0.0]
+        elif wp_mode == WP_MODE_FAR:
+            # horizon 拉到无穷：目标 = 沿轨迹固定 WP_FAR_M 处（不足则取终点）
+            wp = waypoint_body(t_obs, path, fwd_m[n], WP_FAR_M, horizon_s=1e9)
+        else:
+            wp = waypoint_body(t_obs, path, fwd_m[n], lookahead_m)
         t_rel = float(t_obs - frame_abs[0] + streams["f_t"][0])
+
+        # ---- [mode] / [topo]（方案 §10.6，门 G8）----
+        # M0 录制里没有地点图，也没有导航器状态机，所以：
+        #   mode: 按 osc 零速判 stop(3)，其余 follow(0)。
+        #         replan/explore 在 M0-M1 恒无（方案 §10.6 明写 explore 只在 M2 出现）。
+        #   topo: 拿录制轨迹本身当「边」离线合成 prog/lateral/remain，
+        #         格式在 M0 冻死，M3 换真实地点图时 token 位置不变。
+        spd0 = float(np.hypot(act[0][0], act[0][1])) if mask[0] else 0.0
+        mode = MODE_STOP if spd0 <= V_STILL else MODE_FOLLOW
+        if use_astar_guidance and guide is not None and guide.get("valid"):
+            mode = int(guide.get("mode", mode))
+        if wp_mode == WP_MODE_CAUSAL:
+            tp = causal_topo(t_obs, path, fwd_m[n])
+        else:
+            tp = topo_at(t_obs, path, topo_xyz)
+
         out.append(dict(
             t=round(float(t_obs), 6), t_rel=round(t_rel, 6),
             act=act, mask=mask, cls=cls,
             wp=[0.0, 0.0] if wp is None else wp,
+            mode=int(mode),
+            topo=[round(float(x), 4) for x in tp],
+            path=None if guide is None else guide.get("path", []),
+            guide=None if guide is None else {
+                "requested": bool(guide.get("requested", False)),
+                "control_mode": guide.get("control_mode", "unknown"),
+                "valid": bool(guide.get("valid", False)),
+                "confidence": guide.get("confidence"),
+                "pose_age_s": guide.get("pose_age_s"),
+                "sigma_m": guide.get("sigma_m"),
+                "reason": guide.get("reason"),
+                "age_s": guide.get("age_s"),
+                "source": guide.get("source"),
+            },
             split="val" if t_rel >= 0.8 * elapsed_s else "train",
         ))
         if sum(mask) == K_STEPS:
@@ -334,6 +628,7 @@ def extract_images(sess: Path, out_dir: Path, want: list[int],
     if not ff:
         raise RuntimeError("PATH 上没有 ffmpeg")
     meta = json.loads((sess / "meta.json").read_text(encoding="utf-8"))
+    control_mode = str(meta.get("control_mode") or "legacy")
     src_w, src_h = meta["size"]
     w, h = int(size[0]), int(size[1])
     content_h, top = policy_geometry(size)
@@ -377,7 +672,11 @@ def extract_images(sess: Path, out_dir: Path, want: list[int],
 
 # ---------------------------------------------------------------- 单场
 def build_session(sess: Path, out_root: Path, size: tuple[int, int], q: int, lag_s: float,
-                  lookahead_m: float, no_images: bool, overwrite: bool) -> dict:
+                  lookahead_m: float, no_images: bool, overwrite: bool,
+                  wp_mode: str = WP_MODE_NEAR,
+                  omega_src_hz: int = OMEGA_SOURCE_HZ,
+                  omega_agg: str = OMEGA_AGG,
+                  use_astar_guidance: bool = False) -> dict:
     sid = sess.name
     out_dir = out_root / sid
     if out_dir.exists() and not overwrite:
@@ -388,8 +687,33 @@ def build_session(sess: Path, out_root: Path, size: tuple[int, int], q: int, lag
     streams["fwd"] = hmd_forward(streams["quat"])
     frame_abs = streams["f_t"] + anchor
     path = build_dr_path(streams)
+    guidance_rows = load_astar_guidance(sess) if use_astar_guidance else []
+    guidance_required = use_astar_guidance and control_mode not in {"explore", "prompt_local"}
+    if guidance_required and not guidance_rows:
+        raise RuntimeError(
+            f"{sid} 缺少 astar_guidance.jsonl/policy_guidance.jsonl，不能构建 hybrid 数据集")
     labels, stats = build_labels(streams, frame_abs, path, lag_s, lookahead_m,
-                                 float(meta["elapsed_s"]))
+                                 float(meta["elapsed_s"]), wp_mode=wp_mode,
+                                 omega_src_hz=omega_src_hz, omega_agg=omega_agg,
+                                 guidance_rows=guidance_rows,
+                                 use_astar_guidance=use_astar_guidance)
+    # 自由探索/局部命令没有 A* 是正常状态，不把它编码成“规划失败”。
+    # 显式写出 requested=false，训练提示才能与 requested=true 的坏路径区分。
+    for label in labels:
+        label["control_mode"] = control_mode
+        if use_astar_guidance and control_mode in {"explore", "prompt_local"} and not guidance_rows:
+            label["path"] = []
+            label["guide"] = {
+                "requested": False,
+                "control_mode": control_mode,
+                "valid": False,
+                "confidence": 0.0,
+                "pose_age_s": None,
+                "sigma_m": None,
+                "reason": "astar_not_requested",
+                "age_s": 0.0,
+                "source": "astar_navmesh",
+            }
 
     ts = np.array([r["t"] for r in labels])
     j = np.clip(np.searchsorted(frame_abs, ts), 1, len(frame_abs) - 1)
@@ -413,8 +737,13 @@ def build_session(sess: Path, out_root: Path, size: tuple[int, int], q: int, lag
                     "split": k["label"]["split"]}, ensure_ascii=False) + "\n"
         for k in kept), encoding="utf-8")
     (out_dir / "policy_labels.jsonl").write_text("".join(
+        # ⚠️ 这里必须显式带上 mode/topo：build_labels 早就把它们算好了，
+        # 但写盘用的是手写白名单，漏一个字段就会静默丢掉（实测踩过一次）。
         json.dumps({"t": k["label"]["t"], "act": k["label"]["act"], "mask": k["label"]["mask"],
                     "cls": k["label"]["cls"], "wp": k["label"]["wp"],
+                    "mode": k["label"]["mode"], "topo": k["label"]["topo"],
+                    "path": k["label"].get("path"), "guide": k["label"].get("guide"),
+                    "control_mode": k["label"].get("control_mode", "legacy"),
                     "split": k["label"]["split"]}, ensure_ascii=False) + "\n"
         for k in kept), encoding="utf-8")
 
@@ -432,6 +761,7 @@ def build_session(sess: Path, out_root: Path, size: tuple[int, int], q: int, lag
     stats["mask_all1_pct"] = round(100.0 * stats["mask_all1"] / max(1, len(kept)), 2)
     stats.update(dict(
         sid=sid, world=meta.get("world_key", ""), elapsed_s=meta["elapsed_s"],
+        control_mode=control_mode,
         frames=meta["frames"], anchor=anchor, anchor_source=anchor_src,
         samples_kept=len(kept), dropped_noimg=dropped_noimg, images=n_img,
         cls=cls_count, val=int(sum(1 for k in kept if k["label"]["split"] == "val")),
@@ -454,6 +784,20 @@ def main(argv=None) -> int:
     ap.add_argument("--q", type=int, default=JPEG_Q)
     ap.add_argument("--lag", type=float, default=DEFAULT_LAG_S, help="osc_lag_s")
     ap.add_argument("--lookahead", type=float, default=DEFAULT_LOOKAHEAD_M)
+    ap.add_argument("--wp-mode", choices=[WP_MODE_NEAR, WP_MODE_FAR, WP_MODE_CAUSAL],
+                    help="near=1.2 s 行程内的点（模长泄漏速度）；far=沿轨迹固定 4 m（去泄漏）；"
+                         "causal=wp 恒 0 + topo 只用历史（部署口径，2026-11-05）")
+    ap.add_argument("--astar-guidance", action="store_true",
+                    help="读取每场 astar_guidance.jsonl，使用录制时的 A* 局部引导；"
+                         "memory_revisit 缺文件直接失败；explore/prompt_local 允许无引导，"
+                         "不回退到未来轨迹 wp")
+    ap.add_argument("--omega-agg", choices=list(OMEGA_AGG_MODES), default=OMEGA_AGG,
+                    help="ω 窗口聚合方式：mean=窗口内|AngularY|均值×方向（默认，兼容旧数据）；"
+                         "peak=窗口内|AngularY|最大的采样，保留其自身符号")
+    ap.add_argument("--omega-src-hz", type=int, default=OMEGA_SOURCE_HZ,
+                    help="ω 标签的源采样频率（默认 30）。用该频率的子网格对每个 0.1 s "
+                         "动作步做因果窗口聚合；0 = 退回单点 ZOH 的旧行为。"
+                         "注意：只改 ω 标签的计算分辨率，不改视觉 5 Hz 与动作 12x0.1 s")
     ap.add_argument("--no-images", action="store_true", help="只生成标签，不抽帧")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--workers", type=int, default=4,
@@ -475,9 +819,32 @@ def main(argv=None) -> int:
             print("没有匹配的场次")
             return 2
 
+    import sys as _sys
+    # 完整构建命令行。2026-11-05 加：本轮两次出现「参数漏传导致静默错口径」
+    # （先 omega_src_hz、后 omega_agg），而 manifest 恰好读的是 CLI 层对象，
+    # 所以它「看起来」正确。把 argv 原样存下来，是唯一能事后自证的证据。
+    build_cmd = " ".join(_sys.argv)
     manifest = dict(root=str(root), size=list(size), jpeg_q=a.q, grid_hz=1 / GRID_S,
                     steps=K_STEPS, step_s=STEP_S, osc_lag_s=a.lag,
-                    lookahead_m=a.lookahead, sessions={})
+                    lookahead_m=a.lookahead, sessions={},
+                    astar_guidance=bool(a.astar_guidance),
+                    build_cmd=build_cmd,
+                    build_argv=list(_sys.argv),
+                    build_py=_sys.version.split()[0],
+                    # 2026-11-03：动作维从 2 扩到 3（vx, vz, ω），训练侧据此判定头维度
+                    act_dim=3, wp_mode=a.wp_mode,
+                    omega=dict(source="AngularY", unit="rad/s",
+                               # 2026-11-05：源采样频率元数据。
+                               # 30 = 用 30 Hz 子网格做因果窗口聚合（新）；
+                               # 0  = 单点 ZOH 的旧行为。
+                               source_hz=int(a.omega_src_hz),
+                               aggregation=(
+                                   "interval_abs_peak" if (a.omega_src_hz > 0 and a.omega_agg == OMEGA_AGG_PEAK)
+                                   else ("interval_abs_mean" if a.omega_src_hz > 0 else "zoh_point")),
+                               rad_per_unit=ANGULARY_RAD_PER_UNIT,
+                               fullscale_rad=ANGULARY_FULLSCALE_RAD,
+                               sign="right_positive", missing="0.0",
+                               measured="2026-11-03 积分对齐 HMD，R2 0.79-0.96"))
     if a.manifest_only:
         for sess in sess_dirs:
             st_path = out / sess.name / "stats.json"
@@ -488,15 +855,29 @@ def main(argv=None) -> int:
     elif a.workers > 1 and len(sess_dirs) > 1:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            # ⚠️ 并行分支必须与下面的串行分支传**同一组**关键字参数。
+            # 2026-11-05 修：此前漏了 omega_src_hz，默认 30 时碰巧不出错，
+            # 但 `--omega-src-hz 0`（旧单点 ZOH 口径）在多场并行构建时会被
+            # 静默当成 30 —— 结果与串行分支不一致，且不报错。
+            # ⚠️ 2026-11-05 二修：又漏了 omega_agg（与上一轮漏 omega_src_hz 同型）。
+            # 后果：--omega-agg peak 只改了 manifest 里的字符串，标签仍按 mean 生成，
+            # 而峰值与均值在数值上可以完全一致（实测 400/400 标签差 0.0000）——
+            # 不报错、不崩、查不出来。所以两个分支都必须显式传全部 omega_* 参数。
             futs = {sess.name: ex.submit(build_session, sess, out, size, a.q, a.lag,
-                                         a.lookahead, a.no_images, a.overwrite)
+                                         a.lookahead, a.no_images, a.overwrite,
+                                         wp_mode=a.wp_mode,
+                                         omega_src_hz=a.omega_src_hz,
+                                         omega_agg=a.omega_agg,
+                                         use_astar_guidance=a.astar_guidance)
                     for sess in sess_dirs}
             for name, fut in futs.items():
                 manifest["sessions"][name] = fut.result()
     else:
         for sess in sess_dirs:
             manifest["sessions"][sess.name] = build_session(
-                sess, out, size, a.q, a.lag, a.lookahead, a.no_images, a.overwrite)
+                sess, out, size, a.q, a.lag, a.lookahead, a.no_images, a.overwrite,
+                wp_mode=a.wp_mode, omega_src_hz=a.omega_src_hz,
+                omega_agg=a.omega_agg, use_astar_guidance=a.astar_guidance)
 
     all_cls = {}
     tot = dict(grid=0, kept=0, noimg=0, images=0)

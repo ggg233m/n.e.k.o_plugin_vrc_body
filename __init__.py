@@ -139,6 +139,7 @@ _PANEL_SWITCH_NAMES = (
     "vrc_autonomy_disarm",
     "vrc_vision_start",
     "vrc_vision_stop",
+    "vrc_policy_prompt",
     # 聊天框转发开关。放在这一侧而不是 debug_command，因为关掉它等于停止把
     # 她说的话广播给 VRChat 里的其他玩家——这是一项隐私决定，只能由用户做。
     "body_chatbox_relay_enable",
@@ -1889,6 +1890,11 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         )
         with self._ui_event_lock:
             events = list(self._ui_events)
+        policy = await asyncio.to_thread(self._backend_client.policy_state) if self._backend_client else {
+            "present": False,
+            "reason": "backend_unavailable",
+            "task_prompt": {"text": "", "active": False},
+        }
         # 面板要同时读世界快照和采集 worker 状态：只有 worker 里带 FrameSource 的
         # 后端选择与候选错误（dxgi/winrt），那是「为什么没有检测框」和「为什么屏幕
         # 上有黄框」在插件外唯一能看到的证据。/perception 一次返回两者，不多加一轮
@@ -1957,6 +1963,7 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
                 "armed": False,
                 "reason": "backend_unavailable",
             },
+            "policy": policy,
             "clips": clip_library,
             "config": {
                 "anyadance_target": f"{self._body_config.host}:{self._body_config.port}",
@@ -2815,6 +2822,13 @@ class NekoAnyadanceBodyPlugin(NekoPluginBase):
         normalized_reason = str(reason or "manual_stop").replace("\x00", "").strip()[:160] or "manual_stop"
         result = await asyncio.to_thread(self._vision.stop, normalized_reason)
         await self._stop_world_context_bridge()
+        return Ok(result)
+
+    async def vrc_policy_prompt(self, *, text: Any = "", **_: Any):
+        """设置或清除 VLA 场次级测试提示；只影响推理输入，不启动导航。"""
+        if not self._backend_client:
+            return Ok({"accepted": False, "reason": "backend is not initialized"})
+        result = await asyncio.to_thread(self._backend_client.policy_prompt, text)
         return Ok(result)
 
     async def body_chatbox_relay_enable(self, **_: Any):

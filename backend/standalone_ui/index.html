@@ -18,6 +18,7 @@
       <div class="top-actions">
         <span id="connectionBadge" class="badge muted">未连接</span>
         <button id="refreshButton" class="button secondary">刷新</button>
+        <button id="shutdownBackend" class="button danger">关停后端</button>
       </div>
     </header>
 
@@ -170,6 +171,44 @@
               <label class="field"><span>CPU 检测间隔 ms</span><input id="cfgDetectorInterval" type="number" min="0" max="10000"></label>
               <label class="field"><span>加速器检测间隔 ms</span><input id="cfgAcceleratorInterval" type="number" min="0" max="10000"></label>
             </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">VLA POLICY</p><h2>VLA 局部控制</h2></div>
+              <span id="policyStatusBadge" class="badge muted">未加载</span>
+            </div>
+            <div class="notice warning">
+              VLA 根据画面、身体速度和可失效的 A* 软引导输出短时移动/转向；A* 只提供路线先验，不能直接控制动作。下面的提示词入口只用于测试当前模型的零样本泛化，提示词没有参与训练，也不保证模型会执行任务。
+            </div>
+            <div class="form-grid">
+              <label class="switch-field"><input id="cfgPolicyEnabled" type="checkbox"><span>启用 VLA 策略头</span></label>
+              <label class="switch-field"><input id="cfgPolicyDryRun" type="checkbox"><span>只记录，不实际控制（dry-run）</span></label>
+              <label class="field span-2"><span>基础模型目录</span><input id="cfgPolicyModelPath" placeholder="G:\\vrc_recording\\vrc_model\\weights\\GameScaling-0.8B-S3"></label>
+              <label class="field span-2"><span>策略 run/checkpoint 目录</span><input id="cfgPolicyRunPath" placeholder=".venv_xpu\\runs\\B_peak_norm_3ep\\best"></label>
+              <label class="field"><span>推理频率 Hz</span><input id="cfgPolicyHz" type="number" min="0.2" max="10" step="0.1"></label>
+              <label class="field"><span>速度上限 m/s</span><input id="cfgPolicyVmax" type="number" min="0.05" max="4" step="0.05"></label>
+              <label class="field"><span>过期阈值 s</span><input id="cfgPolicyStale" type="number" min="0.1" max="10" step="0.1"></label>
+              <label class="field"><span>最大序列长度</span><input id="cfgPolicyMaxLen" type="number" min="32" max="512" step="1"></label>
+            </div>
+            <div class="form-grid">
+              <label class="field span-2">
+                <span>场次级提示词（最多 96 字符）</span>
+                <textarea id="policyPrompt" rows="3" maxlength="96" placeholder="例如：自由探索这个房间，看到障碍物就绕开"></textarea>
+              </label>
+              <div class="button-row span-2">
+                <button id="setPolicyPrompt" type="button" class="button primary">设置并持续使用</button>
+                <button id="clearPolicyPrompt" type="button" class="button secondary">清除提示</button>
+              </div>
+            </div>
+            <dl class="facts">
+              <div><dt>当前运行状态</dt><dd id="policyRuntimeFact">—</dd></div>
+              <div><dt>最近帧 / 身体速度</dt><dd id="policyInputFact">—</dd></div>
+              <div><dt>最近动作块</dt><dd id="policyActionFact">—</dd></div>
+              <div><dt>场次提示状态</dt><dd id="policyPromptFact">—</dd></div>
+              <div><dt>启动错误</dt><dd id="policyErrorFact">—</dd></div>
+            </dl>
+            <p class="help">保存后需要重启独立后端。首次加载模型可能需要几十秒；建议先保持 dry-run，确认输出和延迟后再解除。</p>
           </article>
 
           <article class="panel">

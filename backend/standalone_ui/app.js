@@ -4,11 +4,16 @@ const state = {
   token: "",
   snapshot: null,
   perception: null,
+  policy: null,
   config: null,
   configInitialized: false,
   frameRevision: null,
   worldmodel: null,
   timer: null,
+  // 输入框正在编辑时，轮询不能用后端旧值覆盖用户内容。
+  policyPromptDirty: false,
+  // 已经点过「关停后端」：进程正在退出，轮询要停，连接失败也不再当错误喊（见 shutdownBackend）。
+  shuttingDown: false,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -139,6 +144,44 @@ function renderOverview() {
   byId("runtimeLog").textContent = lines.join("\n");
   renderEntities(world.entities || []);
   renderAutonomy(autonomy, navigation);
+  renderPolicy();
+}
+
+function renderPolicy() {
+  const policy = state.policy || {};
+  const cfg = policy.config || {};
+  const taskPrompt = policy.task_prompt || {};
+  const badge = byId("policyStatusBadge");
+  if (!badge) return;
+  if (policy.present) {
+    badge.textContent = cfg.dry_run ? "已加载 · dry-run" : "已加载 · 可控制";
+    badge.className = `badge ${cfg.dry_run ? "starting" : "bad"}`;
+  } else if (cfg.enabled) {
+    badge.textContent = "启用但未加载";
+    badge.className = "badge bad";
+  } else {
+    badge.textContent = "未启用";
+    badge.className = "badge muted";
+  }
+  text("policyRuntimeFact", policy.present
+    ? `${policy.runner_alive ? "运行中" : "已停止"} · ${number(policy.runner_hz, 2)} Hz · ${policy.dry_run ? "只记录" : "实际控制"} · ${policy.astar_control_enabled ? "A*执行器开" : "A*执行器关"}`
+    : (policy.reason || "未启动"));
+  text("policyInputFact", policy.present
+     ? `帧 ${number(policy.last_frame_age_s, 2)} s · 身体 ${Array.isArray(policy.body_now) ? policy.body_now.map((v) => number(v, 2)).join(", ") : "—"} · 引导 ${policy.astar_guidance?.valid ? `有效/${number(policy.astar_guidance.confidence, 2)}` : "无效"}`
+    : "—");
+  const block = policy.present ? (policy.executor_block_last || policy.runner_block_last) : null;
+  text("policyActionFact", Array.isArray(block) && block.length
+     ? block.slice(0, 2).map((v) => `[${(v || []).map((x) => number(x, 2)).join(", ")}]`).join(" ")
+    : "—");
+  const promptInput = byId("policyPrompt");
+  if (promptInput && !state.policyPromptDirty && document.activeElement !== promptInput) {
+    promptInput.value = taskPrompt.text || "";
+  }
+  const promptState = taskPrompt.active
+    ? `已生效 · ${taskPrompt.text || "有提示"} · ${taskPrompt.trained ? "已训练" : "仅推理实验"}`
+    : `未设置 · ${taskPrompt.trained ? "已训练" : "仅推理实验"}`;
+  text("policyPromptFact", promptState);
+  text("policyErrorFact", policy.start_error || "无");
 }
 
 function renderEntities(entities) {
@@ -338,6 +381,15 @@ function populateConfig() {
   byId("cfgAutonomyTtl").value = autonomy.session_ttl_minutes ?? 0;
   byId("cfgPersistWorld").checked = Boolean(memory.persist_world);
   byId("cfgPersistPlayers").checked = Boolean(memory.persist_players);
+  const policy = cfg.policy || {};
+  byId("cfgPolicyEnabled").checked = Boolean(policy.enabled);
+  byId("cfgPolicyDryRun").checked = policy.dry_run !== false;
+  byId("cfgPolicyModelPath").value = policy.model_path || "";
+  byId("cfgPolicyRunPath").value = policy.run_path || "";
+  byId("cfgPolicyHz").value = policy.hz ?? 2.0;
+  byId("cfgPolicyVmax").value = policy.v_max ?? 1.2;
+  byId("cfgPolicyStale").value = policy.stale_s ?? 0.8;
+  byId("cfgPolicyMaxLen").value = policy.max_len ?? 192;
   text("settingsPath", state.config.settings_path || "配置由宿主管理");
   byId("restartBanner").classList.toggle("hidden", !state.config.restart_required);
   byId("managedBanner").classList.toggle("hidden", state.config.editable);
@@ -370,6 +422,21 @@ function collectConfig() {
       persist_world: byId("cfgPersistWorld").checked,
       persist_players: byId("cfgPersistPlayers").checked,
     },
+    policy: {
+      enabled: byId("cfgPolicyEnabled").checked,
+      model_path: value("cfgPolicyModelPath"),
+      run_path: value("cfgPolicyRunPath"),
+      // 页面默认勾选；只有用户明确取消才允许真驱动。
+      dry_run: byId("cfgPolicyDryRun").checked,
+      hz: numericValue("cfgPolicyHz"),
+      v_max: numericValue("cfgPolicyVmax"),
+      stale_s: numericValue("cfgPolicyStale"),
+      // 独立 VLA 不接入 A* 跟随器速度下限。
+      floor_frac: 0,
+      max_len: numericValue("cfgPolicyMaxLen"),
+      path_in: false,
+      graph: false,
+    },
     vision: {
       enabled: byId("cfgVisionEnabled").checked,
       source: "none",
@@ -393,18 +460,24 @@ function collectConfig() {
 }
 
 async function refresh({ includeConfig = false } = {}) {
-  if (!state.token) return;
+  if (!state.token || state.shuttingDown) return;
   try {
-    const requests = [api("/snapshot"), api("/perception")];
+    const requests = [api("/snapshot"), api("/perception"), api("/policy/state")];
     if (includeConfig || !state.config) requests.push(api("/config"));
     const results = await Promise.all(requests);
     state.snapshot = results[0];
     state.perception = results[1];
-    if (results[2]) state.config = results[2];
+    state.policy = results[2];
+    if (results[3]) state.config = results[3];
+    // 这批请求可能是在点「关停后端」之前发出的；回来时进程也许已经退了，别再渲染，
+    // 也别把徽标刷回「已连接」——那会让刚关掉的后端看起来还活着。
+    if (state.shuttingDown) return;
     setConnection(true, get(state.snapshot, "backend.dry_run", false) ? "offline" : "live");
     renderOverview();
     populateConfig();
   } catch (error) {
+    // 关停后连接被拒是预期结果，不是故障：继续刷红条只会像是按钮点坏了。
+    if (state.shuttingDown) return;
     setConnection(false);
     toast(error.message || String(error), true);
     return;
@@ -430,6 +503,82 @@ async function command(label, path, payload = {}) {
   }
 }
 
+function stopPolling() {
+  if (state.timer == null) return;
+  window.clearInterval(state.timer);
+  state.timer = null;
+}
+
+// /shutdown 的语义是「先回包、再慢慢拆」：200 之后几百毫秒内进程就可能把连接掐掉。
+// 所以不能沿用 api()——它只按 HTTP 状态码判成败，会把「连接被拒 / 超时」报成错误，
+// 而那恰恰是我们要的结果：请求都发不出去，说明后端本来就已经退了。
+async function requestShutdown() {
+  const controller = new AbortController();
+  // 10 s 上限：后端停机有硬时限兜底，比这更久基本只能认定进程已经不在了。
+  const timer = window.setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch("/shutdown", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Neko-Backend-Token": state.token},
+      body: "{}",
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    // 只有 4xx/5xx 才是真失败（后端还活着但拒绝了）；accepted === false 同理。
+    if (!response.ok || payload.accepted === false) {
+      return {kind: "rejected", status: response.status, reason: payload.error || payload.reason || `HTTP ${response.status}`};
+    }
+    return {kind: "accepted"};
+  } catch (error) {
+    // AbortError = 我们自己的超时；TypeError = 连接被拒 / 被重置。都按「可能已经退出」处理。
+    const detail = error && error.name === "AbortError" ? "超时没响应" : (error.message || String(error));
+    return {kind: "unreachable", reason: detail};
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function shutdownBackend() {
+  const button = byId("shutdownBackend");
+  if (button.disabled) return;
+  // 这一下会真的结束进程：视觉、导航、身体输出全停，撤不回来，所以先问一次。
+  if (!window.confirm("确定要关停独立后端吗？\n\n后端进程会退出，视觉、导航与身体输出都会停止；此页面之后无法再刷新。")) return;
+
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "正在关停…";
+
+  const result = await requestShutdown();
+
+  if (result.kind === "rejected") {
+    // 后端还在（token 不对 / 5xx）：把按钮还回去、保持轮询，让人能重试。
+    button.disabled = false;
+    button.textContent = label;
+    if (result.status === 401) {
+      // 和 api() 保持一致：token 失效就重新要一次，否则用户只看到一个看不懂的 401。
+      sessionStorage.removeItem("nekoBackendToken");
+      state.token = "";
+      byId("authGate").classList.remove("hidden");
+    }
+    toast(`关停后端：${result.reason || "被拒绝"}`, true);
+    return;
+  }
+
+  // accepted / unreachable 都意味着「它正在退或已经退了」：停轮询、锁按钮、把连接状态标成已关停，
+  // 而不是继续每秒撞一次连接被拒、把正常退出画成红色错误。
+  state.shuttingDown = true;
+  stopPolling();
+  button.disabled = true;
+  button.textContent = "后端已停止";
+  const badge = byId("connectionBadge");
+  badge.textContent = "已关停";
+  badge.className = "badge muted";
+  byId("runtimeLog").textContent = "后端已停止：轮询已停止，可以关闭此页面。";
+  toast(result.kind === "accepted"
+    ? "后端已停止，可以关闭此页面"
+    : `连不上后端（${result.reason}），可能已退出，可以关闭此页面`);
+}
+
 function bind() {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === tab));
@@ -439,11 +588,29 @@ function bind() {
     await refresh({ includeConfig: true });
     await loadKnownWorlds();
   });
+  byId("shutdownBackend").addEventListener("click", shutdownBackend);
   byId("enableBody").addEventListener("click", () => command("启用身体", "/action", { kind: "enable", params: {} }));
   byId("disableBody").addEventListener("click", () => command("禁用身体", "/action", { kind: "disable", params: {} }));
   byId("emergencyStop").addEventListener("click", () => command("急停", "/action", { kind: "stop", params: {} }));
   byId("startVision").addEventListener("click", () => command("启动视觉", "/vision/start"));
   byId("stopVision").addEventListener("click", () => command("停止视觉", "/vision/stop", { reason: "standalone_ui" }));
+  byId("policyPrompt").addEventListener("input", () => { state.policyPromptDirty = true; });
+  byId("setPolicyPrompt").addEventListener("click", async () => {
+    const result = await command("设置 VLA 提示", "/policy/prompt", { text: value("policyPrompt") });
+    if (result && result.accepted !== false) {
+      state.policyPromptDirty = false;
+      byId("policyPrompt").value = result.prompt || "";
+      renderPolicy();
+    }
+  });
+  byId("clearPolicyPrompt").addEventListener("click", async () => {
+    const result = await command("清除 VLA 提示", "/policy/prompt", { text: "" });
+    if (result && result.accepted !== false) {
+      state.policyPromptDirty = false;
+      byId("policyPrompt").value = "";
+      renderPolicy();
+    }
+  });
   byId("wmStart").addEventListener("click", () => command("启动世界模型", "/worldmodel/start"));
   byId("wmStop").addEventListener("click", () => command("停止世界模型", "/worldmodel/stop", { reason: "standalone_ui" }));
   byId("wmSaveWorld").addEventListener("click", async () => {

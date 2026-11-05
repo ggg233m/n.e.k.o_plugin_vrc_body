@@ -60,20 +60,29 @@ class BodyAutoEnableTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=False), \
                 mock.patch.object(ph_mod, "PolicyHead", fake_head_cls):
             svc._start_policy_head()
-        return head_calls, submits
+        return head_calls, submits, fake_head_cls.call_args.kwargs
 
     def test_real_drive_enables_disabled_body(self):
-        head_calls, submits = self._run_start("disabled", dry_run=False)
+        head_calls, submits, _ = self._run_start("disabled", dry_run=False)
         self.assertIn("enable", submits)
         self.assertEqual(head_calls, [1])
 
     def test_real_drive_skips_enable_when_already_enabled(self):
-        _, submits = self._run_start("idle", dry_run=False)
+        _, submits, _ = self._run_start("idle", dry_run=False)
         self.assertNotIn("enable", submits)
 
     def test_dry_run_never_touches_body(self):
-        _, submits = self._run_start("disabled", dry_run=True)
+        _, submits, _ = self._run_start("disabled", dry_run=True)
         self.assertNotIn("enable", submits)
+
+    def test_astar_is_soft_guidance_input(self):
+        _, _, kwargs = self._run_start("idle", dry_run=True)
+        self.assertIsNone(kwargs["wp_provider"])
+        self.assertIsNotNone(kwargs["guidance_provider"])
+        self.assertIsNone(kwargs["hold_provider"])
+        self.assertIsNone(kwargs["floor_provider"])
+        self.assertEqual(kwargs["floor_frac"], 0.0)
+        self.assertEqual(kwargs["wp_stop"], 0.0)
 
 
 if __name__ == "__main__":

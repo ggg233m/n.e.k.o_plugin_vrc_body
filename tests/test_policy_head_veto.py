@@ -45,12 +45,18 @@ class PolicyHeadVetoTests(unittest.TestCase):
         self.assertEqual(args[0], block)
         self.assertNotIn('vetoed', args[2] or {})
 
-    def test_veto_zeroes_block_when_obstacle_is_near(self) -> None:
+    def test_veto_marks_safety_gate_instead_of_zeroing_upstream(self) -> None:
+        """2026-11-06：清零收敛到 executor.submit（policy_modes 的唯一停止判定）。
+
+        这里只标 ``safety_veto``，块原样交给下游 —— 这样 ``stop_source`` 才会
+        如实记成 ``safety_gate``，而不是被上游的布尔短路吃掉。
+        """
         head, ex = self._head(near=lambda: (True, 91))
-        block = [[0.3, 1.1]] * 12
+        block = [[0.3, 1.1, 0.2]] * 12
         head._on_block(block, 1.0, {})
         args, _ = ex.submit.call_args
-        self.assertTrue(all(row == [0.0, 0.0] for row in args[0]))
+        self.assertEqual(args[0], block)
+        self.assertTrue(args[2]['safety_veto'])
         self.assertTrue(args[2]['vetoed'])
         self.assertEqual(args[2]['near_obstacle'], 91)
 

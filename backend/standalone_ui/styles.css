@@ -93,8 +93,10 @@ td:first-child { color: var(--cyan); font-family: Consolas, monospace; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 17px; }
 .field { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 13px; }
 .field.span-2 { grid-column: span 2; }
-.field input, .field select { width: 100%; min-height: 42px; padding: 9px 11px; color: var(--text); background: #0e1118; border: 1px solid var(--line); border-radius: 9px; outline: none; }
-.field input:focus, .field select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(93,228,223,.09); }
+.field input, .field select, .field textarea { width: 100%; min-height: 42px; padding: 9px 11px; color: var(--text); background: #0e1118; border: 1px solid var(--line); border-radius: 9px; outline: none; }
+.field textarea { min-height: 86px; resize: vertical; font: inherit; line-height: 1.45; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(93,228,223,.09); }
+.form-grid > .span-2 { grid-column: span 2; }
 .switch-field { display: flex; align-items: center; gap: 9px; min-height: 42px; color: var(--text); }
 .switch-field input { width: 17px; height: 17px; accent-color: var(--cyan); }
 .help { color: var(--muted); line-height: 1.65; }
@@ -118,6 +120,6 @@ td:first-child { color: var(--cyan); font-family: Consolas, monospace; }
   .tabs { width: 100%; overflow-x: auto; }
   .tab { flex: 1 0 auto; }
   .status-grid, .form-grid { grid-template-columns: 1fr; }
-  .field.span-2 { grid-column: span 1; }
+  .field.span-2, .form-grid > .span-2 { grid-column: span 1; }
   .metric { min-height: 112px; }
 }

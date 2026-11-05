@@ -57,6 +57,7 @@ type DebugState = {
   vision_frame?: Record<string, any>
   vision_worker?: Record<string, any>
   autonomy?: Record<string, any>
+  policy?: Record<string, any>
   clips?: {
     clips?: ClipSummary[]
     invalid_clips?: Array<{ name?: string; error?: string }>
@@ -158,6 +159,8 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   // 出现，否则用户会对着一颗永远失败的按钮反复点。
   const calibrationNeedsFallback = calibrationWaiting || hostVmc.managed === false
   const autonomy = state.autonomy || {}
+  const policy = state.policy || {}
+  const taskPrompt = policy.task_prompt || {}
   // 旧插件版本没有这段，llm_freeze 会是 undefined；下面一律按 !== false 判定，
   // 免得升级前的面板把「默认允许」显示成「已禁止」。
   const permissions = state.permissions || {}
@@ -244,6 +247,7 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
   const [autoRefresh, setAutoRefresh] = props.useLocalState("autoRefresh", true)
   const [busy, setBusy] = props.useLocalState("busy", false)
   const [clientLog, setClientLog] = props.useLocalState<string[]>("clientLog", [])
+  const [policyPrompt, setPolicyPrompt] = props.useLocalState("policyPrompt", "")
 
   const [armSide, setArmSide] = props.useLocalState("armSide", "right")
   const [elevation, setElevation] = props.useLocalState("elevation", 90)
@@ -597,6 +601,42 @@ export default function AnyaDanceDebugPanel(props: PluginSurfaceProps<DebugState
             <ButtonGroup>
               <Button tone="warning" disabled={busy || !autonomy.armed} onClick={() => run("body_stop", { scope: "navigation" })}>停止自主目标</Button>
             </ButtonGroup>
+          </Stack>
+        </Card>
+
+        <Card title="VLA 场次提示词测试">
+          <Stack>
+            <Text>
+              只追加到当前模型的推理输入，用于测试原生泛化；不会训练模型，也不会让提示词直接发送摇杆动作。
+            </Text>
+            <Field label="当前任务提示（最多 96 字符）">
+              <textarea
+                value={policyPrompt}
+                rows={3}
+                maxLength={96}
+                placeholder="例如：自由探索这个房间，看到障碍物就绕开"
+                onChange={(event) => setPolicyPrompt(event.target.value)}
+                style={{ width: "100%", resize: "vertical", fontFamily: "inherit", padding: 8 }}
+              />
+            </Field>
+            <KeyValue items={[
+              { key: "active", label: "已生效提示", value: taskPrompt.active ? (taskPrompt.text || "有") : "无" },
+              { key: "scope", label: "作用范围", value: taskPrompt.scope || "—" },
+              { key: "trained", label: "训练状态", value: taskPrompt.trained ? "已训练" : "仅推理实验" },
+            ]} />
+            <ButtonGroup>
+              <Button
+                tone="primary"
+                disabled={busy || !panelAction || !policy.present}
+                onClick={() => void runSwitch("vrc_policy_prompt", { text: policyPrompt })}
+              >设置并持续使用</Button>
+              <Button
+                tone="warning"
+                disabled={busy || !panelAction || !policy.present}
+                onClick={() => { setPolicyPrompt(""); void runSwitch("vrc_policy_prompt", { text: "" }) }}
+              >清除提示</Button>
+            </ButtonGroup>
+            {!policy.present ? <Alert tone="warning">VLA 策略头当前未加载，提示词会保存失败。</Alert> : null}
           </Stack>
         </Card>
       </Grid>

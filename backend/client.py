@@ -206,8 +206,12 @@ class BackendClient:
                     self.request("POST", "/shutdown", {}, timeout_s=1.0)
                 except Exception:
                     process.terminate()
+                # /shutdown 是「先回包、再拆卸」：后端的拆卸链给 LAS2 收尾留了 3 s 上限，
+                # 再加 HTTP 收尾，实测 ~3.5 s。这里给到 8 s 才不会在真正优雅退出的路上
+                # 抢先 TerminateProcess —— 那样虽然进程也没了，但录制/共享内存收尾全丢。
+                # （后端自身另有 20 s 硬时限看门狗兜底，不会无限等。）
                 try:
-                    process.wait(timeout=3.0)
+                    process.wait(timeout=8.0)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     try:
@@ -327,6 +331,24 @@ class BackendClient:
     def catalog(self) -> dict[str, Any]:
         """兼容 Hosted UI 目录接口的名称。"""
         return self.list_clips()
+
+    def policy_state(self) -> dict[str, Any]:
+        """读取 VLA 运行状态与当前场次提示。"""
+        try:
+            return self.request("GET", "/policy/state")
+        except BackendUnavailable as exc:
+            return {
+                "present": False,
+                "reason": str(exc),
+                "task_prompt": {"text": "", "active": False},
+            }
+
+    def policy_prompt(self, text: str | None = "") -> dict[str, Any]:
+        """设置或清除 VLA 的场次级测试提示。"""
+        try:
+            return _control_request(self, "POST", "/policy/prompt", {"text": text or ""})
+        except BackendUnavailable as exc:
+            return {"accepted": False, "reason": str(exc), "prompt": text or ""}
 
     def request(
         self,
