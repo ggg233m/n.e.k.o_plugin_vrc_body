@@ -346,6 +346,13 @@ def check_section_pointers() -> list[str]:
                      REPO / "Docs" / "archive" / target, REPO / target]
             tgt = next((c for c in cands if c.is_file()), None)
             if tgt is None:
+                # 🆕 2026-11-06：日期化过程稿按 README §四 规矩 11 移入 `_local_drafts/`
+                # 留本地、不入库。历史文档（如方案 v3 §15）仍按**旧文件名**引用它们，
+                # 这不是"指针失效"而是"目标已本地化"；见 `_local_drafts/README.md`。
+                # 不豁免会让 D 类门禁逼人把过程稿交回 Docs/，与精简决策冲突。
+                local = REPO / "_local_drafts" / target.split("/")[-1]
+                if local.is_file():
+                    continue
                 # ⚠️ 只报"**带目录前缀**的路径"（`Docs/x.md`）或索引自身。
                 # 裸文件名（`audit/REPORT.md`、`REPORT.md`、`vrchat-cache-…md`）**不报**：
                 # 仓库里同名报告有 7 份 `REPORT.md`，且外部调研稿可能只存在于
@@ -427,8 +434,26 @@ def check_index_coverage() -> list[str]:
     registered = _names(_section("### 3.1"))
     registered_arch = _names(_section("### 3.2"))
 
-    actual = {p.name for p in (REPO / "Docs").glob("*.md")}
-    actual_arch = {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
+    # 2026-11-06：只对「已跟踪但未登记」报错。
+    # 日期化过程稿按 README §四 规矩 11 留本地、不入库，不应逼着登记进 §三；
+    # 否则每写一份草稿就会让门禁 FAIL，反而逼人把过程稿交进版本库。
+    try:
+        import subprocess
+        tracked = set(
+            subprocess.run(
+                ["git", "-c", "core.quotepath=false", "ls-files", "Docs/*.md", "Docs/archive/*.md"],
+                cwd=str(REPO), capture_output=True, text=True, timeout=30,
+            ).stdout.splitlines()
+        )
+        tracked_base = {p.rsplit("/", 1)[-1] for p in tracked}
+        tracked_full = set(tracked)
+        actual = {p.name for p in (REPO / "Docs").glob("*.md") if p.name in tracked_base}
+        actual_arch = {p.name for p in (REPO / "Docs" / "archive").glob("*.md")
+                       if ("Docs/archive/" + p.name) in tracked_full}
+    except Exception:
+        # git 不可用 / 超时时退回全量（旧行为），不静默放过。
+        actual = {p.name for p in (REPO / "Docs").glob("*.md")}
+        actual_arch = {p.name for p in (REPO / "Docs" / "archive").glob("*.md")}
     actual.discard("README.md")  # 索引自身不必登记
     actual_arch.discard("README.md")
 

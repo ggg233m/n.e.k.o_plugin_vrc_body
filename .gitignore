@@ -57,3 +57,8 @@ las_ckpt/
 # 世界标识是**本地状态**（用户按自己访问的世界手动设置），跟着机器走不跟着仓库走。
 # 提交它会让他人的 wrld_xxx 覆盖本地设置，且每次切世界都产生假 diff。
 /world_identity.json
+
+# 2026-11-06 精简：34 篇日期化实验记录 / 被推翻稿移出 Docs/，留本地不入库。
+# 结论已提炼进 Docs/VLA现状定案（2026-11-06）.md；见 _local_drafts/README.md。
+# 忽略整个目录，防止哪次 `git add -A` 把它们带进版本库。
+/_local_drafts/

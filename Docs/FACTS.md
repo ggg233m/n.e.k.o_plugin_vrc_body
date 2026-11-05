@@ -312,3 +312,39 @@
 | `cam_h` 独立几何锚点 | 米制之前无法定案；段 B 合规录制仍未做 | C9 / `ROADMAP.md:271` |
 | `world_scale` 怎么进代码 | **头像缩放已自动（2026-10-14）**，见 §二 `world_scale` 身高换算行；只乘双目→米那一侧（DR 不动）。仍悬空：**换别的 avatar** 的基准值要重标；live 端到端未跑 | `ROADMAP.md:265`；`OSC速度尺度与回访拖影（2026-10-12）.md` §六 |
 | 锚点自身可追溯性 | 尺子刻度由世界作者印，「1 世界单位 = 1 物理米」无法自证 | `ROADMAP.md:277` |
+
+---
+
+## 八、VLA 当前口径（2026-11-06；唯一真值单源）
+
+> 本节的产物路径见 `Docs/VLA现状定案（2026-11-06）.md` §一、§七。
+> 与 11-02~11-06 的日期化过程稿冲突时，**一律以本节为准**；过程稿未提交、不作当前实现引用。
+
+| 项 | 当前值 | 证据 |
+|---|---|---|
+| 当前部署 checkpoint（B3）数据集 | **`m0_policy_448_v6peak`**（`interval_abs_peak` / `wp_mode=causal`）；10 场 / 10 世界 / `kept=23082`、train/val split `23068=18365+4703` | `deploy/b3_peak_norm_3ep.deploy.json` 的 `training.dataset` |
+| 对照基线数据集 | `m0_policy_448_v5omega30`（`interval_abs_mean`，即抹掉短转向事件那一版），与 v6peak 仅 ω 聚合不同 | `G:\vrc_recording\vrc_model\dataset\m0_policy_448_v5omega30\manifest.json` |
+| 动作块 | `act_dim=3` / `steps=12` / `step_s=0.1` = 1.2 s | `deploy/b3_peak_norm_3ep.deploy.json` |
+| 输入 | `drop_wp=true` / `wp_mode=causal` / `history_frame_s=0.2` / `video_frames=2` | 同上 + `build_policy_dataset.py::WP_MODE_CAUSAL` |
+| ω | `omega_source_hz=30` / `rad/s` / 右正 / **B3 当前用 `interval_abs_peak`**；`interval_abs_mean` 属 v5omega30 对照 | deploy manifest `training.dataset_omega.aggregation` + `omega聚合与norm消融` B3 组 |
+| 标定 | `K = −0.008953 rad/unit`（R² 0.787–0.959） | `像人的VLA-数据采集协议` §0.1 积分口径 |
+| 评测 | 会话隔离 5 折（10 世界）/ 完整 12 步 / `stop_recall` 硬门 / `input_schema.json` 强制 | `VLA跨会话评测勘误` §4、§6 |
+| 安全硬门现状 | `idle.stop_recall` 实测 **0.0052 / 0.0099（≈0.01）**，与阶段门 ≥0.30/0.50/0.75 差 50~100 倍 | `omega30最终评测` §7 + `move类唯一实验` |
+| 帧间隔门（措辞已澄清） | 0.4→0.2 s 配对 **p=0.6495 不显著**（n=120）⇒ **不建议仅凭此结果**提频 5→10 Hz，且「以 0.2 s 重训」未测；补录/重新抽帧后按 `VLA工程落地与阻塞` §10.5 的 ③→②→① 仍可做 ①（10 Hz 观测）；0.2 s 漏检 **17.8%** vs 0.4 s 26.9%；**5 Hz 只保留 35.2% 转向事件 / 65% 不在监督信号里**（丢失在标签侧），推荐 10 Hz 观测 + ω 标签 30 Hz；ω 负面结论只在当前采样口径成立 | `历史帧间隔-受控评测结果` §3/§4 + `VLA工程落地与阻塞` §10 |
+| 过期门（两个量） | runner `stale_s=0.8`（2 Hz）；**executor `stale_s=1.3`**（`policy_executor.py:128`），按 `int(age/0.1)` 取步 ⇒ 1.2 s 开环、2 Hz 至少消费 7 步 | 代码事实 |
+| 评测方法学 | 跨会话折必须 `--session-folds`，**禁 `rng.permutation`**（随机折曾凭空 12%）；视觉敏感度用逐样本配对 Δ_i + bootstrap 10,000 次给 CI | `训练方案v4` §5 |
+| 止损门 | `copy8=2.2120`（实测 2.21198）必须低于；LOWO 下连 copy8 都打不过**不要进第 3 步** | `VLA重训执行清单0-3步` §3.6 |
+| 跨会话基线 | `body` 2.8716 / `body+wp` 2.1182 / `+img` **1.5542** / 置黑 2.0992 / 打乱 2.2038；视觉增益 **26.63%** | `.venv_xpu/runs/kfold/kfold.json`（实测逐位核对） |
+| 容量 | r8 5.41M 最好，停止 rank>8 扫描；r32=21.65M、r64≈43.3M | `容量与数据-LoRA容量扫描` §1 |
+| 性能 | 图重放 538→**123.4 ms**；训练 `--compile` **2.16×**（1319.8→611.0 ms/step）；decode 6258→1824 算子 / 338→132.1 ms；**12 步×2 轴=24 token** ×132.1 ms=**3.17 s** ⇒ 2 Hz 不可能 | `CPU派发开销剖析` §5/§15、`陪伴型agent` §1 |
+| 训练计时 | `ms/step` 不含 DataLoader 取数 **27.0 ms**（低估 ~4%）；真实 **p50 670.5 / r8 731.9 ms**，575 ms 是 3.6% 分位最小值；GPU **42.2%**；反向占 **43%** | `训练性能分析复核` §2/§3/§4、`train_policy_lora.py` 计时器（行号随代码漂移，按符号名核对） |
+| 不升级 | PyTorch 2.14.1+xpu 保持；2.15.0 对 5 瓶颈零命中且换 UR 层风险。**升级触发**：PR #194598+#197866 同时 merged 且进 XPU release notes（#200478 仍 open）；升级前验双图 `fallbacks=0` / `cos_min≥0.999` / p95≤123·176 ms，保留 2.14.1 venv 快照 | `PyTorch版本升级评估` §6 |
+| 部署 | B3 = `B_peak_norm_3ep/best`，离线候选（非定案），真机未验 | `deploy/b3_peak_norm_3ep.deploy.json` |
+| A* 软引导第三重限定 | 当前 B3 `input_schema.json` 仍 `drop_wp=true` ⇒ **没学过软引导、会忽略航点**，须重训 `drop_wp=false` hybrid；`requested=false` 不是坏路径样本；仅 `memory_revisit` 开 `path_in` 并对 30% 有效引导增强 | `VLA软引导与视觉自主避障建图方案` |
+| 停车语义（11-06 已修） | 旧 `\|wp\|<wp_stop` 门控已删除；`decide_stop()` 六来源 `nav_state/stop_head/safety_veto/safety_gate_unlocalized/stale/estop`；`localization_gate` 与 wp 解耦；`wp_stop` deprecated 仅作标注。⚠️ **未定位时是否驱动仍是产品决策**（`stops_on` 仍含 unlocalized） | `policy_runtime.py:16-18/312` + deploy manifest `stop_sources`/`wp_stop_semantics` |
+
+**不采信（见 `VLA现状定案` §六）**：`1.48/1.4523/「欠拟合」`、**混 8/12 步的「差 20%」**（同 8 步口径 `1.2371 vs 1.4523` 差 17.4% 仍成立）、`1.4849` 作能力证据、
+`omega_norm 是设计错误`、`Triton 编不过`、`G1 已全过`、`8.33 s/块`、`P0 继续加同类数据`（`2.5×→−23%` 读数本身是建立在泄漏 wp 上的实测，可作历史刻度）。⚠️ `--best-metric` 已实现（`train_policy_lora.py:918`），不属于「不存在的开关」。
+任何跨模型比较必须带「步数 × 子集 × 数据集版本」三件套。
+
+---
