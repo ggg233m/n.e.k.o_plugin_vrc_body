@@ -53,7 +53,7 @@ class PolicyRunner:
         # 路径形状供给（可选）。给 k 个机体系点让模型看见弯；None = 退回单点 prompt。
         # 见 policy_runtime.PROMPT_PATH 的注释：启用会偏离训练分布，只在 A/B 时开。
         self.path_source = path_source
-        # 记忆卡 [mode] 供给（方案 §10.6）。None 时恒用 0=follow。
+        # 导航状态供给：只用于停止决策，**不进记忆卡**（卡 v2 无 [mode]）。
         self.mode_provider = mode_provider
         self.prev_source = prev_source
         self.wp_provider = wp_provider
@@ -208,6 +208,7 @@ class PolicyRunner:
                             stop_source=out.get("stop_source"),
                             stop_reason=out.get("stop_reason"),
                             stop_detail=out.get("stop_detail"),
+                            stop_head_p=out.get("stop_head_p"),
                             gated=stop, stale=stale,
                             # 定位安全门也进 meta：executor 会再判一次（幂等），
                             # 这样即使注入的 runtime 替身忽略该字段也不会漏停。

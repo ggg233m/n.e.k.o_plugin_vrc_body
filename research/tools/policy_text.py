@@ -6,10 +6,16 @@
 
 格式（定长、ASCII 标签、固定顺序、两位小数）：
 
-    [mode] 0 [wp] 0.60 0.00 [topo] 1.20 0.15 2.30 [self] 0.00 1.10
+    [wp] 0.60 0.00 [topo] 1.20 0.15 2.30 [self] 0.00 1.10
 
-四个字段：
-  [mode]  0=follow 1=replan 2=explore 3=stop   —— 导航器状态机的确定性结果
+⚠️ **2026-11-06 起卡格式升到 v2：删除 `[mode]`。** 理由是本轮的实测归因：
+body+img+causal 的 −0.38 增益里 `mode` 独占 −0.40，属于**特权状态**（导航状态机
+直接给出的确定性结果），不是感知能力；把它留在卡里会把「知道导航器想干什么」
+误读成「模型看懂了画面」。`mode` 现在**只允许**进入运行时停止决策
+（``policy_modes.decide_stop`` 的 ``nav_state``），绝不进入模型输入。
+旧 ckpt（含 B3）是用 v1 卡训的，**不能用 v2 卡评测**，已不在基线表内。
+
+三个字段：
   [wp]    前视点，机体系 dx(右)/dz(前)，**世界米**
   [topo]  沿边已走 prog、横向偏差 lateral(右正)、到边终点 remain，**世界米**
   [self]  本体速度 vx/vz，**世界米/秒**
@@ -61,31 +67,45 @@ def _f(v) -> str:
     return "%.2f" % x
 
 
-def build_policy_text(mode, wp, topo, body) -> str:
-    """记忆卡。``wp``/``topo``/``body`` 都是**世界米**口径的二元/三元组。
+# 记忆卡格式版本。v1 含 [mode]，v2 删掉 [mode]（2026-11-06）。
+# 训练侧写入 input_schema["card_version"]，推理侧据此拒绝用 v2 卡评旧 ckpt。
+CARD_VERSION = 2
+CARD_TAGS = ("[wp]", "[topo]", "[self]")
+# 卡里**不允许**出现的字段（泄漏硬门）：mode 是特权导航状态，A*/任务卡尚未就绪。
+FORBIDDEN_CARD_TAGS = ("[mode]", "[guide]", "Path ahead", "Task instruction")
+
+
+def assert_card_clean(text: str) -> str:
+    """泄漏硬门：卡里不得出现 ``[mode]`` / A* 路径 / 任务卡。
+
+    2026-11-06 拍板：S2 是**纯感知读出实验**，mode 只用于运行时停止决策；
+    A* 与任务段数据当前为 0 个，提前让它们进卡等于伪造条件能力。
+    """
+    for tag in FORBIDDEN_CARD_TAGS:
+        if tag in text:
+            raise ValueError("记忆卡含被禁字段 %r（%s）；S2 是纯感知读出实验，"
+                             "mode/A*/任务卡不得进入模型输入" % (tag, text))
+    return text
+
+
+def build_policy_text(wp, topo, body) -> str:
+    """记忆卡（v2，无 ``[mode]``）。``wp``/``topo``/``body`` 都是**世界米**口径。
 
     字段顺序与标签冻结；缺失传 None 即可，会自动写 0.00。
     """
-    try:
-        m = int(mode)
-    except (TypeError, ValueError):
-        m = MODE_FOLLOW
-    if m not in MODE_NAMES:
-        m = MODE_FOLLOW
-
     def trio(v):
         if v is None:
             return (0.0, 0.0, 0.0)
         v = list(v) + [0.0] * (3 - len(v))
         return (v[0], v[1], v[2])
 
-    w = trio(wp) if wp is not None and len(list(wp)) == 3 else None
     wx, wz = (_f(wp[0]), _f(wp[1])) if wp is not None else ("0.00", "0.00")
     tp, tl, tr = trio(topo)
     bx, bz = (_f(body[0]), _f(body[1])) if body is not None else ("0.00", "0.00")
 
-    return ("[mode] %d [wp] %s %s [topo] %s %s %s [self] %s %s"
-            % (m, wx, wz, _f(tp), _f(tl), _f(tr), bx, bz))
+    text = ("[wp] %s %s [topo] %s %s %s [self] %s %s"
+            % (wx, wz, _f(tp), _f(tl), _f(tr), bx, bz))
+    return assert_card_clean(text)
 
 
 def build_guidance_text(guide) -> str:

@@ -5,7 +5,9 @@
 --------------------
 改动前同一个 `mode` 字段在两条链路上有三套互不相同的实现：
 
-1. ``policy_text.MODE_*``：记忆卡 [mode]，``0=follow 1=replan 2=explore 3=stop``；
+1. ``policy_text.MODE_*``：导航状态 → 停止决策的 ``nav_state``，``0=follow 1=replan
+   2=explore 3=stop``；⚠️ **2026-11-06 起 mode 不再进记忆卡**（卡 v2 无 [mode]），
+   只用于运行时 ``decide_stop`` 的归属；
 2. ``nav_online.NavSession.mode``：字符串 ``idle / goto / explore / done``；
 3. ``nav_online._policy_mode``：按**跟随器轴** ``3 if (forward<=0 and turn==0) else 0``。
 
@@ -33,7 +35,7 @@ deprecated、不参与任何决策。停止只能来自五处（顺序即归因�
 """
 from __future__ import annotations
 
-# ---------------------------------------------------------------- 记忆卡 [mode]
+# ---------------------------------------------------------------- 导航状态 → 停止归属
 MODE_FOLLOW = 0
 MODE_REPLAN = 1
 MODE_EXPLORE = 2
@@ -41,7 +43,8 @@ MODE_STOP = 3
 MODE_NAMES = {MODE_FOLLOW: "follow", MODE_REPLAN: "replan",
               MODE_EXPLORE: "explore", MODE_STOP: "stop"}
 
-# NavSession.mode（backend/nav_mapping.py:1622）→ 记忆卡 [mode]。
+# NavSession.mode（backend/nav_mapping.py:1622）→ nav_state（decide_stop 的停止归属）。
+# ⚠️ 2026-11-06 起**不再写记忆卡**（卡 v2 已删 [mode]）；仅在运行时决定「停不停」。
 # 这是**单向**映射：只有这里一处定义，nav_online.policy_mode() 与
 # nav_online.policy_guidance() 都调用它，禁止再各写一套三元表达式。
 NAV_STATE_TO_MODE = {
@@ -160,7 +163,7 @@ def decide_localization(state, pose_age_s=None, *, state_reason=None,
 
 
 def from_session_mode(nav_state) -> int:
-    """NavSession.mode（字符串）→ 记忆卡 [mode]。未知状态按 follow。
+    """NavSession.mode（字符串）→ 停止归属用的 ``nav_state``，**不写记忆卡**。
 
     未知按 follow 而不是 stop：导航状态字符串漂移（新状态名）时，
     宁可让模型按「正常跟随」跑，也不要凭空造出一个停车条件。

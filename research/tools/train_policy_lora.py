@@ -206,7 +206,6 @@ class PolicyDataset(Dataset):
         prev = np.asarray(Image.open(s["prev_img"]).convert("RGB"))
         video = np.stack([prev, cur])  # (T=2, H, W, 3)，T 沿 temporal_patch_size 打成一个 patch
         body = s["body"]
-        mode = int(s.get("mode", 0))
         topo = s.get("topo") or (0.0, 0.0, 0.0)
         guide = dict(s.get("guide") or {})
         guide.setdefault("requested", bool(s.get("path")))
@@ -230,7 +229,6 @@ class PolicyDataset(Dataset):
             # 与方案 §10.6「缺失值一律写 0.0」、§11.4 geometry dropout 同一契约。
             if self.topo_dropout > 0.0 and rng.random() < self.topo_dropout:
                 topo = (0.0, 0.0, 0.0)
-                mode = 0
             if self.guidance_corrupt_p > 0.0 and guide.get("valid") and rng.random() < self.guidance_corrupt_p:
                 r = rng.random()
                 if r < self.guidance_drop_p:
@@ -257,17 +255,21 @@ class PolicyDataset(Dataset):
                     "Predict the next 12 body velocities at 0.1 s steps."
                     % (body[0], body[1], _wp_in[0], _wp_in[1]))
         else:
-            text = build_policy_text(mode, _wp_in, topo, body)
+            # 卡 v2（2026-11-06）：**没有 [mode]**。mode 只用于运行时停止决策，
+            # 不进模型输入 —— 否则会把「导航状态机告诉模型该停」误读成感知能力。
+            text = build_policy_text(_wp_in, topo, body)
         if self.path_in:
             pts = " ".join("%.2f %.2f" % (float(a), float(b)) for a, b in path)
             text += " Path ahead (dx dz, right/fwd, every 0.8 m):" + pts
             text += build_guidance_text(guide)
-        # 数值旁路用的 8 维（与记忆卡同源），P0-1 起直接送 head
+        # 数值旁路用的 7 维（与记忆卡同源，**不含 mode**），P0-1 起直接送 head。
+        # 2026-11-06 由 8 维改为 7 维：mode 被移出模型输入（卡/prompt 同步）。
         num_feat = [float(_wp_in[0]), float(_wp_in[1]),
                     float(topo[0]), float(topo[1]), float(topo[2]),
-                    float(body[0]), float(body[1]), float(mode)]
+                    float(body[0]), float(body[1])]
         if self.quad_feats:
-            # 二次扩张 8 -> 44（原值 + 平方 + 28 个交叉项），**直接拼进 head**。
+            # 二次扩张 7 -> 35（原值 + 平方 + 21 个交叉项），**直接拼进 head**。
+            # 2026-11-06 由 8->44 改为 7->35（去掉 mode 维）；旧 44 维 head 不再兼容。
             # 依据（P2 诊断 2026-11-04，同批 val 400、前 8 步）：
             #   8 数值线性 2.3916 → 二次 1.1834（−50.5%）
             #   pooled 1024 线性 2.2978；pooled+数值线性 2.2990（几乎无增益）
@@ -287,6 +289,9 @@ class PolicyDataset(Dataset):
                     traversability=(None if s.get("traversability") is None else
                                     np.asarray(s["traversability"].get("traversability", []),
                                                dtype=np.float32)),
+                    # stop_head 监督（2026-11-06）：cls==idle → 1。**不看 mask**，
+                    # 因为「这一块是不是停着」是窗口级标签，不是逐步标签。
+                    stop=policy_readout.stop_label(s["cls"]),
                     cls=s["cls"], split=s["split"], sid=s["sid"], t=s["t"])
 
 
@@ -306,6 +311,8 @@ def make_collate(processor, min_pixels: int, max_pixels: int):
             wps=torch.from_numpy(np.stack([b["wp"] for b in batch])),
             nums=torch.from_numpy(np.stack([b["num"] for b in batch])),
             traversability=(torch.from_numpy(np.stack(_trav)).float() if _trav_ok else None),
+            stop=torch.tensor([float(b.get("stop", 0.0)) for b in batch],
+                              dtype=torch.float32),
             cls=[b["cls"] for b in batch], split=[b["split"] for b in batch],
             sid=[b["sid"] for b in batch], t=[b["t"] for b in batch],
         )
@@ -652,21 +659,21 @@ class NumericBypass(nn.Module):
 
 
 def numeric_features(samples: list[dict]) -> list[list[float]]:
-    """8 维数值：wp dx/dz、topo 3 项、body vx/vz、mode。与记忆卡同源。"""
+    """7 维数值：wp dx/dz、topo 3 项、body vx/vz。与记忆卡同源，**不含 mode**。"""
     out = []
     for s in samples:
         wp = s.get("wp") or (0.0, 0.0)
         tp = s.get("topo") or (0.0, 0.0, 0.0)
         bd = s.get("body") or (0.0, 0.0)
         out.append([float(wp[0]), float(wp[1]), float(tp[0]), float(tp[1]),
-                    float(tp[2]), float(bd[0]), float(bd[1]),
-                    float(s.get("mode", 0))])
+                    float(tp[2]), float(bd[0]), float(bd[1])])
     return out
 
 
 def forward_batch(model, head, inputs, device: str, injector=None, event_head=None,
                   traversability_head=None, bypass=None, numeric=None,
-                  quad_feats_active=False, readout=None):
+                  quad_feats_active=False, readout=None, readout_num_in=False,
+                  stop_head=None):
     """绕过 LM head，取 last_hidden_state 的末位 token 池化 —— 视需要再接视觉注入。
 
     ``injector`` 非 None 时：在同一次前向里用 forward hook 取视觉塔输出，
@@ -724,7 +731,14 @@ def forward_batch(model, head, inputs, device: str, injector=None, event_head=No
         if feat is None:
             raise RuntimeError("读出模块需要视觉 token，但视觉输出未捕获")
         _num = numeric.to(device) if numeric is not None else None
-        cat.append(readout(feat.float(), _num))
+        if policy_readout.needs_numeric(readout):
+            # AdditiveFusion 自带数值编码器（视觉 + 数值在 256 维里相加）
+            cat.append(readout(feat.float(), _num))
+        else:
+            # VisionQueryReadout 只吃视觉 token；数值若要进模型，走 head 拼接
+            cat.append(readout(feat.float()))
+            if readout_num_in and _num is not None:
+                cat.append(_num)
     if bypass is not None and numeric is not None:
         # 注意：_num 不在 inputs（那是 processor 产出的）；调用方把 batch["nums"]
         # 以关键字 numeric= 传进来。
@@ -740,7 +754,11 @@ def forward_batch(model, head, inputs, device: str, injector=None, event_head=No
         cat.append(numeric.to(device))
     # use_hidden=False（--no-last-token）时 head 只吃 extra；ActionHead 对空输入报错。
     _x = pooled if getattr(head, "use_hidden", True) else None
-    logits = head(_x, *cat) if cat else head(_x)
+    _parts = ([_x] if _x is not None else []) + list(cat)
+    # stop_head 与动作头**共用同一特征向量**（读出输出 + 数值拼接），
+    # 不另建一套输入口径；它对 safety_gate 是**并联**，不是替代。
+    _head_in = torch.cat(_parts, -1) if _parts else None
+    logits = head(_head_in) if _head_in is not None else head(None)
     act_dim = int(logits.shape[-1]) // K_STEPS
     pred = logits.view(-1, K_STEPS, act_dim)
     aux = []
@@ -751,6 +769,10 @@ def forward_batch(model, head, inputs, device: str, injector=None, event_head=No
         if feat is None:
             raise RuntimeError("可通行性头需要视觉 token，但视觉输出未捕获")
         aux.append(traversability_head(feat.float()))
+    if stop_head is not None:
+        if _head_in is None:
+            raise RuntimeError("stop_head 需要特征输入，但 head 输入为空")
+        aux.append(stop_head(_head_in))
     return (pred, *aux) if aux else pred
 
 
@@ -785,17 +807,19 @@ def _metric_value(metrics: dict, name: str) -> float:
 @torch.no_grad()
 def evaluate(model, head, loader, device: str, injector=None, event_head=None,
              traversability_head=None, bypass=None, quad_active=False,
-             readout=None) -> dict:
+             readout=None, readout_num_in=False, stop_head=None) -> dict:
     model.eval()
     preds, acts, masks, clss = [], [], [], []
     ev_logits, ev_true = [], []
     trav_logits, trav_true = [], []
+    stop_logits, stop_true = [], []
     for batch in loader:
         r = forward_batch(model, head, batch["inputs"], device,
                           injector=injector, event_head=event_head,
                           traversability_head=traversability_head,
                           bypass=bypass, numeric=batch.get("nums"),
-                          quad_feats_active=quad_active, readout=readout)
+                          quad_feats_active=quad_active, readout=readout,
+                          readout_num_in=readout_num_in, stop_head=stop_head)
         if isinstance(r, tuple):
             pred = r[0]
             pos = 1
@@ -806,6 +830,10 @@ def evaluate(model, head, loader, device: str, injector=None, event_head=None,
             if traversability_head is not None and batch.get("traversability") is not None:
                 trav_logits.append(r[pos].float().cpu())
                 trav_true.append(batch["traversability"].float().cpu())
+                pos += 1
+            if stop_head is not None:
+                stop_logits.append(r[-1].float().cpu())
+                stop_true.append(batch["stop"].float().cpu())
         else:
             pred = r
         preds.append(pred.float().cpu())
@@ -878,11 +906,32 @@ def evaluate(model, head, loader, device: str, injector=None, event_head=None,
     # **动作头**来源；绝不能与执行器的 nav_state/stop_head/safety_gate 门控数字
     # 混用或相加（两者口径不同，一个基于标签窗口、一个基于在线否决计数）。
     if "idle" in out:
+        out["idle_mse12"] = out["idle"].get("mse12")
         out["stop_recall"] = out["idle"].get("stop_recall")
         out["stop_recall_source"] = "action_head_first8_idle_windows"
         out["stop_recall_definition"] = (
             "idle 类样本中，预测块前 8 步速度全部 < %.2f m/s 的比例（按块平均，"
             "只统计前 8 步标签全有效者）" % V_STILL)
+    # stop_head（2026-11-06）：独立的二分类停止头，监督 = cls==idle。
+    # 与上面动作头口径**并列**报告，不覆盖、不相加；来源必须可追踪。
+    if stop_logits:
+        sl = torch.cat(stop_logits)
+        st = torch.cat(stop_true)
+        p = torch.sigmoid(sl)
+        idle_sel = st > 0.5
+        out["stop_head"] = {
+            "n": int(len(st)),
+            "acc@0.5": float(((p >= 0.5) == (st > 0.5)).float().mean()),
+            "recall@0.5": (float((p[idle_sel] >= 0.5).float().mean())
+                           if bool(idle_sel.any()) else None),
+            "precision@0.5": (float((st[p >= 0.5] > 0.5).float().mean())
+                              if bool((p >= 0.5).any()) else None),
+            "mean_p_idle": (float(p[idle_sel].mean()) if bool(idle_sel.any()) else None),
+            "mean_p_nonidle": (float(p[~idle_sel].mean()) if bool((~idle_sel).any()) else None),
+            "source": "stop_head_sigmoid@0.5_cls==idle",
+        }
+        out["stop_recall_head"] = out["stop_head"]["recall@0.5"]
+        out["stop_recall_head_source"] = "stop_head_sigmoid>=0.5_idle_windows"
     # 近碰/碰撞：collision.jsonl 尚不存在（见 Docs 缺口登记），
     # 这里如实报 unavailable，**不**用动作误差冒充碰撞率。
     out["near_collision"] = {"available": False, "count": None,
@@ -999,13 +1048,13 @@ def main(argv=None) -> int:
     ap.add_argument("--guidance-drop-p", type=float, default=0.15,
                     help="引导损坏中模拟完全丢失的比例")
     ap.add_argument("--quad-feats", action="store_true",
-                    help="把 8 个数值的二次扩张(44维)直接拼进 head 输入。零额外参数。"
-                         "P2 诊断：8数值线性 2.39 → 二次 1.18")
+                    help="把 7 个数值的二次扩张(35维)直接拼进 head 输入。零额外参数。"
+                         "2026-11-06 去 mode 后由 8→44 改为 7→35")
     ap.add_argument("--numeric-bypass", action="store_true",
-                    help="8 个数值直接接进 head（不经 LM）。P0-1 实验，硬门 mse8<=1.24")
+                    help="7 个数值直接接进 head（不经 LM）。P0-1 实验，硬门 mse8<=1.24")
     ap.add_argument("--bypass-no-quad", dest="bypass_quad", action="store_false",
                     default=True,
-                    help="关闭二次特征扩张（默认开：8→44，与 ridge 的表示对齐）")
+                    help="关闭二次特征扩张（默认开：7→35，与 ridge 的表示对齐）")
     # ---- S2 读出（2026-11-06）：默认全关 = 旧行为。本轮只实现，不启动训练。----
     ap.add_argument("--readout-only", action="store_true",
                     help="冻结主干（含 LoRA）只训读出 + 动作头；要求 --vision-query>0 "
@@ -1023,6 +1072,12 @@ def main(argv=None) -> int:
     ap.add_argument("--no-last-token", action="store_true",
                     help="动作头不吃 LM 末位 hidden，只吃读出模块输出；"
                          "必须与 --vision-query/--fusion 同时用")
+    ap.add_argument("--stop-head", action="store_true",
+                    help="训二值停止头（监督 cls==idle）；--readout-only 时自动开启。"
+                         "与 safety_gate 并联，不替代安全门")
+    ap.add_argument("--stop-hidden", type=int, default=64, help="stop_head 隐层宽度")
+    ap.add_argument("--stop-loss-weight", type=float, default=1.0,
+                    help="stop_head BCE 在总 loss 里的权重")
     ap.add_argument("--symint-fallback", type=int, default=1024,
                     help="unbacked SymInt 的 fallback 值（默认 1024，Inductor 原值 8192）。"
                          "batch>4 时会按 8192 三次方算出 2^43，触发 maxGridSize 断言")
@@ -1124,15 +1179,23 @@ def main(argv=None) -> int:
                                      vit_lora_r=a.vit_lora_r, act_dim=act_dim,
                                      lora_r=a.lora_r)
     # ---- S2 读出（2026-11-06）：默认全关，与旧路径逐位一致 ----------------
-    if int(getattr(a, "vision_query", 0) or 0) > 0 and \
-            str(getattr(a, "fusion", "none")) not in ("none", ""):
-        raise SystemExit("--vision-query 与 --fusion 是两版对照，只能开一个")
-    readout_kind = ("vision_query" if int(getattr(a, "vision_query", 0) or 0) > 0
-                    else str(getattr(a, "fusion", "none") or "none"))
+    # `--vision-query N --fusion additive` 是**组合**：4-query 视觉池化 + 数值 7 维
+    # 直接拼进动作头（数值不占读出参数，B 臂因此保持 263,936 参数量，可与 A′ 对齐）。
+    _vq = int(getattr(a, "vision_query", 0) or 0)
+    _fu = str(getattr(a, "fusion", "none") or "none").strip().lower()
+    if _vq > 0 and _fu == "gated":
+        raise SystemExit("gated 对照本轮暂停（先把 paired readout 做完）；"
+                         "additive 用 --fusion additive")
+    readout_kind = "vision_query" if _vq > 0 else (_fu if _fu not in ("none", "") else "none")
     readout = policy_readout.build_readout(
         readout_kind, q_dim=int(getattr(a, "vision_query_dim", 256) or 256),
         n_query=int(getattr(a, "vision_query", 4) or 4),
         out_dim=int(getattr(a, "fusion_out", 256) or 256))
+    # 数值侧通道：仅当显式 additive/gated 时拼接；纯 vision_query（无 fusion）不拼。
+    readout_num_in = bool(readout is not None and _fu in ("additive", "gated"))
+    if readout_num_in:
+        extra_dim += 7          # 7 维数值直接进 head（与 quad 不同，不做二次扩张）
+        print("[readout] 数值 7 维拼进 head（additive 融合，无读出额外参数）", flush=True)
     if getattr(a, "readout_only", False):
         if readout is None:
             raise SystemExit("--readout-only 需要 --vision-query>0 或 --fusion 非 none")
@@ -1151,15 +1214,15 @@ def main(argv=None) -> int:
     # 依据：45 参数二次 ridge 只用这 8 个数就到 1.2392，而 0.8B+LoRA 只有 1.7569。
     bypass = None
     if a.quad_feats:
-        extra_dim += 44
-        print("[quad] 数值二次扩张 8 -> 44 维直接拼进 head（无额外参数）", flush=True)
+        extra_dim += 35
+        print("[quad] 数值二次扩张 7 -> 35 维直接拼进 head（无额外参数）", flush=True)
     if a.numeric_bypass:
         bypass = NumericBypass(quad=getattr(a, "bypass_quad", True)).to(device)
         _m = np.asarray(numeric_features(train), dtype=np.float64)
         bypass.set_stats(_m.mean(0), _m.std(0))
         extra_dim += bypass.out_dim
         extra_params = list(extra_params) + list(bypass.parameters())
-        print("[bypass] numeric 8 -> %d, params=%d"
+        print("[bypass] numeric 7 -> %d, params=%d"
               % (bypass.out_dim, sum(p.numel() for p in bypass.parameters())), flush=True)
 
     if a.inject_visual or a.numeric_bypass or a.quad_feats or readout is not None:
@@ -1168,6 +1231,17 @@ def main(argv=None) -> int:
         head = ActionHead(hidden, out=K_STEPS * act_dim, extra=extra_dim,
                           use_hidden=not bool(getattr(a, "no_last_token", False))
                           ).to(device)
+
+    # stop_head（2026-11-06）：cls==idle 二分类，输入 = 动作头同一特征向量。
+    # --readout-only 默认开启（只训读出层 + stop_head）；其余训练按开关。
+    stop_head = None
+    if bool(getattr(a, "readout_only", False)) or bool(getattr(a, "stop_head", False)):
+        stop_head = policy_readout.build_stop_head(
+            head.in_dim, hidden=int(getattr(a, "stop_hidden", 64) or 64), enabled=True).to(device)
+        extra_params = list(extra_params) + list(stop_head.parameters())
+        print("[stop_head] in_dim=%d hidden=%d params=%d（与 safety_gate 并联）"
+              % (head.in_dim, int(a.stop_hidden),
+                 sum(p.numel() for p in stop_head.parameters())), flush=True)
 
     # ---- torch.compile 内层模型 ----
     # 为什么：训练每步 1174 ms，而数据准备只占 27 ms、GPU 占用只有 50%。
@@ -1361,6 +1435,8 @@ def main(argv=None) -> int:
             torch.save(injector.state_dict(), d / "injector.pt")
         if readout is not None:
             torch.save(readout.state_dict(), d / "readout.pt")
+        if stop_head is not None:
+            torch.save(stop_head.state_dict(), d / "stop_head.pt")
         if ev_head is not None:
             torch.save(ev_head.state_dict(), d / "event_head.pt")
         if trav_head is not None:
@@ -1378,6 +1454,10 @@ def main(argv=None) -> int:
         _schema.update(policy_readout.schema_fields(
             readout, no_last_token=bool(getattr(a, "no_last_token", False))))
         _schema["head_in_dim"] = int(getattr(head, "in_dim", hidden))
+        _schema["readout_num_in"] = bool(readout_num_in)
+        _schema["stop_head"] = bool(stop_head is not None)
+        _schema["stop_head_in_dim"] = int(getattr(stop_head, "in_dim", 0) or 0)
+        _schema["stop_head_thresh"] = 0.5
         input_schema.save(d, _schema)
 
     best = (math.inf, None)
@@ -1400,7 +1480,8 @@ def main(argv=None) -> int:
                               injector=injector, event_head=ev_head,
                               traversability_head=trav_head,
                               bypass=bypass, numeric=batch.get("nums"),
-                              quad_feats_active=a.quad_feats, readout=readout)
+                              quad_feats_active=a.quad_feats, readout=readout,
+                              readout_num_in=readout_num_in, stop_head=stop_head)
             if isinstance(r, tuple):
                 pred = r[0]
                 _pos = 1
@@ -1408,8 +1489,11 @@ def main(argv=None) -> int:
                 if ev_head is not None:
                     _pos += 1
                 trav_logit = r[_pos] if trav_head is not None else None
+                if trav_head is not None:
+                    _pos += 1
+                stop_logit = r[_pos] if stop_head is not None else None
             else:
-                pred, ev_logit, trav_logit = r, None, None
+                pred, ev_logit, trav_logit, stop_logit = r, None, None, None
             act_d = batch["act"].to(device)
             mask_d = batch["mask"].to(device)
             # ω 通道：先硬裁剪掉异常值，再按 --omega-loss-weight 单独加权。
@@ -1449,6 +1533,12 @@ def main(argv=None) -> int:
                     l_trav = torch.nn.functional.binary_cross_entropy_with_logits(
                         trav_logit[known], trav_y[known])
                     loss = loss + a.traversability_weight * l_trav
+            if stop_logit is not None:
+                # stop_head：二分类停止（监督 = cls==idle）。与动作头 loss 并列，
+                # 权重独立，便于读出实验里两者不互相污染。
+                l_stop = torch.nn.functional.binary_cross_entropy_with_logits(
+                    stop_logit, batch["stop"].to(device))
+                loss = loss + float(a.stop_loss_weight) * l_stop
             loss.backward()
             _clip = trainable + list(head.parameters()) + extra_params
             if _clip:
@@ -1469,7 +1559,8 @@ def main(argv=None) -> int:
         val_metrics = evaluate(model, head, dl_val, device,
                                injector=injector, event_head=ev_head,
                                traversability_head=trav_head, bypass=bypass,
-                               quad_active=a.quad_feats, readout=readout)
+                               quad_active=a.quad_feats, readout=readout,
+                               readout_num_in=readout_num_in, stop_head=stop_head)
         val_metrics["ep"] = epoch
         print(f"[val] ep={epoch} {json.dumps(val_metrics, ensure_ascii=False)}", flush=True)
         log_f.write(json.dumps(val_metrics, ensure_ascii=False) + "\n")

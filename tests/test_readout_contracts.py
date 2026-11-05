@@ -148,12 +148,50 @@ class HeadInputContractTests(unittest.TestCase):
             T.build_extra_heads(1024, "cpu", True, 256, (8, 14), False, 0.0, readout=ro)
 
 
+class StopHeadTests(unittest.TestCase):
+    """stop_head 契约（2026-11-06）：cls==idle 监督、与 safety_gate **并联**。"""
+
+    def test_param_count_is_small(self):
+        m = policy_readout.StopHead(in_dim=1031, hidden=64)
+        n = policy_readout.param_count(m)
+        self.assertEqual(n, 1031 * 64 + 64 + 64 + 1)
+
+    def test_forward_shape_and_range(self):
+        m = policy_readout.StopHead(1031, 64).eval()
+        with torch.no_grad():
+            y = m(torch.randn(5, 1031))
+        self.assertEqual(tuple(y.shape), (5,))
+        p = policy_readout.stop_prob(y)
+        self.assertTrue(bool(((p >= 0) & (p <= 1)).all()))
+
+    def test_rejects_wrong_input_dim(self):
+        m = policy_readout.StopHead(1031, 64)
+        with self.assertRaises(RuntimeError):
+            m(torch.randn(2, 1024))
+
+    def test_label_is_idle_only(self):
+        self.assertEqual(policy_readout.stop_label("idle"), 1.0)
+        for c in ("move", "trans", "none"):
+            self.assertEqual(policy_readout.stop_label(c), 0.0)
+
+    def test_disabled_returns_none(self):
+        self.assertIsNone(policy_readout.build_stop_head(1031, enabled=False))
+
+    def test_shares_head_feature_dim(self):
+        """stop_head 必须吃与动作头**同一**特征向量（读出输出 + 数值 7）。"""
+        readout = policy_readout.VisionQueryReadout(1024, 256, 4)
+        stop = policy_readout.StopHead(readout.out_dim + 7, 64)
+        self.assertEqual(stop.in_dim, readout.out_dim + 7)
+
+
 class SchemaCompatibilityTests(unittest.TestCase):
     """新增开关不得让旧 checkpoint 的语义漂移。"""
 
     def test_legacy_defaults_are_off(self):
         for k, v in (("readout", "none"), ("readout_dim", 0), ("vision_query", 0),
-                     ("no_last_token", False), ("use_hidden", True)):
+                     ("no_last_token", False), ("use_hidden", True),
+                     ("readout_only", False), ("card_version", 1),
+                     ("numeric_dim", 8)):
             self.assertEqual(input_schema.LEGACY_DEFAULTS.get(k), v, k)
 
     def test_old_schema_load_gets_off_defaults(self):
@@ -167,6 +205,9 @@ class SchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(s["readout_dim"], 0)
         self.assertFalse(s["no_last_token"])
         self.assertTrue(s["use_hidden"])
+        self.assertEqual(s["card_version"], 1)
+        self.assertEqual(s["numeric_dim"], 8)
+        self.assertFalse(s["readout_only"])
 
     def test_schema_fields_roundtrip(self):
         if not _TORCH_OK:

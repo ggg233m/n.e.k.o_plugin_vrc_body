@@ -47,6 +47,11 @@ LEGACY_DEFAULTS = {
     "history_frame_s": 0.4,
     # 老 checkpoint 一律按当时的单点 ZOH 口径，源频率记 0。
     "omega_source_hz": 0,
+    # ---- 记忆卡 v2（2026-11-06）：删 [mode]、数值 8→7 维 ----
+    # 老 ckpt 用 v1 卡（含 [mode]），**不能用新卡评测**；这里保留 v1 语义，
+    # 由 policy_runtime 打警告（旧 ckpt 已不在基线表内）。
+    "card_version": 1,
+    "numeric_dim": 8,
     # ---- S2 读出（2026-11-06）：全部默认「关」，旧 checkpoint 语义不变 ----
     # 老 ckpt 的 head 输入只有 LM 末位 hidden；新增开关若默认开，会静默改变
     # 已发布 checkpoint 的输入口径。默认关 + load() setdefault 保证向后兼容。
@@ -56,6 +61,8 @@ LEGACY_DEFAULTS = {
     "vision_query_dim": 0,
     "no_last_token": False,
     "use_hidden": True,
+    # 纯读出实验：只训读出层 + stop_head，冻结主干与 LoRA；禁止 A*/任务卡输入。
+    "readout_only": False,
     "legacy": True,
 }
 
@@ -103,6 +110,10 @@ def from_args(a) -> dict:
         "vision_query_dim": int(g("vision_query_dim", 256) or 256),
         "no_last_token": bool(g("no_last_token", False)),
         "use_hidden": not bool(g("no_last_token", False)),
+        # 卡 v2：无 [mode]；数值旁路 7 维（wp2 + topo3 + body2）。
+        "card_version": int(g("card_version", 2) or 2),
+        "numeric_dim": 7,
+        "readout_only": bool(g("readout_only", False)),
         "legacy": False,
     }
 
@@ -133,5 +144,6 @@ def describe(s: dict) -> str:
     """一行摘要，用于启动日志。"""
     keys = ("act_dim", "steps", "prompt_format", "drop_wp", "path_in", "drop_topo",
             "quad_feats", "numeric_bypass", "traversability_head",
+            "card_version", "numeric_dim", "readout_only",
             "readout", "vision_query", "no_last_token")
     return " ".join("%s=%s" % (k, s.get(k)) for k in keys)

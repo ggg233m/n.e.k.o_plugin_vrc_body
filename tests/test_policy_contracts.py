@@ -181,6 +181,25 @@ class LocalizationGateTests(unittest.TestCase):
         self.assertFalse(loc["ok"])
         self.assertEqual(loc["reason"], "pose_stale")
 
+    def test_7_stop_head_is_parallel_with_safety_gate(self):
+        """stop_head 与 safety_gate **并联**：两个都能停，安全门优先级更高。"""
+        d = pm.decide_stop(stop_head_p=0.95, localization_ok=True)
+        self.assertTrue(d["stop"])
+        self.assertEqual(d["source"], "stop_head")
+        d = pm.decide_stop(safety_veto=True, stop_head_p=0.95, localization_ok=True)
+        self.assertEqual(d["source"], "safety_gate")
+        d = pm.decide_stop(nav_state="stop", stop_head_p=0.95, localization_ok=True)
+        self.assertEqual(d["source"], "nav_state")
+        d = pm.decide_stop(stop_head_p=0.95, localization_ok=False,
+                           localization_reason="unlocalized")
+        self.assertEqual(d["source"], "safety_gate_unlocalized")
+        d = pm.decide_stop(stop_head_p=0.10, localization_ok=True)
+        self.assertFalse(d["stop"])
+
+    def test_8_stop_head_missing_is_not_a_stop(self):
+        d = pm.decide_stop(stop_head_p=None, localization_ok=True)
+        self.assertFalse(d["stop"])
+
     def test_decide_localization_cases(self):
         loc = pm.decide_localization(None, None)
         self.assertTrue(loc["ok"])
@@ -221,7 +240,7 @@ class LocalizationGateTests(unittest.TestCase):
 
 
 class ModeMappingTests(unittest.TestCase):
-    """NavSession.mode → 记忆卡 [mode] 是**单向**映射，只有一处定义。"""
+    """NavSession.mode → 运行时停止决策；**不再进入记忆卡**（v2，2026-11-06）。"""
 
     def test_from_session_mode_table(self):
         self.assertEqual(pm.from_session_mode("goto"), pm.MODE_FOLLOW)
@@ -237,9 +256,11 @@ class ModeMappingTests(unittest.TestCase):
         import policy_text as pt
         self.assertEqual(pt.MODE_STOP, pm.MODE_STOP)
         self.assertEqual(pt.MODE_NAMES, pm.MODE_NAMES)
-        txt = pt.build_policy_text(pm.from_session_mode("explore"), (1.0, 2.0), None,
-                                   (0.0, 0.0))
-        self.assertIn("[mode] 2", txt)
+        # 卡 v2：mode **不进**模型输入（2026-11-06 拍板）。
+        txt = pt.build_policy_text((1.0, 2.0), None, (0.0, 0.0))
+        self.assertNotIn("[mode]", txt)
+        with self.assertRaises(ValueError):
+            pt.assert_card_clean("[mode] 2 [wp] 1.00 2.00")
 
     def test_follower_axes_is_not_a_mode(self):
         self.assertEqual(pm.from_follower_axes(0.0, 0.0), "hold")

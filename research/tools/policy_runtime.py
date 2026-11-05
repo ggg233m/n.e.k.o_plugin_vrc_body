@@ -133,6 +133,17 @@ class PolicyRuntime:
         self.drop_topo = bool(self.schema["drop_topo"])
         self.quad_feats = bool(self.schema["quad_feats"])
         self.prompt_format = str(self.schema["prompt_format"])
+        # 记忆卡 v2（2026-11-06）：无 [mode]。旧 ckpt 用 v1 卡训练，**不能用新卡评测**。
+        # 这里只告警不硬失败：B3 等旧 checkpoint 仍需能加载用于非横向比较的场景，
+        # 但任何与 v2 数字的对比都是无效的。
+        import policy_text
+        self.card_version = int(self.schema.get("card_version", 1) or 1)
+        if self.card_version != policy_text.CARD_VERSION:
+            print("[runtime] ⚠️ card_version=%d，但当前卡是 v%d（无 [mode]）。"
+                  "旧 ckpt 的训练输入含 [mode]，**不得与新卡结果横向比较**。"
+                  % (self.card_version, policy_text.CARD_VERSION), flush=True)
+        # 纯读出实验（S2）：禁止 A* 路径 / 任务卡进入输入（数据仍为 0 个）。
+        self.readout_only = bool(self.schema.get("readout_only", False))
         print("[runtime] input_schema: " + input_schema.describe(self.schema), flush=True)
         _head_sd = torch.load(Path(run_dir) / "head.pt", map_location="cpu")
         _out = int(_head_sd["fc.weight"].shape[0])
@@ -152,10 +163,17 @@ class PolicyRuntime:
             n_query=int(self.schema.get("vision_query", 0) or 4),
             out_dim=int(self.schema.get("readout_dim", 0) or 256))
         self.readout_dim = int(getattr(self.readout, "out_dim", 0) or 0)
+        # 数值 7 维是否直接拼进动作头（--fusion additive 的 S2 口径）
+        self.readout_num_in = bool(self.schema.get("readout_num_in", False))
         # use_hidden=False = 动作头不吃 LM 末位 hidden（--no-last-token）
         self.use_hidden = bool(self.schema.get("use_hidden", True))
         _head_in = int(_head_sd["fc.weight"].shape[1])
-        _expect_extra = self.readout_dim + (44 if self.quad_feats else 0)
+        # 数值旁路维数按 manifest 走（v1 旧卡 8 维 / v2 新卡 7 维，均不含 mode 语义）。
+        _numeric_dim = int(self.schema.get("numeric_dim", 7) or 7)
+        _quad_dim = _numeric_dim + _numeric_dim + _numeric_dim * (_numeric_dim - 1) // 2
+        _expect_extra = (self.readout_dim
+                         + (_numeric_dim if self.readout_num_in else 0)
+                         + (_quad_dim if self.quad_feats else 0))
         _expect_in = (self.hidden if self.use_hidden else 0) + _expect_extra
         if _head_in != _expect_in:
             raise RuntimeError(
@@ -184,6 +202,24 @@ class PolicyRuntime:
                   % (self.schema.get("readout"), self.readout_dim,
                      policy_readout.param_count(self.readout), not self.use_hidden),
                   flush=True)
+        # stop_head（2026-11-06）：manifest 声明就加载；缺失权重**报错**不静默。
+        self.stop_head = None
+        self.stop_thresh = float(self.schema.get("stop_head_thresh", 0.5) or 0.5)
+        if bool(self.schema.get("stop_head", False)):
+            _sh = Path(run_dir) / "stop_head.pt"
+            if not _sh.exists():
+                raise RuntimeError("manifest 声明 stop_head=true，但 %s 不存在" % _sh)
+            _sd = torch.load(_sh, map_location="cpu")
+            _s_in = int(_sd["fc1.weight"].shape[1])
+            if _s_in != _head_in:
+                raise RuntimeError("stop_head 输入 %d 与动作头输入 %d 不一致"
+                                   % (_s_in, _head_in))
+            self.stop_head = policy_readout.StopHead(
+                _s_in, hidden=int(_sd["fc1.weight"].shape[0])).to(self.device)
+            self.stop_head.load_state_dict(_sd)
+            self.stop_head.eval()
+            print("[runtime] stop_head in_dim=%d hidden=%d thresh=%.2f（与 safety_gate 并联）"
+                  % (_s_in, int(_sd["fc1.weight"].shape[0]), self.stop_thresh), flush=True)
         # 训练侧对**内层模型**做了 torch.compile，save_pretrained 会把 372 条 LoRA
         # 键名加上 ._orig_mod. 前缀；裸 load_adapter 会静默跳过，
         # 结果等于用未训练的 adapter 推理（实测 mse8 差 7 倍）。
@@ -248,12 +284,14 @@ class PolicyRuntime:
     # ------------------------------------------------------------ 输入
     def build_inputs(self, cur_rgb: np.ndarray, prev_rgb: np.ndarray,
                      wp, body, preprocessed: bool = False, path=None,
-                     mode: int = 0, topo=None, guide=None,
+                     topo=None, guide=None,
                      task_prompt: str | None = None):
         """``path``：沿路径前进的 k 个机体系点 [(dx,dz), …]；None 或空 = 用单点 prompt。
 
         ⚠️ 给 ``path`` 会改变 token 序列（插入 k 组数字），**偏离训练分布**。
         默认 None 时与训练逐字一致。
+
+        ``mode`` 已从本函数删除（2026-11-06）：mode 只进 ``decide_stop``，不进模型输入。
         """
         if not preprocessed:
             cur_rgb = to_policy_rgb(cur_rgb, self.size)
@@ -265,9 +303,13 @@ class PolicyRuntime:
         if self.drop_topo:
             topo = None
         video = np.stack([np.asarray(prev_rgb, np.uint8), np.asarray(cur_rgb, np.uint8)])
-        # 记忆卡：与训练侧**同一个函数**（方案 §10.6 门 G8 的硬要求）。
+        # 记忆卡 v2（2026-11-06）：**不再传 mode**。与训练侧同一个函数（门 G8）。
         # 各写一套模板必然静默漂移，这条和 §5.2 的图像 resize 是同一类纪律。
-        text = build_policy_text(mode, wp, topo, body)
+        text = build_policy_text(wp, topo, body)
+        # 纯读出实验（S2）硬门：A* 路径与任务卡当前数据为 0 个，禁止提前注入。
+        if self.readout_only and (path or task_prompt):
+            raise RuntimeError("readout_only 模型禁止 A* 路径 / 任务卡输入；"
+                               "S2 是纯感知读出实验，条件输入数据尚未录制")
         if path and self.path_in:
             # 路径形状是**附加**输入（VRC_POLICY_PATH_IN，默认关）。
             # 训练集里没有这些 token，所以它不属于记忆卡格式，单独追加在卡后。
@@ -289,9 +331,10 @@ class PolicyRuntime:
             tokenize=False, add_generation_prompt=True)
         # 数值通道（4-query/additive fusion 与 quad_feats 都要）：与记忆卡**同源**，
         # 且必须是**被 drop_wp / drop_topo 处理过**的值，否则线上口径与训练不一致。
+        # 7 维（wp2 + topo3 + body2，**不含 mode**）：mode 只用于停止决策。
         _tp = tuple(float(x) for x in (topo or (0.0, 0.0, 0.0)))[:3]
         self._nums = torch.tensor([[float(wp[0]), float(wp[1]), _tp[0], _tp[1], _tp[2],
-                                    float(body[0]), float(body[1]), float(mode)]],
+                                    float(body[0]), float(body[1])]],
                                   dtype=torch.float32)
         min_px = max_px = self.size[0] * self.size[1]
         inputs = self.processor(text=[tmpl], videos=[video], return_tensors="pt",
@@ -339,16 +382,27 @@ class PolicyRuntime:
     def _apply_head(self, pooled):
         """拼额外输入后过动作头；``readout`` 用**本次前向**捕到的视觉 token。"""
         extras = []
+        _nums = self._nums.to(self.device)
         if self.readout is not None:
             feat = _extract_visual_feat(self._vis_cap.get("feat"), pooled.shape[0])
             if feat is None:
                 raise RuntimeError("manifest 声明 readout，但这次前向没捕到视觉 token"
                                    "（torch.compile / 双图路径可能吞掉了 hook）")
-            extras.append(self.readout(feat.float(), self._nums.to(self.device)))
+            if policy_readout.needs_numeric(self.readout):
+                extras.append(self.readout(feat.float(), _nums))
+            else:
+                extras.append(self.readout(feat.float()))
+                if self.readout_num_in:
+                    extras.append(_nums)
         if self.quad_feats:
-            extras.append(self._nums.to(self.device))
+            extras.append(_nums)
         x = pooled.float() if self.use_hidden else None
-        return self.head(x, *extras) if extras else self.head(x)
+        _head_in = torch.cat(([x] if x is not None else []) + extras, -1) if extras else x
+        # stop_head（2026-11-06）：与动作头**同一特征向量**；只进 decide_stop，
+        # 不改变喂给模型的输入，也不替代 safety_gate。
+        self._stop_logit = (self.stop_head(_head_in)
+                            if self.stop_head is not None else None)
+        return self.head(_head_in) if extras else self.head(x)
 
     def _forward(self, b):
         if self.dual is not None and self.dual.ready:
@@ -360,6 +414,7 @@ class PolicyRuntime:
                 return self._apply_head(pooled).view(-1, K_STEPS, self.act_dim)
         kw = {k: v.to(self.device) for k, v in b.items()}
         self._vis_cap.clear()
+        self._stop_logit = None
         out = self._inner(**kw, use_cache=False)
         h = out.last_hidden_state
         idx = kw["attention_mask"].sum(-1) - 1
@@ -385,8 +440,10 @@ class PolicyRuntime:
         （STOP 文件、``now - obs_t``），见 policy_executor.decide_stop 的合并。
         """
         t0 = time.perf_counter()
+        # ``mode`` 只为调用方兼容保留（policy_runner 仍在传）；**不进模型输入**。
+        _ = mode
         b = self.build_inputs(cur_rgb, prev_rgb, wp, body, preprocessed=preprocessed,
-                              path=path, mode=mode, topo=topo, guide=guide,
+                              path=path, topo=topo, guide=guide,
                               task_prompt=task_prompt)
         with torch.no_grad():
             pred = self._forward(b)
@@ -402,8 +459,13 @@ class PolicyRuntime:
             wp_near = float(np.hypot(float(wp[0]), float(wp[1]))) < self.wp_stop
         except (TypeError, ValueError, IndexError):
             wp_near = None
+        # stop_head 概率：调用方显式传入优先（联调/回放用），否则用本次前向算出的。
+        _p = None
+        if self._stop_logit is not None:
+            _p = float(torch.sigmoid(self._stop_logit.float())[0])
+        stop_head_p = stop_head if stop_head is not None else _p
         decision = decide_stop(safety_veto=bool(safety_veto), nav_state=nav_state,
-                               stop_head_p=stop_head,
+                               stop_head_p=stop_head_p,
                                localization_ok=localization_ok,
                                localization_reason=localization_reason,
                                wp_near_zero=wp_near)
@@ -413,6 +475,8 @@ class PolicyRuntime:
         return dict(block=block.round(4).tolist(), stop=stop,
                     stop_source=decision["source"], stop_reason=decision["reason"],
                     stop_detail=decision["detail"],
+                    # stop_head 概率（None = 该 checkpoint 没有停止头）
+                    stop_head_p=stop_head_p,
                     # 兼容别名：旧调用方（policy_runner / executor / 日志）只读 gated。
                     gated=stop, obs_t=t0,
                     latency_ms=(time.perf_counter() - t0) * 1000)

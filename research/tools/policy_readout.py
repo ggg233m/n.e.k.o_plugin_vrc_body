@@ -15,7 +15,7 @@
    信息瓶颈在 256 维（4×256 输出），而不是 LM 末位 token 那 1024 维里被 24 层
    递归稀释过的一份摘要；代价是完全没有文本/任务卡语义。
 
-2. ``AdditiveFusion``：视觉与数值（body + 因果历史 8 维）各一个小编码器，
+2. ``AdditiveFusion``：视觉与数值（body + 因果历史 7 维，**无 mode**）各一个小编码器，
    256 维空间里**相加**（``gated`` 时改成学到的 softmax 门控加权）。
    任务卡与 A* 两个槽位**当前留空**：``task.jsonl`` / ``astar_guidance.jsonl``
    在仓库里不存在（见 registry），不造 0 向量参与训练 —— 否则等于把「缺失」
@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-NUMERIC_DIM = 8          # wp dx/dz + topo 3 + body vx/vz + mode（与记忆卡同源）
+NUMERIC_DIM = 7          # wp dx/dz + topo 3 + body vx/vz（2026-11-06 去 mode：8→7）
 VIS_DIM = 1024           # 视觉塔输出维度（Qwen3.5-0.8B-S3）
 VIS_TOKENS = 112         # 448×256，两帧 temporal merge 后的一条序列
 
@@ -93,7 +93,7 @@ class AdditiveFusion(nn.Module):
         else:                                  # 4-query 版本才学「看哪里」
             vis = vis.float()
         if numeric is None:
-            raise ValueError("AdditiveFusion 需要 numeric（8 维）输入；"
+            raise ValueError("AdditiveFusion 需要 numeric（7 维）输入；"
                              "缺它就等于把数值通道静默置零")
         fv = self.vis_enc(vis)
         fn = self.num_enc(numeric.float())
@@ -134,6 +134,45 @@ def readout_kind(m: nn.Module | None) -> str:
 
 def param_count(m: nn.Module | None) -> int:
     return 0 if m is None else int(sum(p.numel() for p in m.parameters()))
+
+
+class StopHead(nn.Module):
+    """二值停止头：``cls == idle`` 监督，与 ``safety_gate`` **并联**（不替代安全门）。
+
+    2026-11-06 拍板：停止不再是「动作头恰好输出接近 0」，而是一个显式的二分类
+    输出；但仍只作为 ``policy_modes.decide_stop`` 的**最后一个**来源，
+    estop / stale / safety_gate / 定位门 / nav_state 的优先级都在它之前。
+    输入是**与动作头完全相同的**特征向量（读出输出 + 数值拼接），
+    所以不引入第二套输入口径。
+    """
+
+    def __init__(self, in_dim: int, hidden: int = 64):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.fc1 = nn.Linear(self.in_dim, int(hidden))
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(int(hidden), 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """返回 ``(B,)`` logits（未过 sigmoid）。"""
+        return self.fc2(self.act(self.fc1(x))).squeeze(-1)
+
+
+def build_stop_head(in_dim: int, hidden: int = 64, enabled: bool = True):
+    return StopHead(in_dim, hidden) if enabled else None
+
+
+def stop_prob(logits: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(logits.float())
+
+
+def stop_label(cls: str) -> float:
+    """stop_head 监督：``cls == idle`` → 1。其余（move/trans）→ 0。
+
+    为什么用窗口类别而不是逐步 mask：停止是**块级**语义（这一拍该不该动），
+    逐步 mask 只是「标签在录制末尾被截断」，两者不能混。
+    """
+    return 1.0 if str(cls) == "idle" else 0.0
 
 
 def schema_fields(m: nn.Module | None, no_last_token: bool = False) -> dict:
