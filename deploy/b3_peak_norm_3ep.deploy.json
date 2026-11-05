@@ -1,0 +1,123 @@
+{
+ "kind": "vrc_policy_deployment",
+ "version": 1,
+ "created_at": "2026-11-05T18:09:52",
+ "note": "由 policy_deploy.py make 生成（本机快照，2026-11-05）。真机未验证；GameScaling 仅通用 3D 先验。路径已做可移植化：仓库内产物用相对路径，外部资产用 <VRC_RECORDING_ROOT> 占位，按 paths_note 替换后重新 make。",
+ "model_dir": "<VRC_RECORDING_ROOT>/weights/GameScaling-0.8B-S3",
+ "run_dir": ".venv_xpu/runs/B_peak_norm_3ep/best",
+ "files": {
+  "head": {
+   "path": ".venv_xpu/runs/B_peak_norm_3ep/best/head.pt",
+   "sha256": "e4e1cf7ecbc81cd836add7e0ac1b3d120d9ddb8a4a9a7c7b6c191cbfb40e20de",
+   "bytes": 149453
+  },
+  "adapter": {
+   "path": ".venv_xpu/runs/B_peak_norm_3ep/best/adapter/adapter_model.safetensors",
+   "sha256": "33fb49607c37f002d5fec48cecf77f56500258606315638954a8c287bb173803",
+   "bytes": 21704280
+  },
+  "input_schema": {
+   "path": ".venv_xpu/runs/B_peak_norm_3ep/best/input_schema.json",
+   "sha256": "161616f912b0269599aa62a8ad803f63f4884b0d4d77966eabe3000a5d0c8b6e"
+  }
+ },
+ "schema": {
+  "version": 1,
+  "act_dim": 3,
+  "steps": 12,
+  "step_s": 0.1,
+  "prompt_format": "card",
+  "drop_wp": true,
+  "drop_topo": false,
+  "topo_mode": "full",
+  "quad_feats": false,
+  "numeric_bypass": false,
+  "mode_dim": 1,
+  "video_frames": 2,
+  "history_frame_s": 0.2,
+  "omega_source_hz": 30,
+  "omega_unit": "rad_s",
+  "omega_norm": true,
+  "legacy": false
+ },
+ "training": {
+  "dataset": "<VRC_RECORDING_ROOT>/dataset/m0_policy_448_v6peak",
+  "dataset_omega": {
+   "source": "AngularY",
+   "unit": "rad/s",
+   "source_hz": 30,
+   "aggregation": "interval_abs_peak",
+   "rad_per_unit": -0.008953,
+   "fullscale_rad": 9.167872,
+   "sign": "right_positive",
+   "missing": "0.0",
+   "measured": "2026-11-03 积分对齐 HMD，R2 0.79-0.96"
+  },
+  "dataset_wp_mode": "causal",
+  "seed": 0,
+  "epochs": 3,
+  "batch": 4,
+  "lora_r": 8,
+  "lr_head": 0.0001,
+  "drop_wp": true,
+  "omega_clip": 9.17
+ },
+ "calibration": {
+  "v_max_mps": 1.2,
+  "dv_max_mps2": 0.5,
+  "w_max_rad_s": 1.57,
+  "dw_max_rad_s2": 3.14,
+  "omega_sign": "right_positive",
+  "turn_channel_sign": "service_left_positive（omega_to_delta_deg 内部反号）",
+  "wp_stop_m": 0.02,
+  "wp_stop_semantics": "annotation_only_wp_never_stops",
+  "wp_stop_zero_means": [
+   "没有路径先验（A* 未请求/失效/未定位）",
+   "自由探索或纯局部提示词任务",
+   "模型应更多依赖画面，而不是被停车"
+  ],
+  "stop_sources": [
+   "estop",
+   "stale",
+   "safety_gate",
+   "safety_gate_unlocalized",
+   "nav_state",
+   "stop_head"
+  ],
+  "localization_gate": {
+   "independent_of_wp": true,
+   "source": "navmesh_state+pose_age",
+   "stops_on": [
+    "unlocalized",
+    "unknown",
+    "pose_stale"
+   ],
+   "pose_stale_s": 0.5,
+   "quality_metric": "none_placeholder",
+   "note": "当前无逐帧定位质量指标（sigma_m 是 NavConfig.dr_sigma_m 常量）；quality_max 留 None"
+  },
+  "saturation_measured": {
+   "n": 37460,
+   "p50": 0.07,
+   "p95": 4.73,
+   "max": 9.17,
+   "sat_pct_at_w_max": 14.46
+  }
+ },
+ "runtime_env": {
+  "VRC_POLICY_HEAD": "1",
+  "VRC_POLICY_MODEL": "<VRC_RECORDING_ROOT>/weights/GameScaling-0.8B-S3",
+  "VRC_POLICY_RUN": ".venv_xpu/runs/B_peak_norm_3ep/best",
+  "VRC_POLICY_DRYRUN": "1",
+  "VRC_POLICY_HZ": "2.0",
+  "VRC_POLICY_VMAX": "1.2",
+  "VRC_POLICY_STALE": "0.8",
+  "VRC_POLICY_FLOOR": "0.6",
+  "VRC_POLICY_GRAPH": "0"
+ },
+ "paths_note": {
+  "repo_relative": "run_dir / files.*.path 相对仓库根（.venv_xpu/runs/...），.venv_xpu 被 .gitignore 忽略，需在本地由训练产出",
+  "external_placeholder": "<VRC_RECORDING_ROOT> = 存放 GameScaling 权重与 v6peak 数据集的外部根目录（本机为 vrc_recording/vrc_model）；换机器时用 policy_deploy.py make --model/--dataset 重新生成 manifest，不要手改 sha256",
+  "preflight": "preflight 直接 Path(path).exists() 校验，不做变量展开；替换占位符或重新 make 之前，含 <...> 的路径必然 FAIL，这是有意的（防止静默用错权重）"
+ }
+}
